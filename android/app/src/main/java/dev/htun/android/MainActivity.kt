@@ -1,7 +1,9 @@
 package dev.htun.android
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -23,70 +25,35 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
+import java.net.URI
+import java.net.URISyntaxException
+import java.util.UUID
 
 class MainActivity : Activity() {
-    private lateinit var server: EditText
-    private lateinit var token: EditText
-    private lateinit var clientId: EditText
-    private lateinit var rememberToken: CheckBox
-    private lateinit var autoConnect: CheckBox
+    private lateinit var profileStore: VpnProfileStore
+    private lateinit var profilesContainer: LinearLayout
     private lateinit var status: TextView
     private lateinit var statusDetail: TextView
     private lateinit var statusDot: View
-    private lateinit var connectButton: Button
-    private lateinit var settingsCard: LinearLayout
-    private lateinit var settingsToggle: TextView
-    private var pendingStart = false
+    private var pendingProfileId: String? = null
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            renderStatus(intent?.getStringExtra(TunnelService.EXTRA_STATUS) ?: getString(R.string.unknown_state))
+            render(intent?.getStringExtra(TunnelService.EXTRA_STATUS) ?: getString(R.string.unknown_state))
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         configureWindow()
-        val preferences = getSharedPreferences("settings", MODE_PRIVATE)
-        val stored = SecureTokenStore(this).load()
-
-        server = field(
-            getString(R.string.gateway_hint),
-            preferredGateway(
-                stored?.server ?: preferences.getString("server", DEFAULT_SERVER) ?: DEFAULT_SERVER,
-            ),
-        )
-        clientId = field(
-            getString(R.string.client_id_hint),
-            stored?.clientId ?: preferences.getString("client_id", Build.MODEL.safeClientId()) ?: "android",
-        )
-        token = field(getString(R.string.token_hint), stored?.token ?: "").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        rememberToken = option(R.string.remember_token).apply {
-            isChecked = stored != null
-        }
-        autoConnect = option(R.string.auto_connect).apply {
-            isChecked = stored != null && preferences.getBoolean("auto_connect", false)
-            isEnabled = rememberToken.isChecked
-            alpha = if (isEnabled) 1f else 0.45f
-        }
-        rememberToken.setOnCheckedChangeListener { _, checked ->
-            autoConnect.isEnabled = checked
-            autoConnect.alpha = if (checked) 1f else 0.45f
-            if (!checked) {
-                autoConnect.isChecked = false
-                SecureTokenStore(this).clear()
-                preferences.edit().putBoolean("auto_connect", false).apply()
-            }
-        }
-        autoConnect.setOnCheckedChangeListener { _, checked ->
-            preferences.edit().putBoolean("auto_connect", checked && rememberToken.isChecked).apply()
-        }
-
+        profileStore = VpnProfileStore(this)
+        profileStore.migrateLegacy(Build.MODEL.safeClientId())
+        pendingProfileId = savedInstanceState?.getString(STATE_PENDING_PROFILE)
         setContentView(buildContent())
-        renderStatus(TunnelService.currentStatus())
+        render(TunnelService.currentStatus())
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -95,16 +62,27 @@ class MainActivity : Activity() {
         }
     }
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onStart() {
         super.onStart()
-        renderStatus(TunnelService.currentStatus())
-        registerReceiver(
-            statusReceiver,
-            IntentFilter(TunnelService.ACTION_STATUS),
-            STATUS_PERMISSION,
-            null,
-            Context.RECEIVER_NOT_EXPORTED,
-        )
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                statusReceiver,
+                IntentFilter(TunnelService.ACTION_STATUS),
+                STATUS_PERMISSION,
+                null,
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(
+                statusReceiver,
+                IntentFilter(TunnelService.ACTION_STATUS),
+                STATUS_PERMISSION,
+                null,
+            )
+        }
+        render(TunnelService.currentStatus())
     }
 
     override fun onStop() {
@@ -112,75 +90,80 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingProfileId?.let { outState.putString(STATE_PENDING_PROFILE, it) }
+    }
+
     @Deprecated("VpnService preparation still uses the activity-result contract")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_VPN && resultCode == RESULT_OK && pendingStart) startTunnel()
-        pendingStart = false
+        if (requestCode == REQUEST_VPN && resultCode == RESULT_OK) {
+            val profileId = pendingProfileId
+            profileStore.profiles().firstOrNull { it.id == profileId }?.let(::startProfile)
+        }
+        pendingProfileId = null
     }
 
     private fun buildContent(): View {
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(28), dp(22), dp(36))
+            setPadding(dp(20), dp(24), dp(20), dp(36))
         }
-        page.addView(TextView(this).apply {
-            text = getString(R.string.app_name)
-            textSize = 30f
-            setTextColor(COLOR_TEXT)
-            setTypeface(typeface, Typeface.BOLD)
-        })
-        page.addView(TextView(this).apply {
-            setText(R.string.tagline)
-            textSize = 14f
-            setTextColor(COLOR_MUTED)
-            setPadding(0, dp(3), 0, dp(24))
-        })
-        page.addView(connectionCard())
 
-        settingsToggle = TextView(this).apply {
-            setText(R.string.connection_settings)
-            textSize = 15f
-            setTextColor(COLOR_TEXT)
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-            background = rounded(COLOR_CARD, 18f)
-            setCompoundDrawablesWithIntrinsicBounds(0, 0, android.R.drawable.arrow_down_float, 0)
-            setOnClickListener { toggleSettings() }
-            layoutParams = marginParams(top = 14)
         }
-        page.addView(settingsToggle)
-
-        settingsCard = LinearLayout(this).apply {
+        header.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-            background = rounded(COLOR_CARD, 18f)
-            visibility = View.GONE
-            layoutParams = marginParams(top = 8)
-            addView(label(R.string.gateway_label))
-            addView(server)
-            addView(label(R.string.token_label, 14))
-            addView(token)
-            addView(rememberToken)
-            addView(autoConnect)
-            addView(label(R.string.device_id_label, 12))
-            addView(clientId)
             addView(TextView(this@MainActivity).apply {
-                setText(R.string.settings_help)
-                textSize = 12f
-                setTextColor(COLOR_MUTED)
-                setPadding(0, dp(14), 0, 0)
+                setText(R.string.app_name)
+                textSize = 29f
+                setTextColor(COLOR_TEXT)
+                setTypeface(typeface, Typeface.BOLD)
             })
+            addView(TextView(this@MainActivity).apply {
+                setText(R.string.profile_tagline)
+                textSize = 13f
+                setTextColor(COLOR_MUTED)
+                setPadding(0, dp(2), 0, 0)
+            })
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        header.addView(Button(this).apply {
+            text = "+"
+            contentDescription = getString(R.string.add_profile)
+            textSize = 24f
+            setTextColor(COLOR_BUTTON_TEXT)
+            background = circle(COLOR_ACCENT)
+            minWidth = 0
+            minHeight = 0
+            setPadding(0, 0, 0, dp(2))
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+            setOnClickListener { showProfileDialog(null) }
+        })
+        page.addView(header)
+        page.addView(connectionSummary().apply {
+            layoutParams = marginParams(top = 22)
+        })
+        page.addView(TextView(this).apply {
+            setText(R.string.vpn_profiles)
+            textSize = 13f
+            setTextColor(COLOR_MUTED)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(2), dp(25), 0, dp(10))
+        })
+        profilesContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
-        page.addView(settingsCard)
-
+        page.addView(profilesContainer)
         page.addView(TextView(this).apply {
             setText(R.string.security_note)
             textSize = 12f
             gravity = Gravity.CENTER
             setTextColor(COLOR_MUTED)
-            setPadding(dp(12), dp(24), dp(12), 0)
+            setPadding(dp(12), dp(25), dp(12), 0)
         })
 
         return ScrollView(this).apply {
@@ -190,181 +173,370 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun connectionCard(): View {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(22), dp(24), dp(22), dp(22))
-            background = rounded(COLOR_CARD, 24f)
-        }
-        val stateRow = LinearLayout(this).apply {
+    private fun connectionSummary(): View {
+        return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        statusDot = View(this).apply {
-            background = circle(COLOR_OFFLINE)
-            layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).apply {
-                marginEnd = dp(9)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), dp(17), dp(18), dp(17))
+            background = rounded(COLOR_CARD, 18f)
+
+            statusDot = View(this@MainActivity).apply {
+                background = circle(COLOR_OFFLINE)
+                layoutParams = LinearLayout.LayoutParams(dp(12), dp(12)).apply {
+                    marginEnd = dp(13)
+                }
             }
-        }
-        status = TextView(this).apply {
-            textSize = 20f
-            setTextColor(COLOR_TEXT)
-            setTypeface(typeface, Typeface.BOLD)
-        }
-        stateRow.addView(statusDot)
-        stateRow.addView(status)
-        card.addView(stateRow)
-
-        statusDetail = TextView(this).apply {
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-            setPadding(0, dp(8), 0, dp(22))
-        }
-        card.addView(statusDetail)
-
-        connectButton = Button(this).apply {
-            isAllCaps = false
-            textSize = 16f
-            setTextColor(COLOR_BUTTON_TEXT)
-            setTypeface(typeface, Typeface.BOLD)
-            minHeight = dp(56)
-            background = rounded(COLOR_ACCENT, 18f)
-            setOnClickListener { handlePrimaryAction() }
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56))
-        }
-        card.addView(connectButton)
-        return card
-    }
-
-    private fun toggleSettings() {
-        val opening = settingsCard.visibility != View.VISIBLE
-        settingsCard.visibility = if (opening) View.VISIBLE else View.GONE
-        settingsToggle.setCompoundDrawablesWithIntrinsicBounds(
-            0,
-            0,
-            if (opening) android.R.drawable.arrow_up_float else android.R.drawable.arrow_down_float,
-            0,
-        )
-    }
-
-    private fun handlePrimaryAction() {
-        val active = isActiveStatus(TunnelService.currentStatus())
-        if (active) {
-            startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
-        } else {
-            requestConnect()
+            addView(statusDot)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                status = TextView(this@MainActivity).apply {
+                    textSize = 17f
+                    setTextColor(COLOR_TEXT)
+                    setTypeface(typeface, Typeface.BOLD)
+                }
+                statusDetail = TextView(this@MainActivity).apply {
+                    textSize = 12f
+                    setTextColor(COLOR_MUTED)
+                    setPadding(0, dp(3), 0, 0)
+                }
+                addView(status)
+                addView(statusDetail)
+            })
         }
     }
 
-    private fun renderStatus(value: String) {
+    private fun render(value: String) {
         if (!::status.isInitialized) return
         val connected = value.startsWith("Connected")
         val waiting = value.startsWith("Waiting")
-        val active = connected || value.startsWith("Connecting") || value.startsWith("Reconnecting") ||
-            value.startsWith("Connection lost") || waiting
+        val active = isActiveStatus(value)
         status.text = when {
             connected -> getString(R.string.connected)
             waiting -> getString(R.string.waiting_for_network)
             active -> getString(R.string.connecting)
-            else -> value
+            else -> getString(R.string.disconnected)
         }
         statusDetail.text = when {
             value.contains("HTTP/3") -> getString(R.string.transport_http3)
             value.contains("HTTP/2") -> getString(R.string.transport_http2)
             value.startsWith("Reconnecting") || value.startsWith("Connection lost") || waiting -> value
             active -> getString(R.string.establishing_secure_tunnel)
-            else -> getString(R.string.ready_to_connect)
+            else -> getString(R.string.choose_profile)
         }
-        statusDot.background = circle(if (connected) COLOR_CONNECTED else if (active) COLOR_CONNECTING else COLOR_OFFLINE)
-        connectButton.text = getString(if (active) R.string.disconnect else R.string.connect)
-        connectButton.setTextColor(if (active) COLOR_TEXT else COLOR_BUTTON_TEXT)
-        connectButton.background = rounded(if (active) COLOR_BUTTON_SECONDARY else COLOR_ACCENT, 18f)
+        statusDot.background = circle(
+            if (connected) COLOR_CONNECTED else if (active) COLOR_CONNECTING else COLOR_OFFLINE,
+        )
+        renderProfiles()
     }
 
-    private fun requestConnect() {
-        if (!server.text.toString().startsWith("https://")) {
-            showConfigurationError(R.string.https_required)
+    private fun renderProfiles() {
+        if (!::profilesContainer.isInitialized) return
+        profilesContainer.removeAllViews()
+        val profiles = profileStore.profiles()
+        if (profiles.isEmpty()) {
+            profilesContainer.addView(emptyProfiles())
             return
         }
-        if (token.text.isBlank() || !CLIENT_ID.matches(clientId.text.toString())) {
-            showConfigurationError(R.string.credentials_required)
+        val activeProfileId = TunnelService.currentProfileId()
+        profiles.forEachIndexed { index, profile ->
+            profilesContainer.addView(
+                profileCard(profile, activeProfileId).apply {
+                    if (index > 0) layoutParams = marginParams(top = 10)
+                },
+            )
+        }
+    }
+
+    private fun profileCard(profile: VpnProfile, activeProfileId: String?): View {
+        val selected = profile.id == profileStore.selectedProfileId()
+        val active = profile.id == activeProfileId && isActiveStatus(TunnelService.currentStatus())
+        val anotherProfileActive = activeProfileId != null && activeProfileId != profile.id &&
+            isActiveStatus(TunnelService.currentStatus())
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(17), dp(16), dp(13), dp(14))
+            background = rounded(COLOR_CARD, 18f, if (selected) COLOR_ACCENT_DARK else COLOR_BORDER)
+
+            val top = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            top.addView(TextView(this@MainActivity).apply {
+                text = profile.name.firstOrNull()?.uppercase() ?: "V"
+                gravity = Gravity.CENTER
+                textSize = 16f
+                setTextColor(COLOR_ACCENT)
+                setTypeface(typeface, Typeface.BOLD)
+                background = circle(COLOR_ICON)
+                layoutParams = LinearLayout.LayoutParams(dp(43), dp(43)).apply {
+                    marginEnd = dp(13)
+                }
+            })
+            top.addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = profile.name
+                    textSize = 16f
+                    setTextColor(COLOR_TEXT)
+                    setTypeface(typeface, Typeface.BOLD)
+                    maxLines = 1
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = profile.server.removePrefix("https://")
+                    textSize = 12f
+                    setTextColor(COLOR_MUTED)
+                    maxLines = 1
+                })
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            @Suppress("DEPRECATION")
+            top.addView(Switch(this@MainActivity).apply {
+                isChecked = active
+                isEnabled = !anotherProfileActive
+                thumbTintList = switchThumbColors()
+                trackTintList = switchTrackColors()
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) requestConnect(profile) else disconnectProfile(profile)
+                }
+            })
+            addView(top)
+
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(56), dp(11), 0, 0)
+                addView(TextView(this@MainActivity).apply {
+                    text = when {
+                        active -> profileStatus(TunnelService.currentStatus())
+                        profile.autoConnect -> getString(R.string.auto_connect_enabled)
+                        selected -> getString(R.string.selected_profile)
+                        else -> getString(R.string.profile_ready)
+                    }
+                    textSize = 12f
+                    setTextColor(if (active) COLOR_ACCENT else COLOR_MUTED)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                addView(TextView(this@MainActivity).apply {
+                    setText(R.string.edit)
+                    textSize = 13f
+                    setTextColor(if (active) COLOR_MUTED else COLOR_ACCENT)
+                    setTypeface(typeface, Typeface.BOLD)
+                    setPadding(dp(14), dp(5), dp(5), dp(5))
+                    isEnabled = !active
+                    setOnClickListener { showProfileDialog(profile) }
+                })
+            })
+        }
+    }
+
+    private fun emptyProfiles(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        setPadding(dp(24), dp(30), dp(24), dp(30))
+        background = rounded(COLOR_CARD, 18f, COLOR_BORDER)
+        addView(TextView(this@MainActivity).apply {
+            setText(R.string.no_profiles)
+            textSize = 17f
+            setTextColor(COLOR_TEXT)
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        addView(TextView(this@MainActivity).apply {
+            setText(R.string.no_profiles_detail)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_MUTED)
+            setPadding(0, dp(7), 0, dp(17))
+        })
+        addView(Button(this@MainActivity).apply {
+            setText(R.string.add_profile)
+            isAllCaps = false
+            setTextColor(COLOR_BUTTON_TEXT)
+            setTypeface(typeface, Typeface.BOLD)
+            background = rounded(COLOR_ACCENT, 14f)
+            setOnClickListener { showProfileDialog(null) }
+        })
+    }
+
+    private fun showProfileDialog(existing: VpnProfile?) {
+        if (existing?.id == TunnelService.currentProfileId() && isActiveStatus(TunnelService.currentStatus())) {
+            Toast.makeText(this, R.string.disconnect_before_editing, Toast.LENGTH_SHORT).show()
             return
         }
-        pendingStart = true
+        val name = dialogField(R.string.profile_name_hint, existing?.name.orEmpty())
+        val server = dialogField(
+            R.string.gateway_hint,
+            existing?.server ?: DEFAULT_SERVER,
+        )
+        val token = dialogField(
+            if (existing == null) R.string.token_hint else R.string.token_unchanged_hint,
+            "",
+        ).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val clientId = dialogField(
+            R.string.client_id_hint,
+            existing?.clientId ?: Build.MODEL.safeClientId(),
+        )
+        val autoConnect = CheckBox(this).apply {
+            setText(R.string.auto_connect)
+            isChecked = existing?.autoConnect ?: false
+            setTextColor(COLOR_TEXT)
+            buttonTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
+        }
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), dp(4), dp(4), 0)
+            addView(dialogLabel(R.string.profile_name))
+            addView(name)
+            addView(dialogLabel(R.string.gateway_label))
+            addView(server)
+            addView(dialogLabel(R.string.token_label))
+            addView(token)
+            addView(dialogLabel(R.string.device_id_label))
+            addView(clientId)
+            addView(autoConnect)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (existing == null) R.string.add_profile else R.string.edit_profile)
+            .setView(form)
+            .setPositiveButton(R.string.save, null)
+            .setNeutralButton(R.string.cancel, null)
+            .apply {
+                if (existing != null) setNegativeButton(R.string.delete) { _, _ -> deleteProfile(existing) }
+            }
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val profile = VpnProfile(
+                    id = existing?.id ?: UUID.randomUUID().toString(),
+                    name = name.text.toString().trim(),
+                    server = server.text.toString().trim().trimEnd('/'),
+                    clientId = clientId.text.toString().trim(),
+                    token = token.text.toString().ifBlank { existing?.token.orEmpty() },
+                    autoConnect = autoConnect.isChecked,
+                )
+                val error = profileValidationError(profile)
+                if (error != null) {
+                    Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                if (!profileStore.save(profile)) {
+                    Toast.makeText(this, R.string.secure_storage_failed, Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                if (profileStore.selectedProfileId() == null) profileStore.select(profile.id)
+                dialog.dismiss()
+                render(TunnelService.currentStatus())
+            }
+        }
+        dialog.show()
+    }
+
+    private fun deleteProfile(profile: VpnProfile) {
+        if (!profileStore.delete(profile.id)) {
+            Toast.makeText(this, R.string.profile_delete_failed, Toast.LENGTH_LONG).show()
+            return
+        }
+        if (profileStore.selectedProfileId() == profile.id) {
+            profileStore.select(profileStore.profiles().firstOrNull()?.id)
+        }
+        render(TunnelService.currentStatus())
+    }
+
+    private fun requestConnect(profile: VpnProfile) {
+        val activeProfileId = TunnelService.currentProfileId()
+        if (activeProfileId != null && activeProfileId != profile.id &&
+            isActiveStatus(TunnelService.currentStatus())
+        ) {
+            Toast.makeText(this, R.string.disconnect_active_profile, Toast.LENGTH_SHORT).show()
+            renderProfiles()
+            return
+        }
+        pendingProfileId = profile.id
         val prepare = VpnService.prepare(this)
         if (prepare == null) {
-            startTunnel()
-            pendingStart = false
+            startProfile(profile)
+            pendingProfileId = null
         } else {
             @Suppress("DEPRECATION")
             startActivityForResult(prepare, REQUEST_VPN)
         }
     }
 
-    private fun showConfigurationError(message: Int) {
-        if (settingsCard.visibility != View.VISIBLE) toggleSettings()
-        status.text = getString(message)
-        statusDetail.setText(R.string.check_connection_settings)
-        statusDot.background = circle(COLOR_ERROR)
-    }
-
-    private fun startTunnel() {
-        val normalizedServer = server.text.toString().trimEnd('/')
-        val normalizedClientId = clientId.text.toString()
-        val tokenValue = token.text.toString()
-        if (rememberToken.isChecked &&
-            !SecureTokenStore(this).save(normalizedServer, normalizedClientId, tokenValue)
-        ) {
-            showConfigurationError(R.string.secure_storage_failed)
-            return
-        }
-        if (!rememberToken.isChecked) SecureTokenStore(this).clear()
-        getSharedPreferences("settings", MODE_PRIVATE).edit()
-            .putString("server", normalizedServer)
-            .putString("client_id", normalizedClientId)
-            .putBoolean("auto_connect", autoConnect.isChecked)
-            .apply()
+    private fun startProfile(profile: VpnProfile) {
+        profileStore.select(profile.id)
         startForegroundService(
             Intent(this, TunnelService::class.java)
                 .setAction(TunnelService.ACTION_START)
-                .putExtra(TunnelService.EXTRA_SERVER, normalizedServer)
-                .putExtra(TunnelService.EXTRA_TOKEN, tokenValue)
-                .putExtra(TunnelService.EXTRA_CLIENT_ID, normalizedClientId),
+                .putExtra(TunnelService.EXTRA_PROFILE_ID, profile.id)
+                .putExtra(TunnelService.EXTRA_PROFILE_NAME, profile.name)
+                .putExtra(TunnelService.EXTRA_SERVER, profile.server)
+                .putExtra(TunnelService.EXTRA_TOKEN, profile.token)
+                .putExtra(TunnelService.EXTRA_CLIENT_ID, profile.clientId),
         )
-        token.text.clear()
-        renderStatus("Connecting")
+        render("Connecting")
     }
 
-    private fun field(hintText: String, initial: String) = EditText(this).apply {
-        hint = hintText
+    private fun disconnectProfile(profile: VpnProfile) {
+        if (TunnelService.currentProfileId() != profile.id) {
+            renderProfiles()
+            return
+        }
+        startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
+    }
+
+    private fun profileValidationError(profile: VpnProfile): Int? {
+        if (profile.name.isBlank()) return R.string.profile_name_required
+        val validServer = try {
+            val uri = URI(profile.server)
+            uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.userInfo == null &&
+                (uri.path.isNullOrEmpty() || uri.path == "/") && uri.query == null && uri.fragment == null
+        } catch (_: URISyntaxException) {
+            false
+        }
+        if (!validServer) return R.string.https_required
+        if (profile.token.isBlank() || !CLIENT_ID.matches(profile.clientId)) return R.string.credentials_required
+        return null
+    }
+
+    private fun profileStatus(value: String): String = when {
+        value.startsWith("Connected") -> getString(R.string.profile_connected)
+        value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
+            getString(R.string.profile_reconnecting)
+        value.startsWith("Waiting") -> getString(R.string.waiting_for_network)
+        else -> getString(R.string.profile_connecting)
+    }
+
+    private fun dialogField(hintResource: Int, initial: String) = EditText(this).apply {
+        setHint(hintResource)
         setText(initial)
         textSize = 15f
         setTextColor(COLOR_TEXT)
         setHintTextColor(COLOR_MUTED)
-        background = rounded(COLOR_FIELD, 14f, COLOR_BORDER)
-        setPadding(dp(14), 0, dp(14), 0)
+        background = rounded(COLOR_FIELD, 12f, COLOR_BORDER)
+        setPadding(dp(13), 0, dp(13), 0)
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         isSingleLine = true
-        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52))
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50))
     }
 
-    private fun option(textResource: Int) = CheckBox(this).apply {
-        setText(textResource)
-        textSize = 14f
-        setTextColor(COLOR_TEXT)
-        buttonTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
-        setPadding(0, dp(8), 0, 0)
-    }
-
-    private fun label(textResource: Int, topMargin: Int = 0) = TextView(this).apply {
+    private fun dialogLabel(textResource: Int) = TextView(this).apply {
         setText(textResource)
         textSize = 12f
         setTextColor(COLOR_MUTED)
         setTypeface(typeface, Typeface.BOLD)
-        setPadding(dp(2), dp(topMargin), 0, dp(7))
+        setPadding(dp(2), dp(12), 0, dp(6))
     }
+
+    private fun switchThumbColors() = android.content.res.ColorStateList(
+        arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+        intArrayOf(COLOR_ACCENT, COLOR_MUTED),
+    )
+
+    private fun switchTrackColors() = android.content.res.ColorStateList(
+        arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+        intArrayOf(COLOR_ACCENT_DARK, COLOR_BORDER),
+    )
 
     private fun marginParams(top: Int) = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
@@ -399,12 +571,10 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun String.safeClientId(): String = replace(Regex("[^A-Za-z0-9._-]+"), "-")
-        .trim('-', '.', '_').take(64).ifBlank { "android" }
-
     companion object {
         private const val REQUEST_VPN = 100
         private const val REQUEST_NOTIFICATIONS = 101
+        private const val STATE_PENDING_PROFILE = "pending_profile"
         private const val STATUS_PERMISSION = "dev.htun.android.permission.STATUS"
         private const val DEFAULT_SERVER = "https://htun.i-csu.org:8443"
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -413,17 +583,20 @@ class MainActivity : Activity() {
         private val COLOR_CARD = Color.rgb(17, 29, 48)
         private val COLOR_FIELD = Color.rgb(11, 23, 40)
         private val COLOR_BORDER = Color.rgb(43, 61, 82)
+        private val COLOR_ICON = Color.rgb(25, 52, 65)
         private val COLOR_TEXT = Color.rgb(242, 247, 252)
         private val COLOR_MUTED = Color.rgb(148, 163, 184)
         private val COLOR_ACCENT = Color.rgb(110, 231, 183)
+        private val COLOR_ACCENT_DARK = Color.rgb(31, 107, 88)
         private val COLOR_BUTTON_TEXT = Color.rgb(5, 35, 29)
-        private val COLOR_BUTTON_SECONDARY = Color.rgb(52, 72, 94)
         private val COLOR_CONNECTED = Color.rgb(74, 222, 128)
         private val COLOR_CONNECTING = Color.rgb(250, 204, 21)
         private val COLOR_OFFLINE = Color.rgb(100, 116, 139)
-        private val COLOR_ERROR = Color.rgb(248, 113, 113)
     }
 }
 
 internal fun preferredGateway(server: String): String =
     if (server == "https://htun.i-csu.org") "https://htun.i-csu.org:8443" else server
+
+internal fun String.safeClientId(): String = replace(Regex("[^A-Za-z0-9._-]+"), "-")
+    .trim('-', '.', '_').take(64).ifBlank { "android" }

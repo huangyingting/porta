@@ -12,6 +12,14 @@ class PacketFilterTest {
     }
 
     @Test
+    fun derivesReadableProfileNamesAndSafeClientIds() {
+        assertTrue(profileName("https://vpn.example.com:8443") == "vpn.example.com")
+        assertTrue(profileName("invalid") == "VPN server")
+        assertTrue("Pixel 10 Pro".safeClientId() == "Pixel-10-Pro")
+        assertTrue("***".safeClientId() == "android")
+    }
+
+    @Test
     fun extractsOnlyValidGatewayHostname() {
         assertTrue(gatewayHost("https://htun.i-csu.org:8443") == "htun.i-csu.org")
         assertTrue(gatewayHost("https://[2001:db8::1]:8443") == "2001:db8::1")

@@ -75,10 +75,11 @@ with this setting if it is absent. Tests set it before process startup.
   DNS, and default routes are configured by a separate PowerShell script so a
   mistaken server address cannot silently cut off the host. MASQUE is the
   default protocol.
-- Android uses `VpnService`. Its socket factory calls `VpnService.protect()`
-  before OkHttp connects, preventing a routing loop. OkHttp does not expose an
-  API for the Extended CONNECT `:protocol` pseudo-header, so Android currently
-  uses the compatibility endpoint.
+- Android uses `VpnService` with a native Go HTTP/3 MASQUE bridge. The UDP
+  socket is protected from the VPN routing loop and bound to Android's selected
+  underlying network. HTTP/2 remains an automatic compatibility fallback.
+  Named server profiles and their tokens are stored locally, with tokens
+  encrypted by Android Keystore.
 
 ## Compatibility protocol
 
@@ -101,11 +102,5 @@ isolated transport patches:
    coordinate duplicate-session ownership, and provide a packet-routing layer
    that can deliver return traffic to the instance holding each live tunnel.
    Sharing the JSON lease file between independent servers is not sufficient.
-4. **Native Android MASQUE:** adopt a maintained QUIC/HTTP/3 stack that exposes
-   Extended CONNECT and HTTP Datagrams, preserve `VpnService.protect()` and
-   underlying-network binding, then run compatibility and roaming tests
-   against the existing Go implementation.
-
 QUIC connection migration, policy management, and a control-plane API remain
-future work. The existing MASQUE capsule package can be reused by a future
-Android transport without changing the VPN interface layer.
+future work.

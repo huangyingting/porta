@@ -70,10 +70,14 @@ class TunnelService : VpnService() {
         val server = intent.getStringExtra(EXTRA_SERVER).orEmpty()
         val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID).orEmpty()
+        val profileId = intent.getStringExtra(EXTRA_PROFILE_ID).orEmpty()
+        val profileLabel = intent.getStringExtra(EXTRA_PROFILE_NAME).orEmpty()
         if (!validConfiguration(server, token, clientId)) {
             stopTunnel("Invalid tunnel configuration")
             return START_NOT_STICKY
         }
+        currentProfileId = profileId.ifBlank { server }
+        currentProfileName = profileLabel.ifBlank { profileName(server) }
 
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -409,7 +413,7 @@ class TunnelService : VpnService() {
         closeVpn()
 
         val builder = Builder()
-            .setSession("hTun")
+            .setSession(currentProfileName ?: "hTun")
             .setMtu(configuration.mtu)
             .addAddress(configuration.address, configuration.prefix)
             .addRoute("0.0.0.0", 0)
@@ -544,6 +548,8 @@ class TunnelService : VpnService() {
         closeNativeSession()
         worker?.interrupt()
         closeVpn()
+        currentProfileId = null
+        currentProfileName = null
         sendStatus(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -558,6 +564,8 @@ class TunnelService : VpnService() {
         closeNativeSession()
         closeVpn()
         worker = null
+        currentProfileId = null
+        currentProfileName = null
         sendStatus(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelfResult(startId)
@@ -612,7 +620,10 @@ class TunnelService : VpnService() {
     private fun sendStatus(value: String) {
         currentStatus = value
         sendBroadcast(
-            Intent(ACTION_STATUS).setPackage(packageName).putExtra(EXTRA_STATUS, value),
+            Intent(ACTION_STATUS)
+                .setPackage(packageName)
+                .putExtra(EXTRA_STATUS, value)
+                .putExtra(EXTRA_PROFILE_ID, currentProfileId),
             STATUS_PERMISSION,
         )
     }
@@ -631,7 +642,7 @@ class TunnelService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("hTun")
+            .setContentTitle(currentProfileName ?: "hTun")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setOngoing(true)
@@ -663,8 +674,12 @@ class TunnelService : VpnService() {
         const val EXTRA_SERVER = "server"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_CLIENT_ID = "client_id"
+        const val EXTRA_PROFILE_ID = "profile_id"
+        const val EXTRA_PROFILE_NAME = "profile_name"
         const val EXTRA_STATUS = "status"
         @Volatile private var currentStatus = "Disconnected"
+        @Volatile private var currentProfileId: String? = null
+        @Volatile private var currentProfileName: String? = null
         private const val CHANNEL_ID = "htun-vpn"
         private const val NOTIFICATION_ID = 1201
         private const val TAG = "hTun"
@@ -676,6 +691,7 @@ class TunnelService : VpnService() {
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
         fun currentStatus(): String = currentStatus
+        fun currentProfileId(): String? = currentProfileId
     }
 
     private data class VpnConfiguration(

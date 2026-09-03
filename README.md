@@ -387,32 +387,34 @@ make android
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-For the deployed test gateway, enter:
+Open hTun, tap **Add profile**, and enter:
 
+- Profile name: any recognizable label, such as `Test gateway`
 - Gateway: `https://htun.i-csu.org:8443`
 - Token: the value after `HTUN_TOKEN=` in `/etc/htun/htun.env` on the server
 - Client ID: a stable unique value such as `android-phone`
 
-Tap **Connect**, approve Android's VPN prompt, and allow notifications if
-prompted. The app first connects with native HTTP/3 MASQUE over UDP 8443. The
-status changes to `Connected over HTTP/3 MASQUE`. If UDP or HTTP/3 is
+Save the profile and use its switch to connect or disconnect. Approve Android's
+VPN prompt and allow notifications if prompted. The app first connects with
+native HTTP/3 MASQUE over UDP 8443. The status changes to
+`Connected over HTTP/3 MASQUE`. If UDP or HTTP/3 is
 unavailable, it automatically falls back to the HTTP/2 compatibility transport
 over TCP 8443. Authentication, certificate, and invalid-configuration failures
 do not trigger a less secure fallback.
 
-By default, the token is passed directly to the private service and cleared
-from the UI without persistence. Enable **Remember token securely** to encrypt
-it with a non-exportable Android Keystore key.
-Enable **Reconnect after device restart** only when unattended boot recovery
-is desired; Android must already have granted this app VPN permission.
-Disabling secure storage removes the encrypted token and disables boot
-reconnect. Retrieve the fallback token on the server when needed with:
+The app supports multiple named VPN server profiles. Tokens are encrypted with
+a non-exportable Android Keystore key, only one profile can be connected at a
+time, and the selected profile is visually highlighted. Enable
+**Reconnect after device restart** on one profile when unattended boot recovery
+is desired; Android must already have granted this app VPN permission. Retrieve
+the fallback token on the server when needed with:
 
 ```sh
 sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
 ```
 
-Tap **Disconnect** before uninstalling the app or switching to another VPN.
+Turn off the active profile before uninstalling the app or switching to another
+VPN profile.
 If the network or server is temporarily unavailable, the app keeps the VPN
 interface active and reconnects with a delay that grows from about one second
 to a maximum of about 31 seconds. Authentication failures and invalid gateway
