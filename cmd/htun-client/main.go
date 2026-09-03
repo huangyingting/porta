@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,6 +38,7 @@ func run() error {
 	interfaceName := flag.String("interface", defaultInterfaceName(), "TUN interface name")
 	clientID := flag.String("client-id", defaultClientID(), "stable client identifier")
 	caPath := flag.String("ca", "", "optional PEM CA certificate")
+	thumbprint := flag.String("thumbprint", "", "optional SHA-256 gateway certificate thumbprint")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (development only)")
 	tokenFlag := flag.String("token", "", "bearer token (prefer HTUN_TOKEN environment variable)")
 	flag.Parse()
@@ -46,7 +50,7 @@ func run() error {
 	if *serverURL == "" || token == "" {
 		return errors.New("--server and HTUN_TOKEN are required")
 	}
-	tlsConfig, err := clientTLSConfig(*caPath, *insecure)
+	tlsConfig, err := clientTLSConfig(*caPath, *thumbprint, *insecure)
 	if err != nil {
 		return err
 	}
@@ -126,8 +130,30 @@ func run() error {
 	}
 }
 
-func clientTLSConfig(caPath string, insecure bool) (*tls.Config, error) {
+func clientTLSConfig(caPath, thumbprint string, insecure bool) (*tls.Config, error) {
+	if insecure && thumbprint != "" {
+		return nil, errors.New("--insecure and --thumbprint cannot be used together")
+	}
+	pinnedThumbprint, err := parseThumbprint(thumbprint)
+	if err != nil {
+		return nil, err
+	}
 	config := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecure} // #nosec G402 -- explicit development flag
+	if pinnedThumbprint != nil {
+		if caPath == "" {
+			config.InsecureSkipVerify = true // #nosec G402 -- the pinned certificate is verified below
+		}
+		config.VerifyConnection = func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("gateway did not provide a certificate")
+			}
+			actual := sha256.Sum256(state.PeerCertificates[0].Raw)
+			if subtle.ConstantTimeCompare(actual[:], pinnedThumbprint) != 1 {
+				return fmt.Errorf("gateway certificate SHA-256 thumbprint mismatch: got %s", hex.EncodeToString(actual[:]))
+			}
+			return nil
+		}
+	}
 	if caPath == "" {
 		return config, nil
 	}
@@ -144,6 +170,22 @@ func clientTLSConfig(caPath string, insecure bool) (*tls.Config, error) {
 	}
 	config.RootCAs = roots
 	return config, nil
+}
+
+func parseThumbprint(value string) ([]byte, error) {
+	if value == "" {
+		return nil, nil
+	}
+	normalized := strings.TrimSpace(value)
+	if len(normalized) >= len("sha256:") && strings.EqualFold(normalized[:len("sha256:")], "sha256:") {
+		normalized = normalized[len("sha256:"):]
+	}
+	normalized = strings.NewReplacer(":", "", "-", "").Replace(normalized)
+	decoded, err := hex.DecodeString(normalized)
+	if err != nil || len(decoded) != sha256.Size {
+		return nil, errors.New("thumbprint must be a 64-digit SHA-256 value (separators and a sha256: prefix are optional)")
+	}
+	return decoded, nil
 }
 
 func defaultInterfaceName() string {

@@ -14,8 +14,10 @@
 
 ## Operator responsibilities
 
-- Use a random token of at least 32 bytes and a publicly trusted or privately
-  pinned certificate. The generated self-signed certificate is for development.
+- Use a random token of at least 32 bytes. The server obtains its certificate
+  from Let's Encrypt, which clients validate through their system trust store.
+- When using automatic Let's Encrypt certificates, protect and persist the ACME
+  cache directory and expose the challenge listener only as required.
 - Restrict gateway egress, rate-limit the public endpoint, rotate credentials,
   and retain only privacy-appropriate operational logs.
 - Review the NAT script for the host's real external interface. Running a VPN

@@ -48,23 +48,22 @@ HTTP/2 Extended CONNECT integration test runs instead of being skipped.
 The Android debug APK is written to
 `android/app/build/outputs/apk/debug/app-debug.apk`.
 
-## Development gateway
-
-Generate a certificate. The output paths must not already exist:
-
-```sh
-./bin/htun-keygen --hosts vpn.example.test,203.0.113.10
-```
+## Gateway
 
 Use a random token of at least 32 bytes. Pass it through the environment so it
-does not appear in the process list:
+does not appear in the process list. The server obtains and renews its
+certificate through Let's Encrypt. Point the domain's A/AAAA record at the
+gateway, expose TCP port 80 for the HTTP-01 challenge, and expose TCP and UDP
+port 443:
 
 ```sh
 export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
 sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
-  --listen :8443 \
-  --cert server.crt \
-  --key server.key \
+  --listen :443 \
+  --acme-domain vpn.example.com \
+  --acme-email admin@example.com \
+  --acme-cache /var/lib/htun/acme \
+  --acme-http-listen :80 \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
@@ -79,7 +78,7 @@ the interface and NAT. Replace `eth0` with the real egress interface:
 sudo ./scripts/server-up.sh htun0 10.66.0.1/24 10.66.0.0/24 eth0
 ```
 
-Open both TCP and UDP port 8443 at the host and cloud firewalls. Tear down only
+Open both TCP and UDP port 443 at the host and cloud firewalls. Tear down only
 the nftables table owned by this project with:
 
 ```sh
@@ -91,9 +90,15 @@ official `GODEBUG=http2xconnect=1` compatibility switch. `htun-server` detects
 its absence and re-executes itself once with that switch enabled while
 preserving existing `GODEBUG` values.
 
-For production, use a certificate trusted by the clients, a service manager,
-an unprivileged process with narrowly scoped TUN capabilities, credential
-rotation, and gateway egress controls.
+The cache directory persists the ACME account and certificates across
+restarts; keep it private and durable. To use TLS-ALPN-01 instead of opening
+port 80, pass an empty `--acme-http-listen`; the gateway's TCP listener must
+then be publicly reachable on port 443. Certificate issuance occurs on the
+first TLS request for the configured domain, and renewal is automatic.
+
+For production, use a service manager, an unprivileged process with narrowly
+scoped TUN and low-port capabilities, credential rotation, and gateway egress
+controls.
 
 ## Windows client
 
@@ -110,6 +115,25 @@ $env:HTUN_TOKEN = "replace-with-the-same-secret"
   --interface hTun `
   --client-id my-windows-pc
 ```
+
+For a compatible private gateway using a self-signed certificate, pin the
+SHA-256 thumbprint instead of disabling TLS verification. The value may contain
+colons or hyphens and may start with `sha256:`:
+
+```powershell
+./htun-client-windows-amd64.exe `
+  --server https://vpn.example.com:8443 `
+  --thumbprint "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" `
+  --client-id my-windows-pc
+```
+
+When used by itself, `--thumbprint` trusts only the exact leaf certificate. If
+combined with `--ca`, the certificate must pass both CA and thumbprint checks.
+It cannot be combined with `--insecure`.
+
+Do not pin an automatically managed Let's Encrypt leaf certificate: its
+thumbprint changes on renewal. Let the client validate those certificates
+against its normal system trust store.
 
 The client prints its RFC 9484 assigned address, for example `10.66.0.2/32`.
 While it is still running, use another elevated PowerShell session to install
