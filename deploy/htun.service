@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/htun/htun.env
-ExecStart=/usr/local/bin/htun-server --behind-proxy --listen 127.0.0.1:8443 --client-token-file /etc/htun/clients --interface htun0 --pool 10.66.0.0/24 --lease-state /var/lib/htun/leases.json --dns 1.1.1.1 --mtu 1300 --json-logs
+ExecStart=/usr/local/bin/htun-server --listen :8443 --tls-cert /etc/htun/tls/server.crt --tls-key /etc/htun/tls/server.key --client-token-file /etc/htun/clients --interface htun0 --pool 10.66.0.0/24 --lease-state /var/lib/htun/leases.json --dns 1.1.1.1 --mtu 1300 --json-logs
 ExecStartPost=/bin/bash -c 'for i in $(seq 1 50); do /usr/sbin/ip link show dev htun0 >/dev/null 2>&1 && exec /usr/local/libexec/htun/server-up.sh htun0 10.66.0.1/24 10.66.0.0/24 eth0; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/htun/server-down.sh htun0 eth0
 Restart=on-failure

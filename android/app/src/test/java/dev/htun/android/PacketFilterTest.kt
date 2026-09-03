@@ -6,6 +6,19 @@ import org.junit.Test
 
 class PacketFilterTest {
     @Test
+    fun migratesPreviousDefaultGatewayToDirectMasqueEndpoint() {
+        assertTrue(preferredGateway("https://htun.i-csu.org") == "https://htun.i-csu.org:8443")
+        assertTrue(preferredGateway("https://vpn.example.com") == "https://vpn.example.com")
+    }
+
+    @Test
+    fun extractsOnlyValidGatewayHostname() {
+        assertTrue(gatewayHost("https://htun.i-csu.org:8443") == "htun.i-csu.org")
+        assertTrue(gatewayHost("https://[2001:db8::1]:8443") == "2001:db8::1")
+        assertTrue(gatewayHost("not a URL") == null)
+    }
+
+    @Test
     fun acceptsOnlyAssignedIPv4Source() {
         val assigned = parseIPv4Address("10.66.0.2")!!
         val packet = ByteArray(20)

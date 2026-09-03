@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/htun-project/htun/internal/certutil"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/net/http2"
@@ -19,6 +23,7 @@ func TestServerTLSConfigACME(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if manager == nil || config.GetCertificate == nil {
 		t.Fatal("ACME mode did not configure dynamic certificates")
 	}
@@ -41,6 +46,71 @@ func TestServerTLSConfigACME(t *testing.T) {
 	}
 	if http3Config.GetCertificate == nil {
 		t.Fatal("HTTP/3 config did not retain dynamic certificates")
+	}
+}
+
+func TestStaticTLSConfigReloadsCertificate(t *testing.T) {
+	directory := t.TempDir()
+	certPath := filepath.Join(directory, "server.crt")
+	keyPath := filepath.Join(directory, "server.key")
+	if err := certutil.Generate(certPath, keyPath, certutil.Options{Hosts: []string{"vpn.example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	config, err := staticTLSConfig(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := config.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("minimum TLS version = %d, want %d", config.MinVersion, tls.VersionTLS12)
+	}
+
+	if err := os.Remove(certPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := certutil.Generate(certPath, keyPath, certutil.Options{Hosts: []string{"vpn.example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := config.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first.Certificate[0], second.Certificate[0]) {
+		t.Fatal("certificate replacement was not reloaded")
+	}
+}
+
+func TestStaticTLSConfigKeepsCertificateDuringPartialReplacement(t *testing.T) {
+	directory := t.TempDir()
+	certPath := filepath.Join(directory, "server.crt")
+	keyPath := filepath.Join(directory, "server.key")
+	if err := certutil.Generate(certPath, keyPath, certutil.Options{Hosts: []string{"vpn.example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	config, err := staticTLSConfig(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := config.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(keyPath, []byte("incomplete replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current, err := config.GetCertificate(nil)
+	if err != nil {
+		t.Fatalf("partial replacement interrupted TLS handshakes: %v", err)
+	}
+	if !bytes.Equal(first.Certificate[0], current.Certificate[0]) {
+		t.Fatal("partial replacement discarded the previous certificate")
 	}
 }
 

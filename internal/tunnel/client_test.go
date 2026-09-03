@@ -102,14 +102,18 @@ func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
 }
 
 func TestHTTP3MasqueDatagramPacketRoundTrip(t *testing.T) {
-	testHTTP3MasqueRoundTrip(t, true)
+	testHTTP3MasqueRoundTrip(t, true, false)
 }
 
 func TestHTTP3MasqueCapsuleFallbackPacketRoundTrip(t *testing.T) {
-	testHTTP3MasqueRoundTrip(t, false)
+	testHTTP3MasqueRoundTrip(t, false, false)
 }
 
-func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams bool) {
+func TestHTTP3MasqueCallerOwnsPacketConn(t *testing.T) {
+	testHTTP3MasqueRoundTrip(t, true, true)
+}
+
+func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bool) {
 	t.Helper()
 	handler, router, dev := testGateway(t, enableDatagrams)
 	tempDir := t.TempDir()
@@ -141,14 +145,30 @@ func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams bool) {
 		_ = packetConn.Close()
 	})
 
-	testPacketRoundTrip(t, router, dev, tunnel.Config{
+	config := tunnel.Config{
 		URL:       "https://" + packetConn.LocalAddr().String(),
 		Token:     testToken,
 		ClientID:  "h3-masque-test",
 		Transport: tunnel.TransportHTTP3,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
 		Timeout:   3 * time.Second,
-	})
+	}
+	if supplyPacketConn {
+		udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracked := &trackingPacketConn{PacketConn: udpConn}
+		t.Cleanup(func() {
+			if tracked.closeCalls != 0 {
+				t.Errorf("caller-owned packet connection closed %d times by tunnel", tracked.closeCalls)
+			}
+			_ = tracked.Close()
+		})
+		config.PacketConn = tracked
+		config.RemoteAddr = packetConn.LocalAddr()
+	}
+	testPacketRoundTrip(t, router, dev, config)
 }
 
 func testGateway(t *testing.T, enableH3Datagrams bool) (http.Handler, *gateway.Router, *fakeDevice) {
@@ -235,6 +255,16 @@ type fakeDevice struct {
 	reads  chan []byte
 	writes chan []byte
 	closed chan struct{}
+}
+
+type trackingPacketConn struct {
+	net.PacketConn
+	closeCalls int
+}
+
+func (c *trackingPacketConn) Close() error {
+	c.closeCalls++
+	return c.PacketConn.Close()
 }
 
 func newFakeDevice() *fakeDevice {

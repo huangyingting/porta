@@ -64,10 +64,12 @@ func ensureExtendedConnect() error {
 
 func run() error {
 	address := flag.String("listen", ":8443", "listen address (TCP and UDP normally, TCP only behind a proxy)")
-	acmeDomain := flag.String("acme-domain", "", "domain for automatic Let's Encrypt certificates (required unless --behind-proxy)")
+	acmeDomain := flag.String("acme-domain", "", "domain for automatic Let's Encrypt certificates (required unless using --behind-proxy or static TLS)")
 	acmeEmail := flag.String("acme-email", "", "contact email for Let's Encrypt")
 	acmeCache := flag.String("acme-cache", "acme-cache", "Let's Encrypt certificate cache directory")
 	acmeHTTPAddress := flag.String("acme-http-listen", ":80", "HTTP-01 challenge listen address (empty uses TLS-ALPN-01)")
+	tlsCert := flag.String("tls-cert", "", "static TLS certificate file (reloaded when replaced)")
+	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
 	clientTokenFile := flag.String("client-token-file", "", "optional client-id=token credential file")
 	interfaceName := flag.String("interface", "htun0", "Linux TUN interface name")
@@ -115,10 +117,18 @@ func run() error {
 		certificateManager *autocert.Manager
 	)
 	if *behindProxy {
-		if normalizeDomain(*acmeDomain) != "" || strings.TrimSpace(*acmeEmail) != "" {
-			return errors.New("--behind-proxy cannot be combined with --acme-domain or --acme-email")
+		if normalizeDomain(*acmeDomain) != "" || strings.TrimSpace(*acmeEmail) != "" || *tlsCert != "" || *tlsKey != "" {
+			return errors.New("--behind-proxy cannot be combined with ACME or static TLS options")
 		}
 		if err := validateProxyListenAddress(*address); err != nil {
+			return err
+		}
+	} else if *tlsCert != "" || *tlsKey != "" {
+		if normalizeDomain(*acmeDomain) != "" || strings.TrimSpace(*acmeEmail) != "" {
+			return errors.New("static TLS cannot be combined with --acme-domain or --acme-email")
+		}
+		tlsConfig, err = staticTLSConfig(*tlsCert, *tlsKey)
+		if err != nil {
 			return err
 		}
 	} else {
@@ -193,7 +203,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var acmeHTTPServer *http.Server
-	if !*behindProxy && *acmeHTTPAddress != "" {
+	if certificateManager != nil && *acmeHTTPAddress != "" {
 		acmeHTTPServer = &http.Server{
 			Addr:              *acmeHTTPAddress,
 			Handler:           certificateManager.HTTPHandler(nil),

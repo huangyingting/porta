@@ -15,7 +15,7 @@ class BootReceiver : BroadcastReceiver() {
         context.startForegroundService(
             Intent(context, TunnelService::class.java)
                 .setAction(TunnelService.ACTION_START)
-                .putExtra(TunnelService.EXTRA_SERVER, config.server)
+                .putExtra(TunnelService.EXTRA_SERVER, preferredGateway(config.server))
                 .putExtra(TunnelService.EXTRA_TOKEN, config.token)
                 .putExtra(TunnelService.EXTRA_CLIENT_ID, config.clientId),
         )

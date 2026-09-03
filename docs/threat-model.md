@@ -40,8 +40,9 @@ security policy.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.
-- Android currently uses the private compatibility protocol rather than
-  Extended CONNECT because OkHttp does not expose the required pseudo-header.
+- Android prefers native HTTP/3 Extended CONNECT through the bundled Go
+  MASQUE bridge. It falls back to the private HTTP/2 compatibility protocol
+  when UDP or HTTP/3 is unavailable.
 - Android relies on the system trust store and does not offer an insecure TLS
   switch.
 - The Windows route setup is explicit rather than automatic. Kill-switch and

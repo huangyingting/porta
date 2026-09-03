@@ -33,8 +33,9 @@ Extended CONNECT pseudo-header required by `CONNECT-IP`. Details are in
 
 ## Build and test
 
-Requirements are Go 1.26 or newer. Android builds additionally require JDK 17
-and Android SDK 35.
+Requirements are Go 1.26 or newer. Android builds additionally require JDK 17,
+Android SDK 35, Android NDK 27.2.12479018, and matching `gomobile` and `gobind`
+binaries on `PATH`.
 
 ```sh
 make test
@@ -122,6 +123,83 @@ For production, use a service manager, an unprivileged process with narrowly
 scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
+### Direct HTTP/3 alongside Caddy
+
+When Caddy already owns port 443, run hTun directly on another public port,
+such as 8443. Caddy can continue managing the domain certificate and serving
+web traffic on 443, while tunnel traffic connects directly to hTun over TCP
+and UDP 8443:
+
+```sh
+sudo ./bin/htun-server \
+  --listen :8443 \
+  --tls-cert /etc/htun/tls/server.crt \
+  --tls-key /etc/htun/tls/server.key \
+  --client-token-file /etc/htun/clients \
+  --interface htun0 \
+  --pool 10.66.0.0/24 \
+  --dns 1.1.1.1 \
+  --mtu 1300
+```
+
+Open both TCP and UDP 8443 in the host and cloud firewalls. HTTP/2 uses the
+TCP listener and HTTP/3/MASQUE uses the UDP listener. For good QUIC throughput,
+install the included socket-buffer limits:
+
+```sh
+sudo install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
+sudo sysctl --system
+```
+
+The static TLS loader detects atomically replaced certificate files during
+new TLS handshakes, so the gateway does not need a restart solely to load a
+renewed certificate. If Caddy owns certificate renewal, do not grant the
+hardened hTun process access to Caddy's private storage. Instead, use the
+included root-run certificate synchronization timer:
+
+```sh
+sudo install -d -m 0755 /usr/local/libexec/htun
+sudo install -m 0755 scripts/sync-caddy-cert.sh /usr/local/libexec/htun/
+sudo install -m 0644 deploy/htun-cert-sync.service deploy/htun-cert-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start htun-cert-sync.service
+sudo systemctl enable --now htun-cert-sync.timer
+```
+
+Adjust the source certificate and key paths in `htun-cert-sync.service` for
+the domain before installing it. The synchronization script validates that the
+certificate and private key match and replaces both destination files. hTun
+loads the renewed pair on subsequent TLS handshakes without disconnecting
+active tunnels.
+
+Caddy may retain a compatibility endpoint on 443 by proxying to hTun's TLS
+listener. This carries only the HTTP/2 fallback; native HTTP/3/MASQUE clients
+connect directly to UDP 8443:
+
+```caddyfile
+vpn.example.com {
+  @metrics path /metrics
+  respond @metrics 404
+
+  reverse_proxy https://127.0.0.1:8443 {
+    flush_interval -1
+    transport http {
+      tls_server_name vpn.example.com
+    }
+  }
+}
+```
+
+Check the direct TLS listener locally without disabling certificate
+verification:
+
+```sh
+curl --resolve vpn.example.com:8443:127.0.0.1 https://vpn.example.com:8443/readyz
+curl --resolve vpn.example.com:8443:127.0.0.1 \
+  -H "Authorization: Bearer $HTUN_METRICS_TOKEN" \
+  https://vpn.example.com:8443/metrics
+```
+
 ### Behind a reverse proxy
 
 Use `--behind-proxy` when a reverse proxy such as Caddy terminates TLS and
@@ -156,23 +234,29 @@ vpn.example.com {
 }
 ```
 
-The repository includes `deploy/htun.service` for a persistent Linux
-deployment using `eth0` as the external interface:
+The repository includes `deploy/htun.service` for a persistent direct TLS
+deployment on TCP and UDP 8443 using `eth0` as the external interface. Adjust
+the domain-specific certificate synchronization unit and network values before
+installing:
 
 ```sh
 make build
 sudo install -m 0755 bin/htun-server /usr/local/bin/htun-server
 sudo install -d -m 0755 /usr/local/libexec/htun /etc/htun
-sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh /usr/local/libexec/htun/
+sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-caddy-cert.sh /usr/local/libexec/htun/
 {
   printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
   printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
 } | sudo tee /etc/htun/htun.env >/dev/null
 sudo install -m 0600 /dev/null /etc/htun/clients
 sudo chmod 0600 /etc/htun/htun.env
-sudo install -m 0644 deploy/htun.service /etc/systemd/system/htun.service
+sudo install -m 0644 deploy/htun.service deploy/htun-cert-sync.service deploy/htun-cert-sync.timer /etc/systemd/system/
+sudo install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
+sudo sysctl --system
 sudo systemctl daemon-reload
+sudo systemctl start htun-cert-sync.service
 sudo systemctl enable --now htun
+sudo systemctl enable --now htun-cert-sync.timer
 ```
 
 Validate and reload Caddy after adding the site block:
@@ -190,6 +274,7 @@ systemctl status htun
 journalctl -u htun -f
 curl https://vpn.example.com/readyz
 METRICS_TOKEN="$(sudo sed -n 's/^HTUN_METRICS_TOKEN=//p' /etc/htun/htun.env)"
+# This loopback HTTP check applies only to the --behind-proxy h2c deployment.
 curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:8443/metrics
 ```
 
@@ -297,15 +382,20 @@ adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 
 For the deployed test gateway, enter:
 
-- Gateway: `https://htun.i-csu.org`
+- Gateway: `https://htun.i-csu.org:8443`
 - Token: the value after `HTUN_TOKEN=` in `/etc/htun/htun.env` on the server
 - Client ID: a stable unique value such as `android-phone`
 
-Tap **Connect over HTTP/2**, approve Android's VPN prompt, and allow
-notifications if prompted. The status should change to
-`Connected over HTTP/2`. By default, the token is passed directly to the
-private service and cleared from the UI without persistence. Enable **Remember
-token securely** to encrypt it with a non-exportable Android Keystore key.
+Tap **Connect**, approve Android's VPN prompt, and allow notifications if
+prompted. The app first connects with native HTTP/3 MASQUE over UDP 8443. The
+status changes to `Connected over HTTP/3 MASQUE`. If UDP or HTTP/3 is
+unavailable, it automatically falls back to the HTTP/2 compatibility transport
+over TCP 8443. Authentication, certificate, and invalid-configuration failures
+do not trigger a less secure fallback.
+
+By default, the token is passed directly to the private service and cleared
+from the UI without persistence. Enable **Remember token securely** to encrypt
+it with a non-exportable Android Keystore key.
 Enable **Reconnect after device restart** only when unattended boot recovery
 is desired; Android must already have granted this app VPN permission.
 Disabling secure storage removes the encrypted token and disables boot
@@ -330,10 +420,10 @@ loss and recovery:
 
 The debug build trusts system and user-installed certificate authorities to
 support local testing. The release build trusts only the Android system trust
-store and contains no insecure-TLS switch. Android currently uses the private
-HTTP/2 compatibility stream because OkHttp cannot construct an Extended
-CONNECT `:protocol=connect-ip` request. A future Cronet or native QUIC transport
-can use the same MASQUE capsule and Datagram formats as the desktop client.
+store and contains no insecure-TLS switch. The HTTP/3 path uses the Go
+`quic-go` MASQUE implementation through a generated Android AAR. Android
+resolves the gateway on the selected underlying network, protects the UDP
+socket from the VPN, and binds it to that network before QUIC starts.
 
 For a signed release APK, provide signing credentials through environment
 variables and build the release variant:

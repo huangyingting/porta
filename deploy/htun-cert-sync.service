@@ -1,0 +1,16 @@
+[Unit]
+Description=Synchronize hTun TLS certificate from Caddy
+After=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/htun/sync-caddy-cert.sh /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/htun.i-csu.org/htun.i-csu.org.crt /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/htun.i-csu.org/htun.i-csu.org.key /etc/htun/tls
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/caddy
+ReadWritePaths=/etc/htun/tls
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_UNIX

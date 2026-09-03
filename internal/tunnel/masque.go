@@ -174,8 +174,20 @@ func dialMasqueHTTP3(
 		MaxIdleTimeout:       60 * time.Second,
 		KeepAlivePeriod:      20 * time.Second,
 	}
+	if (config.PacketConn == nil) != (config.RemoteAddr == nil) {
+		cancel()
+		return nil, errors.New("packet connection and remote address must be provided together")
+	}
 	handshakeCtx, stopHandshake := context.WithTimeout(ctx, config.Timeout)
-	connection, err := quic.DialAddr(handshakeCtx, endpoint.Host, tlsConfig, quicConfig)
+	var (
+		connection *quic.Conn
+		err        error
+	)
+	if config.PacketConn != nil {
+		connection, err = quic.Dial(handshakeCtx, config.PacketConn, config.RemoteAddr, tlsConfig, quicConfig)
+	} else {
+		connection, err = quic.DialAddr(handshakeCtx, endpoint.Host, tlsConfig, quicConfig)
+	}
 	stopHandshake()
 	if err != nil {
 		cancel()
@@ -440,12 +452,22 @@ func setMasqueHeaders(request *http.Request, config Config) {
 func validateMasqueResponse(response *http.Response) error {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_ = response.Body.Close()
-		return fmt.Errorf("gateway returned %s", response.Status)
+		return &GatewayResponseError{StatusCode: response.StatusCode, Status: response.Status}
 	}
 	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
 		return errors.New("gateway response did not enable the Capsule Protocol")
 	}
 	return nil
+}
+
+// GatewayResponseError reports a non-success response from a tunnel endpoint.
+type GatewayResponseError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *GatewayResponseError) Error() string {
+	return fmt.Sprintf("gateway returned %s", e.Status)
 }
 
 func timedRoundTrip(ctx context.Context, transport http.RoundTripper, request *http.Request, timeout time.Duration) (*http.Response, error) {

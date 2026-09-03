@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -40,6 +41,13 @@ type Config struct {
 	Protocol  Protocol
 	TLSConfig *tls.Config
 	Timeout   time.Duration
+
+	// PacketConn and RemoteAddr allow callers such as Android VPN clients to
+	// create and protect the UDP socket before QUIC starts. They must be set
+	// together and are only used by HTTP/3 MASQUE. PacketConn remains owned by
+	// the caller and is never closed by Conn.
+	PacketConn net.PacketConn
+	RemoteAddr net.Addr
 }
 
 type Lease struct {

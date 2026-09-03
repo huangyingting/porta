@@ -41,7 +41,9 @@ class MainActivity : Activity() {
 
         server = field(
             getString(R.string.gateway_hint),
-            stored?.server ?: preferences.getString("server", "") ?: "",
+            preferredGateway(
+                stored?.server ?: preferences.getString("server", DEFAULT_SERVER) ?: DEFAULT_SERVER,
+            ),
         )
         clientId = field(
             getString(R.string.client_id_hint),
@@ -198,6 +200,10 @@ class MainActivity : Activity() {
         private const val REQUEST_VPN = 100
         private const val REQUEST_NOTIFICATIONS = 101
         private const val STATUS_PERMISSION = "dev.htun.android.permission.STATUS"
+        private const val DEFAULT_SERVER = "https://htun.i-csu.org:8443"
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
     }
 }
+
+internal fun preferredGateway(server: String): String =
+    if (server == "https://htun.i-csu.org") "https://htun.i-csu.org:8443" else server

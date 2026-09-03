@@ -14,6 +14,10 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import htunmobile.Htunmobile
+import htunmobile.Dialer
+import htunmobile.Protector
+import htunmobile.Session
 import okhttp3.Call
 import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
@@ -41,6 +45,8 @@ class TunnelService : VpnService() {
     private val selectedNetwork = AtomicReference<Network?>()
     private val outboundPackets = ArrayBlockingQueue<ByteArray>(256)
     @Volatile private var call: Call? = null
+    private val nativeSession = AtomicReference<Session?>()
+    private val nativeDialer = AtomicReference<Dialer?>()
     private var input: FileInputStream? = null
     private var output: FileOutputStream? = null
     private var worker: Thread? = null
@@ -77,7 +83,7 @@ class TunnelService : VpnService() {
         sendStatus("Connecting")
         worker = Thread(
             { runTunnel(server, token, clientId, runGeneration, startId) },
-            "htun-http2",
+            "htun-transport",
         ).also { it.start() }
         return START_NOT_STICKY
     }
@@ -137,8 +143,31 @@ class TunnelService : VpnService() {
                     val reconnecting = descriptor.get() != null
                     sendStatus(if (reconnecting) "Reconnecting" else "Connecting")
                     updateNotification(if (reconnecting) "Reconnecting" else "Connecting")
-                    connectOnce(client, server, token, clientId, attemptActive, vpnReady, runGeneration) {
-                        attemptConnectedAt = System.currentTimeMillis()
+                    try {
+                        connectNativeOnce(
+                            server,
+                            token,
+                            clientId,
+                            network,
+                            attemptActive,
+                            runGeneration,
+                        ) {
+                            attemptConnectedAt = System.currentTimeMillis()
+                        }
+                    } catch (error: NativeTransportUnavailableException) {
+                        if (!isRunActive(runGeneration)) break
+                        Log.i(TAG, "HTTP/3 MASQUE unavailable; falling back to HTTP/2")
+                        connectLegacyOnce(
+                            client,
+                            server,
+                            token,
+                            clientId,
+                            attemptActive,
+                            vpnReady,
+                            runGeneration,
+                        ) {
+                            attemptConnectedAt = System.currentTimeMillis()
+                        }
                     }
                 } catch (error: PermanentTunnelException) {
                     finalStatus = error.message ?: "Connection rejected"
@@ -167,7 +196,140 @@ class TunnelService : VpnService() {
         }
     }
 
-    private fun connectOnce(
+    private fun connectNativeOnce(
+        server: String,
+        token: String,
+        clientId: String,
+        network: Network,
+        attemptActive: AtomicBoolean,
+        runGeneration: Long,
+        onConnected: () -> Unit,
+    ) {
+        val host = gatewayHost(server)
+            ?: throw PermanentTunnelException("Gateway URL has no hostname")
+        val remoteAddresses = try {
+            network.getAllByName(host).mapNotNull { it.hostAddress }.distinct()
+        } catch (error: UnknownHostException) {
+            throw IOException("Could not resolve the gateway on the underlying network", error)
+        }
+        if (remoteAddresses.isEmpty()) {
+            throw IOException("Gateway hostname resolved to no addresses")
+        }
+
+        val protector = object : Protector {
+            override fun prepare(fd: Int): String {
+                if (!this@TunnelService.protect(fd)) {
+                    return "configuration: Android refused to protect the UDP socket"
+                }
+                return try {
+                    ParcelFileDescriptor.fromFd(fd).use { socket ->
+                        network.bindSocket(socket.fileDescriptor)
+                    }
+                    ""
+                } catch (error: IOException) {
+                    "transport unavailable: could not bind UDP socket to the selected network"
+                }
+            }
+        }
+        val dialer = Htunmobile.newDialer()
+        if (!nativeDialer.compareAndSet(null, dialer)) {
+            dialer.close()
+            throw IOException("Another native connection attempt is active")
+        }
+        var session: Session? = null
+        var unavailable: Exception? = null
+        var connected = false
+        try {
+            for (remoteAddress in remoteAddresses) {
+                try {
+                    session = dialer.dial(server, token, clientId, remoteAddress, protector)
+                    connected = true
+                    break
+                } catch (error: Exception) {
+                    val message = error.message.orEmpty()
+                    when {
+                        Htunmobile.isTransportUnavailable(message) -> unavailable = error
+                        Htunmobile.isRetryable(message) -> throw IOException(message, error)
+                        else -> throw PermanentTunnelException(message.ifBlank { "Native tunnel rejected" })
+                    }
+                }
+            }
+        } finally {
+            if (!connected) {
+                nativeDialer.compareAndSet(dialer, null)
+                dialer.close()
+            }
+        }
+        val activeSession = session
+            ?: throw NativeTransportUnavailableException(
+                unavailable?.message ?: "HTTP/3 MASQUE is unavailable",
+            )
+        if (!nativeSession.compareAndSet(null, activeSession)) {
+            nativeDialer.compareAndSet(dialer, null)
+            dialer.close()
+            activeSession.close()
+            throw IOException("Another native tunnel is active")
+        }
+
+        val senderError = AtomicReference<Exception?>()
+        val sender = Thread({
+            try {
+                while (isRunActive(runGeneration) && attemptActive.get()) {
+                    val packet = outboundPackets.poll(1, TimeUnit.SECONDS) ?: continue
+                    activeSession.send(packet)
+                }
+            } catch (error: Exception) {
+                if (isRunActive(runGeneration) && attemptActive.get()) {
+                    senderError.compareAndSet(null, error)
+                    try {
+                        activeSession.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }, "htun-http3-upload")
+
+        try {
+            configureVpn(
+                activeSession.address(),
+                activeSession.dns(),
+                activeSession.mtu().toString(),
+                runGeneration,
+            )
+            onConnected()
+            sendStatus("Connected over HTTP/3 MASQUE")
+            updateNotification("Connected over HTTP/3 MASQUE")
+            sender.start()
+            while (isRunActive(runGeneration) && attemptActive.get()) {
+                val packet = activeSession.receive()
+                output?.write(packet)
+            }
+            if (isRunActive(runGeneration)) throw IOException("Gateway closed the native tunnel")
+        } catch (error: Exception) {
+            val uploadError = senderError.get()
+            if (uploadError != null) throw IOException("Native tunnel upload stopped", uploadError)
+            if (isRunActive(runGeneration)) throw error
+        } finally {
+            attemptActive.set(false)
+            sender.interrupt()
+            if (sender.isAlive && sender !== Thread.currentThread()) {
+                try {
+                    sender.join(REQUEST_WRITER_STOP_TIMEOUT_MILLIS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            nativeDialer.compareAndSet(dialer, null)
+            dialer.close()
+            nativeSession.compareAndSet(activeSession, null)
+            try {
+                activeSession.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun connectLegacyOnce(
         client: OkHttpClient,
         server: String,
         token: String,
@@ -378,6 +540,8 @@ class TunnelService : VpnService() {
         generation.incrementAndGet()
         call?.cancel()
         call = null
+        closeNativeDialer()
+        closeNativeSession()
         worker?.interrupt()
         closeVpn()
         sendStatus(message)
@@ -390,6 +554,8 @@ class TunnelService : VpnService() {
         if (generation.get() != runGeneration) return
         running.set(false)
         call = null
+        closeNativeDialer()
+        closeNativeSession()
         closeVpn()
         worker = null
         sendStatus(message)
@@ -415,6 +581,18 @@ class TunnelService : VpnService() {
         vpnConfiguration = null
         selectedNetwork.set(null)
         outboundPackets.clear()
+    }
+
+    private fun closeNativeSession() {
+        val session = nativeSession.getAndSet(null) ?: return
+        try {
+            session.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun closeNativeDialer() {
+        nativeDialer.getAndSet(null)?.close()
     }
 
     private fun validConfiguration(server: String, token: String, clientId: String): Boolean = try {
@@ -508,6 +686,13 @@ class TunnelService : VpnService() {
     )
 
     private class PermanentTunnelException(message: String) : Exception(message)
+    private class NativeTransportUnavailableException(message: String) : Exception(message)
+}
+
+internal fun gatewayHost(server: String): String? = try {
+    URI(server).host?.removePrefix("[")?.removeSuffix("]")?.takeIf { it.isNotBlank() }
+} catch (_: Exception) {
+    null
 }
 
 internal fun parseIPv4Address(value: String): ByteArray? {
