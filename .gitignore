@@ -1,0 +1,13 @@
+/bin/
+/dist/
+/*.pem
+/*.key
+/*.crt
+/.idea/
+/.gradle/
+/android/.gradle/
+/android/local.properties
+/android/app/build/
+/android/build/
+*.log
+

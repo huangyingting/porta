@@ -1,0 +1,88 @@
+package masque
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+
+	"github.com/quic-go/quic-go/quicvarint"
+)
+
+const (
+	CapsuleDatagram           uint64 = 0x00
+	CapsuleAddressAssign      uint64 = 0x01
+	CapsuleAddressRequest     uint64 = 0x02
+	CapsuleRouteAdvertisement uint64 = 0x03
+
+	MaxCapsuleSize = 1 << 20
+)
+
+var ErrCapsuleTooLarge = errors.New("MASQUE capsule exceeds maximum size")
+
+type Capsule struct {
+	Type  uint64
+	Value []byte
+}
+
+type Encoder struct {
+	w  io.Writer
+	mu sync.Mutex
+}
+
+func NewEncoder(w io.Writer) *Encoder { return &Encoder{w: w} }
+
+func (e *Encoder) Write(capsuleType uint64, value []byte) error {
+	if len(value) > MaxCapsuleSize {
+		return ErrCapsuleTooLarge
+	}
+	header := quicvarint.Append(nil, capsuleType)
+	header = quicvarint.Append(header, uint64(len(value)))
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := writeAll(e.w, header); err != nil {
+		return err
+	}
+	return writeAll(e.w, value)
+}
+
+type Decoder struct {
+	r *bufio.Reader
+}
+
+func NewDecoder(r io.Reader) *Decoder { return &Decoder{r: bufio.NewReader(r)} }
+
+func (d *Decoder) Read() (Capsule, error) {
+	capsuleType, err := quicvarint.Read(d.r)
+	if err != nil {
+		return Capsule{}, err
+	}
+	length, err := quicvarint.Read(d.r)
+	if err != nil {
+		return Capsule{}, fmt.Errorf("read capsule length: %w", err)
+	}
+	if length > MaxCapsuleSize {
+		return Capsule{}, ErrCapsuleTooLarge
+	}
+	value := make([]byte, int(length))
+	if _, err := io.ReadFull(d.r, value); err != nil {
+		return Capsule{}, fmt.Errorf("read capsule value: %w", err)
+	}
+	return Capsule{Type: capsuleType, Value: value}, nil
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}

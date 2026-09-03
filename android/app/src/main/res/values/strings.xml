@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">hTun</string>
+    <string name="description">Authenticated IPv4 tunnel over a standard HTTP/2 TLS connection.</string>
+    <string name="gateway_hint">Gateway HTTPS origin</string>
+    <string name="token_hint">Bearer token (not stored)</string>
+    <string name="client_id_hint">Stable client ID</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="connect_http2">Connect over HTTP/2</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="https_required">Gateway must begin with https://</string>
+    <string name="credentials_required">Enter a token and a 1–64 character client ID.</string>
+</resources>
