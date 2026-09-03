@@ -6,8 +6,8 @@ same port. The repository includes a Linux gateway, a Windows Wintun client,
 and an Android `VpnService` client.
 
 It is designed for authorized remote access and compatibility with standard
-HTTP infrastructure. Ordinary browser visits receive a compact Porta product
-page, while operational endpoints remain isolated on the loopback admin
+HTTP infrastructure. Ordinary browser visits receive a compact, neutral Porta
+studio page, while operational endpoints remain isolated on the loopback admin
 listener. Read
 [the threat model](docs/threat-model.md) before deployment.
 
@@ -22,7 +22,7 @@ listener. Read
 - Durable per-client lease state across planned gateway restarts
 - Client accounts with hashed tokens and configurable multi-device limits
 - Authenticated Prometheus metrics
-- Compact Porta landing page for ordinary public HTTP requests
+- Compact neutral Porta studio page for ordinary public HTTP requests
 - Windows Wintun client plus explicit route setup/teardown scripts
 - Android native HTTP/3 MASQUE `VpnService` client with four-lane HTTP/2 fallback
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
@@ -155,7 +155,7 @@ For production, use a service manager, an unprivileged process with narrowly
 scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
-Ordinary browser requests receive a Porta HTML landing page by default.
+Ordinary browser requests receive a neutral Porta studio page by default.
 `/healthz`, `/readyz`, `/metrics`, and the admin UI are not exposed on the
 public tunnel listener. They are available only from the loopback listener at
 `127.0.0.1:9090` by default. Reach the UI through an SSH tunnel and open

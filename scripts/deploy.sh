@@ -391,7 +391,7 @@ curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/nu
 landing_page=$(curl --silent --show-error --fail \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
   die "gateway admin endpoint is ready but public TLS is unavailable"
-grep -q '<title>Porta · Private network access</title>' <<<"$landing_page" ||
+grep -q '<title>Porta · Digital product studio</title>' <<<"$landing_page" ||
   die "public endpoint did not return the expected landing page"
 systemctl is-active --quiet porta.service ||
   die "gateway exited after its readiness check"

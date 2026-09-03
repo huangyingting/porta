@@ -27,11 +27,16 @@ func TestPublicSiteServesPortaLandingPage(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "<h1>") {
 		t.Fatal("landing page has no visible heading")
 	}
-	if !strings.Contains(response.Body.String(), "Your network.") {
+	if !strings.Contains(response.Body.String(), "Thoughtful work.") {
 		t.Fatal("landing page is missing its primary message")
 	}
-	if !strings.Contains(response.Body.String(), "<title>Porta · Private network access</title>") {
+	if !strings.Contains(response.Body.String(), "<title>Porta · Digital product studio</title>") {
 		t.Fatal("landing page is not branded as Porta")
+	}
+	for _, term := range []string{"network", "vpn", "gateway", "tunnel", "http/3", "self-hosted"} {
+		if strings.Contains(strings.ToLower(response.Body.String()), term) {
+			t.Fatalf("landing page exposes service term %q", term)
+		}
 	}
 	if !strings.Contains(response.Body.String(), `font-family:"Mona Sans"`) {
 		t.Fatal("landing page does not use the bundled Mona Sans font")

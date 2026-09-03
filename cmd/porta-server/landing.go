@@ -11,7 +11,7 @@ const landingHTML = `<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f5f6fa">
-  <title>Porta · Private network access</title>
+  <title>Porta · Digital product studio</title>
   <style>
     @font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-style:normal;font-weight:200 900;font-display:swap}
     :root{color-scheme:light;font-family:"Mona Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--ink:#121522;--muted:#686d7c;--line:rgba(25,29,45,.1);--violet:#665cf6;--aqua:#73d9d0;font-feature-settings:"cv11","ss01","ss03";font-synthesis:none}
@@ -40,22 +40,22 @@ const landingHTML = `<!doctype html>
   <div class="page">
     <header>
       <div class="brand"><span class="brand-mark"></span>Porta</div>
-      <nav><span>Private networking</span><span class="availability"><span>Gateway online</span></span></nav>
+      <nav><span>Selected work</span><span class="availability"><span>Available for new projects</span></span></nav>
     </header>
     <main>
       <section class="copy">
-        <div class="eyebrow">Private network access</div>
-        <h1>Your network.<br><em>Within reach.</em></h1>
-        <p class="lead">Porta creates a fast, secure path to the networks and services that matter to you.</p>
-        <div class="principles"><span>HTTP/3</span><span>Multi-device</span><span>Self-hosted</span></div>
+        <div class="eyebrow">Independent digital studio</div>
+        <h1>Thoughtful work.<br><em>Clearly made.</em></h1>
+        <p class="lead">Porta shapes focused digital products and distinctive brand experiences for ambitious teams.</p>
+        <div class="principles"><span>Strategy</span><span>Design</span><span>Technology</span></div>
       </section>
       <section class="canvas" aria-label="Abstract geometric artwork">
         <div class="mesh"></div><div class="ring two"></div><div class="ring one"></div><div class="halo"></div>
         <span class="node n1"></span><span class="node n2"></span><span class="node n3"></span>
-        <div class="note"><div><strong>Reliable access, simply managed.</strong><small>Modern transport. Focused controls.</small></div><span class="number">PORTA</span></div>
+        <div class="note"><div><strong>Designed around what matters.</strong><small>Clear thinking. Considered outcomes.</small></div><span class="number">PORTA</span></div>
       </section>
     </main>
-    <footer><span>Porta</span><span>Private network gateway</span></footer>
+    <footer><span>Porta Studio</span><span>Digital products and experiences</span></footer>
   </div>
 </body>
 </html>

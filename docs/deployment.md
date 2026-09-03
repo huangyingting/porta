@@ -100,8 +100,9 @@ the previous gateway.
 
 ## Landing page and admin UI
 
-Porta serves a compact product landing page to ordinary browser requests by
-default.
+Porta serves a compact, neutral studio landing page to ordinary browser
+requests by default. The page contains no VPN, tunnel, gateway, or transport
+language.
 The public listener does not route the admin UI, `/healthz`, `/readyz`, or
 `/metrics`; these are served only on `127.0.0.1:9090` by default.
 
