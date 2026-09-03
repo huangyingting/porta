@@ -43,6 +43,9 @@ fingerprints from network inspection.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.
+- Android mitigates fallback head-of-line blocking with four independent
+  HTTP/2 connections, including a dedicated DNS lane. Loss can still stall all
+  flows assigned to the affected lane.
 - Android prefers native HTTP/3 Extended CONNECT through the bundled Go
   MASQUE bridge. It falls back to the private HTTP/2 compatibility protocol
   when UDP or HTTP/3 is unavailable.

@@ -85,7 +85,11 @@ with this setting if it is absent. Tests set it before process startup.
 
 The older protocol uses the private media type
 `application/x-htun-packets` and two-byte length-prefixed IPv4 packets over
-`POST /v1/tunnel`. It remains tested but is no longer the desktop default.
+`POST /v1/tunnel`. Android opens four independent HTTP/2 connections for this
+fallback, reserves lane zero for DNS, and consistently distributes other IP
+flows across three data lanes. Each lane has its own TCP loss domain, reducing
+but not eliminating TCP head-of-line blocking. It remains tested but is no
+longer the desktop default.
 
 ## Production evolution
 

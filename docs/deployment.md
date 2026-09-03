@@ -194,13 +194,14 @@ Give the profile a recognizable name, enter the token and a stable device ID,
 then save it and enable its connection switch. The app can store multiple VPN
 server profiles with Android Keystore-encrypted tokens, while allowing only one
 active connection. The status should show **HTTP/3 MASQUE**. If UDP is blocked,
-the app automatically uses encrypted HTTP/2 fallback on the same configured
-port.
+the app automatically uses four independent encrypted HTTP/2 connections on
+the same configured port. DNS uses a dedicated lane and other flows are hashed
+across three data lanes to limit TCP head-of-line blocking.
 
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org/download/htun-android-0.5.1-debug.apk
+APK:     https://htun.i-csu.org/download/htun-android-0.5.2-debug.apk
 Gateway: https://htun.i-csu.org:8443
 ```
 

@@ -22,6 +22,19 @@ const TunnelPath = "/v1/tunnel"
 const MasquePath = "/.well-known/masque/ip/*/*/"
 
 var validClientID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+var validLaneSessionID = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
+
+const (
+	laneSessionHeader = "X-HTun-Lane-Session"
+	laneIndexHeader   = "X-HTun-Lane"
+	laneCountHeader   = "X-HTun-Lanes"
+)
+
+type laneConfig struct {
+	sessionID string
+	index     int
+	count     int
+}
 
 func ValidClientID(value string) bool {
 	return validClientID.MatchString(value)
@@ -127,7 +140,17 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported content type", http.StatusUnsupportedMediaType)
 		return
 	}
-	lease, err := c.Pool.Acquire(clientID)
+	lanes, err := parseLaneConfig(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var lease Lease
+	if lanes == nil {
+		lease, err = c.Pool.Acquire(clientID)
+	} else {
+		lease, err = c.Pool.AcquireGroup(clientID, lanes.sessionID)
+	}
 	if err != nil {
 		http.Error(w, "no tunnel addresses available", http.StatusServiceUnavailable)
 		return
@@ -135,12 +158,34 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 
 	defer c.Pool.Release(lease)
 
-	session, sessionCtx := c.Router.Register(r.Context(), lease.Address)
+	var (
+		session    *Session
+		sessionCtx context.Context
+	)
+	if lanes == nil {
+		session, sessionCtx = c.Router.Register(r.Context(), lease.Address)
+	} else {
+		session, sessionCtx, err = c.Router.RegisterGroup(
+			r.Context(),
+			lease.Address,
+			lanes.sessionID,
+			lanes.index,
+			lanes.count,
+		)
+		if err != nil {
+			http.Error(w, "invalid tunnel lane group", http.StatusConflict)
+			return
+		}
+	}
 	defer session.Close()
 	c.Metrics.connected()
 	defer c.Metrics.disconnected()
 	remoteHost := clientAddress(r, c.TrustProxyHeaders)
-	c.Logger.Info("tunnel connected", "client_id", clientID, "address", lease.Address, "transport", r.Proto, "remote", remoteHost)
+	logAttributes := []any{"client_id", clientID, "address", lease.Address, "transport", r.Proto, "remote", remoteHost}
+	if lanes != nil {
+		logAttributes = append(logAttributes, "lane", lanes.index, "lanes", lanes.count)
+	}
+	c.Logger.Info("tunnel connected", logAttributes...)
 	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
 
 	w.Header().Set("Content-Type", protocol.ContentType)
@@ -149,6 +194,11 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-HTun-Address", lease.Prefix().String())
 	w.Header().Set("X-HTun-Gateway", lease.Gateway.String())
 	w.Header().Set("X-HTun-MTU", strconv.Itoa(c.MTU))
+	if lanes != nil {
+		w.Header().Set(laneSessionHeader, lanes.sessionID)
+		w.Header().Set(laneIndexHeader, strconv.Itoa(lanes.index))
+		w.Header().Set(laneCountHeader, strconv.Itoa(lanes.count))
+	}
 	if c.DNS != "" {
 		w.Header().Set("X-HTun-DNS", c.DNS)
 	}
@@ -158,6 +208,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	if err := encoder.WritePacket(nil); err != nil {
 		return
 	}
+
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -215,6 +266,27 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func parseLaneConfig(r *http.Request) (*laneConfig, error) {
+	sessionID := strings.TrimSpace(r.Header.Get(laneSessionHeader))
+	indexValue := strings.TrimSpace(r.Header.Get(laneIndexHeader))
+	countValue := strings.TrimSpace(r.Header.Get(laneCountHeader))
+	if sessionID == "" && indexValue == "" && countValue == "" {
+		return nil, nil
+	}
+	if !validLaneSessionID.MatchString(sessionID) {
+		return nil, errors.New("invalid tunnel lane session")
+	}
+	index, err := strconv.Atoi(indexValue)
+	if err != nil {
+		return nil, errors.New("invalid tunnel lane index")
+	}
+	count, err := strconv.Atoi(countValue)
+	if err != nil || count < 2 || count > 8 || index < 0 || index >= count {
+		return nil, errors.New("invalid tunnel lane count")
+	}
+	return &laneConfig{sessionID: sessionID, index: index, count: count}, nil
 }
 
 func (c HandlerConfig) authorizedClient(header, clientID string) bool {

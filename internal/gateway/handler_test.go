@@ -51,6 +51,7 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	handler, err := NewHandler(HandlerConfig{
 		Token:        "client-token-0123456789",
 		MetricsToken: "metrics-token-0123456789",
@@ -76,6 +77,29 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("metrics credential status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestParseLaneConfig(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, TunnelPath, nil)
+	if config, err := parseLaneConfig(request); err != nil || config != nil {
+		t.Fatalf("empty lane config = %#v, %v", config, err)
+	}
+
+	request.Header.Set(laneSessionHeader, "session-1234567890")
+	request.Header.Set(laneIndexHeader, "2")
+	request.Header.Set(laneCountHeader, "4")
+	config, err := parseLaneConfig(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.sessionID != "session-1234567890" || config.index != 2 || config.count != 4 {
+		t.Fatalf("lane config = %#v", config)
+	}
+
+	request.Header.Set(laneIndexHeader, "4")
+	if _, err := parseLaneConfig(request); err == nil {
+		t.Fatal("out-of-range lane index accepted")
 	}
 }
 

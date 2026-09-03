@@ -37,7 +37,7 @@
     <string name="connecting">Connecting</string>
     <string name="waiting_for_network">Waiting for network</string>
     <string name="transport_http3">HTTP/3 MASQUE • Fast and resilient</string>
-    <string name="transport_http2">HTTP/2 fallback • Encrypted</string>
+    <string name="transport_http2">4-lane HTTP/2 fallback • Encrypted</string>
     <string name="establishing_secure_tunnel">Establishing a secure tunnel…</string>
     <string name="choose_profile">Choose a VPN profile to connect</string>
     <string name="profile_connected">Connected</string>

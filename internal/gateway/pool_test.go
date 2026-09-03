@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -10,10 +11,12 @@ func TestPoolReconnectKeepsAddressAndOldReleaseIsIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	first, err := pool.Acquire("client-a")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	second, err := pool.Acquire("client-a")
 	if err != nil {
 		t.Fatal(err)
@@ -28,6 +31,38 @@ func TestPoolReconnectKeepsAddressAndOldReleaseIsIgnored(t *testing.T) {
 	}
 	if third.Address == second.Address {
 		t.Fatal("stale release freed the active reconnect lease")
+	}
+}
+
+func TestPoolGroupStaysActiveUntilLastLaneReleases(t *testing.T) {
+	pool, err := NewPool("10.66.0.0/30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := pool.AcquireGroup("client-a", "session-12345678")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := pool.AcquireGroup("client-a", "session-12345678")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Address != second.Address || first.generation != second.generation {
+		t.Fatal("lanes in one group did not share a lease generation")
+	}
+
+	pool.Release(first)
+	if _, err := pool.Acquire("client-b"); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("partially active group allowed address reuse: %v", err)
+	}
+
+	pool.Release(second)
+	reused, err := pool.Acquire("client-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.Address != first.Address {
+		t.Fatalf("reused address = %s, want %s", reused.Address, first.Address)
 	}
 }
 

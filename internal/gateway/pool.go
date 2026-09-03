@@ -30,12 +30,19 @@ type leaseRecord struct {
 	active     bool
 }
 
+type activeLeaseGroup struct {
+	id         string
+	generation uint64
+	references int
+}
+
 type Pool struct {
 	mu        sync.Mutex
 	prefix    netip.Prefix
 	gateway   netip.Addr
 	byClient  map[string]leaseRecord
 	byAddr    map[netip.Addr]string
+	groups    map[string]activeLeaseGroup
 	nextGen   uint64
 	statePath string
 }
@@ -69,6 +76,7 @@ func newPool(cidr, statePath string) (*Pool, error) {
 		gateway:   gateway,
 		byClient:  make(map[string]leaseRecord),
 		byAddr:    make(map[netip.Addr]string),
+		groups:    make(map[string]activeLeaseGroup),
 		statePath: statePath,
 	}
 	if statePath != "" {
@@ -80,19 +88,44 @@ func newPool(cidr, statePath string) (*Pool, error) {
 }
 
 func (p *Pool) Acquire(clientID string) (Lease, error) {
+	return p.acquire(clientID, "")
+}
+
+func (p *Pool) AcquireGroup(clientID, groupID string) (Lease, error) {
+	if groupID == "" {
+		return Lease{}, errors.New("lease group ID is required")
+	}
+	return p.acquire(clientID, groupID)
+}
+
+func (p *Pool) acquire(clientID, groupID string) (Lease, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if group, ok := p.groups[clientID]; ok && group.id == groupID && groupID != "" {
+		record, exists := p.byClient[clientID]
+		if exists && record.generation == group.generation && record.active {
+			group.references++
+			p.groups[clientID] = group
+			return p.lease(clientID, record), nil
+		}
+	}
 
 	p.nextGen++
 	if existing, ok := p.byClient[clientID]; ok {
 		previous := existing
+		previousGroup, hadPreviousGroup := p.groups[clientID]
 		existing.generation = p.nextGen
 		existing.active = true
 		p.byClient[clientID] = existing
 		if err := p.persistStateLocked(); err != nil {
 			p.byClient[clientID] = previous
+			if hadPreviousGroup {
+				p.groups[clientID] = previousGroup
+			}
 			return Lease{}, err
 		}
+		p.activateGroup(clientID, groupID, existing.generation)
 		return p.lease(clientID, existing), nil
 	}
 
@@ -109,6 +142,7 @@ func (p *Pool) Acquire(clientID string) (Lease, error) {
 			delete(p.byAddr, candidate)
 			return Lease{}, err
 		}
+		p.activateGroup(clientID, groupID, record.generation)
 		return p.lease(clientID, record), nil
 	}
 	var (
@@ -133,6 +167,7 @@ func (p *Pool) Acquire(clientID string) (Lease, error) {
 			p.byAddr[reclaimRecord.address] = reclaimClient
 			return Lease{}, err
 		}
+		p.activateGroup(clientID, groupID, record.generation)
 		return p.lease(clientID, record), nil
 	}
 	return Lease{}, ErrPoolExhausted
@@ -145,8 +180,28 @@ func (p *Pool) Release(lease Lease) {
 	if !ok || record.generation != lease.generation {
 		return
 	}
+	if group, exists := p.groups[lease.clientID]; exists && group.generation == lease.generation {
+		group.references--
+		if group.references > 0 {
+			p.groups[lease.clientID] = group
+			return
+		}
+		delete(p.groups, lease.clientID)
+	}
 	record.active = false
 	p.byClient[lease.clientID] = record
+}
+
+func (p *Pool) activateGroup(clientID, groupID string, generation uint64) {
+	if groupID == "" {
+		delete(p.groups, clientID)
+		return
+	}
+	p.groups[clientID] = activeLeaseGroup{
+		id:         groupID,
+		generation: generation,
+		references: 1,
+	}
 }
 
 func (p *Pool) Gateway() netip.Addr { return p.gateway }

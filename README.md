@@ -407,8 +407,10 @@ VPN prompt and allow notifications if prompted. The app first connects with
 native HTTP/3 MASQUE over UDP 8443. The status changes to
 `Connected over HTTP/3 MASQUE`. If UDP or HTTP/3 is
 unavailable, it automatically falls back to the HTTP/2 compatibility transport
-over TCP 8443. Authentication, certificate, and invalid-configuration failures
-do not trigger a less secure fallback.
+over TCP 8443. The fallback opens four independent TCP connections, reserves
+one lane for DNS, and hashes other flows across the remaining lanes so packet
+loss stalls only one subset of traffic. Authentication, certificate, and
+invalid-configuration failures do not trigger a less secure fallback.
 
 The app supports multiple named VPN server profiles. Tokens are encrypted with
 a non-exportable Android Keystore key, only one profile can be connected at a
