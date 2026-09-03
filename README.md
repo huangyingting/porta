@@ -6,9 +6,9 @@ same port. The repository includes a Linux gateway, a Windows Wintun client,
 and an Android `VpnService` client.
 
 It is designed for authorized remote access and compatibility with standard
-HTTP infrastructure. A neutral landing page prevents casual browser visits
-from identifying the service, but the tunnel does not impersonate browser
-traffic and cannot promise to be undetectable. Read
+HTTP infrastructure. Ordinary browser visits receive a compact Porta product
+page, while operational endpoints remain isolated on the loopback admin
+listener. Read
 [the threat model](docs/threat-model.md) before deployment.
 
 ## Current scope
@@ -22,7 +22,7 @@ traffic and cannot promise to be undetectable. Read
 - Durable per-client lease state across planned gateway restarts
 - Client accounts with hashed tokens and configurable multi-device limits
 - Authenticated Prometheus metrics
-- Neutral browser cover page for ordinary public HTTP requests
+- Compact Porta landing page for ordinary public HTTP requests
 - Windows Wintun client plus explicit route setup/teardown scripts
 - Android native HTTP/3 MASQUE `VpnService` client with four-lane HTTP/2 fallback
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
@@ -155,13 +155,13 @@ For production, use a service manager, an unprivileged process with narrowly
 scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
-Ordinary browser requests receive a neutral HTML landing page by default.
+Ordinary browser requests receive a Porta HTML landing page by default.
 `/healthz`, `/readyz`, `/metrics`, and the admin UI are not exposed on the
 public tunnel listener. They are available only from the loopback listener at
 `127.0.0.1:9090` by default. Reach the UI through an SSH tunnel and open
 `http://127.0.0.1:9090`; API data requires `PORTA_ADMIN_TOKEN`. Use
-`--cover-site=false` only when an API-style 404 is preferred over the landing
-page. This is camouflage for casual visitors, not a security boundary.
+`--landing-page=false` only when an API-style 404 is preferred over the landing
+page.
 
 ### Direct HTTP/3 alongside an existing web server
 
@@ -484,8 +484,8 @@ release. Configure these repository Actions secrets before tagging:
   `PORTA_METRICS_TOKEN` is set and requires that exact bearer token.
 - Admin-listener `GET /` serves the client-management UI. Its `/api/*`
   requests require `PORTA_ADMIN_TOKEN`.
-- Ordinary public `GET` and `HEAD` requests receive only the neutral HTML cover
-  page by default; operational endpoints are never routed on that listener.
+- Ordinary public `GET` and `HEAD` requests receive the Porta landing page by
+  default; operational endpoints are never routed on that listener.
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
   template for unrestricted IPv4 proxying. It requires `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.

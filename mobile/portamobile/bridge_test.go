@@ -22,11 +22,11 @@ func (p *recordingProtector) Prepare(fd int32) string {
 }
 
 func TestEndpointAddressPreservesHostnameAndUsesNumericRemote(t *testing.T) {
-	endpoint, address, err := endpointAddress("https://htun.i-csu.org:8443", "203.0.113.7")
+	endpoint, address, err := endpointAddress("https://vpn.example.com:8443", "203.0.113.7")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if endpoint.Hostname() != "htun.i-csu.org" {
+	if endpoint.Hostname() != "vpn.example.com" {
 		t.Fatalf("hostname = %q", endpoint.Hostname())
 	}
 	if want := netip.MustParseAddrPort("203.0.113.7:8443"); address != want {
@@ -60,7 +60,7 @@ func TestDialerCloseCancelsDial(t *testing.T) {
 	dialer := NewDialer()
 	dialer.Close()
 	_, err := dialer.Dial(
-		"https://htun.i-csu.org:8443",
+		"https://vpn.example.com:8443",
 		"0123456789abcdef",
 		"android-test",
 		"127.0.0.1",

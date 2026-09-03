@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestPublicSiteServesBrowserCoverPage(t *testing.T) {
+func TestPublicSiteServesPortaLandingPage(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Fatal("ordinary browser request reached the tunnel handler")
 	})
@@ -25,19 +25,19 @@ func TestPublicSiteServesBrowserCoverPage(t *testing.T) {
 		t.Fatalf("content type = %q, want HTML", contentType)
 	}
 	if !strings.Contains(response.Body.String(), "<h1>") {
-		t.Fatal("cover page has no visible heading")
+		t.Fatal("landing page has no visible heading")
 	}
-	if !strings.Contains(response.Body.String(), "Ideas made <em>clear.</em>") {
-		t.Fatal("cover page is missing its primary visual message")
+	if !strings.Contains(response.Body.String(), "Your network.") {
+		t.Fatal("landing page is missing its primary message")
 	}
-	if strings.Contains(strings.ToLower(response.Body.String()), "porta") {
-		t.Fatal("cover page identifies the tunnel service")
+	if !strings.Contains(response.Body.String(), "<title>Porta · Private network access</title>") {
+		t.Fatal("landing page is not branded as Porta")
 	}
 	if !strings.Contains(response.Body.String(), `font-family:"Mona Sans"`) {
-		t.Fatal("cover page does not use the bundled Mona Sans font")
+		t.Fatal("landing page does not use the bundled Mona Sans font")
 	}
 	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "font-src 'self'") {
-		t.Fatalf("cover CSP = %q", policy)
+		t.Fatalf("landing CSP = %q", policy)
 	}
 }
 
@@ -51,7 +51,7 @@ func TestPublicSiteConcealsOperationalEndpoints(t *testing.T) {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://vpn.example.com"+path, nil))
 		if !strings.Contains(response.Body.String(), "<h1>") {
-			t.Fatalf("%s did not receive the cover page", path)
+			t.Fatalf("%s did not receive the landing page", path)
 		}
 	}
 	if nextCalled {
@@ -103,7 +103,7 @@ func TestAdminSiteServesBundledFont(t *testing.T) {
 	}
 }
 
-func TestPublicSiteCanDisableCoverWithoutExposingOperations(t *testing.T) {
+func TestPublicSiteCanDisableLandingWithoutExposingOperations(t *testing.T) {
 	handler := publicSiteHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 	}), false)
@@ -111,7 +111,7 @@ func TestPublicSiteCanDisableCoverWithoutExposingOperations(t *testing.T) {
 	root := httptest.NewRecorder()
 	handler.ServeHTTP(root, httptest.NewRequest(http.MethodGet, "https://vpn.example.com/", nil))
 	if root.Code != http.StatusTeapot {
-		t.Fatalf("disabled cover status = %d, want 418", root.Code)
+		t.Fatalf("disabled landing status = %d, want 418", root.Code)
 	}
 
 	health := httptest.NewRecorder()

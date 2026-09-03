@@ -72,7 +72,7 @@ func run() error {
 	tlsCert := flag.String("tls-cert", "", "static TLS certificate file (reloaded when replaced)")
 	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
-	coverSite := flag.Bool("cover-site", true, "serve a neutral HTML page to ordinary browser requests")
+	landingPage := flag.Bool("landing-page", true, "serve the Porta landing page to ordinary browser requests")
 	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for the admin UI, health, readiness, and metrics (empty disables)")
 	clientRegistryPath := flag.String("client-registry", "clients.json", "persistent client registry path")
 	interfaceName := flag.String("interface", "porta0", "Linux TUN interface name")
@@ -178,7 +178,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	publicHandler := publicSiteHandler(handler, *coverSite)
+	publicHandler := publicSiteHandler(handler, *landingPage)
 
 	tcpHandler := publicHandler
 	if *behindProxy {

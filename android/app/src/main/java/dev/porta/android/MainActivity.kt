@@ -482,7 +482,7 @@ class MainActivity : Activity() {
         val name = dialogField(R.string.profile_name_hint, existing?.name.orEmpty())
         val server = dialogField(
             R.string.gateway_hint,
-            existing?.server ?: DEFAULT_SERVER,
+            existing?.server.orEmpty(),
         )
         val token = dialogField(
             if (existing == null) R.string.token_hint else R.string.token_unchanged_hint,
@@ -727,7 +727,6 @@ class MainActivity : Activity() {
         private const val REQUEST_NOTIFICATIONS = 101
         private const val STATE_PENDING_PROFILE = "pending_profile"
         private const val STATUS_PERMISSION = "dev.porta.android.permission.STATUS"
-        private const val DEFAULT_SERVER = "https://htun.i-csu.org:8443"
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
         private val COLOR_BACKGROUND = Color.rgb(8, 17, 31)
@@ -746,9 +745,6 @@ class MainActivity : Activity() {
         private val COLOR_OFFLINE = Color.rgb(100, 116, 139)
     }
 }
-
-internal fun preferredGateway(server: String): String =
-    if (server == "https://htun.i-csu.org") "https://htun.i-csu.org:8443" else server
 
 internal fun String.safeClientId(): String = replace(Regex("[^A-Za-z0-9._-]+"), "-")
     .trim('-', '.', '_').take(64).ifBlank { "android" }

@@ -243,82 +243,6 @@ fi
 chmod 0600 "$environment_file"
 
 client_registry=/var/lib/porta/clients.json
-migrated_client_file=false
-if [[ ! -f $client_registry && -s /etc/porta/clients ]]; then
-  install -d -m 0700 /var/lib/porta
-  python3 - "$environment_file" /etc/porta/clients "$client_registry" <<'PY' ||
-    die "could not import existing client credentials"
-import datetime
-import hashlib
-import json
-import os
-import re
-import secrets
-import sys
-import tempfile
-
-environment_path, credentials_path, registry_path = sys.argv[1:]
-environment = {}
-with open(environment_path, encoding="utf-8") as stream:
-    for raw_line in stream:
-        key, separator, value = raw_line.strip().partition("=")
-        if separator:
-            environment[key] = value
-bootstrap = environment.get("PORTA_TOKEN", "")
-if len(bootstrap) < 16:
-    raise SystemExit("PORTA_TOKEN is missing or too short")
-
-now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-clients = [{
-    "id": secrets.token_hex(8),
-    "name": "Default client",
-    "token_hash": hashlib.sha256(bootstrap.encode()).hexdigest(),
-    "max_devices": 5,
-    "enabled": True,
-    "created_at": now,
-}]
-by_hash = {clients[0]["token_hash"]: clients[0]}
-client_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-with open(credentials_path, encoding="utf-8") as stream:
-    for line_number, raw_line in enumerate(stream, 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        client_id, separator, token = line.partition("=")
-        client_id, token = client_id.strip(), token.strip()
-        if not separator or not client_id_pattern.fullmatch(client_id) or len(token) < 16:
-            raise SystemExit(f"invalid credential on line {line_number}")
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        if token_hash in by_hash:
-            by_hash[token_hash]["max_devices"] = min(100, by_hash[token_hash]["max_devices"] + 1)
-            continue
-        client = {
-            "id": secrets.token_hex(8),
-            "name": f"Imported {client_id}",
-            "token_hash": token_hash,
-            "max_devices": 1,
-            "enabled": True,
-            "created_at": now,
-        }
-        clients.append(client)
-        by_hash[token_hash] = client
-
-directory = os.path.dirname(registry_path)
-descriptor, temporary_path = tempfile.mkstemp(prefix=".clients-", dir=directory)
-try:
-    os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump({"version": 1, "clients": clients}, stream, indent=2)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary_path, registry_path)
-finally:
-    if os.path.exists(temporary_path):
-        os.unlink(temporary_path)
-PY
-  migrated_client_file=true
-fi
 
 rollback_directory=$(mktemp -d)
 deployment_complete=false
@@ -464,10 +388,10 @@ for _ in $(seq 1 30); do
 done
 curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
-cover_page=$(curl --silent --show-error --fail \
+landing_page=$(curl --silent --show-error --fail \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
   die "gateway admin endpoint is ready but public TLS is unavailable"
-grep -q '<title>Northline</title>' <<<"$cover_page" ||
+grep -q '<title>Porta · Private network access</title>' <<<"$landing_page" ||
   die "public endpoint did not return the expected landing page"
 systemctl is-active --quiet porta.service ||
   die "gateway exited after its readiness check"
@@ -475,10 +399,6 @@ ss -H -ltnp "sport = :$port" | grep -q '"porta-server"' ||
   die "gateway is not listening on public TCP port $port"
 ss -H -lunp "sport = :$port" | grep -q '"porta-server"' ||
   die "gateway is not listening on public UDP port $port"
-if $migrated_client_file; then
-  rm -f /etc/porta/clients
-fi
-
 deployment_complete=true
 cat <<EOF
 

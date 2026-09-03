@@ -29,6 +29,7 @@ jobs:
           mkdir -p dist/linux-amd64 dist/windows-amd64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-server ./cmd/porta-server
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-client ./cmd/porta-client
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-keygen ./cmd/porta-keygen
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o dist/windows-amd64/porta-client.exe ./cmd/porta-client
           tar -C dist/linux-amd64 -czf dist/porta-linux-amd64.tar.gz .
           zip -jq dist/porta-windows-amd64.zip dist/windows-amd64/porta-client.exe

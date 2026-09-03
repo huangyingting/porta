@@ -17,7 +17,7 @@ class BootReceiver : BroadcastReceiver() {
                 .setAction(TunnelService.ACTION_START)
                 .putExtra(TunnelService.EXTRA_PROFILE_ID, config.id)
                 .putExtra(TunnelService.EXTRA_PROFILE_NAME, config.name)
-                .putExtra(TunnelService.EXTRA_SERVER, preferredGateway(config.server))
+                .putExtra(TunnelService.EXTRA_SERVER, config.server)
                 .putExtra(TunnelService.EXTRA_TOKEN, config.token)
                 .putExtra(TunnelService.EXTRA_CLIENT_ID, config.clientId),
         )

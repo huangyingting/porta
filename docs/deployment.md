@@ -98,14 +98,12 @@ gateway. If the new service cannot obtain its certificate or pass the
 readiness check, it restores the previous systemd configuration and restarts
 the previous gateway.
 
-## Browser cover page and admin UI
+## Landing page and admin UI
 
-Porta serves a neutral HTML landing page to ordinary browser requests by
-default, so visiting the tunnel origin does not identify the VPN service.
+Porta serves a compact product landing page to ordinary browser requests by
+default.
 The public listener does not route the admin UI, `/healthz`, `/readyz`, or
-`/metrics`; these are served only on `127.0.0.1:9090` by default. Tunnel
-authentication remains the actual security boundary—the cover page only
-reduces casual service fingerprinting.
+`/metrics`; these are served only on `127.0.0.1:9090` by default.
 
 Open the admin UI without exposing it publicly:
 
@@ -119,7 +117,7 @@ create, edit, disable, and delete clients; rotate tokens; set device limits;
 and forget enrolled devices to free a slot. A device that still has the shared
 client token can enroll again. Tokens are shown only when created or rotated.
 
-For direct manual server runs, pass `--cover-site=false` to replace the landing
+For direct manual server runs, pass `--landing-page=false` to replace the landing
 page with normal API 404 responses. Use `--admin-listen` to change or disable
 the loopback operational listener.
 
