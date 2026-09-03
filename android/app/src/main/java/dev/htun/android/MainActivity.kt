@@ -30,6 +30,9 @@ import android.widget.TextView
 import android.widget.Toast
 import java.net.URI
 import java.net.URISyntaxException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 class MainActivity : Activity() {
@@ -38,11 +41,30 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var statusDetail: TextView
     private lateinit var statusDot: View
+    private lateinit var bandwidthChart: BandwidthChartView
+    private lateinit var downloadRate: TextView
+    private lateinit var uploadRate: TextView
+    private lateinit var trafficTotal: TextView
+    private lateinit var trafficState: TextView
     private var pendingProfileId: String? = null
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            render(intent?.getStringExtra(TunnelService.EXTRA_STATUS) ?: getString(R.string.unknown_state))
+            val sessionId = intent?.getLongExtra(TunnelService.EXTRA_SESSION_ID, 0L) ?: 0L
+            if (sessionId != TunnelService.currentSessionId()) return
+            if (intent?.action == TunnelService.ACTION_STATS) {
+                updateBandwidth(
+                    TrafficSnapshot(
+                        downloadBytesPerSecond = intent.getLongExtra(TunnelService.EXTRA_DOWNLOAD_BPS, 0),
+                        uploadBytesPerSecond = intent.getLongExtra(TunnelService.EXTRA_UPLOAD_BPS, 0),
+                        totalDownloadedBytes = intent.getLongExtra(TunnelService.EXTRA_TOTAL_DOWNLOAD, 0),
+                        totalUploadedBytes = intent.getLongExtra(TunnelService.EXTRA_TOTAL_UPLOAD, 0),
+                    ),
+                    addSample = true,
+                )
+            } else {
+                render(intent?.getStringExtra(TunnelService.EXTRA_STATUS) ?: getString(R.string.unknown_state))
+            }
         }
     }
 
@@ -68,7 +90,7 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(
                 statusReceiver,
-                IntentFilter(TunnelService.ACTION_STATUS),
+                statusIntentFilter(),
                 STATUS_PERMISSION,
                 null,
                 Context.RECEIVER_NOT_EXPORTED,
@@ -77,7 +99,7 @@ class MainActivity : Activity() {
             @Suppress("DEPRECATION")
             registerReceiver(
                 statusReceiver,
-                IntentFilter(TunnelService.ACTION_STATUS),
+                statusIntentFilter(),
                 STATUS_PERMISSION,
                 null,
             )
@@ -131,6 +153,21 @@ class MainActivity : Activity() {
             })
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
+        header.addView(TextView(this).apply {
+            setText(R.string.log)
+            textSize = 14f
+            setTextColor(COLOR_ACCENT)
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener { showClientLog() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(48),
+            ).apply {
+                marginEnd = dp(8)
+            }
+        })
         header.addView(Button(this).apply {
             text = "+"
             contentDescription = getString(R.string.add_profile)
@@ -146,6 +183,9 @@ class MainActivity : Activity() {
         page.addView(header)
         page.addView(connectionSummary().apply {
             layoutParams = marginParams(top = 22)
+        })
+        page.addView(bandwidthCard().apply {
+            layoutParams = marginParams(top = 12)
         })
         page.addView(TextView(this).apply {
             setText(R.string.vpn_profiles)
@@ -205,6 +245,64 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun bandwidthCard(): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(17), dp(15), dp(17), dp(14))
+            background = rounded(COLOR_CARD, 18f)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    setText(R.string.traffic)
+                    textSize = 13f
+                    setTextColor(COLOR_TEXT)
+                    setTypeface(typeface, Typeface.BOLD)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                trafficState = TextView(this@MainActivity).apply {
+                    setText(R.string.live)
+                    textSize = 10f
+                    setTextColor(COLOR_ACCENT)
+                    setTypeface(typeface, Typeface.BOLD)
+                }
+                addView(trafficState)
+            })
+            bandwidthChart = BandwidthChartView(this@MainActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(112),
+                ).apply {
+                    topMargin = dp(12)
+                    bottomMargin = dp(12)
+                }
+            }
+            addView(bandwidthChart)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                downloadRate = trafficValue(R.string.download, COLOR_ACCENT)
+                uploadRate = trafficValue(R.string.upload, COLOR_UPLOAD)
+                addView(downloadRate, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(uploadRate, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            })
+            trafficTotal = TextView(this@MainActivity).apply {
+                textSize = 11f
+                setTextColor(COLOR_MUTED)
+                gravity = Gravity.CENTER
+                setPadding(0, dp(10), 0, 0)
+            }
+            addView(trafficTotal)
+        }
+    }
+
+    private fun trafficValue(labelResource: Int, color: Int) = TextView(this).apply {
+        textSize = 12f
+        setTextColor(color)
+        setTypeface(typeface, Typeface.BOLD)
+        gravity = Gravity.CENTER
+        text = getString(labelResource, formatDataRate(0))
+    }
+
     private fun render(value: String) {
         if (!::status.isInitialized) return
         val connected = value.startsWith("Connected")
@@ -226,7 +324,27 @@ class MainActivity : Activity() {
         statusDot.background = circle(
             if (connected) COLOR_CONNECTED else if (active) COLOR_CONNECTING else COLOR_OFFLINE,
         )
+        trafficState.setText(if (active) R.string.live else R.string.idle)
+        trafficState.setTextColor(if (active) COLOR_ACCENT else COLOR_MUTED)
+        updateBandwidth(TunnelService.currentTrafficSnapshot(), addSample = false)
         renderProfiles()
+    }
+
+    private fun updateBandwidth(snapshot: TrafficSnapshot, addSample: Boolean) {
+        if (!::bandwidthChart.isInitialized) return
+        if (addSample) {
+            bandwidthChart.addSample(
+                snapshot.downloadBytesPerSecond,
+                snapshot.uploadBytesPerSecond,
+            )
+        }
+        downloadRate.text = getString(R.string.download, formatDataRate(snapshot.downloadBytesPerSecond))
+        uploadRate.text = getString(R.string.upload, formatDataRate(snapshot.uploadBytesPerSecond))
+        trafficTotal.text = getString(
+            R.string.traffic_total,
+            formatDataSize(snapshot.totalDownloadedBytes),
+            formatDataSize(snapshot.totalUploadedBytes),
+        )
     }
 
     private fun renderProfiles() {
@@ -432,6 +550,34 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
+    private fun showClientLog() {
+        val entries = ClientLogStore(this).entries()
+        val content = if (entries.isEmpty()) {
+            getString(R.string.log_empty)
+        } else {
+            val formatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+            entries.joinToString("\n") {
+                "${formatter.format(Date(it.timestampMillis))}  ${it.message}"
+            }
+        }
+        val logView = TextView(this).apply {
+            text = content
+            textSize = 12f
+            setTextColor(COLOR_TEXT)
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(18), dp(12), dp(18), dp(18))
+            setTextIsSelectable(true)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.connection_log)
+            .setView(ScrollView(this).apply { addView(logView) })
+            .setPositiveButton(R.string.close, null)
+            .setNeutralButton(R.string.clear_log) { _, _ ->
+                ClientLogStore(this).clear()
+            }
+            .show()
+    }
+
     private fun deleteProfile(profile: VpnProfile) {
         if (!profileStore.delete(profile.id)) {
             Toast.makeText(this, R.string.profile_delete_failed, Toast.LENGTH_LONG).show()
@@ -465,6 +611,8 @@ class MainActivity : Activity() {
 
     private fun startProfile(profile: VpnProfile) {
         profileStore.select(profile.id)
+        bandwidthChart.reset()
+        updateBandwidth(TrafficSnapshot(), addSample = false)
         startForegroundService(
             Intent(this, TunnelService::class.java)
                 .setAction(TunnelService.ACTION_START)
@@ -538,6 +686,10 @@ class MainActivity : Activity() {
         intArrayOf(COLOR_ACCENT_DARK, COLOR_BORDER),
     )
 
+    private fun statusIntentFilter() = IntentFilter(TunnelService.ACTION_STATUS).apply {
+        addAction(TunnelService.ACTION_STATS)
+    }
+
     private fun marginParams(top: Int) = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -588,6 +740,7 @@ class MainActivity : Activity() {
         private val COLOR_MUTED = Color.rgb(148, 163, 184)
         private val COLOR_ACCENT = Color.rgb(110, 231, 183)
         private val COLOR_ACCENT_DARK = Color.rgb(31, 107, 88)
+        private val COLOR_UPLOAD = Color.rgb(96, 165, 250)
         private val COLOR_BUTTON_TEXT = Color.rgb(5, 35, 29)
         private val COLOR_CONNECTED = Color.rgb(74, 222, 128)
         private val COLOR_CONNECTING = Color.rgb(250, 204, 21)

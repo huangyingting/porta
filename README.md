@@ -413,6 +413,11 @@ the fallback token on the server when needed with:
 sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
 ```
 
+The dashboard includes a 60-second real-time upload/download chart with current
+rates and session totals. Tap **Log** to inspect a bounded local history of
+connection attempts, transport fallback, reconnect delays, failures, and
+disconnects. Tokens and authorization headers are never written to this log.
+
 Turn off the active profile before uninstalling the app or switching to another
 VPN profile.
 If the network or server is temporarily unavailable, the app keeps the VPN

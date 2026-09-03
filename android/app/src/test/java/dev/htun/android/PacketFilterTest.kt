@@ -20,6 +20,13 @@ class PacketFilterTest {
     }
 
     @Test
+    fun formatsTrafficRatesAndTotals() {
+        assertTrue(formatDataRate(0) == "0 B/s")
+        assertTrue(formatDataRate(1536) == "1.5 KB/s")
+        assertTrue(formatDataSize(2 * 1024 * 1024) == "2.0 MB")
+    }
+
+    @Test
     fun extractsOnlyValidGatewayHostname() {
         assertTrue(gatewayHost("https://htun.i-csu.org:8443") == "htun.i-csu.org")
         assertTrue(gatewayHost("https://[2001:db8::1]:8443") == "2001:db8::1")

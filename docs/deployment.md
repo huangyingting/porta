@@ -189,7 +189,7 @@ port.
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org/download/htun-android-0.5.0-debug.apk
+APK:     https://htun.i-csu.org/download/htun-android-0.5.1-debug.apk
 Gateway: https://htun.i-csu.org:8443
 ```
 

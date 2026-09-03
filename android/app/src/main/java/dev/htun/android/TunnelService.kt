@@ -41,6 +41,8 @@ import java.util.concurrent.atomic.AtomicReference
 class TunnelService : VpnService() {
     private val running = AtomicBoolean(false)
     private val generation = AtomicLong(0)
+    private val uploadedBytes = AtomicLong(0)
+    private val downloadedBytes = AtomicLong(0)
     private val descriptor = AtomicReference<ParcelFileDescriptor?>()
     private val selectedNetwork = AtomicReference<Network?>()
     private val outboundPackets = ArrayBlockingQueue<ByteArray>(256)
@@ -50,6 +52,7 @@ class TunnelService : VpnService() {
     private var input: FileInputStream? = null
     private var output: FileOutputStream? = null
     private var worker: Thread? = null
+    private var statsWorker: Thread? = null
     private var vpnReader: Thread? = null
     private var vpnConfiguration: VpnConfiguration? = null
 
@@ -73,11 +76,17 @@ class TunnelService : VpnService() {
         val profileId = intent.getStringExtra(EXTRA_PROFILE_ID).orEmpty()
         val profileLabel = intent.getStringExtra(EXTRA_PROFILE_NAME).orEmpty()
         if (!validConfiguration(server, token, clientId)) {
+            logEvent("Connection rejected: invalid profile configuration")
             stopTunnel("Invalid tunnel configuration")
             return START_NOT_STICKY
         }
         currentProfileId = profileId.ifBlank { server }
         currentProfileName = profileLabel.ifBlank { profileName(server) }
+        currentSessionId = runGeneration
+        uploadedBytes.set(0)
+        downloadedBytes.set(0)
+        currentSnapshot = TrafficSnapshot()
+        logEvent("Connecting ${currentProfileName} to ${gatewayHost(server) ?: server}")
 
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -85,6 +94,7 @@ class TunnelService : VpnService() {
             startForeground(NOTIFICATION_ID, notification("Connecting"))
         }
         sendStatus("Connecting")
+        startStats(runGeneration)
         worker = Thread(
             { runTunnel(server, token, clientId, runGeneration, startId) },
             "htun-transport",
@@ -135,6 +145,7 @@ class TunnelService : VpnService() {
             while (isRunActive(runGeneration)) {
                 val network = underlyingNetwork()
                 if (network == null) {
+                    logEvent("No usable underlying network")
                     if (!waitForRetry("Waiting for a network", backoff.nextDelayMillis(), runGeneration)) break
                     continue
                 }
@@ -148,6 +159,7 @@ class TunnelService : VpnService() {
                     sendStatus(if (reconnecting) "Reconnecting" else "Connecting")
                     updateNotification(if (reconnecting) "Reconnecting" else "Connecting")
                     try {
+                        logEvent("Trying HTTP/3 MASQUE")
                         connectNativeOnce(
                             server,
                             token,
@@ -161,6 +173,7 @@ class TunnelService : VpnService() {
                     } catch (error: NativeTransportUnavailableException) {
                         if (!isRunActive(runGeneration)) break
                         Log.i(TAG, "HTTP/3 MASQUE unavailable; falling back to HTTP/2")
+                        logEvent("HTTP/3 unavailable; trying encrypted HTTP/2 fallback")
                         connectLegacyOnce(
                             client,
                             server,
@@ -176,10 +189,12 @@ class TunnelService : VpnService() {
                 } catch (error: PermanentTunnelException) {
                     finalStatus = error.message ?: "Connection rejected"
                     Log.w(TAG, "Tunnel rejected: ${error.message}")
+                    logEvent("Connection rejected: ${safeErrorMessage(error, token)}")
                     break
                 } catch (error: Exception) {
                     if (!isRunActive(runGeneration)) break
                     Log.w(TAG, "Tunnel interrupted", error)
+                    logEvent("Connection interrupted: ${safeErrorMessage(error, token)}")
                     if (attemptConnectedAt != 0L &&
                         System.currentTimeMillis() - attemptConnectedAt >= STABLE_CONNECTION_MILLIS
                     ) {
@@ -280,7 +295,11 @@ class TunnelService : VpnService() {
             try {
                 while (isRunActive(runGeneration) && attemptActive.get()) {
                     val packet = outboundPackets.poll(1, TimeUnit.SECONDS) ?: continue
+                    if (!isRunActive(runGeneration) || !attemptActive.get()) break
                     activeSession.send(packet)
+                    if (isRunActive(runGeneration)) {
+                        uploadedBytes.addAndGet(packet.size.toLong())
+                    }
                 }
             } catch (error: Exception) {
                 if (isRunActive(runGeneration) && attemptActive.get()) {
@@ -300,13 +319,18 @@ class TunnelService : VpnService() {
                 activeSession.mtu().toString(),
                 runGeneration,
             )
+            val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
             onConnected()
+            logEvent("Connected using HTTP/3 MASQUE")
             sendStatus("Connected over HTTP/3 MASQUE")
             updateNotification("Connected over HTTP/3 MASQUE")
             sender.start()
             while (isRunActive(runGeneration) && attemptActive.get()) {
                 val packet = activeSession.receive()
-                output?.write(packet)
+                tunnelOutput.write(packet)
+                if (isRunActive(runGeneration)) {
+                    downloadedBytes.addAndGet(packet.size.toLong())
+                }
             }
             if (isRunActive(runGeneration)) throw IOException("Gateway closed the native tunnel")
         } catch (error: Exception) {
@@ -344,7 +368,7 @@ class TunnelService : VpnService() {
         onConnected: () -> Unit,
     ) {
         val attemptCall = AtomicReference<Call?>()
-        val requestBody = TunRequestBody(attemptActive, vpnReady, attemptCall)
+        val requestBody = TunRequestBody(attemptActive, vpnReady, attemptCall, runGeneration)
         val request = Request.Builder()
             .url(server.trimEnd('/') + "/v1/tunnel")
             .header("Authorization", "Bearer $token")
@@ -373,15 +397,20 @@ class TunnelService : VpnService() {
                     response.header("X-HTun-MTU"),
                     runGeneration,
                 )
+                val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
                 vpnReady.countDown()
                 onConnected()
                 val responseBody = response.body ?: throw IOException("Gateway returned no response stream")
+                logEvent("Connected using encrypted HTTP/2 fallback")
                 sendStatus("Connected over HTTP/2")
                 updateNotification("Connected over HTTP/2")
                 val source = responseBody.source()
                 while (isRunActive(runGeneration) && attemptActive.get()) {
                     val packet = PacketFraming.read(source) ?: continue
-                    output?.write(packet)
+                    tunnelOutput.write(packet)
+                    if (isRunActive(runGeneration)) {
+                        downloadedBytes.addAndGet(packet.size.toLong())
+                    }
                 }
                 if (isRunActive(runGeneration)) throw IOException("Gateway closed the tunnel")
             }
@@ -474,6 +503,7 @@ class TunnelService : VpnService() {
 
     private fun waitForRetry(reason: String, delayMillis: Long, runGeneration: Long): Boolean {
         val seconds = (delayMillis + 999L) / 1_000L
+        logEvent("$reason; retrying in ${seconds}s")
         sendStatus("$reason; retrying in ${seconds}s")
         updateNotification("Reconnecting in ${seconds}s")
         return try {
@@ -491,6 +521,7 @@ class TunnelService : VpnService() {
         private val active: AtomicBoolean,
         private val ready: CountDownLatch,
         private val ownerCall: AtomicReference<Call?>,
+        private val runGeneration: Long,
     ) : RequestBody() {
         private val writer = AtomicReference<Thread?>()
 
@@ -504,7 +535,11 @@ class TunnelService : VpnService() {
                     ready.await()
                     while (running.get() && active.get()) {
                         val packet = outboundPackets.poll(1, TimeUnit.SECONDS) ?: continue
+                        if (!isRunActive(runGeneration) || !active.get()) break
                         PacketFraming.write(sink, packet)
+                        if (isRunActive(runGeneration)) {
+                            uploadedBytes.addAndGet(packet.size.toLong())
+                        }
                     }
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
@@ -547,9 +582,16 @@ class TunnelService : VpnService() {
         closeNativeDialer()
         closeNativeSession()
         worker?.interrupt()
+        stopStatsWorker()
         closeVpn()
         currentProfileId = null
         currentProfileName = null
+        currentSessionId = NO_SESSION
+        currentSnapshot = TrafficSnapshot(
+            totalDownloadedBytes = downloadedBytes.get(),
+            totalUploadedBytes = uploadedBytes.get(),
+        )
+        logEvent(message)
         sendStatus(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -562,10 +604,17 @@ class TunnelService : VpnService() {
         call = null
         closeNativeDialer()
         closeNativeSession()
+        stopStatsWorker()
         closeVpn()
         worker = null
         currentProfileId = null
         currentProfileName = null
+        currentSessionId = NO_SESSION
+        currentSnapshot = TrafficSnapshot(
+            totalDownloadedBytes = downloadedBytes.get(),
+            totalUploadedBytes = uploadedBytes.get(),
+        )
+        logEvent(message)
         sendStatus(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelfResult(startId)
@@ -623,10 +672,81 @@ class TunnelService : VpnService() {
             Intent(ACTION_STATUS)
                 .setPackage(packageName)
                 .putExtra(EXTRA_STATUS, value)
-                .putExtra(EXTRA_PROFILE_ID, currentProfileId),
+                .putExtra(EXTRA_PROFILE_ID, currentProfileId)
+                .putExtra(EXTRA_SESSION_ID, currentSessionId),
             STATUS_PERMISSION,
         )
     }
+
+    private fun startStats(runGeneration: Long) {
+        stopStatsWorker()
+        statsWorker = Thread({
+            var previousDownload = 0L
+            var previousUpload = 0L
+            var previousTime = System.nanoTime()
+            while (isRunActive(runGeneration)) {
+                try {
+                    Thread.sleep(STATS_INTERVAL_MILLIS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!isRunActive(runGeneration)) break
+                val now = System.nanoTime()
+                val download = downloadedBytes.get()
+                val upload = uploadedBytes.get()
+                val elapsedNanos = (now - previousTime).coerceAtLeast(1L)
+                val snapshot = TrafficSnapshot(
+                    downloadBytesPerSecond = (download - previousDownload) * NANOS_PER_SECOND / elapsedNanos,
+                    uploadBytesPerSecond = (upload - previousUpload) * NANOS_PER_SECOND / elapsedNanos,
+                    totalDownloadedBytes = download,
+                    totalUploadedBytes = upload,
+                )
+                previousDownload = download
+                previousUpload = upload
+                previousTime = now
+                if (!isRunActive(runGeneration)) break
+                currentSnapshot = snapshot
+                sendBroadcast(
+                    Intent(ACTION_STATS)
+                        .setPackage(packageName)
+                        .putExtra(EXTRA_PROFILE_ID, currentProfileId)
+                        .putExtra(EXTRA_SESSION_ID, runGeneration)
+                        .putExtra(EXTRA_DOWNLOAD_BPS, snapshot.downloadBytesPerSecond)
+                        .putExtra(EXTRA_UPLOAD_BPS, snapshot.uploadBytesPerSecond)
+                        .putExtra(EXTRA_TOTAL_DOWNLOAD, snapshot.totalDownloadedBytes)
+                        .putExtra(EXTRA_TOTAL_UPLOAD, snapshot.totalUploadedBytes),
+                    STATUS_PERMISSION,
+                )
+            }
+        }, "htun-traffic-stats").also { it.start() }
+    }
+
+    private fun stopStatsWorker() {
+        val stats = statsWorker
+        statsWorker = null
+        stats?.interrupt()
+        if (stats != null && stats !== Thread.currentThread()) {
+            try {
+                stats.join(STATS_STOP_TIMEOUT_MILLIS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+
+        }
+    }
+
+    private fun logEvent(message: String) {
+        Log.i(TAG, message)
+        ClientLogStore(this).add(message)
+    }
+
+    private fun safeErrorMessage(error: Exception, token: String): String =
+        error.message.orEmpty()
+            .replace(token, "[redacted]")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(180)
+            .ifBlank { error.javaClass.simpleName }
 
     private fun notification(text: String): Notification {
         val openApp = PendingIntent.getActivity(
@@ -671,27 +791,41 @@ class TunnelService : VpnService() {
         const val ACTION_START = "dev.htun.android.START"
         const val ACTION_STOP = "dev.htun.android.STOP"
         const val ACTION_STATUS = "dev.htun.android.STATUS"
+        const val ACTION_STATS = "dev.htun.android.STATS"
         const val EXTRA_SERVER = "server"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_CLIENT_ID = "client_id"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
+        const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_STATUS = "status"
+        const val EXTRA_DOWNLOAD_BPS = "download_bps"
+        const val EXTRA_UPLOAD_BPS = "upload_bps"
+        const val EXTRA_TOTAL_DOWNLOAD = "total_download"
+        const val EXTRA_TOTAL_UPLOAD = "total_upload"
         @Volatile private var currentStatus = "Disconnected"
         @Volatile private var currentProfileId: String? = null
         @Volatile private var currentProfileName: String? = null
+        @Volatile private var currentSessionId = NO_SESSION
+        @Volatile private var currentSnapshot = TrafficSnapshot()
         private const val CHANNEL_ID = "htun-vpn"
         private const val NOTIFICATION_ID = 1201
         private const val TAG = "hTun"
         private const val STABLE_CONNECTION_MILLIS = 30_000L
         private const val VPN_READER_STOP_TIMEOUT_MILLIS = 2_000L
         private const val REQUEST_WRITER_STOP_TIMEOUT_MILLIS = 2_000L
+        private const val STATS_INTERVAL_MILLIS = 1_000L
+        private const val STATS_STOP_TIMEOUT_MILLIS = 2_000L
+        private const val NANOS_PER_SECOND = 1_000_000_000L
+        private const val NO_SESSION = 0L
         private const val STATUS_PERMISSION = "dev.htun.android.permission.STATUS"
         private val RETRYABLE_HTTP_CODES = setOf(408, 425, 429)
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
         fun currentStatus(): String = currentStatus
         fun currentProfileId(): String? = currentProfileId
+        internal fun currentSessionId(): Long = currentSessionId
+        internal fun currentTrafficSnapshot(): TrafficSnapshot = currentSnapshot
     }
 
     private data class VpnConfiguration(
@@ -704,6 +838,13 @@ class TunnelService : VpnService() {
     private class PermanentTunnelException(message: String) : Exception(message)
     private class NativeTransportUnavailableException(message: String) : Exception(message)
 }
+
+internal data class TrafficSnapshot(
+    val downloadBytesPerSecond: Long = 0,
+    val uploadBytesPerSecond: Long = 0,
+    val totalDownloadedBytes: Long = 0,
+    val totalUploadedBytes: Long = 0,
+)
 
 internal fun gatewayHost(server: String): String? = try {
     URI(server).host?.removePrefix("[")?.removeSuffix("]")?.takeIf { it.isNotBlank() }

@@ -3,6 +3,17 @@
     <string name="app_name">hTun</string>
     <string name="profile_tagline">Secure access to your networks</string>
     <string name="vpn_profiles">VPN PROFILES</string>
+    <string name="log">Log</string>
+    <string name="connection_log">Connection log</string>
+    <string name="log_empty">No connection events yet.</string>
+    <string name="clear_log">Clear</string>
+    <string name="close">Close</string>
+    <string name="traffic">REAL-TIME TRAFFIC</string>
+    <string name="live">● LIVE</string>
+    <string name="idle">IDLE</string>
+    <string name="download">↓ %1$s</string>
+    <string name="upload">↑ %1$s</string>
+    <string name="traffic_total">Downloaded %1$s  •  Uploaded %2$s</string>
     <string name="add_profile">Add profile</string>
     <string name="edit_profile">Edit profile</string>
     <string name="profile_name">Profile name</string>
