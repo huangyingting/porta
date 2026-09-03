@@ -52,6 +52,28 @@ HTTP/2 Extended CONNECT integration test runs instead of being skipped.
 The Android debug APK is written to
 `android/app/build/outputs/apk/debug/app-debug.apk`.
 
+## One-click production deployment
+
+For a Linux server where Caddy or another issuer already manages the TLS
+certificate, deploy direct HTTP/2 and HTTP/3 on TCP and UDP 8443 with:
+
+```sh
+sudo ./scripts/deploy.sh \
+  --domain vpn.example.com \
+  --cert /absolute/path/vpn.example.com.crt \
+  --key /absolute/path/vpn.example.com.key
+```
+
+The command builds and installs hTun, creates credentials on first use,
+configures systemd, certificate synchronization, QUIC socket buffers,
+forwarding, and NAT, then verifies the TLS readiness endpoint. It preserves
+credentials and leases when run again for an upgrade. It does not modify the
+shared Caddyfile or cloud firewall.
+
+See [the production deployment guide](docs/deployment.md) for prerequisites,
+custom ports and networks, Caddy fallback, firewall rules, credentials,
+validation, Android setup, and removal.
+
 ## Gateway
 
 Use a random token of at least 32 bytes. Pass it through the environment so it
