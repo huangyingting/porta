@@ -177,14 +177,17 @@ class TunnelService : VpnService() {
         runGeneration: Long,
         onConnected: () -> Unit,
     ) {
+        val attemptCall = AtomicReference<Call?>()
+        val requestBody = TunRequestBody(attemptActive, vpnReady, attemptCall)
         val request = Request.Builder()
             .url(server.trimEnd('/') + "/v1/tunnel")
             .header("Authorization", "Bearer $token")
             .header("X-HTun-Version", PacketFraming.VERSION)
             .header("X-HTun-Client-ID", clientId)
-            .post(TunRequestBody(attemptActive, vpnReady))
+            .post(requestBody)
             .build()
         val activeCall = client.newCall(request)
+        attemptCall.set(activeCall)
         call = activeCall
         try {
             activeCall.execute().use { response ->
@@ -217,6 +220,7 @@ class TunnelService : VpnService() {
                 if (isRunActive(runGeneration)) throw IOException("Gateway closed the tunnel")
             }
         } finally {
+            requestBody.stop()
             activeCall.cancel()
             if (call === activeCall) call = null
         }
@@ -317,16 +321,50 @@ class TunnelService : VpnService() {
     private inner class TunRequestBody(
         private val active: AtomicBoolean,
         private val ready: CountDownLatch,
+        private val ownerCall: AtomicReference<Call?>,
     ) : RequestBody() {
+        private val writer = AtomicReference<Thread?>()
+
         override fun contentType() = PacketFraming.CONTENT_TYPE.toMediaType()
         override fun isDuplex() = true
 
         override fun writeTo(sink: BufferedSink) {
             PacketFraming.write(sink, byteArrayOf())
-            ready.await()
-            while (running.get() && active.get()) {
-                val packet = outboundPackets.poll(1, TimeUnit.SECONDS) ?: continue
-                PacketFraming.write(sink, packet)
+            val thread = Thread({
+                try {
+                    ready.await()
+                    while (running.get() && active.get()) {
+                        val packet = outboundPackets.poll(1, TimeUnit.SECONDS) ?: continue
+                        PacketFraming.write(sink, packet)
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (_: Exception) {
+                    if (running.get() && active.get()) {
+                        ownerCall.get()?.cancel()
+                    }
+                } finally {
+                    try {
+                        sink.close()
+                    } catch (_: IOException) {
+                    }
+                }
+            }, "htun-http2-upload")
+            check(writer.compareAndSet(null, thread)) { "duplex request body was written more than once" }
+            thread.start()
+        }
+
+        fun stop() {
+            active.set(false)
+            ready.countDown()
+            val thread = writer.getAndSet(null)
+            thread?.interrupt()
+            if (thread != null && thread !== Thread.currentThread()) {
+                try {
+                    thread.join(REQUEST_WRITER_STOP_TIMEOUT_MILLIS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
             }
         }
     }
@@ -451,6 +489,7 @@ class TunnelService : VpnService() {
         private const val TAG = "hTun"
         private const val STABLE_CONNECTION_MILLIS = 30_000L
         private const val VPN_READER_STOP_TIMEOUT_MILLIS = 2_000L
+        private const val REQUEST_WRITER_STOP_TIMEOUT_MILLIS = 2_000L
         private const val STATUS_PERMISSION = "dev.htun.android.permission.STATUS"
         private val RETRYABLE_HTTP_CODES = setOf(408, 425, 429)
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
