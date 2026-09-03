@@ -19,12 +19,30 @@ not 443.
 
 ## Prerequisites
 
-- Linux with systemd, nftables, `/dev/net/tun`, and IPv4 forwarding support
-- Go 1.26 or a prebuilt `bin/porta-server`
+- Linux with `curl`, `sha256sum`, systemd, nftables, `/dev/net/tun`, and IPv4
+  forwarding support
 - A DNS hostname pointing to the server
 - Either public TCP port 80 for automatic Let's Encrypt issuance, or an
   existing certificate and private key covering the hostname
 - Both TCP and UDP on the selected port allowed by host and cloud firewalls
+
+## Download the deployment bundle
+
+Each tagged GitHub release contains a deployment bundle plus standalone server
+and client binaries. Download and verify the latest bundle:
+
+```sh
+curl -fLO https://github.com/huangyingting/porta/releases/latest/download/porta-deploy.tar.gz
+curl -fLO https://github.com/huangyingting/porta/releases/latest/download/SHA256SUMS
+grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
+tar -xzf porta-deploy.tar.gz
+cd porta
+```
+
+By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
+`porta-server` from that release and verifies it with `SHA256SUMS`. Pass
+`--release vX.Y.Z` to pin a release. Developers working from a full source
+checkout can pass `--build-local` instead.
 
 ## One-command installation with Let's Encrypt
 
@@ -48,7 +66,7 @@ production web server merely to renew a second certificate is not recommended.
 
 ## One-command installation with an existing certificate
 
-From a checked-out Porta repository:
+From the extracted deployment bundle or a checked-out Porta repository:
 
 ```sh
 sudo ./scripts/deploy.sh \
@@ -86,12 +104,26 @@ sudo ./scripts/deploy.sh \
   --gateway-cidr 10.77.0.1/24
 ```
 
-The script is idempotent. Re-running it rebuilds and upgrades the server while
+The script is idempotent. Re-running it downloads and upgrades the server while
 preserving `/etc/porta/porta.env`, `/var/lib/porta/clients.json`, and persistent leases.
 The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
-`--reset-leases` to archive those leases deliberately. Use `--no-build` to
-deploy an existing `bin/porta-server`.
+`--reset-leases` to archive those leases deliberately.
+
+## Client downloads
+
+Release clients are available directly from the same GitHub release:
+
+```text
+porta-client-linux-amd64
+porta-client-linux-arm64
+porta-client-windows-amd64.exe
+porta-android-arm64-v8a.apk
+porta-android-armeabi-v7a.apk
+porta-android-x86_64.apk
+```
+
+Use the release `SHA256SUMS` file to verify every downloaded asset.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the

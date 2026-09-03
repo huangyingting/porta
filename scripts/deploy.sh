@@ -24,7 +24,8 @@ Options:
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU (default: 1100)
   --reset-leases            Archive leases incompatible with a changed pool
-  --no-build                Install the existing bin/porta-server
+  --release VERSION         GitHub release to deploy (default: latest)
+  --build-local             Build the server from the current checkout instead
   --help                    Show this help
 
 The script preserves existing /etc/porta credentials. On a new installation it
@@ -57,7 +58,8 @@ pool=10.66.0.0/24
 gateway_cidr=
 dns=1.1.1.1
 mtu=1100
-build=true
+release=latest
+build_local=false
 reset_leases=false
 
 while [[ $# -gt 0 ]]; do
@@ -75,7 +77,8 @@ while [[ $# -gt 0 ]]; do
     --dns) require_value "$@"; dns=$2; shift 2 ;;
     --mtu) require_value "$@"; mtu=$2; shift 2 ;;
     --reset-leases) reset_leases=true; shift ;;
-    --no-build) build=false; shift ;;
+    --release) require_value "$@"; release=$2; shift 2 ;;
+    --build-local) build_local=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -106,10 +109,17 @@ email_pattern='^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
+[[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
+  die "--release must be latest or a tag beginning with v"
 
-for command in install systemctl ip nft openssl curl sed awk make getent sudo sysctl python3 ss grep; do
+for command in install systemctl ip nft openssl curl sed awk sysctl python3 ss grep sha256sum uname; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
+if $build_local; then
+  for command in make getent sudo; do
+    command -v "$command" >/dev/null || die "required command not found: $command"
+  done
+fi
 
 if [[ -z $external_interface ]]; then
   external_interface=$(ip -4 route show default | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
@@ -175,7 +185,15 @@ if [[ -n $admin_listeners ]] && grep -qv '"porta-server"' <<<"$admin_listeners";
   die "TCP admin port $admin_port is already used by another service"
 fi
 
-if $build; then
+server_binary=
+release_asset_base=
+release_download_directory=
+if [[ $release == latest ]]; then
+  release_page_url=https://github.com/huangyingting/porta/releases/latest
+else
+  release_page_url=https://github.com/huangyingting/porta/releases/tag/$release
+fi
+if $build_local; then
   go_binary=$(command -v go || true)
   if [[ -z $go_binary ]]; then
     for candidate in /usr/local/go/bin/go /usr/local/bin/go /usr/bin/go; do
@@ -192,8 +210,42 @@ if $build; then
   else
     make GO="$go_binary" build
   fi
+  server_binary=bin/porta-server
+else
+  case "$(uname -m)" in
+    x86_64|amd64) release_arch=amd64 ;;
+    aarch64|arm64) release_arch=arm64 ;;
+    *) die "GitHub releases do not provide a server binary for $(uname -m)" ;;
+  esac
+  release_asset=porta-server-linux-$release_arch
+  if [[ $release == latest ]]; then
+    release_asset_base=https://github.com/huangyingting/porta/releases/latest/download
+  else
+    release_asset_base=https://github.com/huangyingting/porta/releases/download/$release
+  fi
+  release_download_directory=$(mktemp -d)
+  cleanup_release_download() {
+    rm -f "$release_download_directory/$release_asset" \
+      "$release_download_directory/SHA256SUMS"
+    rmdir "$release_download_directory"
+  }
+  trap cleanup_release_download EXIT
+  curl --fail --location --silent --show-error \
+    "$release_asset_base/$release_asset" \
+    --output "$release_download_directory/$release_asset"
+  curl --fail --location --silent --show-error \
+    "$release_asset_base/SHA256SUMS" \
+    --output "$release_download_directory/SHA256SUMS"
+  expected_checksum=$(awk -v asset="$release_asset" '$2 == asset { print $1; exit }' \
+    "$release_download_directory/SHA256SUMS")
+  [[ $expected_checksum =~ ^[0-9a-f]{64}$ ]] ||
+    die "release checksum does not contain $release_asset"
+  actual_checksum=$(sha256sum "$release_download_directory/$release_asset" | awk '{ print $1 }')
+  [[ $actual_checksum == "$expected_checksum" ]] ||
+    die "checksum verification failed for $release_asset"
+  server_binary="$release_download_directory/$release_asset"
 fi
-[[ -x bin/porta-server ]] || die "bin/porta-server is missing; remove --no-build or run make build"
+[[ -f $server_binary ]] || die "Porta server binary is missing"
 
 lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'
@@ -219,11 +271,80 @@ then
   fi
 fi
 
+rollback_directory=$(mktemp -d)
+deployment_complete=false
+had_active_service=false
+backup_file() {
+  local source=$1
+  local name=$2
+  if [[ -f $source ]]; then
+    cp -a "$source" "$rollback_directory/$name"
+  fi
+}
+backup_file /usr/local/bin/porta-server porta-server
+backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
+backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
+backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
+backup_file /etc/sysctl.d/99-porta-quic.conf 99-porta-quic.conf
+for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
+  backup_file "/etc/systemd/system/$unit" "$unit"
+done
+if systemctl is-active --quiet porta.service; then
+  had_active_service=true
+fi
+restore_file() {
+  local name=$1
+  local destination=$2
+  if [[ -f $rollback_directory/$name ]]; then
+    cp -a "$rollback_directory/$name" "$destination"
+  else
+    rm -f "$destination"
+  fi
+}
+rollback() {
+  local status=$?
+  if [[ $status -ne 0 && $deployment_complete == false ]]; then
+    set +e
+    systemctl stop porta.service
+    restore_file porta-server /usr/local/bin/porta-server
+    restore_file server-up.sh /usr/local/libexec/porta/server-up.sh
+    restore_file server-down.sh /usr/local/libexec/porta/server-down.sh
+    restore_file sync-cert.sh /usr/local/libexec/porta/sync-cert.sh
+    restore_file 99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
+    for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
+      restore_file "$unit" "/etc/systemd/system/$unit"
+    done
+    systemctl daemon-reload
+    if $had_active_service; then
+      systemctl restart porta.service
+    fi
+    echo "deploy: restored the previous Porta installation after deployment failure" >&2
+  fi
+  if [[ -n $release_download_directory ]]; then
+    cleanup_release_download
+  fi
+  rm -f "$rollback_directory/porta-server" \
+    "$rollback_directory/server-up.sh" \
+    "$rollback_directory/server-down.sh" \
+    "$rollback_directory/sync-cert.sh" \
+    "$rollback_directory/99-porta-quic.conf" \
+    "$rollback_directory/porta.service" \
+    "$rollback_directory/porta-cert-sync.service" \
+    "$rollback_directory/porta-cert-sync.timer"
+  rmdir "$rollback_directory"
+  exit "$status"
+}
+trap rollback EXIT
+
 install -d -m 0755 /usr/local/libexec/porta /etc/porta
-install -m 0755 bin/porta-server /usr/local/bin/porta-server
+install -m 0755 "$server_binary" /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
   /usr/local/libexec/porta/
 install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
+if ! $build_local; then
+  cleanup_release_download
+  release_download_directory=
+fi
 
 environment_file=/etc/porta/porta.env
 if [[ ! -f $environment_file ]]; then
@@ -243,43 +364,6 @@ fi
 chmod 0600 "$environment_file"
 
 client_registry=/var/lib/porta/clients.json
-
-rollback_directory=$(mktemp -d)
-deployment_complete=false
-had_active_service=false
-for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
-  if [[ -f /etc/systemd/system/$unit ]]; then
-    cp -a "/etc/systemd/system/$unit" "$rollback_directory/$unit"
-  fi
-done
-if systemctl is-active --quiet porta.service; then
-  had_active_service=true
-fi
-rollback() {
-  local status=$?
-  if [[ $status -ne 0 && $deployment_complete == false ]]; then
-    set +e
-    systemctl stop porta.service
-    for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
-      if [[ -f $rollback_directory/$unit ]]; then
-        cp -a "$rollback_directory/$unit" "/etc/systemd/system/$unit"
-      else
-        rm -f "/etc/systemd/system/$unit"
-      fi
-    done
-    systemctl daemon-reload
-    if $had_active_service; then
-      systemctl restart porta.service
-    fi
-    echo "deploy: restored the previous Porta service after deployment failure" >&2
-  fi
-  rm -f "$rollback_directory/porta.service" \
-    "$rollback_directory/porta-cert-sync.service" \
-    "$rollback_directory/porta-cert-sync.timer"
-  rmdir "$rollback_directory"
-  exit "$status"
-}
-trap rollback EXIT
 
 if systemctl is-active --quiet porta.service; then
   systemctl stop porta.service
@@ -407,9 +491,11 @@ Porta is ready.
 Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
 TLS mode:        $tls_mode
+Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "GitHub release $release")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Admin access:    ssh -L $admin_port:127.0.0.1:$admin_port USER@$domain
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 Initial client:  sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
+Client downloads: $release_page_url
 Ensure both TCP and UDP $port are allowed by the host and cloud firewalls.
 EOF

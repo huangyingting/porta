@@ -22,17 +22,31 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
-      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Build Go release archives
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+      - name: Install Go mobile tools
         run: |
-          mkdir -p dist/linux-amd64 dist/windows-amd64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-server ./cmd/porta-server
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-client ./cmd/porta-client
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-keygen ./cmd/porta-keygen
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o dist/windows-amd64/porta-client.exe ./cmd/porta-client
-          tar -C dist/linux-amd64 -czf dist/porta-linux-amd64.tar.gz .
-          zip -jq dist/porta-windows-amd64.zip dist/windows-amd64/porta-client.exe
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Test release source
+        run: |
+          make test
+          make vet
+      - name: Build Go release binaries
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-server-linux-$arch" ./cmd/porta-server
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-client-linux-$arch" ./cmd/porta-client
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-keygen-linux-$arch" ./cmd/porta-keygen
+          done
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/porta-client-windows-amd64.exe ./cmd/porta-client
+      - name: Package deployment tools
+        run: |
+          mkdir -p dist/deploy-bundle/porta/scripts dist/deploy-bundle/porta/deploy
+          cp scripts/deploy.sh scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh dist/deploy-bundle/porta/scripts/
+          cp deploy/99-porta-quic.conf deploy/porta-cert-sync.timer dist/deploy-bundle/porta/deploy/
+          tar -C dist/deploy-bundle -czf dist/porta-deploy.tar.gz porta
       - name: Prepare Android signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.PORTA_ANDROID_KEYSTORE_BASE64 }}
@@ -40,12 +54,14 @@ jobs:
           KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
         run: |
-          test -n "$KEYSTORE_BASE64" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.jks"
+          if [[ -n "$KEYSTORE_BASE64" || -n "$KEYSTORE_PASSWORD" || -n "$KEY_ALIAS" || -n "$KEY_PASSWORD" ]]; then
+            test -n "$KEYSTORE_BASE64" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.jks"
+            echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.jks" >> "$GITHUB_ENV"
+          fi
       - name: Build Android release
         working-directory: android
         env:
-          PORTA_ANDROID_KEYSTORE: ${{ runner.temp }}/porta-release.jks
           PORTA_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
           PORTA_ANDROID_KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
           PORTA_ANDROID_KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
@@ -56,8 +72,16 @@ jobs:
           cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk dist/porta-android-armeabi-v7a.apk
           cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/porta-android-x86_64.apk
           cd dist
-          sha256sum porta-linux-amd64.tar.gz porta-windows-amd64.zip *.apk > SHA256SUMS
+          sha256sum porta-server-* porta-client-* porta-keygen-* porta-android-* porta-deploy.tar.gz > SHA256SUMS
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/porta-linux-amd64.tar.gz dist/porta-windows-amd64.zip dist/*.apk dist/SHA256SUMS --generate-notes --verify-tag
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/porta-server-* \
+            dist/porta-client-* \
+            dist/porta-keygen-* \
+            dist/porta-android-* \
+            dist/porta-deploy.tar.gz \
+            dist/SHA256SUMS \
+            --generate-notes --verify-tag

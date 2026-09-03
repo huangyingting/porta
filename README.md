@@ -56,6 +56,18 @@ APK is the normal choice for current physical Android devices.
 
 ## One-click production deployment
 
+GitHub Releases are the distribution source. Download the small deployment
+bundle and its checksum, then let the script fetch and verify the current
+server binary:
+
+```sh
+curl -fLO https://github.com/huangyingting/porta/releases/latest/download/porta-deploy.tar.gz
+curl -fLO https://github.com/huangyingting/porta/releases/latest/download/SHA256SUMS
+grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
+tar -xzf porta-deploy.tar.gz
+cd porta
+```
+
 For a standalone Linux server, deploy direct HTTP/2 and HTTP/3 on TCP and UDP
 443 with automatic Let's Encrypt issuance:
 
@@ -77,7 +89,8 @@ sudo ./scripts/deploy.sh \
   --port 8443
 ```
 
-The command builds and installs Porta, creates credentials on first use,
+The command downloads the matching `porta-server` release binary, verifies it
+against the release checksum, installs it, creates credentials on first use,
 configures systemd, TLS issuance or certificate synchronization, QUIC socket
 buffers, forwarding, and NAT, then verifies the TLS readiness endpoint. It
 preserves credentials and leases when run again for an upgrade and rolls back
@@ -87,6 +100,20 @@ proxy configuration or cloud firewall rules.
 See [the production deployment guide](docs/deployment.md) for prerequisites,
 custom ports and networks, reverse-proxy fallback, firewall rules, credentials,
 validation, Android setup, and removal.
+
+## Client downloads
+
+The same release publishes direct client downloads:
+
+- Linux x86-64: `porta-client-linux-amd64`
+- Linux ARM64: `porta-client-linux-arm64`
+- Windows x86-64: `porta-client-windows-amd64.exe`
+- Android: `porta-android-arm64-v8a.apk`, `porta-android-armeabi-v7a.apk`, or
+  `porta-android-x86_64.apk`
+
+Download them from
+<https://github.com/huangyingting/porta/releases/latest>. Every asset is listed
+in the release `SHA256SUMS` file.
 
 ## Gateway
 
@@ -467,7 +494,10 @@ public distribution and protect the upload key separately.
 
 GitHub Actions runs Go tests, race detection, vet, cross-platform builds, and
 Android builds on pushes and pull requests. Tags matching `v*` create a GitHub
-release. Configure these repository Actions secrets before tagging:
+release containing Linux AMD64/ARM64 servers, clients and key generators, the
+Windows client, Android APKs, deployment tools, and `SHA256SUMS`. Configure
+these repository Actions secrets before tagging to use production Android
+signing; without them, the existing development signing fallback is used:
 
 - `PORTA_ANDROID_KEYSTORE_BASE64`
 - `PORTA_ANDROID_KEYSTORE_PASSWORD`
