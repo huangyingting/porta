@@ -23,6 +23,7 @@ listener. Read
 - Client accounts with hashed tokens and configurable multi-device limits
 - Authenticated Prometheus metrics
 - Compact neutral Porta studio page for ordinary public HTTP requests
+- Optional authenticated HTTP/HTTPS forward proxy on the same TLS listener
 - Windows Wintun client plus explicit route setup/teardown scripts
 - Android native HTTP/3 MASQUE `VpnService` client with four-lane HTTP/2 fallback
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
@@ -105,6 +106,36 @@ proxy configuration or cloud firewall rules.
 See [the production deployment guide](docs/deployment.md) for prerequisites,
 custom ports and networks, reverse-proxy fallback, firewall rules, credentials,
 validation, Android setup, and removal.
+
+## Forward proxy
+
+Enable the forward proxy during deployment:
+
+```sh
+sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
+  --domain vpn.example.com \
+  --cert /absolute/path/vpn.example.com.crt \
+  --key /absolute/path/vpn.example.com.key \
+  --port 8443 \
+  --forward-proxy
+```
+
+The proxy reuses Porta client accounts. Use a stable device ID as the Basic
+username and that client's token as the password:
+
+```sh
+curl --proxy https://vpn.example.com:8443 \
+  --proxy-basic --proxy-user 'laptop:CLIENT_TOKEN' \
+  https://example.com/
+```
+
+Both ordinary HTTP forwarding and HTTPS `CONNECT` are supported, including
+HTTP/2 CONNECT streams. Only destination ports 80 and 443 are allowed.
+Loopback, private, link-local, metadata, multicast, documentation, benchmark,
+and other non-public addresses are rejected after DNS resolution. Invalid or
+missing credentials receive the normal camouflage response instead of a proxy
+authentication challenge, so clients must send Basic credentials
+preemptively. Porta does not publish a PAC file and does not cache responses.
 
 ## Client downloads
 

@@ -81,6 +81,9 @@ sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --port 8443
 ```
 
+Add `--forward-proxy` to expose Porta's authenticated HTTP/HTTPS forward proxy
+on the same TLS port. It remains disabled unless explicitly requested.
+
 The default deployment:
 
 - listens on TCP and UDP 443;
@@ -130,6 +133,29 @@ porta-android-x86_64.apk
 
 Use `gh release download latest --repo huangyingting/porta` while authenticated,
 then verify every downloaded asset with the release `SHA256SUMS` file.
+
+## Forward proxy
+
+The forward proxy uses the same client accounts managed by the admin UI. The
+Basic-auth username is a stable device ID and the password is the client token:
+
+```sh
+curl --proxy https://vpn.example.com:8443 \
+  --proxy-basic --proxy-user 'laptop:CLIENT_TOKEN' \
+  https://example.com/
+```
+
+Porta supports absolute-form HTTP requests and HTTPS `CONNECT`, including
+CONNECT over HTTP/2. It permits only public destinations on ports 80 and 443.
+DNS results are checked before dialing, and any private, loopback, link-local,
+metadata, multicast, documentation, or benchmark address rejects the request.
+Proxy credentials and client-supplied forwarding identity headers are never
+sent to the destination.
+
+Camouflage is enabled automatically: unauthenticated proxy-shaped traffic sees
+the ordinary landing behavior rather than a recognizable `407` challenge.
+Clients therefore need to send Basic credentials preemptively. Porta does not
+serve a public PAC file and does not cache proxy responses.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the

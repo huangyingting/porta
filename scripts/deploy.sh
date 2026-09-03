@@ -23,6 +23,7 @@ Options:
   --gateway-cidr CIDR       Gateway address and prefix (default: 10.66.0.1/24)
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU (default: 1100)
+  --forward-proxy           Enable authenticated HTTP/HTTPS forward proxying
   --reset-leases            Archive leases incompatible with a changed pool
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
@@ -58,6 +59,7 @@ pool=10.66.0.0/24
 gateway_cidr=
 dns=1.1.1.1
 mtu=1100
+forward_proxy=false
 release=latest
 build_local=false
 reset_leases=false
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --gateway-cidr) require_value "$@"; gateway_cidr=$2; shift 2 ;;
     --dns) require_value "$@"; dns=$2; shift 2 ;;
     --mtu) require_value "$@"; mtu=$2; shift 2 ;;
+    --forward-proxy) forward_proxy=true; shift ;;
     --reset-leases) reset_leases=true; shift ;;
     --release) require_value "$@"; release=$2; shift 2 ;;
     --build-local) build_local=true; shift ;;
@@ -422,6 +425,10 @@ fi
 if (( port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
   capabilities+=" CAP_NET_BIND_SERVICE"
 fi
+forward_proxy_argument=
+if $forward_proxy; then
+  forward_proxy_argument="--forward-proxy"
+fi
 
 cat >/etc/systemd/system/porta.service <<EOF
 [Unit]
@@ -433,7 +440,7 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments --client-registry /var/lib/porta/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument --client-registry /var/lib/porta/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -521,6 +528,7 @@ Porta is ready.
 
 Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
+Forward proxy:   $([[ $forward_proxy == true ]] && echo "enabled (ports 80 and 443)" || echo "disabled")
 TLS mode:        $tls_mode
 Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "GitHub release $release")
 Admin endpoint:  http://127.0.0.1:$admin_port

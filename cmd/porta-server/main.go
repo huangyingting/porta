@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/device"
+	"github.com/huangyingting/porta/internal/forwardproxy"
 	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
@@ -73,6 +74,7 @@ func run() error {
 	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
 	landingPage := flag.Bool("landing-page", true, "serve the Porta landing page to ordinary browser requests")
+	enableForwardProxy := flag.Bool("forward-proxy", false, "enable the authenticated HTTP forward proxy on the public listener")
 	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for the admin UI, health, readiness, and metrics (empty disables)")
 	clientRegistryPath := flag.String("client-registry", "clients.json", "persistent client registry path")
 	interfaceName := flag.String("interface", "porta0", "Linux TUN interface name")
@@ -179,6 +181,24 @@ func run() error {
 		return err
 	}
 	publicHandler := publicSiteHandler(handler, *landingPage)
+	if *enableForwardProxy {
+		proxyHandler, err := forwardproxy.New(forwardproxy.Config{
+			Next: publicHandler,
+			Authorize: func(token, deviceID string) (forwardproxy.Identity, error) {
+				identity, authorizeErr := registry.Authenticate(token, deviceID)
+				return forwardproxy.Identity{
+					AccountID: identity.AccountID,
+					DeviceID:  deviceID,
+				}, authorizeErr
+			},
+			Logger:     logger,
+			Camouflage: true,
+		})
+		if err != nil {
+			return err
+		}
+		publicHandler = proxyHandler
+	}
 
 	tcpHandler := publicHandler
 	if *behindProxy {
