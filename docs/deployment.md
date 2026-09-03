@@ -152,10 +152,13 @@ metadata, multicast, documentation, or benchmark address rejects the request.
 Proxy credentials and client-supplied forwarding identity headers are never
 sent to the destination.
 
-Camouflage is enabled automatically: unauthenticated proxy-shaped traffic sees
-the ordinary landing behavior rather than a recognizable `407` challenge.
-Clients therefore need to send Basic credentials preemptively. Porta does not
-serve a public PAC file and does not cache proxy responses.
+Proxy-shaped traffic without valid credentials receives the standard `407`
+Basic authentication challenge used by browsers and extensions such as
+ZeroOmega. Configure ZeroOmega with type **HTTPS**, the Porta hostname and
+port, a stable device ID such as `chrome-zeroomega` as the username, and the
+client token as the password. Ordinary non-proxy browser visits still receive
+the landing page. Porta does not serve a public PAC file and does not cache
+proxy responses.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the

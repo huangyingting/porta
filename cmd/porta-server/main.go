@@ -191,8 +191,7 @@ func run() error {
 					DeviceID:  deviceID,
 				}, authorizeErr
 			},
-			Logger:     logger,
-			Camouflage: true,
+			Logger: logger,
 		})
 		if err != nil {
 			return err

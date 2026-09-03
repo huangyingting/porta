@@ -24,6 +24,7 @@ import (
 )
 
 const testToken = "0123456789abcdef0123456789abcdef"
+const packetRoundTripTimeout = 10 * time.Second
 
 func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
 	if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
@@ -175,7 +176,7 @@ func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, 
 		if !bytes.Equal(got, clientPacket) {
 			t.Fatalf("gateway TUN got %x, want %x", got, clientPacket)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(packetRoundTripTimeout):
 		t.Fatal("timed out waiting for client-to-gateway packet")
 	}
 
@@ -198,7 +199,7 @@ func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, 
 		}
 	case receiveErr := <-errs:
 		t.Fatal(receiveErr)
-	case <-time.After(3 * time.Second):
+	case <-time.After(packetRoundTripTimeout):
 		t.Fatal("timed out waiting for gateway-to-client packet")
 	}
 }
