@@ -186,7 +186,6 @@ if [[ -n $admin_listeners ]] && grep -qv '"porta-server"' <<<"$admin_listeners";
 fi
 
 server_binary=
-release_asset_base=
 release_download_directory=
 if [[ $release == latest ]]; then
   release_page_url=https://github.com/huangyingting/porta/releases/latest
@@ -218,23 +217,55 @@ else
     *) die "GitHub releases do not provide a server binary for $(uname -m)" ;;
   esac
   release_asset=porta-server-linux-$release_arch
-  if [[ $release == latest ]]; then
-    release_asset_base=https://github.com/huangyingting/porta/releases/latest/download
-  else
-    release_asset_base=https://github.com/huangyingting/porta/releases/download/$release
-  fi
   release_download_directory=$(mktemp -d)
   cleanup_release_download() {
     rm -f "$release_download_directory/$release_asset" \
-      "$release_download_directory/SHA256SUMS"
+      "$release_download_directory/SHA256SUMS" \
+      "$release_download_directory/release.json"
     rmdir "$release_download_directory"
   }
   trap cleanup_release_download EXIT
-  curl --fail --location --silent --show-error \
-    "$release_asset_base/$release_asset" \
+
+  github_api_headers=(
+    --header "Accept: application/vnd.github+json"
+    --header "X-GitHub-Api-Version: 2022-11-28"
+  )
+  github_token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+  if [[ -n $github_token ]]; then
+    github_api_headers+=(--header "Authorization: Bearer $github_token")
+  fi
+  if [[ $release == latest ]]; then
+    release_api_url=https://api.github.com/repos/huangyingting/porta/releases/latest
+  else
+    release_api_url=https://api.github.com/repos/huangyingting/porta/releases/tags/$release
+  fi
+  curl --fail --location --silent --show-error "${github_api_headers[@]}" \
+    "$release_api_url" \
+    --output "$release_download_directory/release.json" ||
+    die "could not read GitHub release metadata; private repositories require GH_TOKEN"
+  mapfile -t release_asset_urls < <(python3 - \
+    "$release_download_directory/release.json" "$release_asset" SHA256SUMS <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as release_file:
+    release = json.load(release_file)
+assets = {asset["name"]: asset["url"] for asset in release.get("assets", [])}
+for name in sys.argv[2:]:
+    url = assets.get(name)
+    if not url:
+        raise SystemExit(f"release asset not found: {name}")
+    print(url)
+PY
+  ) || die "release metadata is missing required assets"
+  [[ ${#release_asset_urls[@]} -eq 2 ]] ||
+    die "release metadata is missing required assets"
+  github_api_headers[1]="Accept: application/octet-stream"
+  curl --fail --location --silent --show-error "${github_api_headers[@]}" \
+    "${release_asset_urls[0]}" \
     --output "$release_download_directory/$release_asset"
-  curl --fail --location --silent --show-error \
-    "$release_asset_base/SHA256SUMS" \
+  curl --fail --location --silent --show-error "${github_api_headers[@]}" \
+    "${release_asset_urls[1]}" \
     --output "$release_download_directory/SHA256SUMS"
   expected_checksum=$(awk -v asset="$release_asset" '$2 == asset { print $1; exit }' \
     "$release_download_directory/SHA256SUMS")

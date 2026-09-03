@@ -32,12 +32,17 @@ Each tagged GitHub release contains a deployment bundle plus standalone server
 and client binaries. Download and verify the latest bundle:
 
 ```sh
-curl -fLO https://github.com/huangyingting/porta/releases/latest/download/porta-deploy.tar.gz
-curl -fLO https://github.com/huangyingting/porta/releases/latest/download/SHA256SUMS
+gh release download latest --repo huangyingting/porta \
+  --pattern porta-deploy.tar.gz --pattern SHA256SUMS
 grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf porta-deploy.tar.gz
 cd porta
+export GH_TOKEN=$(gh auth token)
 ```
+
+The repository is private, so `gh` must be authenticated with an account that
+can read it. Preserve `GH_TOKEN` through `sudo` when using release deployment;
+the token is not written to Porta's configuration.
 
 By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
 `porta-server` from that release and verifies it with `SHA256SUMS`. Pass
@@ -50,7 +55,7 @@ When no certificate paths are supplied, Porta obtains and renews its own
 Let's Encrypt certificate:
 
 ```sh
-sudo ./scripts/deploy.sh \
+sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --domain vpn.example.com \
   --acme-email admin@example.com
 ```
@@ -69,7 +74,7 @@ production web server merely to renew a second certificate is not recommended.
 From the extracted deployment bundle or a checked-out Porta repository:
 
 ```sh
-sudo ./scripts/deploy.sh \
+sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --domain vpn.example.com \
   --cert /etc/letsencrypt/live/vpn.example.com/fullchain.pem \
   --key /etc/letsencrypt/live/vpn.example.com/privkey.pem \
@@ -112,7 +117,7 @@ pool change is rejected when existing leases are incompatible; use
 
 ## Client downloads
 
-Release clients are available directly from the same GitHub release:
+Release clients are available from the same private GitHub release:
 
 ```text
 porta-client-linux-amd64
@@ -123,7 +128,8 @@ porta-android-armeabi-v7a.apk
 porta-android-x86_64.apk
 ```
 
-Use the release `SHA256SUMS` file to verify every downloaded asset.
+Use `gh release download latest --repo huangyingting/porta` while authenticated,
+then verify every downloaded asset with the release `SHA256SUMS` file.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the
@@ -236,7 +242,7 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     https://github.com/huangyingting/porta/releases/latest/download/porta-android-arm64-v8a.apk
+APK:     porta-android-arm64-v8a.apk from the private GitHub release
 Gateway: https://htun.i-csu.org:8443
 ```
 

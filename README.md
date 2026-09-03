@@ -61,18 +61,23 @@ bundle and its checksum, then let the script fetch and verify the current
 server binary:
 
 ```sh
-curl -fLO https://github.com/huangyingting/porta/releases/latest/download/porta-deploy.tar.gz
-curl -fLO https://github.com/huangyingting/porta/releases/latest/download/SHA256SUMS
+gh release download latest --repo huangyingting/porta \
+  --pattern porta-deploy.tar.gz --pattern SHA256SUMS
 grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf porta-deploy.tar.gz
 cd porta
+export GH_TOKEN=$(gh auth token)
 ```
+
+The repository is private, so the GitHub CLI must be authenticated with an
+account that can read it. The token is used only for the release download and
+is not written to Porta's configuration.
 
 For a standalone Linux server, deploy direct HTTP/2 and HTTP/3 on TCP and UDP
 443 with automatic Let's Encrypt issuance:
 
 ```sh
-sudo ./scripts/deploy.sh \
+sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --domain vpn.example.com \
   --acme-email admin@example.com
 ```
@@ -82,7 +87,7 @@ server already owns ports 80 and 443, use an externally managed certificate
 and choose another direct port:
 
 ```sh
-sudo ./scripts/deploy.sh \
+sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --domain vpn.example.com \
   --cert /absolute/path/vpn.example.com.crt \
   --key /absolute/path/vpn.example.com.key \
@@ -111,9 +116,9 @@ The same release publishes direct client downloads:
 - Android: `porta-android-arm64-v8a.apk`, `porta-android-armeabi-v7a.apk`, or
   `porta-android-x86_64.apk`
 
-Download them from
-<https://github.com/huangyingting/porta/releases/latest>. Every asset is listed
-in the release `SHA256SUMS` file.
+Download them with `gh release download latest --repo huangyingting/porta`
+while authenticated to the private repository. Every asset is listed in the
+release `SHA256SUMS` file.
 
 ## Gateway
 
