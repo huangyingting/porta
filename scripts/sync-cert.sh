@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-source_certificate=${1:?usage: sync-caddy-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
-source_key=${2:?usage: sync-caddy-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
-destination_directory=${3:?usage: sync-caddy-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
+source_certificate=${1:?usage: sync-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
+source_key=${2:?usage: sync-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
+destination_directory=${3:?usage: sync-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
 
 install -d -m 0700 "$destination_directory"
 install -m 0644 "$source_certificate" "$destination_directory/server.crt.new"

@@ -63,8 +63,8 @@ sudo ./scripts/deploy.sh \
   --acme-email admin@example.com
 ```
 
-Public TCP port 80 must reach hTun for the HTTP-01 challenge. If Caddy or
-another service already owns ports 80 and 443, use its existing certificate
+Public TCP port 80 must reach hTun for the HTTP-01 challenge. If another web
+server already owns ports 80 and 443, use an externally managed certificate
 and choose another direct port:
 
 ```sh
@@ -79,11 +79,11 @@ The command builds and installs hTun, creates credentials on first use,
 configures systemd, TLS issuance or certificate synchronization, QUIC socket
 buffers, forwarding, and NAT, then verifies the TLS readiness endpoint. It
 preserves credentials and leases when run again for an upgrade and rolls back
-the service configuration if deployment fails. It does not modify the shared
-Caddyfile or cloud firewall.
+the service configuration if deployment fails. It does not modify reverse
+proxy configuration or cloud firewall rules.
 
 See [the production deployment guide](docs/deployment.md) for prerequisites,
-custom ports and networks, Caddy fallback, firewall rules, credentials,
+custom ports and networks, reverse-proxy fallback, firewall rules, credentials,
 validation, Android setup, and removal.
 
 ## Gateway
@@ -157,12 +157,12 @@ For production, use a service manager, an unprivileged process with narrowly
 scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
-### Direct HTTP/3 alongside Caddy
+### Direct HTTP/3 alongside an existing web server
 
-When Caddy already owns port 443, run hTun directly on another public port,
-such as 8443. Caddy can continue managing the domain certificate and serving
-web traffic on 443, while tunnel traffic connects directly to hTun over TCP
-and UDP 8443:
+When another web server already owns port 443, run hTun directly on another
+public port, such as 8443. The existing service can continue managing the
+domain certificate and serving web traffic on 443, while tunnel traffic
+connects directly to hTun over TCP and UDP 8443:
 
 ```sh
 sudo ./bin/htun-server \
@@ -187,13 +187,13 @@ sudo sysctl --system
 
 The static TLS loader detects atomically replaced certificate files during
 new TLS handshakes, so the gateway does not need a restart solely to load a
-renewed certificate. If Caddy owns certificate renewal, do not grant the
-hardened hTun process access to Caddy's private storage. Instead, use the
+renewed certificate. If another service owns certificate renewal, do not grant
+the hardened hTun process access to its private storage. Instead, use the
 included root-run certificate synchronization timer:
 
 ```sh
 sudo install -d -m 0755 /usr/local/libexec/htun
-sudo install -m 0755 scripts/sync-caddy-cert.sh /usr/local/libexec/htun/
+sudo install -m 0755 scripts/sync-cert.sh /usr/local/libexec/htun/
 sudo install -m 0644 deploy/htun-cert-sync.service deploy/htun-cert-sync.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start htun-cert-sync.service
@@ -206,23 +206,10 @@ certificate and private key match and replaces both destination files. hTun
 loads the renewed pair on subsequent TLS handshakes without disconnecting
 active tunnels.
 
-Caddy may retain a compatibility endpoint on 443 by proxying to hTun's TLS
-listener. This carries only the HTTP/2 fallback; native HTTP/3/MASQUE clients
-connect directly to UDP 8443:
-
-```caddyfile
-vpn.example.com {
-  @metrics path /metrics
-  respond @metrics 404
-
-  reverse_proxy https://127.0.0.1:8443 {
-    flush_interval -1
-    transport http {
-      tls_server_name vpn.example.com
-    }
-  }
-}
-```
+An existing reverse proxy may retain a compatibility endpoint on 443 by
+forwarding HTTP/2 requests to hTun's TLS listener with response buffering
+disabled and TLS server name `vpn.example.com`. This carries only the HTTP/2
+fallback; native HTTP/3/MASQUE clients connect directly to UDP 8443.
 
 Check the direct TLS listener locally without disabling certificate
 verification:
@@ -236,8 +223,8 @@ curl --resolve vpn.example.com:8443:127.0.0.1 \
 
 ### Behind a reverse proxy
 
-Use `--behind-proxy` when a reverse proxy such as Caddy terminates TLS and
-manages the public certificate. hTun then serves plaintext HTTP/2 (h2c) on its
+Use `--behind-proxy` when a reverse proxy terminates TLS and manages the public
+certificate. hTun then serves plaintext HTTP/2 (h2c) on its
 TCP listener and does not start ACME, TLS, or HTTP/3 listeners. Bind the
 backend to loopback so it cannot be reached directly:
 
@@ -252,21 +239,8 @@ sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
   --mtu 1100
 ```
 
-Proxy the domain to that h2c backend and disable response buffering:
-
-```caddyfile
-vpn.example.com {
-  header Strict-Transport-Security "max-age=31536000"
-  log
-
-  @metrics path /metrics
-  respond @metrics 404
-
-  reverse_proxy h2c://127.0.0.1:8443 {
-    flush_interval -1
-  }
-}
-```
+Configure the reverse proxy to use HTTP/2 cleartext for the loopback backend,
+disable response buffering, and keep `/metrics` inaccessible publicly.
 
 The repository includes `deploy/htun.service` for a persistent direct TLS
 deployment on TCP and UDP 8443 using `eth0` as the external interface. Adjust
@@ -277,7 +251,7 @@ installing:
 make build
 sudo install -m 0755 bin/htun-server /usr/local/bin/htun-server
 sudo install -d -m 0755 /usr/local/libexec/htun /etc/htun
-sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-caddy-cert.sh /usr/local/libexec/htun/
+sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh /usr/local/libexec/htun/
 {
   printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
   printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
@@ -293,12 +267,11 @@ sudo systemctl enable --now htun
 sudo systemctl enable --now htun-cert-sync.timer
 ```
 
-Validate and reload Caddy after adding the site block:
+Validate the direct listener after deployment:
 
 ```sh
-sudo caddy validate --config /etc/caddy/Caddyfile
-sudo systemctl reload caddy
-curl https://vpn.example.com/healthz
+curl --resolve vpn.example.com:8443:127.0.0.1 \
+  https://vpn.example.com:8443/healthz
 ```
 
 Operational checks:
@@ -325,8 +298,8 @@ sudo systemctl restart htun
 ```
 
 Standard HTTP reverse proxies do not preserve MASQUE `CONNECT-IP` or proxy
-QUIC datagrams to the backend. Clients behind Caddy must therefore use the
-HTTP/2 compatibility stream:
+QUIC datagrams to the backend. Clients behind a reverse proxy must therefore
+use the HTTP/2 compatibility stream:
 
 ```sh
 HTUN_TOKEN="replace-with-the-same-secret" ./bin/htun-client \

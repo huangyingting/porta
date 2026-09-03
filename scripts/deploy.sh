@@ -12,7 +12,7 @@ Required:
   --domain DOMAIN           TLS hostname used by clients
 
 Options:
-  --cert PATH               Certificate managed by Caddy or another issuer
+  --cert PATH               Certificate managed by an external issuer
   --key PATH                Matching private key; required with --cert
   --acme-email EMAIL        Optional Let's Encrypt account contact
   --port PORT               Direct TCP and UDP port (default: 443)
@@ -31,7 +31,7 @@ creates random fallback and metrics tokens, but never prints them.
 
 When --cert and --key are omitted, hTun obtains and renews a Let's Encrypt
 certificate using HTTP-01. Public TCP port 80 must reach this server and must
-not already be owned by Caddy or another process.
+not already be owned by another process.
 EOF
 }
 
@@ -211,7 +211,7 @@ fi
 
 install -d -m 0755 /usr/local/libexec/htun /etc/htun
 install -m 0755 bin/htun-server /usr/local/bin/htun-server
-install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-caddy-cert.sh \
+install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
   /usr/local/libexec/htun/
 install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
 
@@ -343,7 +343,7 @@ Description=Synchronize the hTun TLS certificate
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/htun/sync-caddy-cert.sh $certificate $private_key /etc/htun/tls
+ExecStart=/usr/local/libexec/htun/sync-cert.sh $certificate $private_key /etc/htun/tls
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -354,20 +354,6 @@ else
   systemctl disable --now htun-cert-sync.timer >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/htun-cert-sync.service /etc/systemd/system/htun-cert-sync.timer
 fi
-cat >/etc/htun/Caddyfile.example <<EOF
-$domain {
-  @metrics path /metrics
-  respond @metrics 404
-
-  reverse_proxy https://127.0.0.1:$port {
-    flush_interval -1
-    transport http {
-      tls_server_name $domain
-    }
-  }
-}
-EOF
-
 sysctl -p /etc/sysctl.d/99-htun-quic.conf >/dev/null
 systemctl daemon-reload
 systemctl enable htun.service >/dev/null
@@ -400,7 +386,5 @@ Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
 TLS mode:        $tls_mode
 Android token:   sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
-Caddy example:   /etc/htun/Caddyfile.example
-
 Ensure both TCP and UDP $port are allowed by the host and cloud firewalls.
 EOF

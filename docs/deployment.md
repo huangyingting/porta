@@ -1,15 +1,16 @@
 # Production deployment
 
-This guide deploys hTun directly on one TCP and UDP port. Caddy may continue
-serving websites and renewing the certificate on port 443, but native
-HTTP/3/MASQUE traffic goes directly to hTun and does not pass through Caddy.
+This guide deploys hTun directly on one TCP and UDP port. An existing web
+server may continue serving websites and renewing the certificate on port 443,
+but native HTTP/3/MASQUE traffic goes directly to hTun and does not pass
+through a reverse proxy.
 
 ## Choose a deployment mode
 
 | Environment | Command options | Tunnel port | Certificate renewal |
 |---|---|---:|---|
 | Standalone server | `--domain vpn.example.com` | 443 by default | hTun/Let's Encrypt |
-| Caddy already uses 80/443 | `--domain`, `--cert`, `--key`, `--port 8443` | 8443 | Caddy or external issuer |
+| Another service uses 80/443 | `--domain`, `--cert`, `--key`, `--port 8443` | 8443 | External issuer |
 | Custom standalone port | `--domain`, `--port PORT` | Configured value | hTun/Let's Encrypt through TCP 80 |
 
 `--port` controls both the TCP HTTP/2 listener and UDP HTTP/3/QUIC listener.
@@ -24,13 +25,6 @@ not 443.
 - Either public TCP port 80 for automatic Let's Encrypt issuance, or an
   existing certificate and private key covering the hostname
 - Both TCP and UDP on the selected port allowed by host and cloud firewalls
-
-If Caddy manages the certificate, locate its certificate and key files:
-
-```sh
-sudo find /var/lib/caddy/.local/share/caddy/certificates \
-  -type f \( -name 'vpn.example.com.crt' -o -name 'vpn.example.com.key' \)
-```
 
 ## One-command installation with Let's Encrypt
 
@@ -48,9 +42,9 @@ public TCP port 80, regardless of the configured tunnel port. DNS must already
 point to the server, the cloud and host firewalls must allow TCP 80, and no
 other process may own port 80.
 
-This mode is appropriate for a standalone gateway. If Caddy already owns port
-80, use the existing-certificate mode below instead; stopping Caddy merely to
-renew a second certificate is not recommended.
+This mode is appropriate for a standalone gateway. If another service already
+owns port 80, use the existing-certificate mode below instead; stopping a
+production web server merely to renew a second certificate is not recommended.
 
 ## One-command installation with an existing certificate
 
@@ -59,8 +53,8 @@ From a checked-out hTun repository:
 ```sh
 sudo ./scripts/deploy.sh \
   --domain vpn.example.com \
-  --cert /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com/vpn.example.com.crt \
-  --key /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com/vpn.example.com.key \
+  --cert /etc/letsencrypt/live/vpn.example.com/fullchain.pem \
+  --key /etc/letsencrypt/live/vpn.example.com/privkey.pem \
   --port 8443
 ```
 
@@ -104,21 +98,13 @@ gateway. If the new service cannot obtain its certificate or pass the
 readiness check, it restores the previous systemd configuration and restarts
 the previous gateway.
 
-## Caddy compatibility route
+## Reverse-proxy compatibility
 
-The deployment script writes `/etc/htun/Caddyfile.example` but deliberately
-does not edit or reload the shared Caddy configuration. Review and merge the
-generated site block if HTTP/2 clients must also connect on port 443:
-
-```sh
-sudo cat /etc/htun/Caddyfile.example
-sudo caddy validate --config /etc/caddy/Caddyfile
-sudo systemctl reload caddy
-```
-
-When Caddy owns port 443, deploy hTun with `--port 8443`. The Caddy route is
-only a fallback; Android and other native MASQUE clients should use
-`https://vpn.example.com:8443` directly.
+The deployment script deliberately does not edit or reload reverse-proxy
+configuration. When another service owns port 443, deploy hTun with
+`--port 8443`. A reverse proxy may forward HTTP/2 requests to that TLS
+listener for compatibility, but Android and other native MASQUE clients
+should use `https://vpn.example.com:8443` directly so UDP traffic reaches hTun.
 
 ## Firewall
 
@@ -168,7 +154,7 @@ curl --resolve vpn.example.com:443:127.0.0.1 \
 sudo ss -lntup | grep ':443'
 ```
 
-For a Caddy coexistence deployment, replace 443 with 8443 and include
+For an existing-web-server deployment, replace 443 with 8443 and include
 `:8443` in the URL. Static-certificate deployments also install
 `htun-cert-sync.timer`:
 
