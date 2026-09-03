@@ -154,6 +154,10 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+	encoder := protocol.NewEncoder(w)
+	if err := encoder.WritePacket(nil); err != nil {
+		return
+	}
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -182,7 +186,6 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	encoder := protocol.NewEncoder(w)
 	keepalive := time.NewTicker(c.KeepaliveInterval)
 	defer keepalive.Stop()
 	for {
