@@ -322,6 +322,7 @@ class TunnelService : VpnService() {
         override fun isDuplex() = true
 
         override fun writeTo(sink: BufferedSink) {
+            PacketFraming.write(sink, byteArrayOf())
             ready.await()
             while (running.get() && active.get()) {
                 val packet = outboundPackets.poll(1, TimeUnit.SECONDS) ?: continue
