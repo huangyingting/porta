@@ -61,7 +61,8 @@ func TestAdminPageIsProfessionalAndDoesNotEmbedSecrets(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
 	if response.Code != http.StatusOK || !strings.Contains(body, "hTun Control") ||
-		!strings.Contains(body, "Clients, without complexity.") {
+		!strings.Contains(body, "Client overview") ||
+		!strings.Contains(body, "Search clients or devices") {
 		t.Fatalf("admin page is incomplete: %d", response.Code)
 	}
 	if strings.Contains(body, testAdminToken) || strings.Contains(body, "bootstrap-token") {
@@ -69,6 +70,12 @@ func TestAdminPageIsProfessionalAndDoesNotEmbedSecrets(t *testing.T) {
 	}
 	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "frame-ancestors 'none'") {
 		t.Fatalf("admin CSP = %q", policy)
+	}
+	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "font-src 'self'") {
+		t.Fatalf("admin CSP = %q", policy)
+	}
+	if !strings.Contains(body, `font-family:"Mona Sans"`) {
+		t.Fatal("admin page does not use the bundled Mona Sans font")
 	}
 }
 

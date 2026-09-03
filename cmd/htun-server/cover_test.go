@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -26,8 +27,17 @@ func TestPublicSiteServesBrowserCoverPage(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "<h1>") {
 		t.Fatal("cover page has no visible heading")
 	}
+	if !strings.Contains(response.Body.String(), "Ideas made <em>clear.</em>") {
+		t.Fatal("cover page is missing its primary visual message")
+	}
 	if strings.Contains(strings.ToLower(response.Body.String()), "htun") {
 		t.Fatal("cover page identifies the tunnel service")
+	}
+	if !strings.Contains(response.Body.String(), `font-family:"Mona Sans"`) {
+		t.Fatal("cover page does not use the bundled Mona Sans font")
+	}
+	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "font-src 'self'") {
+		t.Fatalf("cover CSP = %q", policy)
 	}
 }
 
@@ -59,6 +69,37 @@ func TestPublicSitePreservesTunnelRequests(t *testing.T) {
 
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("tunnel status = %d, want 202", response.Code)
+	}
+}
+
+func TestPublicSiteServesBundledFont(t *testing.T) {
+	handler := publicSiteHandler(http.NotFoundHandler(), true)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://vpn.example.com"+webFontPath, nil))
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "font/woff2" {
+		t.Fatalf("font response = %d %q", response.Code, response.Header().Get("Content-Type"))
+	}
+	if response.Body.Len() != len(monaSans) {
+		t.Fatalf("font length = %d, want %d", response.Body.Len(), len(monaSans))
+	}
+	if cacheControl := response.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "immutable") {
+		t.Fatalf("font Cache-Control = %q", cacheControl)
+	}
+}
+
+func TestAdminSiteServesBundledFont(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), "bootstrap-token-0123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := adminHandler(http.NotFoundHandler(), registry, "admin-token-01234567890123456789")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodHead, "http://127.0.0.1:9090"+webFontPath, nil))
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "font/woff2" {
+		t.Fatalf("font response = %d %q", response.Code, response.Header().Get("Content-Type"))
+	}
+	if response.Header().Get("Content-Length") != strconv.Itoa(len(monaSans)) {
+		t.Fatalf("font Content-Length = %q", response.Header().Get("Content-Length"))
 	}
 }
 
