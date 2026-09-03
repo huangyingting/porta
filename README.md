@@ -76,10 +76,11 @@ sudo ./scripts/deploy.sh \
 ```
 
 The command builds and installs hTun, creates credentials on first use,
-configures systemd, certificate synchronization, QUIC socket buffers,
-forwarding, and NAT, then verifies the TLS readiness endpoint. It preserves
-credentials and leases when run again for an upgrade. It does not modify the
-shared Caddyfile or cloud firewall.
+configures systemd, TLS issuance or certificate synchronization, QUIC socket
+buffers, forwarding, and NAT, then verifies the TLS readiness endpoint. It
+preserves credentials and leases when run again for an upgrade and rolls back
+the service configuration if deployment fails. It does not modify the shared
+Caddyfile or cloud firewall.
 
 See [the production deployment guide](docs/deployment.md) for prerequisites,
 custom ports and networks, Caddy fallback, firewall rules, credentials,

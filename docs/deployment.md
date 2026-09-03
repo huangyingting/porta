@@ -4,6 +4,18 @@ This guide deploys hTun directly on one TCP and UDP port. Caddy may continue
 serving websites and renewing the certificate on port 443, but native
 HTTP/3/MASQUE traffic goes directly to hTun and does not pass through Caddy.
 
+## Choose a deployment mode
+
+| Environment | Command options | Tunnel port | Certificate renewal |
+|---|---|---:|---|
+| Standalone server | `--domain vpn.example.com` | 443 by default | hTun/Let's Encrypt |
+| Caddy already uses 80/443 | `--domain`, `--cert`, `--key`, `--port 8443` | 8443 | Caddy or external issuer |
+| Custom standalone port | `--domain`, `--port PORT` | Configured value | hTun/Let's Encrypt through TCP 80 |
+
+`--port` controls both the TCP HTTP/2 listener and UDP HTTP/3/QUIC listener.
+It defaults to 443. The Android gateway URL must include the port when it is
+not 443.
+
 ## Prerequisites
 
 - Linux with systemd, nftables, `/dev/net/tun`, and IPv4 forwarding support
@@ -87,6 +99,11 @@ pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately. Use `--no-build` to
 deploy an existing `bin/htun-server`.
 
+The installer validates port availability before stopping an existing
+gateway. If the new service cannot obtain its certificate or pass the
+readiness check, it restores the previous systemd configuration and restarts
+the previous gateway.
+
 ## Caddy compatibility route
 
 The deployment script writes `/etc/htun/Caddyfile.example` but deliberately
@@ -141,12 +158,24 @@ After all clients use device credentials, remove `HTUN_TOKEN` from
 
 ## Validation and operations
 
+For a default port-443 deployment:
+
 ```sh
-sudo systemctl status htun htun-cert-sync.timer
+sudo systemctl status htun
 sudo journalctl -u htun -f
+curl --resolve vpn.example.com:443:127.0.0.1 \
+  https://vpn.example.com/readyz
+sudo ss -lntup | grep ':443'
+```
+
+For a Caddy coexistence deployment, replace 443 with 8443 and include
+`:8443` in the URL. Static-certificate deployments also install
+`htun-cert-sync.timer`:
+
+```sh
+sudo systemctl status htun-cert-sync.timer
 curl --resolve vpn.example.com:8443:127.0.0.1 \
   https://vpn.example.com:8443/readyz
-sudo ss -lntup | grep ':443'
 ```
 
 The expected listeners are TCP and UDP on the configured port. Certificate
@@ -159,10 +188,14 @@ HTTP-01 challenges and stores its ACME account and certificates under
 
 ## Android
 
-Install the APK, enter the direct endpoint such as
-`https://vpn.example.com:8443`, enter the token and a stable device ID, then
-tap **Connect**. The status should show **HTTP/3 MASQUE**. If UDP is blocked,
-the app automatically uses encrypted HTTP/2 fallback.
+Install the APK and enter the direct endpoint:
+
+- Default port 443: `https://vpn.example.com`
+- Alternate port: `https://vpn.example.com:8443`
+
+Enter the token and a stable device ID, then tap **Connect**. The status should
+show **HTTP/3 MASQUE**. If UDP is blocked, the app automatically uses encrypted
+HTTP/2 fallback on the same configured port.
 
 For the public test deployment:
 
@@ -176,7 +209,8 @@ Gateway: https://htun.i-csu.org:8443
 Stop and disable the units before removing installed files:
 
 ```sh
-sudo systemctl disable --now htun.service htun-cert-sync.timer
+sudo systemctl disable --now htun.service
+sudo systemctl disable --now htun-cert-sync.timer 2>/dev/null || true
 sudo /usr/local/libexec/htun/server-down.sh htun0 eth0
 ```
 

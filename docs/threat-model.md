@@ -14,8 +14,9 @@
 
 ## Operator responsibilities
 
-- Use a random token of at least 32 bytes. The server obtains its certificate
-  from Let's Encrypt, which clients validate through their system trust store.
+- Use a random token of at least 32 bytes. The server can obtain its certificate
+  from Let's Encrypt or load an externally managed certificate; clients
+  validate either through their system trust store.
 - When using automatic Let's Encrypt certificates, protect and persist the ACME
   cache directory and expose the challenge listener only as required.
 - Restrict gateway egress, rate-limit the public endpoint, rotate credentials,
