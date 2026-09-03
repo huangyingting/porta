@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -127,7 +128,12 @@ func testGateway(t *testing.T, enableH3Datagrams bool) (http.Handler, *gateway.R
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	router := gateway.NewRouter(dev, logger)
 	handler, err := gateway.NewHandler(gateway.HandlerConfig{
-		Token:             testToken,
+		AuthorizeClient: func(token, deviceID string) (gateway.ClientIdentity, error) {
+			if token != testToken {
+				return gateway.ClientIdentity{}, errors.New("unauthorized")
+			}
+			return gateway.ClientIdentity{AccountID: "test", LeaseID: "test-" + deviceID}, nil
+		},
 		Pool:              pool,
 		Router:            router,
 		DNS:               "1.1.1.1",

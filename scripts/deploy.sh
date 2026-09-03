@@ -16,7 +16,7 @@ Options:
   --key PATH                Matching private key; required with --cert
   --acme-email EMAIL        Optional Let's Encrypt account contact
   --port PORT               Direct TCP and UDP port (default: 443)
-  --admin-port PORT         Loopback health and metrics port (default: 9090)
+  --admin-port PORT         Loopback admin UI and operations port (default: 9090)
   --external-interface IF   Internet-facing interface (auto-detected)
   --tun-interface IF        TUN interface (default: htun0)
   --pool CIDR               Client pool (default: 10.66.0.0/24)
@@ -28,7 +28,7 @@ Options:
   --help                    Show this help
 
 The script preserves existing /etc/htun credentials. On a new installation it
-creates random fallback and metrics tokens, but never prints them.
+creates random client, admin, and metrics tokens.
 
 When --cert and --key are omitted, hTun obtains and renews a Let's Encrypt
 certificate using HTTP-01. Public TCP port 80 must reach this server and must
@@ -230,14 +230,94 @@ if [[ ! -f $environment_file ]]; then
   umask 077
   {
     printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
+    printf 'HTUN_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)"
     printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
   } >"$environment_file"
 fi
+if ! grep -q '^HTUN_TOKEN=' "$environment_file"; then
+  printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
+fi
+if ! grep -q '^HTUN_ADMIN_TOKEN=' "$environment_file"; then
+  printf 'HTUN_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
+fi
 chmod 0600 "$environment_file"
-if [[ ! -f /etc/htun/clients ]]; then
-  install -m 0600 /dev/null /etc/htun/clients
-else
-  chmod 0600 /etc/htun/clients
+
+client_registry=/var/lib/htun/clients.json
+migrated_client_file=false
+if [[ ! -f $client_registry && -s /etc/htun/clients ]]; then
+  install -d -m 0700 /var/lib/htun
+  python3 - "$environment_file" /etc/htun/clients "$client_registry" <<'PY' ||
+    die "could not import existing client credentials"
+import datetime
+import hashlib
+import json
+import os
+import re
+import secrets
+import sys
+import tempfile
+
+environment_path, credentials_path, registry_path = sys.argv[1:]
+environment = {}
+with open(environment_path, encoding="utf-8") as stream:
+    for raw_line in stream:
+        key, separator, value = raw_line.strip().partition("=")
+        if separator:
+            environment[key] = value
+bootstrap = environment.get("HTUN_TOKEN", "")
+if len(bootstrap) < 16:
+    raise SystemExit("HTUN_TOKEN is missing or too short")
+
+now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+clients = [{
+    "id": secrets.token_hex(8),
+    "name": "Default client",
+    "token_hash": hashlib.sha256(bootstrap.encode()).hexdigest(),
+    "max_devices": 5,
+    "enabled": True,
+    "created_at": now,
+}]
+by_hash = {clients[0]["token_hash"]: clients[0]}
+client_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+with open(credentials_path, encoding="utf-8") as stream:
+    for line_number, raw_line in enumerate(stream, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        client_id, separator, token = line.partition("=")
+        client_id, token = client_id.strip(), token.strip()
+        if not separator or not client_id_pattern.fullmatch(client_id) or len(token) < 16:
+            raise SystemExit(f"invalid credential on line {line_number}")
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        if token_hash in by_hash:
+            by_hash[token_hash]["max_devices"] = min(100, by_hash[token_hash]["max_devices"] + 1)
+            continue
+        client = {
+            "id": secrets.token_hex(8),
+            "name": f"Imported {client_id}",
+            "token_hash": token_hash,
+            "max_devices": 1,
+            "enabled": True,
+            "created_at": now,
+        }
+        clients.append(client)
+        by_hash[token_hash] = client
+
+directory = os.path.dirname(registry_path)
+descriptor, temporary_path = tempfile.mkstemp(prefix=".clients-", dir=directory)
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump({"version": 1, "clients": clients}, stream, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary_path, registry_path)
+finally:
+    if os.path.exists(temporary_path):
+        os.unlink(temporary_path)
+PY
+  migrated_client_file=true
 fi
 
 rollback_directory=$(mktemp -d)
@@ -314,7 +394,7 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/htun/htun.env
 $tls_preflight
-ExecStart=/usr/local/bin/htun-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments --client-token-file /etc/htun/clients --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/htun-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments --client-registry /var/lib/htun/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/htun/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/htun/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -387,7 +467,7 @@ curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/nu
 cover_page=$(curl --silent --show-error --fail \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
   die "gateway admin endpoint is ready but public TLS is unavailable"
-grep -q '<title>Welcome</title>' <<<"$cover_page" ||
+grep -q '<title>Northline</title>' <<<"$cover_page" ||
   die "public endpoint did not return the expected landing page"
 systemctl is-active --quiet htun.service ||
   die "gateway exited after its readiness check"
@@ -395,6 +475,9 @@ ss -H -ltnp "sport = :$port" | grep -q '"htun-server"' ||
   die "gateway is not listening on public TCP port $port"
 ss -H -lunp "sport = :$port" | grep -q '"htun-server"' ||
   die "gateway is not listening on public UDP port $port"
+if $migrated_client_file; then
+  rm -f /etc/htun/clients
+fi
 
 deployment_complete=true
 cat <<EOF
@@ -405,6 +488,8 @@ Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
 TLS mode:        $tls_mode
 Admin endpoint:  http://127.0.0.1:$admin_port
-Android token:   sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
+Admin access:    ssh -L $admin_port:127.0.0.1:$admin_port USER@$domain
+Admin token:     sudo sed -n 's/^HTUN_ADMIN_TOKEN=//p' /etc/htun/htun.env
+Initial client:  sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
 Ensure both TCP and UDP $port are allowed by the host and cloud firewalls.
 EOF

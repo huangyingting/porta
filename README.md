@@ -20,7 +20,7 @@ traffic and cannot promise to be undetectable. Read
 - Bearer authentication, per-client IPv4 `/32` leases, and source validation
 - One Linux TUN interface with bounded per-client receive queues
 - Durable per-client lease state across planned gateway restarts
-- Per-device credentials with an optional migration fallback token
+- Client accounts with hashed tokens and configurable multi-device limits
 - Authenticated Prometheus metrics
 - Neutral browser cover page for ordinary public HTTP requests
 - Windows Wintun client plus explicit route setup/teardown scripts
@@ -89,40 +89,36 @@ validation, Android setup, and removal.
 
 ## Gateway
 
-Use a random token of at least 32 bytes. Pass it through the environment so it
-does not appear in the process list. The server obtains and renews its
-certificate through Let's Encrypt. Point the domain's A/AAAA record at the
-gateway, expose TCP port 80 for the HTTP-01 challenge, and expose TCP and UDP
-port 443:
+Use separate random bootstrap, admin, and metrics tokens. The bootstrap token
+creates the first client account only when the registry does not yet exist.
+Pass tokens through the environment so they do not appear in the process list.
+The server obtains and renews its certificate through Let's Encrypt. Point the
+domain's A/AAAA record at the gateway, expose TCP port 80 for the HTTP-01
+challenge, and expose TCP and UDP port 443:
 
 ```sh
 export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
+export HTUN_ADMIN_TOKEN="use-a-different-random-admin-secret"
 export HTUN_METRICS_TOKEN="use-a-different-random-secret"
-sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
+sudo --preserve-env=HTUN_TOKEN,HTUN_ADMIN_TOKEN,HTUN_METRICS_TOKEN ./bin/htun-server \
   --listen :443 \
+  --admin-listen 127.0.0.1:9090 \
   --acme-domain vpn.example.com \
   --acme-email admin@example.com \
   --acme-cache /var/lib/htun/acme \
   --acme-http-listen :80 \
+  --client-registry /var/lib/htun/clients.json \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
   --mtu 1100
 ```
 
-For per-device revocation, create a root-readable credential file containing
-one stable client ID and token per line:
-
-```text
-android-phone=replace-with-a-random-device-secret
-windows-laptop=replace-with-another-random-device-secret
-```
-
-Start the server with `--client-token-file /etc/htun/clients`. A listed client
-must use its own token; the global `HTUN_TOKEN` remains a fallback only for
-unlisted clients during migration. Remove `HTUN_TOKEN` after every active
-client has an entry to enforce device-only authentication. Rotate or revoke a
-credential by replacing or removing its line and restarting hTun.
+The loopback admin UI manages client accounts, tokens, device limits, enabled
+state, and enrolled devices without restarting hTun. Tokens are generated with
+32 random bytes, stored only as SHA-256 hashes, and displayed once when created
+or rotated. One client token may be used by several device IDs up to that
+client's configured limit.
 
 The daemon creates `htun0`, but deliberately does not modify forwarding or
 firewall state. In another root shell, after reviewing the script, configure
@@ -159,11 +155,12 @@ scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
 Ordinary browser requests receive a neutral HTML landing page by default.
-`/healthz`, `/readyz`, and `/metrics` are not exposed on the public tunnel
-listener; they are available only from the loopback admin listener at
-`127.0.0.1:9090` by default. Use `--cover-site=false` only when an API-style
-404 is preferred over the landing page. This is camouflage for casual
-visitors, not an authentication or security boundary.
+`/healthz`, `/readyz`, `/metrics`, and the admin UI are not exposed on the
+public tunnel listener. They are available only from the loopback listener at
+`127.0.0.1:9090` by default. Reach the UI through an SSH tunnel and open
+`http://127.0.0.1:9090`; API data requires `HTUN_ADMIN_TOKEN`. Use
+`--cover-site=false` only when an API-style 404 is preferred over the landing
+page. This is camouflage for casual visitors, not a security boundary.
 
 ### Direct HTTP/3 alongside an existing web server
 
@@ -177,7 +174,7 @@ sudo ./bin/htun-server \
   --listen :8443 \
   --tls-cert /etc/htun/tls/server.crt \
   --tls-key /etc/htun/tls/server.key \
-  --client-token-file /etc/htun/clients \
+  --client-registry /var/lib/htun/clients.json \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
@@ -238,9 +235,12 @@ backend to loopback so it cannot be reached directly:
 
 ```sh
 export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
-sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
+export HTUN_ADMIN_TOKEN="use-a-different-random-admin-secret"
+sudo --preserve-env=HTUN_TOKEN,HTUN_ADMIN_TOKEN ./bin/htun-server \
   --behind-proxy \
   --listen 127.0.0.1:8443 \
+  --admin-listen 127.0.0.1:9090 \
+  --client-registry /var/lib/htun/clients.json \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
@@ -262,9 +262,9 @@ sudo install -d -m 0755 /usr/local/libexec/htun /etc/htun
 sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh /usr/local/libexec/htun/
 {
   printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
+  printf 'HTUN_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)"
   printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
 } | sudo tee /etc/htun/htun.env >/dev/null
-sudo install -m 0600 /dev/null /etc/htun/clients
 sudo chmod 0600 /etc/htun/htun.env
 sudo install -m 0644 deploy/htun.service deploy/htun-cert-sync.service deploy/htun-cert-sync.timer /etc/systemd/system/
 sudo install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
@@ -287,6 +287,8 @@ Operational checks:
 systemctl status htun
 journalctl -u htun -f
 curl http://127.0.0.1:9090/readyz
+ADMIN_TOKEN="$(sudo sed -n 's/^HTUN_ADMIN_TOKEN=//p' /etc/htun/htun.env)"
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/api/clients
 METRICS_TOKEN="$(sudo sed -n 's/^HTUN_METRICS_TOKEN=//p' /etc/htun/htun.env)"
 # This loopback HTTP check applies only to the --behind-proxy h2c deployment.
 curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:9090/metrics
@@ -408,7 +410,7 @@ a non-exportable Android Keystore key, only one profile can be connected at a
 time, and the selected profile is visually highlighted. Enable
 **Reconnect after device restart** on one profile when unattended boot recovery
 is desired; Android must already have granted this app VPN permission. Retrieve
-the fallback token on the server when needed with:
+the initial client token on the server when needed with:
 
 ```sh
 sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
@@ -472,6 +474,8 @@ release. Configure these repository Actions secrets before tagging:
   gateway handler is ready to accept tunnel requests.
 - Admin-listener `GET /metrics` is enabled only when
   `HTUN_METRICS_TOKEN` is set and requires that exact bearer token.
+- Admin-listener `GET /` serves the client-management UI. Its `/api/*`
+  requests require `HTUN_ADMIN_TOKEN`.
 - Ordinary public `GET` and `HEAD` requests receive only the neutral HTML cover
   page by default; operational endpoints are never routed on that listener.
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
@@ -479,9 +483,9 @@ release. Configure these repository Actions secrets before tagging:
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.
 - `POST /v1/tunnel` is Android's authenticated four-lane HTTP/2 fallback when
   HTTP/3 is unavailable. Requests missing valid lane metadata are rejected.
-- A reconnect using the same client ID reuses its retained lease and replaces
-  the older stream. When the pool is full, the oldest inactive lease is
-  reclaimed for a new client.
+- A token identifies a client account; `X-HTun-Client-ID` identifies one
+  enrolled device under that account. The account/device pair retains its
+  lease and cannot collide with the same device ID in another account.
 
 RFC 9484 does not standardize DNS or link-MTU configuration. hTun sends these
 as optional `X-HTun-DNS` and `X-HTun-MTU` response extensions. The default MTU

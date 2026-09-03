@@ -37,13 +37,19 @@ type laneConfig struct {
 	count     int
 }
 
+type ClientIdentity struct {
+	AccountID string
+	LeaseID   string
+}
+
+type AuthorizeClientFunc func(token, deviceID string) (ClientIdentity, error)
+
 func ValidClientID(value string) bool {
 	return validClientID.MatchString(value)
 }
 
 type HandlerConfig struct {
-	Token             string
-	ClientTokens      map[string]string
+	AuthorizeClient   AuthorizeClientFunc
 	MetricsToken      string
 	Metrics           *Metrics
 	Pool              *Pool
@@ -57,25 +63,14 @@ type HandlerConfig struct {
 }
 
 func NewHandler(config HandlerConfig) (http.Handler, error) {
-	if config.Token != "" && len(config.Token) < 16 {
-		return nil, errors.New("gateway fallback token must contain at least 16 characters")
-	}
-	if config.Token == "" && len(config.ClientTokens) == 0 {
-		return nil, errors.New("at least one gateway credential is required")
+	if config.AuthorizeClient == nil {
+		return nil, errors.New("gateway client authorizer is required")
 	}
 	if config.MetricsToken != "" && len(config.MetricsToken) < 16 {
 		return nil, errors.New("metrics token must contain at least 16 characters")
 	}
 	if config.Metrics == nil {
 		config.Metrics = &Metrics{}
-	}
-	for clientID, token := range config.ClientTokens {
-		if !validClientID.MatchString(clientID) {
-			return nil, fmt.Errorf("invalid credential client ID %q", clientID)
-		}
-		if len(token) < 16 {
-			return nil, fmt.Errorf("credential token for %q must contain at least 16 characters", clientID)
-		}
 	}
 	if config.Pool == nil || config.Router == nil {
 		return nil, errors.New("gateway pool and router are required")
@@ -126,7 +121,8 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
 		return
 	}
-	if !c.authorizedClient(r.Header.Get("Authorization"), clientID) {
+	identity, err := c.authorizeClient(r.Header.Get("Authorization"), clientID)
+	if err != nil {
 		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -146,7 +142,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	lease, err := c.Pool.AcquireGroup(clientID, lanes.sessionID)
+	lease, err := c.Pool.AcquireGroup(identity.LeaseID, lanes.sessionID)
 	if err != nil {
 		http.Error(w, "no tunnel addresses available", http.StatusServiceUnavailable)
 		return
@@ -171,6 +167,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	remoteHost := clientAddress(r, c.TrustProxyHeaders)
 	logAttributes := []any{
 		"client_id", clientID,
+		"account_id", identity.AccountID,
 		"address", lease.Address,
 		"transport", r.Proto,
 		"remote", remoteHost,
@@ -276,11 +273,16 @@ func parseLaneConfig(r *http.Request) (laneConfig, error) {
 	return laneConfig{sessionID: sessionID, index: index, count: count}, nil
 }
 
-func (c HandlerConfig) authorizedClient(header, clientID string) bool {
-	if token, ok := c.ClientTokens[clientID]; ok {
-		return authorized(header, token)
+func (c HandlerConfig) authorizeClient(header, deviceID string) (ClientIdentity, error) {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ClientIdentity{}, errors.New("missing bearer token")
 	}
-	return c.Token != "" && authorized(header, c.Token)
+	token := strings.TrimPrefix(header, prefix)
+	if len(token) < 16 {
+		return ClientIdentity{}, errors.New("invalid bearer token")
+	}
+	return c.AuthorizeClient(token, deviceID)
 }
 
 func clientAddress(r *http.Request, trustProxyHeaders bool) string {

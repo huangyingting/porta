@@ -32,14 +32,15 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
 		return
 	}
-	if !c.authorizedClient(r.Header.Get("Authorization"), clientID) {
+	identity, err := c.authorizeClient(r.Header.Get("Authorization"), clientID)
+	if err != nil {
 		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	lease, err := c.Pool.Acquire(clientID)
+	lease, err := c.Pool.Acquire(identity.LeaseID)
 	if err != nil {
 		http.Error(w, "no tunnel addresses available", http.StatusServiceUnavailable)
 		return
@@ -84,7 +85,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	} else {
 		flush(w)
 	}
-	c.Logger.Info("tunnel connected", "client_id", clientID, "address", lease.Address, "transport", transportName, "remote", remoteHost)
+	c.Logger.Info("tunnel connected", "client_id", clientID, "account_id", identity.AccountID, "address", lease.Address, "transport", transportName, "remote", remoteHost)
 	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
 
 	encoder := masque.NewEncoder(writer)

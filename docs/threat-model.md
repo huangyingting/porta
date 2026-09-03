@@ -4,19 +4,22 @@
 
 - TLS 1.3 protects HTTP/3 traffic; the TLS configuration also permits the TLS
   version required by HTTP/2 implementations.
-- A bearer token is checked in constant time before a lease is allocated.
+- A bearer token hash is checked in constant time before a lease is allocated.
+- Client tokens are stored only as SHA-256 hashes; newly generated tokens are
+  displayed once. A separate admin token protects the loopback management API.
 - The gateway rejects packets whose IPv4 source does not equal the session's
   lease, preventing one client from spoofing another client address.
 - Packet lengths, IP versions, header lengths, total lengths, and destinations
   are validated before packets cross trust boundaries.
-- Tokens are accepted through flags or environment variables and are never
-  intentionally logged.
+- Tokens are accepted through environment variables or the admin UI and are
+  never intentionally logged.
 
 ## Operator responsibilities
 
-- Use a random token of at least 32 bytes. The server can obtain its certificate
-  from Let's Encrypt or load an externally managed certificate; clients
-  validate either through their system trust store.
+- Keep the admin listener bound to loopback and access it through an SSH tunnel.
+  Use independent random admin and client tokens. The server can obtain its
+  certificate from Let's Encrypt or load an externally managed certificate;
+  clients validate either through their system trust store.
 - When using automatic Let's Encrypt certificates, protect and persist the ACME
   cache directory and expose the challenge listener only as required.
 - Restrict gateway egress, rate-limit the public endpoint, rotate credentials,
@@ -38,8 +41,8 @@ fingerprints from network inspection.
 
 ## Known MVP limitations
 
-- Bearer tokens identify access, not individual users, unless an operator runs
-  separate gateway instances or adds a control plane.
+- Client accounts identify administrative access groups, not human users.
+  Devices sharing one token have equal network privileges.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.

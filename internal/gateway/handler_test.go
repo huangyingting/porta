@@ -29,20 +29,24 @@ func TestClientAddressTrustsProxyHeadersOnlyFromLoopback(t *testing.T) {
 }
 
 func TestAuthorizedClientPrefersBoundCredential(t *testing.T) {
+	want := ClientIdentity{AccountID: "account-a", LeaseID: "lease-a"}
 	config := HandlerConfig{
-		Token: "fallback-token-0123456789",
-		ClientTokens: map[string]string{
-			"android-phone": "device-token-0123456789",
+		AuthorizeClient: func(token, deviceID string) (ClientIdentity, error) {
+			if token == "device-token-0123456789" && deviceID == "android-phone" {
+				return want, nil
+			}
+			return ClientIdentity{}, errors.New("unauthorized")
 		},
 	}
-	if !config.authorizedClient("Bearer device-token-0123456789", "android-phone") {
-		t.Fatal("bound device token was rejected")
+	identity, err := config.authorizeClient("Bearer device-token-0123456789", "android-phone")
+	if err != nil || identity != want {
+		t.Fatalf("authorized identity = %#v, %v", identity, err)
 	}
-	if config.authorizedClient("Bearer fallback-token-0123456789", "android-phone") {
-		t.Fatal("fallback token bypassed a bound device credential")
+	if _, err := config.authorizeClient("Bearer wrong-token-0123456789", "android-phone"); err == nil {
+		t.Fatal("invalid token was accepted")
 	}
-	if !config.authorizedClient("Bearer fallback-token-0123456789", "unbound-client") {
-		t.Fatal("fallback token was rejected for an unbound client")
+	if _, err := config.authorizeClient("not-bearer", "android-phone"); err == nil {
+		t.Fatal("invalid authorization scheme was accepted")
 	}
 }
 
@@ -53,7 +57,9 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 	}
 
 	handler, err := NewHandler(HandlerConfig{
-		Token:        "client-token-0123456789",
+		AuthorizeClient: func(string, string) (ClientIdentity, error) {
+			return ClientIdentity{AccountID: "test", LeaseID: "test"}, nil
+		},
 		MetricsToken: "metrics-token-0123456789",
 		Pool:         pool,
 		Router:       NewRouter(testPacketDevice{}, nil),

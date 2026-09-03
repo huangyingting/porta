@@ -73,8 +73,8 @@ func run() error {
 	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
 	coverSite := flag.Bool("cover-site", true, "serve a neutral HTML page to ordinary browser requests")
-	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for health, readiness, and metrics (empty disables)")
-	clientTokenFile := flag.String("client-token-file", "", "optional client-id=token credential file")
+	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for the admin UI, health, readiness, and metrics (empty disables)")
+	clientRegistryPath := flag.String("client-registry", "clients.json", "persistent client registry path")
 	interfaceName := flag.String("interface", "htun0", "Linux TUN interface name")
 	poolCIDR := flag.String("pool", "10.66.0.0/24", "IPv4 client address pool")
 	leaseState := flag.String("lease-state", "", "optional persistent client lease state file")
@@ -89,15 +89,12 @@ func run() error {
 	if token == "" {
 		token = *tokenFlag
 	}
-	clientTokens, err := loadClientTokens(*clientTokenFile)
-	if err != nil {
-		return err
-	}
 	if token != "" && len(token) < 16 {
 		return errors.New("HTUN_TOKEN must contain at least 16 characters")
 	}
-	if token == "" && len(clientTokens) == 0 {
-		return errors.New("set HTUN_TOKEN or provide --client-token-file with at least one credential")
+	registry, err := openClientRegistry(*clientRegistryPath, token)
+	if err != nil {
+		return err
 	}
 	metricsToken := os.Getenv("HTUN_METRICS_TOKEN")
 	if metricsToken == "" {
@@ -105,6 +102,10 @@ func run() error {
 	}
 	if metricsToken != "" && len(metricsToken) < 16 {
 		return errors.New("HTUN_METRICS_TOKEN must contain at least 16 characters")
+	}
+	adminToken := os.Getenv("HTUN_ADMIN_TOKEN")
+	if *adminAddress != "" && len(adminToken) < 24 {
+		return errors.New("HTUN_ADMIN_TOKEN must contain at least 24 characters when the admin listener is enabled")
 	}
 	if *adminAddress != "" {
 		if err := validateLoopbackListenAddress(*adminAddress, "--admin-listen"); err != nil {
@@ -163,8 +164,7 @@ func run() error {
 	router := gateway.NewRouter(tunDevice, logger)
 	metrics := &gateway.Metrics{}
 	handler, err := gateway.NewHandler(gateway.HandlerConfig{
-		Token:             token,
-		ClientTokens:      clientTokens,
+		AuthorizeClient:   registry.Authenticate,
 		MetricsToken:      metricsToken,
 		Metrics:           metrics,
 		Pool:              pool,
@@ -224,7 +224,7 @@ func run() error {
 	if *adminAddress != "" {
 		adminServer = &http.Server{
 			Addr:              *adminAddress,
-			Handler:           adminHandler(handler),
+			Handler:           adminHandler(handler, registry, adminToken),
 			ReadHeaderTimeout: 5 * time.Second,
 			IdleTimeout:       30 * time.Second,
 		}

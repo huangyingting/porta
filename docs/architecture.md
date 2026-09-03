@@ -40,7 +40,14 @@ payload in RFC 9297 DATAGRAM capsules.
 RFC 9484 does not define DNS or link-MTU negotiation, so the gateway provides
 optional `X-HTun-DNS` and `X-HTun-MTU` response extensions. Authentication uses
 `Authorization: Bearer <token>`, and `X-HTun-Client-ID` provides stable lease
-selection and reconnect replacement.
+selection and reconnect replacement. The token identifies a client account,
+while the client ID identifies one enrolled device. Their combined identity
+prevents device-name collisions between accounts.
+
+The persistent client registry stores only SHA-256 token hashes. Each account
+has an enabled state and a device limit. The loopback-only admin API manages
+accounts, token rotation, and device enrollment without restarting the tunnel
+service.
 
 ## Gateway routing
 

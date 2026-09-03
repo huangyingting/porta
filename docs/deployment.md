@@ -87,7 +87,7 @@ sudo ./scripts/deploy.sh \
 ```
 
 The script is idempotent. Re-running it rebuilds and upgrades the server while
-preserving `/etc/htun/htun.env`, `/etc/htun/clients`, and persistent leases.
+preserving `/etc/htun/htun.env`, `/var/lib/htun/clients.json`, and persistent leases.
 The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately. Use `--no-build` to
@@ -98,14 +98,26 @@ gateway. If the new service cannot obtain its certificate or pass the
 readiness check, it restores the previous systemd configuration and restarts
 the previous gateway.
 
-## Browser cover page
+## Browser cover page and admin UI
 
 hTun serves a neutral HTML landing page to ordinary browser requests by
 default, so visiting the tunnel origin does not identify the VPN service.
-The public listener does not route `/healthz`, `/readyz`, or `/metrics`;
-operational endpoints are served only on `127.0.0.1:9090` by default. Tunnel
+The public listener does not route the admin UI, `/healthz`, `/readyz`, or
+`/metrics`; these are served only on `127.0.0.1:9090` by default. Tunnel
 authentication remains the actual security boundary—the cover page only
 reduces casual service fingerprinting.
+
+Open the admin UI without exposing it publicly:
+
+```sh
+ssh -L 9090:127.0.0.1:9090 user@vpn.example.com
+sudo sed -n 's/^HTUN_ADMIN_TOKEN=//p' /etc/htun/htun.env
+```
+
+Then browse to `http://127.0.0.1:9090` and enter the admin token. The UI can
+create, edit, disable, and delete clients; rotate tokens; set device limits;
+and forget enrolled devices to free a slot. A device that still has the shared
+client token can enroll again. Tokens are shown only when created or rotated.
 
 For direct manual server runs, pass `--cover-site=false` to replace the landing
 page with normal API 404 responses. Use `--admin-listen` to change or disable
@@ -132,29 +144,20 @@ UDP 443 (or configured port): HTTP/3/QUIC MASQUE
 The deployment script does not modify UFW, firewalld, Azure NSGs, AWS security
 groups, or other perimeter policy. Open the port in every applicable layer.
 
-## Credentials
+## Clients and credentials
 
-Retrieve the generated migration token without printing it during deployment:
+The first deployment creates a default client using the generated bootstrap
+token:
 
 ```sh
 sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
 ```
 
-For per-device revocation, add credentials to `/etc/htun/clients`:
-
-```text
-android-phone=replace-with-a-random-device-secret
-windows-laptop=replace-with-another-random-device-secret
-```
-
-Restart hTun after changing that file:
-
-```sh
-sudo systemctl restart htun
-```
-
-After all clients use device credentials, remove `HTUN_TOKEN` from
-`/etc/htun/htun.env`.
+Use the admin UI for additional clients. Each client receives one random token
+that can enroll multiple unique device IDs up to its configured limit. The
+registry stores only token hashes in `/var/lib/htun/clients.json`. Disabling a
+client or rotating its token blocks future connections immediately; existing
+tunnel connections end normally or when the service is restarted.
 
 ## Validation and operations
 

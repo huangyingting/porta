@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -80,9 +81,13 @@ func TestPublicSiteCanDisableCoverWithoutExposingOperations(t *testing.T) {
 }
 
 func TestAdminHandlerAllowsOnlyOperationalGETs(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), "bootstrap-token-0123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
 	handler := adminHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(r.URL.Path))
-	}))
+	}), registry, "admin-token-01234567890123456789")
 
 	for _, path := range []string{"/healthz", "/readyz", "/metrics"} {
 		response := httptest.NewRecorder()
