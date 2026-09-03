@@ -152,13 +152,14 @@ metadata, multicast, documentation, or benchmark address rejects the request.
 Proxy credentials and client-supplied forwarding identity headers are never
 sent to the destination.
 
-Proxy-shaped traffic without valid credentials receives the standard `407`
-Basic authentication challenge used by browsers and extensions such as
-ZeroOmega. Configure ZeroOmega with type **HTTPS**, the Porta hostname and
-port, a stable device ID such as `chrome-zeroomega` as the username, and the
-client token as the password. Ordinary non-proxy browser visits still receive
-the landing page. Porta does not serve a public PAC file and does not cache
-proxy responses.
+Valid preemptive Basic credentials activate the proxy. Proxy-shaped traffic
+without valid credentials falls through to the ordinary landing or
+unsupported-request behavior without a recognizable `407` challenge.
+Configure ZeroOmega with type **HTTPS**, the Porta hostname and port, a stable
+device ID such as `chrome-zeroomega` as the username, and the client token as
+the password. The extension must send the stored credentials preemptively;
+Porta intentionally does not trigger the browser authentication dialog. Porta
+does not serve a public PAC file and does not cache proxy responses.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the
