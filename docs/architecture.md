@@ -100,7 +100,7 @@ flows across three data lanes. Each lane has its own TCP loss domain, reducing
 but not eliminating TCP head-of-line blocking. All four lanes are mandatory;
 the gateway rejects headerless or partial single-lane requests.
 
-## Production evolution
+## Roadmap
 
 The following changes require coordinated protocol and operational design, not
 isolated transport patches:

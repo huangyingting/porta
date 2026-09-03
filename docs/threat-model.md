@@ -38,7 +38,7 @@ fronting, traffic-shape forgery, or mechanisms intended to defeat an explicit
 security policy. The browser-facing Porta landing page does not conceal
 transport fingerprints from network inspection.
 
-## Known MVP limitations
+## Operational boundaries
 
 - Client accounts identify administrative access groups, not human users.
   Devices sharing one token have equal network privileges.

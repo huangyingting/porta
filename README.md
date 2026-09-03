@@ -1,9 +1,9 @@
 # Porta
 
-Porta is a small, auditable IPv4 VPN MVP implementing MASQUE `CONNECT-IP`
-(RFC 9484). The gateway accepts HTTP/2 over TCP and HTTP/3 over QUIC/UDP on the
-same port. The repository includes a Linux gateway, a Windows Wintun client,
-and an Android `VpnService` client.
+Porta is a production-oriented, auditable IPv4 VPN and authenticated forward
+proxy implementing MASQUE `CONNECT-IP` (RFC 9484). The gateway accepts HTTP/2
+over TCP and HTTP/3 over QUIC/UDP on the same port. The repository includes a
+Linux gateway, a Windows Wintun client, and an Android `VpnService` client.
 
 It is designed for authorized remote access and compatibility with standard
 HTTP infrastructure. Ordinary browser visits receive a compact, neutral Porta
@@ -11,7 +11,7 @@ studio page, while operational endpoints remain isolated on the loopback admin
 listener. Read
 [the threat model](docs/threat-model.md) before deployment.
 
-## Current scope
+## Production capabilities
 
 - RFC 9484 Extended CONNECT with `:protocol=connect-ip`
 - ADDRESS_REQUEST, ADDRESS_ASSIGN, and ROUTE_ADVERTISEMENT capsules
@@ -460,9 +460,10 @@ and DNS settings with:
 ./scripts/windows-down.ps1 -InterfaceAlias Porta
 ```
 
-The MVP keeps route changes explicit. It does not install a kill switch;
-deployments that require one should enforce it with Windows Filtering Platform
-or managed firewall policy.
+Windows route changes remain explicit so operators can preserve access to the
+gateway and apply organization-specific routing policy. Deployments requiring
+a kill switch should enforce it with Windows Filtering Platform or managed
+firewall policy.
 
 ## Android client
 

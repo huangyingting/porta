@@ -64,7 +64,7 @@ func newPool(cidr, statePath string) (*Pool, error) {
 	}
 	prefix = prefix.Masked()
 	if !prefix.Addr().Is4() {
-		return nil, errors.New("the MVP address pool must be IPv4")
+		return nil, errors.New("the address pool must be IPv4")
 	}
 	if prefix.Bits() < 16 || prefix.Bits() > 30 {
 		return nil, fmt.Errorf("pool prefix /%d is outside /16../30", prefix.Bits())
