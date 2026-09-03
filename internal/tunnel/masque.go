@@ -439,12 +439,8 @@ func setMasqueHeaders(request *http.Request, config Config) {
 
 func validateMasqueResponse(response *http.Response) error {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		var body []byte
-		if response.Body != nil {
-			defer response.Body.Close()
-			body, _ = io.ReadAll(io.LimitReader(response.Body, 4096))
-		}
-		return fmt.Errorf("gateway returned %s: %s", response.Status, string(body))
+		_ = response.Body.Close()
+		return fmt.Errorf("gateway returned %s", response.Status)
 	}
 	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
 		return errors.New("gateway response did not enable the Capsule Protocol")

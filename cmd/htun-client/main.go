@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/htun-project/htun/internal/device"
+	"github.com/htun-project/htun/internal/protocol"
 	"github.com/htun-project/htun/internal/tunnel"
 )
 
@@ -41,6 +42,8 @@ func run() error {
 	thumbprint := flag.String("thumbprint", "", "optional SHA-256 gateway certificate thumbprint")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (development only)")
 	tokenFlag := flag.String("token", "", "bearer token (prefer HTUN_TOKEN environment variable)")
+	reconnect := flag.Bool("reconnect", true, "reconnect automatically after an established tunnel is interrupted")
+	reconnectMaxDelay := flag.Duration("reconnect-max-delay", 30*time.Second, "maximum reconnect delay")
 	flag.Parse()
 
 	token := os.Getenv("HTUN_TOKEN")
@@ -57,7 +60,7 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	connection, err := tunnel.Dial(ctx, tunnel.Config{
+	config := tunnel.Config{
 		URL:       *serverURL,
 		Token:     token,
 		ClientID:  *clientID,
@@ -65,14 +68,15 @@ func run() error {
 		Protocol:  tunnel.Protocol(*protocolName),
 		TLSConfig: tlsConfig,
 		Timeout:   15 * time.Second,
-	})
+	}
+	connection, err := tunnel.Dial(ctx, config)
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
 
 	tunDevice, err := device.OpenNative(*interfaceName, connection.Lease.MTU)
 	if err != nil {
+		_ = connection.Close()
 		return err
 	}
 	defer tunDevice.Close()
@@ -94,16 +98,104 @@ func run() error {
 		slog.Info("configure the interface and routes explicitly; see README.md")
 	}
 
-	errCh := make(chan error, 2)
+	outbound := make(chan []byte, 256)
+	deviceErrors := make(chan error, 1)
 	go func() {
 		for {
 			packet, err := tunDevice.ReadPacket(ctx)
 			if err != nil {
-				errCh <- err
+				deviceErrors <- err
 				return
 			}
-			if err := connection.Send(packet); err != nil {
-				errCh <- err
+			if _, err := protocol.ParseIPv4(packet); err != nil {
+				continue
+			}
+			select {
+			case outbound <- packet:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	initialLease := connection.Lease
+	failures := 0
+	connectionStarted := time.Now()
+	for {
+		err := runConnection(ctx, tunDevice, connection, outbound, deviceErrors)
+		_ = connection.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var deviceErr clientDeviceError
+		if errors.As(err, &deviceErr) || !*reconnect {
+			return err
+		}
+		if time.Since(connectionStarted) >= 30*time.Second {
+			failures = 0
+		}
+		delay := reconnectDelay(failures, *reconnectMaxDelay)
+		failures++
+		slog.Warn("tunnel interrupted; reconnecting", "error", err, "delay", delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		for {
+			connection, err = tunnel.Dial(ctx, config)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			delay = reconnectDelay(failures, *reconnectMaxDelay)
+			failures++
+			slog.Warn("reconnect failed", "error", err, "delay", delay)
+			timer.Reset(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if connection.Lease != initialLease {
+			_ = connection.Close()
+			return fmt.Errorf("gateway lease changed from %+v to %+v; reconfigure the interface and routes", initialLease, connection.Lease)
+		}
+		connectionStarted = time.Now()
+		slog.Info("tunnel reconnected", "address", connection.Lease.Address)
+	}
+}
+
+type clientDeviceError struct{ err error }
+
+func (e clientDeviceError) Error() string { return e.err.Error() }
+func (e clientDeviceError) Unwrap() error { return e.err }
+
+func runConnection(
+	ctx context.Context,
+	tunDevice device.PacketDevice,
+	connection *tunnel.Conn,
+	outbound <-chan []byte,
+	deviceErrors <-chan error,
+) error {
+	connectionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() {
+		for {
+			select {
+			case packet := <-outbound:
+				if err := connection.Send(packet); err != nil {
+					errCh <- err
+					return
+				}
+			case <-connectionCtx.Done():
 				return
 			}
 		}
@@ -115,19 +207,34 @@ func run() error {
 				errCh <- err
 				return
 			}
-			if err := tunDevice.WritePacket(ctx, packet); err != nil {
-				errCh <- err
+			if err := tunDevice.WritePacket(connectionCtx, packet); err != nil {
+				errCh <- clientDeviceError{err}
 				return
 			}
 		}
 	}()
-
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case err := <-deviceErrors:
+		return clientDeviceError{err}
 	case err := <-errCh:
 		return err
 	}
+}
+
+func reconnectDelay(failures int, maximum time.Duration) time.Duration {
+	if maximum < time.Second {
+		maximum = time.Second
+	}
+	if failures > 5 {
+		failures = 5
+	}
+	delay := time.Second << failures
+	if delay > maximum {
+		return maximum
+	}
+	return delay
 }
 
 func clientTLSConfig(caPath, thumbprint string, insecure bool) (*tls.Config, error) {

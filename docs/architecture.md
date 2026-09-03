@@ -86,10 +86,26 @@ The older protocol uses the private media type
 `application/x-htun-packets` and two-byte length-prefixed IPv4 packets over
 `POST /v1/tunnel`. It remains tested but is no longer the desktop default.
 
-## Non-goals and future work
+## Production evolution
 
-Out of scope are IPv6 address assignment, QUIC connection migration across
-Android network changes, configurable request scope and split routes,
-multi-token identity storage, and a control-plane API. A future Android Cronet
-or native QUIC transport can reuse the MASQUE capsule package without changing
-the `VpnService` layer.
+The following changes require coordinated protocol and operational design, not
+isolated transport patches:
+
+1. **IPv6:** add IPv6 lease and route capsules, dual-stack source validation,
+   Android/Windows interface configuration, IPv6 forwarding, and tests that
+   prevent traffic leaks when only one address family is available.
+2. **Split routing:** authenticate server-defined route policy, advertise only
+   authorized prefixes, configure platform-specific route exclusions, and
+   define DNS behavior for included and excluded destinations.
+3. **High availability:** use a shared identity and lease control plane,
+   coordinate duplicate-session ownership, and provide a packet-routing layer
+   that can deliver return traffic to the instance holding each live tunnel.
+   Sharing the JSON lease file between independent servers is not sufficient.
+4. **Native Android MASQUE:** adopt a maintained QUIC/HTTP/3 stack that exposes
+   Extended CONNECT and HTTP Datagrams, preserve `VpnService.protect()` and
+   underlying-network binding, then run compatibility and roaming tests
+   against the existing Go implementation.
+
+QUIC connection migration, policy management, and a control-plane API remain
+future work. The existing MASQUE capsule package can be reused by a future
+Android transport without changing the VPN interface layer.

@@ -23,20 +23,45 @@ const MasquePath = "/.well-known/masque/ip/*/*/"
 
 var validClientID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+func ValidClientID(value string) bool {
+	return validClientID.MatchString(value)
+}
+
 type HandlerConfig struct {
 	Token             string
+	ClientTokens      map[string]string
+	MetricsToken      string
+	Metrics           *Metrics
 	Pool              *Pool
 	Router            *Router
 	DNS               string
 	MTU               int
 	EnableH3Datagrams bool
+	TrustProxyHeaders bool
 	KeepaliveInterval time.Duration
 	Logger            *slog.Logger
 }
 
 func NewHandler(config HandlerConfig) (http.Handler, error) {
-	if len(config.Token) < 16 {
-		return nil, errors.New("gateway token must contain at least 16 characters")
+	if config.Token != "" && len(config.Token) < 16 {
+		return nil, errors.New("gateway fallback token must contain at least 16 characters")
+	}
+	if config.Token == "" && len(config.ClientTokens) == 0 {
+		return nil, errors.New("at least one gateway credential is required")
+	}
+	if config.MetricsToken != "" && len(config.MetricsToken) < 16 {
+		return nil, errors.New("metrics token must contain at least 16 characters")
+	}
+	if config.Metrics == nil {
+		config.Metrics = &Metrics{}
+	}
+	for clientID, token := range config.ClientTokens {
+		if !validClientID.MatchString(clientID) {
+			return nil, fmt.Errorf("invalid credential client ID %q", clientID)
+		}
+		if len(token) < 16 {
+			return nil, fmt.Errorf("credential token for %q must contain at least 16 characters", clientID)
+		}
 	}
 	if config.Pool == nil || config.Router == nil {
 		return nil, errors.New("gateway pool and router are required")
@@ -57,6 +82,21 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
 	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ready"}`+"\n")
+	})
+	if config.MetricsToken != "" {
+		mux.Handle("GET /metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !authorized(r.Header.Get("Authorization"), config.MetricsToken) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="htun-metrics"`)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			config.Metrics.ServeHTTP(w, r)
+		}))
+	}
 	mux.HandleFunc("POST "+TunnelPath, config.serveTunnel)
 	mux.HandleFunc("CONNECT "+MasquePath, config.serveMasque)
 	return securityHeaders(mux), nil
@@ -67,7 +107,13 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hTun requires HTTP/2 or HTTP/3", http.StatusHTTPVersionNotSupported)
 		return
 	}
-	if !authorized(r.Header.Get("Authorization"), c.Token) {
+	clientID := r.Header.Get("X-HTun-Client-ID")
+	if !validClientID.MatchString(clientID) {
+		http.Error(w, "invalid client ID", http.StatusBadRequest)
+		return
+	}
+	if !c.authorizedClient(r.Header.Get("Authorization"), clientID) {
+		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -81,22 +127,19 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported content type", http.StatusUnsupportedMediaType)
 		return
 	}
-	clientID := r.Header.Get("X-HTun-Client-ID")
-	if !validClientID.MatchString(clientID) {
-		http.Error(w, "invalid client ID", http.StatusBadRequest)
-		return
-	}
-
 	lease, err := c.Pool.Acquire(clientID)
 	if err != nil {
 		http.Error(w, "no tunnel addresses available", http.StatusServiceUnavailable)
 		return
 	}
+
 	defer c.Pool.Release(lease)
 
 	session, sessionCtx := c.Router.Register(r.Context(), lease.Address)
 	defer session.Close()
-	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+	c.Metrics.connected()
+	defer c.Metrics.disconnected()
+	remoteHost := clientAddress(r, c.TrustProxyHeaders)
 	c.Logger.Info("tunnel connected", "client_id", clientID, "address", lease.Address, "transport", r.Proto, "remote", remoteHost)
 	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
 
@@ -109,6 +152,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	if c.DNS != "" {
 		w.Header().Set("X-HTun-DNS", c.DNS)
 	}
+
 	w.WriteHeader(http.StatusOK)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
@@ -134,6 +178,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 				inboundDone <- err
 				return
 			}
+			c.Metrics.receivedFromClient()
 		}
 	}()
 
@@ -146,6 +191,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 			if err := encoder.WritePacket(packet); err != nil {
 				return
 			}
+			c.Metrics.sentToClient()
 			flush(w)
 		case <-keepalive.C:
 			if err := encoder.WritePacket(nil); err != nil {
@@ -161,6 +207,33 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func (c HandlerConfig) authorizedClient(header, clientID string) bool {
+	if token, ok := c.ClientTokens[clientID]; ok {
+		return authorized(header, token)
+	}
+	return c.Token != "" && authorized(header, c.Token)
+}
+
+func clientAddress(r *http.Request, trustProxyHeaders bool) string {
+	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteHost = r.RemoteAddr
+	}
+	if !trustProxyHeaders || !net.ParseIP(remoteHost).IsLoopback() {
+		return remoteHost
+	}
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		if address := net.ParseIP(strings.TrimSpace(forwarded[index])); address != nil {
+			return address.String()
+		}
+	}
+	if address := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); address != nil {
+		return address.String()
+	}
+	return remoteHost
 }
 
 func authorized(header, expected string) bool {

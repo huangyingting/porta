@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -28,14 +27,15 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Capsule-Protocol: ?1 is required", http.StatusBadRequest)
 		return
 	}
-	if !authorized(r.Header.Get("Authorization"), c.Token) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 	clientID := r.Header.Get("X-HTun-Client-ID")
 	if !validClientID.MatchString(clientID) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
+		return
+	}
+	if !c.authorizedClient(r.Header.Get("Authorization"), clientID) {
+		c.Metrics.authenticationFailed()
+		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -47,6 +47,8 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	defer c.Pool.Release(lease)
 	session, sessionCtx := c.Router.Register(r.Context(), lease.Address)
 	defer session.Close()
+	c.Metrics.connected()
+	defer c.Metrics.disconnected()
 
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 	w.Header().Set("Cache-Control", "no-store")
@@ -56,7 +58,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 
-	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+	remoteHost := clientAddress(r, c.TrustProxyHeaders)
 	transportName := "masque-h2-capsule"
 	var stream *http3.Stream
 	useDatagrams := false
@@ -82,7 +84,6 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	} else {
 		flush(w)
 	}
-
 	c.Logger.Info("tunnel connected", "client_id", clientID, "address", lease.Address, "transport", transportName, "remote", remoteHost)
 	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
 
@@ -108,6 +109,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 				}
 				flush(w)
 			}
+			c.Metrics.sentToClient()
 		case err := <-inboundDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				c.Logger.Warn("MASQUE receive stopped", "client_id", clientID, "error", err)
@@ -268,7 +270,11 @@ func (c HandlerConfig) injectMasquePacket(ctx context.Context, address netip.Add
 	if _, err := protocol.ParseIPv4(packet); err != nil {
 		return err
 	}
-	return c.Router.Inject(ctx, address, packet)
+	if err := c.Router.Inject(ctx, address, packet); err != nil {
+		return err
+	}
+	c.Metrics.receivedFromClient()
+	return nil
 }
 
 func isConnectIP(r *http.Request) bool {

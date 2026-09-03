@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClientTLSConfigThumbprint(t *testing.T) {
@@ -50,5 +51,14 @@ func TestParseThumbprintWithSeparators(t *testing.T) {
 	}
 	if len(got) != sha256.Size {
 		t.Fatalf("decoded thumbprint length = %d, want %d", len(got), sha256.Size)
+	}
+}
+
+func TestReconnectDelay(t *testing.T) {
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 5 * time.Second}
+	for index, expected := range want {
+		if got := reconnectDelay(index, 5*time.Second); got != expected {
+			t.Fatalf("delay %d = %s, want %s", index, got, expected)
+		}
 	}
 }

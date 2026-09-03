@@ -1,4 +1,4 @@
-GO ?= /usr/local/go/bin/go
+GO ?= go
 
 .PHONY: test test-race vet build build-windows android clean
 

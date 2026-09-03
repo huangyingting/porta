@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"testing"
 
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme"
+	"golang.org/x/net/http2"
 )
 
 func TestServerTLSConfigACME(t *testing.T) {
@@ -56,6 +62,65 @@ func TestServerTLSConfigRejectsInvalidACMEOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProxyBackendHandlerServesH2C(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: proxyBackendHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "%d", r.ProtoMajor)
+	}))}
+	go func() {
+		if serveErr := server.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			t.Errorf("serve h2c backend: %v", serveErr)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = server.Shutdown(context.Background())
+	})
+
+	transport := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, address string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		},
+	}
+	response, err := transport.RoundTrip(mustRequest(t, "http://"+listener.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "2" {
+		t.Fatalf("backend protocol = %q, want HTTP/2", body)
+	}
+}
+
+func TestValidateProxyListenAddress(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:8443", "[::1]:8443", "localhost:8443"} {
+		if err := validateProxyListenAddress(address); err != nil {
+			t.Fatalf("%s rejected: %v", address, err)
+		}
+	}
+	for _, address := range []string{":8443", "0.0.0.0:8443", "10.0.0.4:8443", "invalid"} {
+		if err := validateProxyListenAddress(address); err == nil {
+			t.Fatalf("%s accepted", address)
+		}
+	}
+}
+
+func mustRequest(t *testing.T, url string) *http.Request {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
 }
 
 func contains(values []string, target string) bool {

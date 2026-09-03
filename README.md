@@ -18,6 +18,9 @@ before deployment.
 - HTTP/2 and HTTP/3-without-Datagram fallback using RFC 9297 DATAGRAM capsules
 - Bearer authentication, per-client IPv4 `/32` leases, and source validation
 - One Linux TUN interface with bounded per-client receive queues
+- Durable per-client lease state across planned gateway restarts
+- Per-device credentials with an optional migration fallback token
+- Authenticated Prometheus metrics
 - Windows Wintun client plus explicit route setup/teardown scripts
 - Android HTTP/2 `VpnService` client using protected sockets
 - Backward-compatible private stream protocol for Android and older clients
@@ -58,6 +61,7 @@ port 443:
 
 ```sh
 export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
+export HTUN_METRICS_TOKEN="use-a-different-random-secret"
 sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
   --listen :443 \
   --acme-domain vpn.example.com \
@@ -69,6 +73,20 @@ sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
   --dns 1.1.1.1 \
   --mtu 1300
 ```
+
+For per-device revocation, create a root-readable credential file containing
+one stable client ID and token per line:
+
+```text
+android-phone=replace-with-a-random-device-secret
+windows-laptop=replace-with-another-random-device-secret
+```
+
+Start the server with `--client-token-file /etc/htun/clients`. A listed client
+must use its own token; the global `HTUN_TOKEN` remains a fallback only for
+unlisted clients during migration. Remove `HTUN_TOKEN` after every active
+client has an entry to enforce device-only authentication. Rotate or revoke a
+credential by replacing or removing its line and restarting hTun.
 
 The daemon creates `htun0`, but deliberately does not modify forwarding or
 firewall state. In another root shell, after reviewing the script, configure
@@ -82,8 +100,12 @@ Open both TCP and UDP port 443 at the host and cloud firewalls. Tear down only
 the nftables table owned by this project with:
 
 ```sh
-sudo ./scripts/server-down.sh htun0
+sudo ./scripts/server-down.sh htun0 eth0
 ```
+
+When Docker's `DOCKER-USER` chain is present, the setup script also installs
+the two forwarding exceptions required for `htun0`. Passing the external
+interface to the teardown script removes those exceptions.
 
 The current Go HTTP/2 implementation gates Extended CONNECT behind the
 official `GODEBUG=http2xconnect=1` compatibility switch. `htun-server` detects
@@ -99,6 +121,110 @@ first TLS request for the configured domain, and renewal is automatic.
 For production, use a service manager, an unprivileged process with narrowly
 scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
+
+### Behind a reverse proxy
+
+Use `--behind-proxy` when a reverse proxy such as Caddy terminates TLS and
+manages the public certificate. hTun then serves plaintext HTTP/2 (h2c) on its
+TCP listener and does not start ACME, TLS, or HTTP/3 listeners. Bind the
+backend to loopback so it cannot be reached directly:
+
+```sh
+export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
+sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
+  --behind-proxy \
+  --listen 127.0.0.1:8443 \
+  --interface htun0 \
+  --pool 10.66.0.0/24 \
+  --dns 1.1.1.1 \
+  --mtu 1300
+```
+
+Proxy the domain to that h2c backend and disable response buffering:
+
+```caddyfile
+vpn.example.com {
+  header Strict-Transport-Security "max-age=31536000"
+  log
+
+  @metrics path /metrics
+  respond @metrics 404
+
+  reverse_proxy h2c://127.0.0.1:8443 {
+    flush_interval -1
+  }
+}
+```
+
+The repository includes `deploy/htun.service` for a persistent Linux
+deployment using `eth0` as the external interface:
+
+```sh
+make build
+sudo install -m 0755 bin/htun-server /usr/local/bin/htun-server
+sudo install -d -m 0755 /usr/local/libexec/htun /etc/htun
+sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh /usr/local/libexec/htun/
+{
+  printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
+  printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
+} | sudo tee /etc/htun/htun.env >/dev/null
+sudo install -m 0600 /dev/null /etc/htun/clients
+sudo chmod 0600 /etc/htun/htun.env
+sudo install -m 0644 deploy/htun.service /etc/systemd/system/htun.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now htun
+```
+
+Validate and reload Caddy after adding the site block:
+
+```sh
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+curl https://vpn.example.com/healthz
+```
+
+Operational checks:
+
+```sh
+systemctl status htun
+journalctl -u htun -f
+curl https://vpn.example.com/readyz
+METRICS_TOKEN="$(sudo sed -n 's/^HTUN_METRICS_TOKEN=//p' /etc/htun/htun.env)"
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:8443/metrics
+```
+
+To upgrade, build and install the new server binary, then restart the service.
+Connected Android clients reconnect automatically with bounded backoff. They
+retain the VPN interface when the restarted server assigns the same lease; if
+the lease changes, Android safely replaces the interface and existing flows
+reconnect:
+
+```sh
+make build
+sudo install -m 0755 bin/htun-server /usr/local/bin/htun-server
+sudo systemctl restart htun
+```
+
+Standard HTTP reverse proxies do not preserve MASQUE `CONNECT-IP` or proxy
+QUIC datagrams to the backend. Clients behind Caddy must therefore use the
+HTTP/2 compatibility stream:
+
+```sh
+HTUN_TOKEN="replace-with-the-same-secret" ./bin/htun-client \
+  --server https://vpn.example.com \
+  --transport h2 \
+  --protocol legacy \
+  --client-id my-client
+```
+
+The desktop client keeps its TUN interface open and reconnects an interrupted
+established session with bounded exponential backoff. It exits if the server
+assigns a different lease or MTU because existing operating-system routes
+would no longer be valid. Use `--reconnect=false` to retain one-shot behavior
+or `--reconnect-max-delay` to change the retry ceiling. Initial configuration
+or authentication failures still return immediately.
+
+Run hTun directly when HTTP/3 or standards-based MASQUE transport is required.
 
 ## Windows client
 
@@ -169,9 +295,38 @@ make android
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Enter an `https://` gateway origin, bearer token, and stable client ID, then
-approve Android's VPN prompt. The token is passed directly to the private
-service and is not saved in preferences.
+For the deployed test gateway, enter:
+
+- Gateway: `https://htun.i-csu.org`
+- Token: the value after `HTUN_TOKEN=` in `/etc/htun/htun.env` on the server
+- Client ID: a stable unique value such as `android-phone`
+
+Tap **Connect over HTTP/2**, approve Android's VPN prompt, and allow
+notifications if prompted. The status should change to
+`Connected over HTTP/2`. By default, the token is passed directly to the
+private service and cleared from the UI without persistence. Enable **Remember
+token securely** to encrypt it with a non-exportable Android Keystore key.
+Enable **Reconnect after device restart** only when unattended boot recovery
+is desired; Android must already have granted this app VPN permission.
+Disabling secure storage removes the encrypted token and disables boot
+reconnect. Retrieve the fallback token on the server when needed with:
+
+```sh
+sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
+```
+
+Tap **Disconnect** before uninstalling the app or switching to another VPN.
+If the network or server is temporarily unavailable, the app keeps the VPN
+interface active and reconnects with a delay that grows from about one second
+to a maximum of about 31 seconds. Authentication failures and invalid gateway
+responses stop immediately instead of retrying forever.
+
+With a device attached and an active hTun connection, exercise repeated Wi-Fi
+loss and recovery:
+
+```sh
+./scripts/android-soak.sh 20
+```
 
 The debug build trusts system and user-installed certificate authorities to
 support local testing. The release build trusts only the Android system trust
@@ -180,16 +335,46 @@ HTTP/2 compatibility stream because OkHttp cannot construct an Extended
 CONNECT `:protocol=connect-ip` request. A future Cronet or native QUIC transport
 can use the same MASQUE capsule and Datagram formats as the desktop client.
 
+For a signed release APK, provide signing credentials through environment
+variables and build the release variant:
+
+```sh
+export HTUN_ANDROID_KEYSTORE=/secure/path/htun-release.jks
+export HTUN_ANDROID_KEYSTORE_PASSWORD='...'
+export HTUN_ANDROID_KEY_ALIAS=htun
+export HTUN_ANDROID_KEY_PASSWORD='...'
+cd android
+./gradlew testDebugUnitTest assembleRelease
+```
+
+Do not commit the keystore or passwords. Prefer managed Play App Signing for
+public distribution and protect the upload key separately.
+
+GitHub Actions runs Go tests, race detection, vet, cross-platform builds, and
+Android builds on pushes and pull requests. Tags matching `v*` create a GitHub
+release. Configure these repository Actions secrets before tagging:
+
+- `HTUN_ANDROID_KEYSTORE_BASE64`
+- `HTUN_ANDROID_KEYSTORE_PASSWORD`
+- `HTUN_ANDROID_KEY_ALIAS`
+- `HTUN_ANDROID_KEY_PASSWORD`
+
 ## Protocol endpoints
 
 - `GET /healthz` is unauthenticated and returns only `{"status":"ok"}`.
+- `GET /readyz` is unauthenticated and reports that the initialized gateway
+  handler is ready to accept tunnel requests.
+- `GET /metrics` is enabled only when `HTUN_METRICS_TOKEN` is set and requires
+  that separate bearer token. Keep it blocked at the public reverse proxy and
+  scrape the loopback h2c backend.
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
   template for unrestricted IPv4 proxying. It requires `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.
 - `POST /v1/tunnel` is the authenticated private compatibility protocol used
   by the current Android client.
-- A reconnect using the same client ID reuses its lease and replaces the older
-  stream.
+- A reconnect using the same client ID reuses its retained lease and replaces
+  the older stream. When the pool is full, the oldest inactive lease is
+  reclaimed for a new client.
 
 RFC 9484 does not standardize DNS or link-MTU configuration. hTun sends these
 as optional `X-HTun-DNS` and `X-HTun-MTU` response extensions. The default MTU
@@ -197,5 +382,6 @@ is 1300 to leave room for QUIC, UDP, IP, and TLS overhead.
 
 Logs contain client IDs, tunnel addresses, remote IPs, and transport names, but
 never intentionally contain bearer tokens or packet contents. IPv6 assignment,
-configurable split routing, multi-user identity, automatic roaming, and
-kill-switch policy are not implemented in this MVP.
+configurable split routing, multi-instance HA, native Android MASQUE, and
+kill-switch policy require the coordinated architecture phases described in
+`docs/architecture.md`.

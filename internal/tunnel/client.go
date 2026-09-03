@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -175,12 +174,12 @@ func dialLegacy(ctx context.Context, config Config) (*Conn, error) {
 	}
 
 	if response.StatusCode != http.StatusOK {
-		defer response.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		status := response.Status
 		cancel()
 		_ = writer.Close()
+		_ = response.Body.Close()
 		_ = closer.Close()
-		return nil, fmt.Errorf("gateway returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("gateway returned %s", status)
 	}
 	lease, err := parseLease(response.Header)
 	if err != nil {
