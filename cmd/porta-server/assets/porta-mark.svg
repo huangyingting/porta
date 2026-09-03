@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Porta">
+  <rect width="48" height="48" rx="14" fill="#171923"/>
+  <path d="M14 35V22c0-7.4 4.2-12 10-12s10 4.6 10 12v13" fill="none" stroke="#73D9D0" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M24 18v17" fill="none" stroke="#7165F4" stroke-width="4.5" stroke-linecap="round"/>
+  <circle cx="24" cy="18" r="2.25" fill="#F8F8FC"/>
+</svg>

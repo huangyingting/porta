@@ -956,7 +956,7 @@ class TunnelService : VpnService() {
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle(currentProfileName ?: "Porta")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setSmallIcon(R.drawable.ic_porta_status)
             .setOngoing(true)
             .setContentIntent(openApp)
             .addAction(

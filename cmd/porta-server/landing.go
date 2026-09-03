@@ -11,6 +11,7 @@ const landingHTML = `<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f5f6fa">
+  <link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml">
   <title>Porta · Digital product studio</title>
   <style>
     @font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-style:normal;font-weight:200 900;font-display:swap}
@@ -19,7 +20,7 @@ const landingHTML = `<!doctype html>
     body:before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at 74% 12%,rgba(116,216,208,.24),transparent 25rem),radial-gradient(circle at 12% 84%,rgba(109,94,246,.13),transparent 32rem)}
     .page{position:relative;width:min(1120px,calc(100% - 40px));min-height:100vh;margin:auto;display:grid;grid-template-rows:auto 1fr auto}
     header{height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}
-    .brand{display:flex;align-items:center;gap:12px;font-size:15px;font-weight:760;letter-spacing:-.025em}.brand-mark{position:relative;width:32px;height:32px;border-radius:10px;background:#171a27;box-shadow:0 8px 22px rgba(23,26,39,.16)}.brand-mark:after{content:"";position:absolute;width:10px;height:10px;right:5px;top:5px;border-radius:50%;background:linear-gradient(135deg,var(--aqua),#b8f3e5)}
+    .brand{display:flex;align-items:center;gap:12px;font-size:15px;font-weight:760;letter-spacing:-.025em}.brand-mark{width:32px;height:32px;filter:drop-shadow(0 8px 11px rgba(23,26,39,.16))}
     nav{display:flex;align-items:center;gap:24px;color:#747987;font-size:12px}.availability{display:flex;align-items:center;gap:8px;padding:7px 11px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.56);color:#4f5564}.availability:before{content:"";width:7px;height:7px;border-radius:50%;background:#44bf87;box-shadow:0 0 0 4px rgba(68,191,135,.12)}
     main{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(350px,.95fr);gap:clamp(42px,6vw,78px);align-items:center;padding:36px 0}
     .copy{max-width:720px}.eyebrow{display:flex;align-items:center;gap:12px;color:#707584;font-size:11px;font-weight:750;letter-spacing:.17em;text-transform:uppercase}.eyebrow:before{content:"";width:34px;height:1px;background:#9ba0ad}
@@ -39,7 +40,7 @@ const landingHTML = `<!doctype html>
 <body>
   <div class="page">
     <header>
-      <div class="brand"><span class="brand-mark"></span>Porta</div>
+      <div class="brand"><img class="brand-mark" src="/assets/porta-mark.svg" alt="">Porta</div>
       <nav><span>Selected work</span><span class="availability"><span>Available for new projects</span></span></nav>
     </header>
     <main>
@@ -64,6 +65,9 @@ const landingHTML = `<!doctype html>
 func publicSiteHandler(next http.Handler, landingEnabled bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if serveWebFont(w, r) {
+			return
+		}
+		if serveBrandAsset(w, r) {
 			return
 		}
 		if isOperationalPath(r.URL.Path) {
@@ -92,12 +96,10 @@ func isOperationalPath(path string) bool {
 
 func serveLandingPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; font-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	switch r.URL.Path {
-	case "/favicon.ico":
-		w.WriteHeader(http.StatusNoContent)
 	case "/robots.txt":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if r.Method == http.MethodGet {

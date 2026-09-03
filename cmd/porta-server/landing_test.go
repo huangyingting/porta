@@ -41,6 +41,9 @@ func TestPublicSiteServesPortaLandingPage(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `font-family:"Mona Sans"`) {
 		t.Fatal("landing page does not use the bundled Mona Sans font")
 	}
+	if !strings.Contains(response.Body.String(), `src="/assets/porta-mark.svg"`) {
+		t.Fatal("landing page does not use the Porta mark")
+	}
 	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "font-src 'self'") {
 		t.Fatalf("landing CSP = %q", policy)
 	}
@@ -105,6 +108,27 @@ func TestAdminSiteServesBundledFont(t *testing.T) {
 	}
 	if response.Header().Get("Content-Length") != strconv.Itoa(len(monaSans)) {
 		t.Fatalf("font Content-Length = %q", response.Header().Get("Content-Length"))
+	}
+}
+
+func TestWebSitesServePortaMark(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), "bootstrap-token-0123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers := []http.Handler{
+		publicSiteHandler(http.NotFoundHandler(), true),
+		adminHandler(http.NotFoundHandler(), registry, "admin-token-01234567890123456789"),
+	}
+	for _, handler := range handlers {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, portaMarkPath, nil))
+		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "image/svg+xml" {
+			t.Fatalf("mark response = %d %q", response.Code, response.Header().Get("Content-Type"))
+		}
+		if response.Body.Len() != len(portaMark) {
+			t.Fatalf("mark length = %d, want %d", response.Body.Len(), len(portaMark))
+		}
 	}
 }
 

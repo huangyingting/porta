@@ -32,6 +32,9 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if serveWebFont(w, r) {
 		return
 	}
+	if serveBrandAsset(w, r) {
+		return
+	}
 	if r.Method == http.MethodGet && isOperationalPath(r.URL.Path) {
 		a.next.ServeHTTP(w, r)
 		return
