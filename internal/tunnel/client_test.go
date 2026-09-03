@@ -24,59 +24,6 @@ import (
 
 const testToken = "0123456789abcdef0123456789abcdef"
 
-func TestHTTP2LegacyPacketRoundTrip(t *testing.T) {
-	handler, router, dev := testGateway(t, false)
-	server := httptest.NewUnstartedServer(handler)
-	server.EnableHTTP2 = true
-	if err := http2.ConfigureServer(server.Config, &http2.Server{}); err != nil {
-		t.Fatal(err)
-	}
-
-	server.StartTLS()
-	t.Cleanup(server.Close)
-
-	testPacketRoundTrip(t, router, dev, tunnel.Config{
-		URL:       server.URL,
-		Token:     testToken,
-		ClientID:  "h2-test",
-		Transport: tunnel.TransportHTTP2,
-		Protocol:  tunnel.ProtocolLegacy,
-		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
-		Timeout:   3 * time.Second,
-	})
-}
-
-func TestHTTP2LegacyAuthenticationFailureDoesNotWaitForResponseEOF(t *testing.T) {
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	}))
-	server.EnableHTTP2 = true
-	if err := http2.ConfigureServer(server.Config, &http2.Server{}); err != nil {
-		t.Fatal(err)
-	}
-	server.StartTLS()
-	t.Cleanup(server.Close)
-
-	started := time.Now()
-	_, err := tunnel.Dial(context.Background(), tunnel.Config{
-		URL:       server.URL,
-		Token:     "wrong-token-0123456789",
-		ClientID:  "invalid-auth-test",
-		Transport: tunnel.TransportHTTP2,
-		Protocol:  tunnel.ProtocolLegacy,
-		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
-		Timeout:   time.Second,
-	})
-	if err == nil || !strings.Contains(err.Error(), "401") {
-		t.Fatalf("authentication error = %v, want HTTP 401", err)
-	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("authentication failure took %s", elapsed)
-	}
-}
-
 func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
 	if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
 		t.Skip("set GODEBUG=http2xconnect=1 to exercise HTTP/2 Extended CONNECT")
@@ -95,7 +42,6 @@ func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
 		Token:     testToken,
 		ClientID:  "h2-masque-test",
 		Transport: tunnel.TransportHTTP2,
-		Protocol:  tunnel.ProtocolMasque,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
 		Timeout:   3 * time.Second,
 	})

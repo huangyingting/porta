@@ -50,8 +50,8 @@ class TunnelService : VpnService() {
     private val descriptor = AtomicReference<ParcelFileDescriptor?>()
     private val selectedNetwork = AtomicReference<Network?>()
     private val outboundPackets = ArrayBlockingQueue<ByteArray>(512)
-    private val legacyCalls = ConcurrentHashMap.newKeySet<Call>()
-    private val legacyLaneQueues = AtomicReference<List<ArrayBlockingQueue<ByteArray>>?>()
+    private val http2Calls = ConcurrentHashMap.newKeySet<Call>()
+    private val http2LaneQueues = AtomicReference<List<ArrayBlockingQueue<ByteArray>>?>()
     private val queueRoutingLock = Any()
     private val nativeSession = AtomicReference<Session?>()
     private val nativeDialer = AtomicReference<Dialer?>()
@@ -180,31 +180,16 @@ class TunnelService : VpnService() {
                         if (!isRunActive(runGeneration)) break
                         Log.i(TAG, "HTTP/3 MASQUE unavailable; falling back to HTTP/2")
                         logEvent("HTTP/3 unavailable; trying encrypted HTTP/2 fallback")
-                        try {
-                            connectLegacyOnce(
-                                client,
-                                server,
-                                token,
-                                clientId,
-                                attemptActive,
-                                vpnReady,
-                                runGeneration,
-                            ) {
-                                attemptConnectedAt = System.currentTimeMillis()
-                            }
-                        } catch (_: MultiLaneUnavailableException) {
-                            logEvent("Gateway does not support multiple HTTP/2 lanes; using one compatibility lane")
-                            connectSingleLegacyOnce(
-                                client,
-                                server,
-                                token,
-                                clientId,
-                                attemptActive,
-                                vpnReady,
-                                runGeneration,
-                            ) {
-                                attemptConnectedAt = System.currentTimeMillis()
-                            }
+                        connectHttp2Once(
+                            client,
+                            server,
+                            token,
+                            clientId,
+                            attemptActive,
+                            vpnReady,
+                            runGeneration,
+                        ) {
+                            attemptConnectedAt = System.currentTimeMillis()
                         }
                     }
                 } catch (error: PermanentTunnelException) {
@@ -378,7 +363,7 @@ class TunnelService : VpnService() {
         }
     }
 
-    private fun connectLegacyOnce(
+    private fun connectHttp2Once(
         client: OkHttpClient,
         server: String,
         token: String,
@@ -403,7 +388,7 @@ class TunnelService : VpnService() {
         val sessionCalls = ConcurrentHashMap.newKeySet<Call>()
         val laneThreads = laneClients.mapIndexed { laneIndex, laneClient ->
             Thread({
-                runLegacyLane(
+                runHttp2Lane(
                     laneClient,
                     server,
                     token,
@@ -438,10 +423,10 @@ class TunnelService : VpnService() {
             if (!lanesActive.get()) throw IOException("HTTP/2 fallback lane stopped during setup")
             val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
             synchronized(queueRoutingLock) {
-                if (legacyLaneQueues.get() != null) {
+                if (http2LaneQueues.get() != null) {
                     throw IOException("Another HTTP/2 fallback session is active")
                 }
-                legacyLaneQueues.set(laneQueues)
+                http2LaneQueues.set(laneQueues)
                 while (true) {
                     val packet = outboundPackets.poll() ?: break
                     offerLatest(laneQueues[http2PacketLane(packet, laneQueues.size)], packet)
@@ -494,8 +479,8 @@ class TunnelService : VpnService() {
             }
             laneClients.forEach { it.connectionPool.evictAll() }
             synchronized(queueRoutingLock) {
-                if (legacyLaneQueues.get() === laneQueues) {
-                    legacyLaneQueues.set(null)
+                if (http2LaneQueues.get() === laneQueues) {
+                    http2LaneQueues.set(null)
                     if (isRunActive(runGeneration)) {
                         laneQueues.forEach { queue ->
                             while (true) {
@@ -511,7 +496,7 @@ class TunnelService : VpnService() {
         }
     }
 
-    private fun runLegacyLane(
+    private fun runHttp2Lane(
         client: OkHttpClient,
         server: String,
         token: String,
@@ -543,7 +528,7 @@ class TunnelService : VpnService() {
             .build()
         val activeCall = client.newCall(request)
         attemptCall.set(activeCall)
-        legacyCalls.add(activeCall)
+        http2Calls.add(activeCall)
         sessionCalls.add(activeCall)
         try {
             activeCall.execute().use { response ->
@@ -561,7 +546,7 @@ class TunnelService : VpnService() {
                     response.header(HEADER_LANE_INDEX) != laneIndex.toString() ||
                     response.header(HEADER_LANE_COUNT) != HTTP2_LANE_COUNT.toString()
                 ) {
-                    throw MultiLaneUnavailableException()
+                    throw PermanentTunnelException("Gateway rejected HTTP/2 lane negotiation")
                 }
 
                 val configuration = parseVpnConfiguration(
@@ -599,78 +584,8 @@ class TunnelService : VpnService() {
         } finally {
             requestBody.stop()
             activeCall.cancel()
-            legacyCalls.remove(activeCall)
+            http2Calls.remove(activeCall)
             sessionCalls.remove(activeCall)
-        }
-    }
-
-    private fun connectSingleLegacyOnce(
-        client: OkHttpClient,
-        server: String,
-        token: String,
-        clientId: String,
-        attemptActive: AtomicBoolean,
-        vpnReady: CountDownLatch,
-        runGeneration: Long,
-        onConnected: () -> Unit,
-    ) {
-        val attemptCall = AtomicReference<Call?>()
-        val requestBody = TunRequestBody(
-            attemptActive,
-            vpnReady,
-            attemptCall,
-            outboundPackets,
-            runGeneration,
-        )
-        val request = Request.Builder()
-            .url(server.trimEnd('/') + "/v1/tunnel")
-            .header("Authorization", "Bearer $token")
-            .header("X-HTun-Version", PacketFraming.VERSION)
-            .header("X-HTun-Client-ID", clientId)
-            .post(requestBody)
-            .build()
-        val activeCall = client.newCall(request)
-        attemptCall.set(activeCall)
-        legacyCalls.add(activeCall)
-        try {
-            activeCall.execute().use { response ->
-                if (!response.isSuccessful) {
-                    val message = "Gateway returned HTTP ${response.code}"
-                    if (response.code in 400..499 && response.code !in RETRYABLE_HTTP_CODES) {
-                        throw PermanentTunnelException(message)
-                    }
-                    throw IOException(message)
-                }
-                if (response.protocol != Protocol.HTTP_2) {
-                    throw PermanentTunnelException("Gateway did not negotiate HTTP/2")
-                }
-                configureVpn(
-                    response.header("X-HTun-Address"),
-                    response.header("X-HTun-DNS"),
-                    response.header("X-HTun-MTU"),
-                    runGeneration,
-                )
-                val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
-                vpnReady.countDown()
-                onConnected()
-                val responseBody = response.body ?: throw IOException("Gateway returned no response stream")
-                logEvent("Connected using one encrypted HTTP/2 compatibility lane")
-                sendStatus("Connected over HTTP/2")
-                updateNotification("Connected over HTTP/2")
-                val source = responseBody.source()
-                while (isRunActive(runGeneration) && attemptActive.get()) {
-                    val packet = PacketFraming.read(source) ?: continue
-                    tunnelOutput.write(packet)
-                    if (isRunActive(runGeneration)) {
-                        downloadedBytes.addAndGet(packet.size.toLong())
-                    }
-                }
-                if (isRunActive(runGeneration)) throw IOException("Gateway closed the tunnel")
-            }
-        } finally {
-            requestBody.stop()
-            activeCall.cancel()
-            legacyCalls.remove(activeCall)
         }
     }
 
@@ -737,7 +652,7 @@ class TunnelService : VpnService() {
                     if (!isAssignedIPv4Packet(buffer, count, sourceAddress)) continue
                     val packet = buffer.copyOf(count)
                     synchronized(queueRoutingLock) {
-                        val lanes = legacyLaneQueues.get()
+                        val lanes = http2LaneQueues.get()
                         val queue = if (lanes == null) {
                             outboundPackets
                         } else {
@@ -853,9 +768,9 @@ class TunnelService : VpnService() {
 
     @Synchronized
     private fun stopTunnel(message: String) {
-        if (!running.getAndSet(false) && descriptor.get() == null && legacyCalls.isEmpty()) return
+        if (!running.getAndSet(false) && descriptor.get() == null && http2Calls.isEmpty()) return
         generation.incrementAndGet()
-        legacyCalls.forEach(Call::cancel)
+        http2Calls.forEach(Call::cancel)
         closeNativeDialer()
         closeNativeSession()
         worker?.interrupt()
@@ -878,7 +793,7 @@ class TunnelService : VpnService() {
     private fun finishTunnel(runGeneration: Long, startId: Int, message: String) {
         if (generation.get() != runGeneration) return
         running.set(false)
-        legacyCalls.forEach(Call::cancel)
+        http2Calls.forEach(Call::cancel)
         closeNativeDialer()
         closeNativeSession()
         stopStatsWorker()
@@ -1119,7 +1034,6 @@ class TunnelService : VpnService() {
 
     private class PermanentTunnelException(message: String) : Exception(message)
     private class NativeTransportUnavailableException(message: String) : Exception(message)
-    private class MultiLaneUnavailableException : Exception()
 }
 
 internal data class TrafficSnapshot(

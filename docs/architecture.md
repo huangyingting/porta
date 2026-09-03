@@ -11,7 +11,7 @@ its protocol fingerprint.
 ```text
 Windows Wintun                 Android VpnService
        |                               |
-MASQUE CONNECT-IP              legacy hTun v1 stream
+MASQUE CONNECT-IP              four-lane hTun stream
        |                               |
   +----+-------------------------------+
   |                                    |
@@ -77,19 +77,19 @@ with this setting if it is absent. Tests set it before process startup.
   default protocol.
 - Android uses `VpnService` with a native Go HTTP/3 MASQUE bridge. The UDP
   socket is protected from the VPN routing loop and bound to Android's selected
-  underlying network. HTTP/2 remains an automatic compatibility fallback.
+  underlying network. Four-lane HTTP/2 remains an automatic fallback.
   Named server profiles and their tokens are stored locally, with tokens
   encrypted by Android Keystore.
 
-## Compatibility protocol
+## Android HTTP/2 fallback
 
-The older protocol uses the private media type
+The Android fallback uses the private media type
 `application/x-htun-packets` and two-byte length-prefixed IPv4 packets over
 `POST /v1/tunnel`. Android opens four independent HTTP/2 connections for this
 fallback, reserves lane zero for DNS, and consistently distributes other IP
 flows across three data lanes. Each lane has its own TCP loss domain, reducing
-but not eliminating TCP head-of-line blocking. It remains tested but is no
-longer the desktop default.
+but not eliminating TCP head-of-line blocking. All four lanes are mandatory;
+the gateway rejects headerless or partial single-lane requests.
 
 ## Production evolution
 

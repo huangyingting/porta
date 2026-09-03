@@ -35,7 +35,6 @@ func main() {
 func run() error {
 	serverURL := flag.String("server", "", "gateway origin, for example https://vpn.example.com:8443")
 	transportName := flag.String("transport", "h3", "tunnel transport: h3 or h2")
-	protocolName := flag.String("protocol", "masque", "tunnel protocol: masque or legacy")
 	interfaceName := flag.String("interface", defaultInterfaceName(), "TUN interface name")
 	clientID := flag.String("client-id", defaultClientID(), "stable client identifier")
 	caPath := flag.String("ca", "", "optional PEM CA certificate")
@@ -65,7 +64,6 @@ func run() error {
 		Token:     token,
 		ClientID:  *clientID,
 		Transport: tunnel.Transport(*transportName),
-		Protocol:  tunnel.Protocol(*protocolName),
 		TLSConfig: tlsConfig,
 		Timeout:   15 * time.Second,
 	}
@@ -86,7 +84,7 @@ func run() error {
 		"dns", connection.Lease.DNS,
 		"mtu", connection.Lease.MTU,
 		"transport", *transportName,
-		"protocol", *protocolName,
+		"protocol", "masque",
 	}
 	if connection.Lease.Gateway.IsValid() {
 		attributes = append(attributes, "gateway", connection.Lease.Gateway)

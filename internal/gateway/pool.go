@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"sync"
 )
 
@@ -231,25 +230,6 @@ func (p *Pool) loadState() error {
 		return fmt.Errorf("decode lease state: %w", err)
 	}
 	switch header.Version {
-	case 1:
-		var legacy struct {
-			Leases map[string]string `json:"leases"`
-		}
-		if err := json.Unmarshal(data, &legacy); err != nil {
-			return fmt.Errorf("decode legacy lease state: %w", err)
-		}
-		clientIDs := make([]string, 0, len(legacy.Leases))
-		for clientID := range legacy.Leases {
-			clientIDs = append(clientIDs, clientID)
-		}
-		sort.Strings(clientIDs)
-		for _, clientID := range clientIDs {
-			p.nextGen++
-			if err := p.restoreLease(clientID, legacy.Leases[clientID], p.nextGen); err != nil {
-				return err
-			}
-		}
-		return nil
 	case 2:
 		var state poolState
 		if err := json.Unmarshal(data, &state); err != nil {

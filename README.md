@@ -24,14 +24,13 @@ traffic and cannot promise to be undetectable. Read
 - Authenticated Prometheus metrics
 - Neutral browser cover page for ordinary public HTTP requests
 - Windows Wintun client plus explicit route setup/teardown scripts
-- Android native HTTP/3 MASQUE `VpnService` client with HTTP/2 fallback
-- Backward-compatible private stream protocol for Android and older clients
+- Android native HTTP/3 MASQUE `VpnService` client with four-lane HTTP/2 fallback
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
 
-Desktop clients use MASQUE by default. The older `POST /v1/tunnel` protocol is
-retained behind `--protocol legacy` because OkHttp does not expose the HTTP/2
-Extended CONNECT pseudo-header required by `CONNECT-IP`. Details are in
-[the architecture document](docs/architecture.md).
+Desktop clients use MASQUE exclusively. Android uses MASQUE over HTTP/3 when
+available and a required four-lane `POST /v1/tunnel` transport over HTTP/2
+because OkHttp does not expose the Extended CONNECT pseudo-header required by
+`CONNECT-IP`. Details are in [the architecture document](docs/architecture.md).
 
 ## Build and test
 
@@ -306,16 +305,9 @@ sudo systemctl restart htun
 ```
 
 Standard HTTP reverse proxies do not preserve MASQUE `CONNECT-IP` or proxy
-QUIC datagrams to the backend. Clients behind a reverse proxy must therefore
-use the HTTP/2 compatibility stream:
-
-```sh
-HTUN_TOKEN="replace-with-the-same-secret" ./bin/htun-client \
-  --server https://vpn.example.com \
-  --transport h2 \
-  --protocol legacy \
-  --client-id my-client
-```
+QUIC datagrams to the backend. Android can use its four-lane HTTP/2 fallback
+through a proxy that streams request and response bodies without buffering.
+Desktop clients require direct standards-based MASQUE connectivity.
 
 The desktop client keeps its TUN interface open and reconnects an interrupted
 established session with bounded exponential backoff. It exits if the server
@@ -337,7 +329,6 @@ $env:HTUN_TOKEN = "replace-with-the-same-secret"
 ./htun-client-windows-amd64.exe `
   --server https://vpn.example.com:8443 `
   --transport h3 `
-  --protocol masque `
   --interface hTun `
   --client-id my-windows-pc
 ```
@@ -375,8 +366,8 @@ the script preserves a host route to it before adding VPN routes:
 ```
 
 If UDP is unavailable, change the client to `--transport h2`; it will keep
-using MASQUE and carry IP packets in DATAGRAM capsules. `--protocol legacy` is
-only a compatibility option. Remove client routes and DNS settings with:
+using MASQUE and carry IP packets in DATAGRAM capsules. Remove client routes
+and DNS settings with:
 
 ```powershell
 ./scripts/windows-down.ps1 -InterfaceAlias hTun
@@ -406,8 +397,8 @@ Save the profile and use its switch to connect or disconnect. Approve Android's
 VPN prompt and allow notifications if prompted. The app first connects with
 native HTTP/3 MASQUE over UDP 8443. The status changes to
 `Connected over HTTP/3 MASQUE`. If UDP or HTTP/3 is
-unavailable, it automatically falls back to the HTTP/2 compatibility transport
-over TCP 8443. The fallback opens four independent TCP connections, reserves
+unavailable, it automatically falls back to the four-lane HTTP/2 transport over
+TCP 8443. The fallback opens four independent TCP connections, reserves
 one lane for DNS, and hashes other flows across the remaining lanes so packet
 loss stalls only one subset of traffic. Authentication, certificate, and
 invalid-configuration failures do not trigger a less secure fallback.
@@ -486,8 +477,8 @@ release. Configure these repository Actions secrets before tagging:
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
   template for unrestricted IPv4 proxying. It requires `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.
-- `POST /v1/tunnel` is the authenticated private compatibility protocol used
-  by Android when HTTP/3 is unavailable.
+- `POST /v1/tunnel` is Android's authenticated four-lane HTTP/2 fallback when
+  HTTP/3 is unavailable. Requests missing valid lane metadata are rejected.
 - A reconnect using the same client ID reuses its retained lease and replaces
   the older stream. When the pool is full, the oldest inactive lease is
   reclaimed for a new client.

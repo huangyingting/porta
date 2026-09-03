@@ -82,8 +82,8 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 
 func TestParseLaneConfig(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, TunnelPath, nil)
-	if config, err := parseLaneConfig(request); err != nil || config != nil {
-		t.Fatalf("empty lane config = %#v, %v", config, err)
+	if _, err := parseLaneConfig(request); err == nil {
+		t.Fatal("missing lane config accepted")
 	}
 
 	request.Header.Set(laneSessionHeader, "session-1234567890")
@@ -100,6 +100,12 @@ func TestParseLaneConfig(t *testing.T) {
 	request.Header.Set(laneIndexHeader, "4")
 	if _, err := parseLaneConfig(request); err == nil {
 		t.Fatal("out-of-range lane index accepted")
+	}
+
+	request.Header.Set(laneIndexHeader, "1")
+	request.Header.Set(laneCountHeader, "2")
+	if _, err := parseLaneConfig(request); err == nil {
+		t.Fatal("non-four-lane configuration accepted")
 	}
 }
 

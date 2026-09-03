@@ -111,13 +111,14 @@ For direct manual server runs, pass `--cover-site=false` to replace the landing
 page with normal API 404 responses. Use `--admin-listen` to change or disable
 the loopback operational listener.
 
-## Reverse-proxy compatibility
+## Reverse proxies
 
 The deployment script deliberately does not edit or reload reverse-proxy
 configuration. When another service owns port 443, deploy hTun with
 `--port 8443`. A reverse proxy may forward HTTP/2 requests to that TLS
-listener for compatibility, but Android and other native MASQUE clients
-should use `https://vpn.example.com:8443` directly so UDP traffic reaches hTun.
+listener for Android's four-lane fallback if it supports unbuffered duplex
+streaming, but native MASQUE clients should use `https://vpn.example.com:8443`
+directly so UDP traffic reaches hTun.
 
 ## Firewall
 
@@ -201,7 +202,7 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org/download/htun-android-0.5.2-debug.apk
+APK:     https://htun.i-csu.org/download/htun-android-0.5.3-debug.apk
 Gateway: https://htun.i-csu.org:8443
 ```
 

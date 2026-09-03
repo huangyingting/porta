@@ -12,7 +12,6 @@ import org.json.JSONObject
 import java.io.IOException
 import java.security.GeneralSecurityException
 import java.security.KeyStore
-import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -65,29 +64,6 @@ internal class VpnProfileStore(private val context: Context) {
         preferences.edit().apply {
             if (profileId == null) remove(KEY_SELECTED_PROFILE) else putString(KEY_SELECTED_PROFILE, profileId)
         }.apply()
-    }
-
-    fun migrateLegacy(defaultClientId: String) {
-        if (preferences.getBoolean(KEY_MIGRATED, false)) return
-        val legacy = SecureTokenStore(context).load()
-        var migrated = legacy == null || profiles().isNotEmpty()
-        if (!migrated && legacy != null) {
-            val profile = VpnProfile(
-                id = UUID.randomUUID().toString(),
-                name = profileName(legacy.server),
-                server = preferredGateway(legacy.server),
-                clientId = legacy.clientId.ifBlank { defaultClientId },
-                token = legacy.token,
-                autoConnect = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
-                    .getBoolean("auto_connect", false),
-            )
-            if (save(profile) && profiles().any { it.id == profile.id }) {
-                select(profile.id)
-                SecureTokenStore(context).clear()
-                migrated = true
-            }
-        }
-        if (migrated) preferences.edit().putBoolean(KEY_MIGRATED, true).apply()
     }
 
     @SuppressLint("ApplySharedPref")
@@ -184,7 +160,6 @@ internal class VpnProfileStore(private val context: Context) {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val KEY_PROFILES = "profiles"
         private const val KEY_SELECTED_PROFILE = "selected_profile"
-        private const val KEY_MIGRATED = "legacy_migrated"
         private const val KEY_ID = "id"
         private const val KEY_NAME = "name"
         private const val KEY_SERVER = "server"

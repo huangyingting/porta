@@ -72,7 +72,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         configureWindow()
         profileStore = VpnProfileStore(this)
-        profileStore.migrateLegacy(Build.MODEL.safeClientId())
         pendingProfileId = savedInstanceState?.getString(STATE_PENDING_PROFILE)
         setContentView(buildContent())
         render(TunnelService.currentStatus())

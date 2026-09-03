@@ -90,7 +90,6 @@ func dial(ctx context.Context, serverURL, token, clientID, remoteIP string, prot
 		Token:      token,
 		ClientID:   clientID,
 		Transport:  tunnel.TransportHTTP3,
-		Protocol:   tunnel.ProtocolMasque,
 		TLSConfig:  &tls.Config{MinVersion: tls.VersionTLS12, ServerName: endpoint.Hostname()},
 		Timeout:    15 * time.Second,
 		PacketConn: packetConn,
@@ -156,7 +155,7 @@ func (s *Session) Close() error {
 }
 
 // IsTransportUnavailable reports whether Dial failed in a way that permits
-// Android to fall back to the legacy HTTP/2 transport.
+// Android to fall back to its multi-lane HTTP/2 transport.
 func IsTransportUnavailable(message string) bool {
 	return strings.HasPrefix(message, transportUnavailablePrefix)
 }
