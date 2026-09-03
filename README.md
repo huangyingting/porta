@@ -54,14 +54,25 @@ The Android debug APK is written to
 
 ## One-click production deployment
 
-For a Linux server where Caddy or another issuer already manages the TLS
-certificate, deploy direct HTTP/2 and HTTP/3 on TCP and UDP 8443 with:
+For a standalone Linux server, deploy direct HTTP/2 and HTTP/3 on TCP and UDP
+443 with automatic Let's Encrypt issuance:
+
+```sh
+sudo ./scripts/deploy.sh \
+  --domain vpn.example.com \
+  --acme-email admin@example.com
+```
+
+Public TCP port 80 must reach hTun for the HTTP-01 challenge. If Caddy or
+another service already owns ports 80 and 443, use its existing certificate
+and choose another direct port:
 
 ```sh
 sudo ./scripts/deploy.sh \
   --domain vpn.example.com \
   --cert /absolute/path/vpn.example.com.crt \
-  --key /absolute/path/vpn.example.com.key
+  --key /absolute/path/vpn.example.com.key \
+  --port 8443
 ```
 
 The command builds and installs hTun, creates credentials on first use,

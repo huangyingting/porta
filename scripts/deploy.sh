@@ -6,15 +6,16 @@ usage() {
 Deploy or upgrade a direct hTun HTTP/2 + HTTP/3 gateway managed by systemd.
 
 Usage:
-  sudo ./scripts/deploy.sh --domain DOMAIN --cert CERTIFICATE --key PRIVATE_KEY [options]
+  sudo ./scripts/deploy.sh --domain DOMAIN [--cert CERTIFICATE --key PRIVATE_KEY] [options]
 
 Required:
   --domain DOMAIN           TLS hostname used by clients
-  --cert PATH               Certificate file managed by Caddy or another issuer
-  --key PATH                Matching private key file
 
 Options:
-  --port PORT               Direct TCP and UDP port (default: 8443)
+  --cert PATH               Certificate managed by Caddy or another issuer
+  --key PATH                Matching private key; required with --cert
+  --acme-email EMAIL        Optional Let's Encrypt account contact
+  --port PORT               Direct TCP and UDP port (default: 443)
   --external-interface IF   Internet-facing interface (auto-detected)
   --tun-interface IF        TUN interface (default: htun0)
   --pool CIDR               Client pool (default: 10.66.0.0/24)
@@ -27,6 +28,10 @@ Options:
 
 The script preserves existing /etc/htun credentials. On a new installation it
 creates random fallback and metrics tokens, but never prints them.
+
+When --cert and --key are omitted, hTun obtains and renews a Let's Encrypt
+certificate using HTTP-01. Public TCP port 80 must reach this server and must
+not already be owned by Caddy or another process.
 EOF
 }
 
@@ -42,7 +47,8 @@ require_value() {
 domain=
 certificate=
 private_key=
-port=8443
+acme_email=
+port=443
 external_interface=
 tun_interface=htun0
 pool=10.66.0.0/24
@@ -57,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --domain) require_value "$@"; domain=$2; shift 2 ;;
     --cert) require_value "$@"; certificate=$2; shift 2 ;;
     --key) require_value "$@"; private_key=$2; shift 2 ;;
+    --acme-email) require_value "$@"; acme_email=$2; shift 2 ;;
     --port) require_value "$@"; port=$2; shift 2 ;;
     --external-interface) require_value "$@"; external_interface=$2; shift 2 ;;
     --tun-interface) require_value "$@"; tun_interface=$2; shift 2 ;;
@@ -74,19 +81,27 @@ done
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
 [[ $domain =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $domain == *.* ]] ||
   die "--domain must be a DNS hostname"
-[[ $certificate == /* && -f $certificate ]] || die "--cert must name an existing absolute path"
-[[ $private_key == /* && -f $private_key ]] || die "--key must name an existing absolute path"
-[[ $certificate != *[$'\n\r\t ']* && $private_key != *[$'\n\r\t ']* ]] ||
-  die "certificate paths containing whitespace are not supported"
+if [[ -n $certificate || -n $private_key ]]; then
+  [[ $certificate == /* && -f $certificate ]] || die "--cert must name an existing absolute path"
+  [[ $private_key == /* && -f $private_key ]] || die "--key must name an existing absolute path"
+  [[ $certificate != *[$'\n\r\t ']* && $private_key != *[$'\n\r\t ']* ]] ||
+    die "certificate paths containing whitespace are not supported"
+  [[ $certificate =~ ^/[A-Za-z0-9_./:@+-]+$ && $private_key =~ ^/[A-Za-z0-9_./:@+-]+$ ]] ||
+    die "certificate paths contain unsupported characters"
+  tls_mode=static
+else
+  tls_mode=acme
+fi
+email_pattern='^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+[[ -z $acme_email || $acme_email =~ $email_pattern ]] ||
+  die "invalid --acme-email"
 [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die "invalid --port"
 [[ $mtu =~ ^[0-9]+$ && $mtu -ge 576 && $mtu -le 1400 ]] || die "invalid --mtu"
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
-[[ $certificate =~ ^/[A-Za-z0-9_./:@+-]+$ && $private_key =~ ^/[A-Za-z0-9_./:@+-]+$ ]] ||
-  die "certificate paths contain unsupported characters"
 
-for command in install systemctl ip nft openssl curl sed awk make getent sudo sysctl python3; do
+for command in install systemctl ip nft openssl curl sed awk make getent sudo sysctl python3 ss grep; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 
@@ -124,14 +139,31 @@ fi
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repository_root"
 
-certificate_public_key=$(openssl x509 -in "$certificate" -pubkey -noout) ||
-  die "could not read certificate"
-private_public_key=$(openssl pkey -in "$private_key" -pubout) ||
-  die "could not read private key"
-[[ $certificate_public_key == "$private_public_key" ]] ||
-  die "certificate and private key do not match"
-openssl x509 -in "$certificate" -checkhost "$domain" -noout >/dev/null ||
-  die "certificate does not cover $domain"
+if [[ $tls_mode == static ]]; then
+  certificate_public_key=$(openssl x509 -in "$certificate" -pubkey -noout) ||
+    die "could not read certificate"
+  private_public_key=$(openssl pkey -in "$private_key" -pubout) ||
+    die "could not read private key"
+  [[ $certificate_public_key == "$private_public_key" ]] ||
+    die "certificate and private key do not match"
+  openssl x509 -in "$certificate" -checkhost "$domain" -noout >/dev/null ||
+    die "certificate does not cover $domain"
+else
+  (( port != 80 )) || die "--port 80 cannot be used with Let's Encrypt HTTP-01"
+  port80_listeners=$(ss -H -ltnp 'sport = :80')
+  if [[ -n $port80_listeners ]] &&
+    { grep -qv '"htun-server"' <<<"$port80_listeners" ||
+      ! systemctl cat htun.service 2>/dev/null | grep -q -- '--acme-domain'; }; then
+    die "TCP port 80 is already in use; provide --cert and --key or free port 80 for Let's Encrypt HTTP-01"
+  fi
+fi
+
+tcp_listeners=$(ss -H -ltnp "sport = :$port")
+udp_listeners=$(ss -H -lunp "sport = :$port")
+if { [[ -n $tcp_listeners ]] && grep -qv '"htun-server"' <<<"$tcp_listeners"; } ||
+  { [[ -n $udp_listeners ]] && grep -qv '"htun-server"' <<<"$udp_listeners"; }; then
+  die "TCP or UDP port $port is already used by another service"
+fi
 
 if $build; then
   go_binary=$(command -v go || true)
@@ -198,6 +230,43 @@ else
   chmod 0600 /etc/htun/clients
 fi
 
+rollback_directory=$(mktemp -d)
+deployment_complete=false
+had_active_service=false
+for unit in htun.service htun-cert-sync.service htun-cert-sync.timer; do
+  if [[ -f /etc/systemd/system/$unit ]]; then
+    cp -a "/etc/systemd/system/$unit" "$rollback_directory/$unit"
+  fi
+done
+if systemctl is-active --quiet htun.service; then
+  had_active_service=true
+fi
+rollback() {
+  local status=$?
+  if [[ $status -ne 0 && $deployment_complete == false ]]; then
+    set +e
+    systemctl stop htun.service
+    for unit in htun.service htun-cert-sync.service htun-cert-sync.timer; do
+      if [[ -f $rollback_directory/$unit ]]; then
+        cp -a "$rollback_directory/$unit" "/etc/systemd/system/$unit"
+      else
+        rm -f "/etc/systemd/system/$unit"
+      fi
+    done
+    systemctl daemon-reload
+    if $had_active_service; then
+      systemctl restart htun.service
+    fi
+    echo "deploy: restored the previous hTun service after deployment failure" >&2
+  fi
+  rm -f "$rollback_directory/htun.service" \
+    "$rollback_directory/htun-cert-sync.service" \
+    "$rollback_directory/htun-cert-sync.timer"
+  rmdir "$rollback_directory"
+  exit "$status"
+}
+trap rollback EXIT
+
 if systemctl is-active --quiet htun.service; then
   systemctl stop htun.service
 fi
@@ -205,17 +274,37 @@ if $reset_leases && [[ -s $lease_state ]]; then
   mv "$lease_state" "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).bak"
 fi
 
+if [[ $tls_mode == static ]]; then
+  unit_after="After=network-online.target htun-cert-sync.service"
+  unit_wants="Wants=network-online.target htun-cert-sync.service"
+  tls_arguments="--tls-cert /etc/htun/tls/server.crt --tls-key /etc/htun/tls/server.key"
+  tls_preflight="ExecStartPre=/bin/sh -c 'test -s /etc/htun/tls/server.crt && test -s /etc/htun/tls/server.key'"
+  capabilities=CAP_NET_ADMIN
+else
+  unit_after="After=network-online.target"
+  unit_wants="Wants=network-online.target"
+  tls_arguments="--acme-domain $domain --acme-cache /var/lib/htun/acme --acme-http-listen :80"
+  if [[ -n $acme_email ]]; then
+    tls_arguments+=" --acme-email $acme_email"
+  fi
+  tls_preflight=
+  capabilities="CAP_NET_ADMIN CAP_NET_BIND_SERVICE"
+fi
+if (( port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
+  capabilities+=" CAP_NET_BIND_SERVICE"
+fi
+
 cat >/etc/systemd/system/htun.service <<EOF
 [Unit]
 Description=hTun VPN gateway
-After=network-online.target htun-cert-sync.service
-Wants=network-online.target htun-cert-sync.service
+$unit_after
+$unit_wants
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/htun/htun.env
-ExecStartPre=/bin/sh -c 'test -s /etc/htun/tls/server.crt && test -s /etc/htun/tls/server.key'
-ExecStart=/usr/local/bin/htun-server --listen :$port --tls-cert /etc/htun/tls/server.crt --tls-key /etc/htun/tls/server.key --client-token-file /etc/htun/clients --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
+$tls_preflight
+ExecStart=/usr/local/bin/htun-server --listen :$port $tls_arguments --client-token-file /etc/htun/clients --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/htun/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/htun/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -238,8 +327,8 @@ LockPersonality=true
 RestrictRealtime=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=$capabilities
+AmbientCapabilities=$capabilities
 DevicePolicy=closed
 DeviceAllow=/dev/net/tun rw
 
@@ -247,7 +336,8 @@ DeviceAllow=/dev/net/tun rw
 WantedBy=multi-user.target
 EOF
 
-cat >/etc/systemd/system/htun-cert-sync.service <<EOF
+if [[ $tls_mode == static ]]; then
+  cat >/etc/systemd/system/htun-cert-sync.service <<EOF
 [Unit]
 Description=Synchronize the hTun TLS certificate
 
@@ -259,7 +349,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-install -m 0644 deploy/htun-cert-sync.timer /etc/systemd/system/htun-cert-sync.timer
+  install -m 0644 deploy/htun-cert-sync.timer /etc/systemd/system/htun-cert-sync.timer
+else
+  systemctl disable --now htun-cert-sync.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/htun-cert-sync.service /etc/systemd/system/htun-cert-sync.timer
+fi
 cat >/etc/htun/Caddyfile.example <<EOF
 $domain {
   @metrics path /metrics
@@ -276,10 +370,15 @@ EOF
 
 sysctl -p /etc/sysctl.d/99-htun-quic.conf >/dev/null
 systemctl daemon-reload
-systemctl enable htun.service htun-cert-sync.timer >/dev/null
-systemctl start htun-cert-sync.service
+systemctl enable htun.service >/dev/null
+if [[ $tls_mode == static ]]; then
+  systemctl enable htun-cert-sync.timer >/dev/null
+  systemctl start htun-cert-sync.service
+fi
 systemctl restart htun.service
-systemctl start htun-cert-sync.timer
+if [[ $tls_mode == static ]]; then
+  systemctl start htun-cert-sync.timer
+fi
 
 for _ in $(seq 1 30); do
   if curl --silent --show-error --fail \
@@ -292,12 +391,14 @@ curl --silent --show-error --fail \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
 
+deployment_complete=true
 cat <<EOF
 
 hTun is ready.
 
 Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
+TLS mode:        $tls_mode
 Android token:   sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
 Caddy example:   /etc/htun/Caddyfile.example
 

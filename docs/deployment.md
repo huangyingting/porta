@@ -9,7 +9,8 @@ HTTP/3/MASQUE traffic goes directly to hTun and does not pass through Caddy.
 - Linux with systemd, nftables, `/dev/net/tun`, and IPv4 forwarding support
 - Go 1.26 or a prebuilt `bin/htun-server`
 - A DNS hostname pointing to the server
-- A certificate and private key covering that hostname
+- Either public TCP port 80 for automatic Let's Encrypt issuance, or an
+  existing certificate and private key covering the hostname
 - Both TCP and UDP on the selected port allowed by host and cloud firewalls
 
 If Caddy manages the certificate, locate its certificate and key files:
@@ -19,7 +20,27 @@ sudo find /var/lib/caddy/.local/share/caddy/certificates \
   -type f \( -name 'vpn.example.com.crt' -o -name 'vpn.example.com.key' \)
 ```
 
-## One-command installation
+## One-command installation with Let's Encrypt
+
+When no certificate paths are supplied, hTun obtains and renews its own
+Let's Encrypt certificate:
+
+```sh
+sudo ./scripts/deploy.sh \
+  --domain vpn.example.com \
+  --acme-email admin@example.com
+```
+
+The email is optional. Let's Encrypt HTTP-01 validation always connects to
+public TCP port 80, regardless of the configured tunnel port. DNS must already
+point to the server, the cloud and host firewalls must allow TCP 80, and no
+other process may own port 80.
+
+This mode is appropriate for a standalone gateway. If Caddy already owns port
+80, use the existing-certificate mode below instead; stopping Caddy merely to
+renew a second certificate is not recommended.
+
+## One-command installation with an existing certificate
 
 From a checked-out hTun repository:
 
@@ -27,18 +48,20 @@ From a checked-out hTun repository:
 sudo ./scripts/deploy.sh \
   --domain vpn.example.com \
   --cert /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com/vpn.example.com.crt \
-  --key /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com/vpn.example.com.key
+  --key /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com/vpn.example.com.key \
+  --port 8443
 ```
 
 The default deployment:
 
-- listens on TCP and UDP 8443;
+- listens on TCP and UDP 443;
 - uses HTTP/3 MASQUE with HTTP/2 fallback;
 - creates `htun0` and the `10.66.0.0/24` client network;
 - advertises `1.1.1.1` and an MTU of 1100;
 - installs narrowly scoped nftables NAT and forwarding rules;
 - installs hardened systemd services;
-- synchronizes renewed certificate files every six hours;
+- either renews its own Let's Encrypt certificate or synchronizes externally
+  managed certificate files every six hours;
 - tunes Linux UDP buffers for QUIC;
 - creates random fallback and metrics tokens on first installation;
 - preserves existing credentials and lease state during upgrades.
@@ -51,7 +74,7 @@ sudo ./scripts/deploy.sh \
   --domain vpn.example.com \
   --cert /etc/letsencrypt/live/vpn.example.com/fullchain.pem \
   --key /etc/letsencrypt/live/vpn.example.com/privkey.pem \
-  --port 9443 \
+  --port 8443 \
   --external-interface ens3 \
   --pool 10.77.0.0/24 \
   --gateway-cidr 10.77.0.1/24
@@ -76,16 +99,17 @@ sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-This route is only a fallback. Android and other native MASQUE clients should
-use `https://vpn.example.com:8443` directly.
+When Caddy owns port 443, deploy hTun with `--port 8443`. The Caddy route is
+only a fallback; Android and other native MASQUE clients should use
+`https://vpn.example.com:8443` directly.
 
 ## Firewall
 
-Allow both protocols on the direct port:
+Allow both protocols on the selected direct port:
 
 ```text
-TCP 8443: HTTP/2 over TLS
-UDP 8443: HTTP/3/QUIC MASQUE
+TCP 443 (or configured port): HTTP/2 over TLS
+UDP 443 (or configured port): HTTP/3/QUIC MASQUE
 ```
 
 The deployment script does not modify UFW, firewalld, Azure NSGs, AWS security
@@ -122,12 +146,16 @@ sudo systemctl status htun htun-cert-sync.timer
 sudo journalctl -u htun -f
 curl --resolve vpn.example.com:8443:127.0.0.1 \
   https://vpn.example.com:8443/readyz
-sudo ss -lntup | grep ':8443'
+sudo ss -lntup | grep ':443'
 ```
 
-The expected listeners are TCP 8443 and UDP 8443. Certificate synchronization
-replaces the copied files atomically; new TLS handshakes load the renewed
-certificate without disconnecting active tunnels.
+The expected listeners are TCP and UDP on the configured port. Certificate
+synchronization replaces the copied files atomically; new TLS handshakes load
+the renewed certificate without disconnecting active tunnels.
+
+In automatic Let's Encrypt mode, hTun additionally listens on TCP 80 for
+HTTP-01 challenges and stores its ACME account and certificates under
+`/var/lib/htun/acme`.
 
 ## Android
 
