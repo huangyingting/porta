@@ -259,10 +259,12 @@ class TunnelService : VpnService() {
         output = FileOutputStream(vpn.fileDescriptor)
         vpnConfiguration = configuration
         selectedNetwork.get()?.let { setUnderlyingNetworks(arrayOf(it)) }
-        startVpnReader()
+        val sourceAddress = parseIPv4Address(configuration.address)
+            ?: throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
+        startVpnReader(sourceAddress)
     }
 
-    private fun startVpnReader() {
+    private fun startVpnReader(sourceAddress: ByteArray) {
         val readerDescriptor = descriptor.get() ?: return
         val readerInput = input ?: return
         vpnReader = Thread({
@@ -272,6 +274,7 @@ class TunnelService : VpnService() {
                     val count = readerInput.read(buffer)
                     if (count <= 0) continue
                     if (descriptor.get() !== readerDescriptor) break
+                    if (!isAssignedIPv4Packet(buffer, count, sourceAddress)) continue
                     val packet = buffer.copyOf(count)
                     if (!outboundPackets.offer(packet)) {
                         outboundPackets.poll()
@@ -505,4 +508,24 @@ class TunnelService : VpnService() {
     )
 
     private class PermanentTunnelException(message: String) : Exception(message)
+}
+
+internal fun parseIPv4Address(value: String): ByteArray? {
+    val parts = value.split('.')
+    if (parts.size != 4) return null
+    val result = ByteArray(4)
+    for (index in parts.indices) {
+        val octet = parts[index].toIntOrNull() ?: return null
+        if (octet !in 0..255) return null
+        result[index] = octet.toByte()
+    }
+    return result
+}
+
+internal fun isAssignedIPv4Packet(packet: ByteArray, length: Int, sourceAddress: ByteArray): Boolean {
+    if (length < 20 || sourceAddress.size != 4 || (packet[0].toInt() ushr 4) != 4) return false
+    for (index in sourceAddress.indices) {
+        if (packet[12 + index] != sourceAddress[index]) return false
+    }
+    return true
 }

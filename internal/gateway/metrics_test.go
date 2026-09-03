@@ -12,6 +12,7 @@ func TestMetricsRenderPrometheusFormat(t *testing.T) {
 	metrics.authenticationFailed()
 	metrics.receivedFromClient()
 	metrics.sentToClient()
+	metrics.droppedFromClient()
 
 	recorder := httptest.NewRecorder()
 	metrics.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
@@ -22,6 +23,7 @@ func TestMetricsRenderPrometheusFormat(t *testing.T) {
 		"htun_auth_failures_total 1",
 		"htun_packets_from_client_total 1",
 		"htun_packets_to_client_total 1",
+		"htun_dropped_packets_from_client_total 1",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("metrics output missing %q:\n%s", expected, body)

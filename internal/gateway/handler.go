@@ -175,8 +175,13 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if len(packet) > c.MTU {
-				inboundDone <- fmt.Errorf("packet length %d exceeds tunnel MTU %d", len(packet), c.MTU)
-				return
+				c.Metrics.droppedFromClient()
+				continue
+			}
+			info, err := protocol.ParseIPv4(packet)
+			if err != nil || info.Source != lease.Address {
+				c.Metrics.droppedFromClient()
+				continue
 			}
 			if err := c.Router.Inject(sessionCtx, lease.Address, packet); err != nil {
 				inboundDone <- err
