@@ -72,7 +72,7 @@ sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
-  --mtu 1300
+  --mtu 1100
 ```
 
 For per-device revocation, create a root-readable credential file containing
@@ -139,7 +139,7 @@ sudo ./bin/htun-server \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
-  --mtu 1300
+  --mtu 1100
 ```
 
 Open both TCP and UDP 8443 in the host and cloud firewalls. HTTP/2 uses the
@@ -215,7 +215,7 @@ sudo --preserve-env=HTUN_TOKEN ./bin/htun-server \
   --interface htun0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
-  --mtu 1300
+  --mtu 1100
 ```
 
 Proxy the domain to that h2c backend and disable response buffering:
@@ -468,10 +468,11 @@ release. Configure these repository Actions secrets before tagging:
 
 RFC 9484 does not standardize DNS or link-MTU configuration. hTun sends these
 as optional `X-HTun-DNS` and `X-HTun-MTU` response extensions. The default MTU
-is 1300 to leave room for QUIC, UDP, IP, and TLS overhead.
+is 1100 so complete tunneled IP packets fit conservative mobile QUIC Datagram
+limits before path-MTU discovery has increased the available payload size.
 
 Logs contain client IDs, tunnel addresses, remote IPs, and transport names, but
 never intentionally contain bearer tokens or packet contents. IPv6 assignment,
-configurable split routing, multi-instance HA, native Android MASQUE, and
-kill-switch policy require the coordinated architecture phases described in
+configurable split routing, multi-instance HA, and kill-switch policy require
+the coordinated architecture phases described in
 `docs/architecture.md`.

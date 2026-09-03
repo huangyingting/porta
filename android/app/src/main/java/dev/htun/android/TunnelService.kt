@@ -175,7 +175,7 @@ class TunnelService : VpnService() {
                     break
                 } catch (error: Exception) {
                     if (!isRunActive(runGeneration)) break
-                    Log.w(TAG, "Tunnel interrupted: ${error.javaClass.simpleName}")
+                    Log.w(TAG, "Tunnel interrupted", error)
                     if (attemptConnectedAt != 0L &&
                         System.currentTimeMillis() - attemptConnectedAt >= STABLE_CONNECTION_MILLIS
                     ) {
@@ -400,7 +400,7 @@ class TunnelService : VpnService() {
         if (addressParts?.size != 2) throw PermanentTunnelException("Gateway returned an invalid lease")
         val prefix = addressParts[1].toIntOrNull()
             ?: throw PermanentTunnelException("Gateway returned an invalid lease prefix")
-        val mtu = mtuHeader?.toIntOrNull() ?: 1300
+        val mtu = mtuHeader?.toIntOrNull() ?: 1100
         if (prefix !in 0..32 || mtu !in 576..9000) {
             throw PermanentTunnelException("Gateway returned invalid network parameters")
         }

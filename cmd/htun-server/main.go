@@ -76,7 +76,7 @@ func run() error {
 	poolCIDR := flag.String("pool", "10.66.0.0/24", "IPv4 client address pool")
 	leaseState := flag.String("lease-state", "", "optional persistent client lease state file")
 	dns := flag.String("dns", "1.1.1.1", "DNS address advertised to clients")
-	mtu := flag.Int("mtu", 1300, "tunnel MTU")
+	mtu := flag.Int("mtu", 1100, "tunnel MTU")
 	tokenFlag := flag.String("token", "", "bearer token (prefer HTUN_TOKEN environment variable)")
 	metricsTokenFlag := flag.String("metrics-token", "", "metrics bearer token (prefer HTUN_METRICS_TOKEN environment variable; empty disables /metrics)")
 	jsonLogs := flag.Bool("json-logs", false, "write structured JSON logs")

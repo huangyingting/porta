@@ -101,10 +101,12 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 			value := masque.EncodeIPPacket(packet)
 			if useDatagrams {
 				if err := stream.SendDatagram(value); err != nil {
+					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 					return
 				}
 			} else {
 				if err := encoder.Write(masque.CapsuleDatagram, value); err != nil {
+					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 					return
 				}
 				flush(w)

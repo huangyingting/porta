@@ -382,8 +382,6 @@ func (m *masqueClient) deliver(packet []byte) {
 	select {
 	case m.packets <- copyOfPacket:
 	case <-m.ctx.Done():
-	default:
-		m.report(errors.New("MASQUE client receive queue is full"))
 	}
 }
 
