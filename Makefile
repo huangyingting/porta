@@ -22,7 +22,7 @@ build-windows:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -o bin/htun-client-windows-amd64.exe ./cmd/htun-client
 
 android:
-	cd android && ANDROID_HOME=$${ANDROID_HOME:-/home/azadmin/Android/Sdk} ./gradlew testDebugUnitTest assembleDebug
+	cd android && ANDROID_HOME=$${ANDROID_HOME:-/home/azadmin/Android/Sdk} ./gradlew testDebugUnitTest assembleRelease
 
 clean:
 	$(GO) clean

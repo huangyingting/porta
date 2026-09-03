@@ -25,5 +25,7 @@ mkdir -p "$(dirname "${OUTPUT}")"
 cd "${ROOT}"
 PATH="$(dirname "${GOMOBILE}"):${PATH}" \
     ANDROID_HOME="${ANDROID_HOME}" ANDROID_NDK_HOME="${ANDROID_NDK_HOME}" \
-    "${GOMOBILE}" bind -target=android -androidapi=26 -trimpath \
+    "${GOMOBILE}" bind \
+    -target=android/arm,android/arm64,android/amd64 \
+    -androidapi=26 -trimpath -ldflags="-s -w" \
     -o "${OUTPUT}" ./mobile/htunmobile

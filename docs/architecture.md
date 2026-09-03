@@ -85,6 +85,8 @@ with this setting if it is absent. Tests set it before process startup.
 - Android uses `VpnService` with a native Go HTTP/3 MASQUE bridge. The UDP
   socket is protected from the VPN routing loop and bound to Android's selected
   underlying network. Four-lane HTTP/2 remains an automatic fallback.
+  Distribution uses stripped per-ABI APKs so each device downloads only one Go
+  runtime while retaining the complete HTTP/3 implementation.
   Named server profiles and their tokens are stored locally, with tokens
   encrypted by Android Keystore.
 

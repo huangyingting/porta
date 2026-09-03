@@ -205,9 +205,14 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org/download/htun-android-0.5.3-debug.apk
+APK:     https://htun.i-csu.org/download/htun-android-0.5.4.apk
 Gateway: https://htun.i-csu.org:8443
 ```
+
+The default APK is the optimized ARM64 build used by most current phones. Use
+`htun-android-0.5.4-armeabi-v7a.apk` for older 32-bit ARM devices or
+`htun-android-0.5.4-x86_64.apk` for an emulator. Each APK contains only its
+required native Go runtime instead of bundling every Android CPU architecture.
 
 ## Removal
 

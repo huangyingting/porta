@@ -50,8 +50,9 @@ make android
 `make test` enables the official `GODEBUG=http2xconnect=1` switch so the
 HTTP/2 Extended CONNECT integration test runs instead of being skipped.
 
-The Android debug APK is written to
-`android/app/build/outputs/apk/debug/app-debug.apk`.
+Optimized Android APKs are written to
+`android/app/build/outputs/apk/release/`, one per CPU architecture. The ARM64
+APK is the normal choice for current physical Android devices.
 
 ## One-click production deployment
 
@@ -381,12 +382,19 @@ or managed firewall policy.
 
 ## Android client
 
-Build and install the debug APK:
+Build the optimized APKs and install the one matching the device:
 
 ```sh
 make android
-adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb shell getprop ro.product.cpu.abi
+adb install -r android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
 ```
+
+Available outputs are `arm64-v8a` for current phones and tablets,
+`armeabi-v7a` for older 32-bit ARM devices, and `x86_64` for emulators. The
+release build strips Go debug symbols, shrinks Kotlin/resources, and packages
+only one native runtime per APK. A local build uses the Android debug signing
+key unless release-signing environment variables are configured.
 
 Open hTun, tap **Add profile**, and enter:
 

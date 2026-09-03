@@ -51,7 +51,9 @@ jobs:
         run: ./gradlew testDebugUnitTest assembleRelease --no-daemon
       - name: Collect artifacts
         run: |
-          cp android/app/build/outputs/apk/release/*.apk dist/
+          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk dist/htun-android-arm64-v8a.apk
+          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk dist/htun-android-armeabi-v7a.apk
+          cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/htun-android-x86_64.apk
           cd dist
           sha256sum htun-linux-amd64.tar.gz htun-windows-amd64.zip *.apk > SHA256SUMS
       - name: Publish GitHub release

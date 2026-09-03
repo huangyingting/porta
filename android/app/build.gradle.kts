@@ -15,6 +15,7 @@ val buildNativeMasqueAar by tasks.registering(Exec::class) {
     inputs.files(
         rootProject.projectDir.parentFile.resolve("go.mod"),
         rootProject.projectDir.parentFile.resolve("go.sum"),
+        rootProject.projectDir.parentFile.resolve("scripts/build-android-aar.sh"),
     )
     inputs.dir(rootProject.projectDir.parentFile.resolve("internal"))
     inputs.dir(rootProject.projectDir.parentFile.resolve("mobile/htunmobile"))
@@ -40,8 +41,8 @@ android {
         applicationId = "dev.htun.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.5.3"
+        versionCode = 13
+        versionName = "0.5.4"
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
@@ -60,9 +61,27 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.findByName("release")
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = false
+        }
+    }
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
     }
 
     compileOptions {
