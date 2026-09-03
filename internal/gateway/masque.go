@@ -75,7 +75,13 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		defer stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 		reader, writer = stream, stream
 		if settings, ok := w.(http3.Settingser); ok {
-			useDatagrams = c.EnableH3Datagrams && settings.Settings().EnableDatagrams
+			select {
+			case <-settings.ReceivedSettings():
+				peerSettings := settings.Settings()
+				useDatagrams = c.EnableH3Datagrams && peerSettings != nil && peerSettings.EnableDatagrams
+			case <-r.Context().Done():
+				return
+			}
 		}
 		if useDatagrams {
 			transportName = "masque-h3-datagram"

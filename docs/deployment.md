@@ -236,13 +236,13 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org/download/porta-android-0.6.0.apk
+APK:     https://github.com/huangyingting/porta/releases/latest/download/porta-android-arm64-v8a.apk
 Gateway: https://htun.i-csu.org:8443
 ```
 
 The default APK is the optimized ARM64 build used by most current phones. Use
-`porta-android-0.6.0-armeabi-v7a.apk` for older 32-bit ARM devices or
-`porta-android-0.6.0-x86_64.apk` for an emulator. Each APK contains only its
+`porta-android-armeabi-v7a.apk` for older 32-bit ARM devices or
+`porta-android-x86_64.apk` for an emulator. Each APK contains only its
 required native Go runtime instead of bundling every Android CPU architecture.
 
 ## Removal
