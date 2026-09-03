@@ -46,8 +46,8 @@ the token is not written to Porta's configuration.
 
 By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
 `porta-server` from that release and verifies it with `SHA256SUMS`. Pass
-`--release vX.Y.Z` to pin a release. Developers working from a full source
-checkout can pass `--build-local` instead.
+`--release vX.Y.Z` to pin release `v0.9.0` or newer. Developers working from a
+full source checkout can pass `--build-local` instead.
 
 ## One-command installation with Let's Encrypt
 
@@ -120,7 +120,8 @@ pool change is rejected when existing leases are incompatible; use
 
 ## Client downloads
 
-Release clients are available from the same private GitHub release:
+Release clients are mirrored from the private GitHub release to the deployed
+Porta server:
 
 ```text
 porta-client-linux-amd64
@@ -131,8 +132,18 @@ porta-android-armeabi-v7a.apk
 porta-android-x86_64.apk
 ```
 
-Use `gh release download latest --repo huangyingting/porta` while authenticated,
-then verify every downloaded asset with the release `SHA256SUMS` file.
+Download an artifact and its checksum directly, including the configured port
+when it is not 443:
+
+```sh
+curl -fLO https://vpn.example.com:8443/download/porta-android-arm64-v8a.apk
+curl -fLO https://vpn.example.com:8443/download/SHA256SUMS
+grep ' porta-android-arm64-v8a.apk$' SHA256SUMS | sha256sum -c -
+```
+
+Only the listed release filenames are served. There is no directory listing,
+and the camouflage landing page does not link to the downloads. Authenticated
+GitHub release downloads remain available as an operator fallback.
 
 ## Forward proxy
 
@@ -272,7 +283,7 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     porta-android-arm64-v8a.apk from the private GitHub release
+APK:     https://htun.i-csu.org:8443/download/porta-android-arm64-v8a.apk
 Gateway: https://htun.i-csu.org:8443
 ```
 

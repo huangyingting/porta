@@ -154,9 +154,23 @@ The same release publishes direct client downloads:
 - Android: `porta-android-arm64-v8a.apk`, `porta-android-armeabi-v7a.apk`, or
   `porta-android-x86_64.apk`
 
-Download them with `gh release download latest --repo huangyingting/porta`
-while authenticated to the private repository. Every asset is listed in the
-release `SHA256SUMS` file.
+Release deployments also mirror these files onto the Porta server, so clients
+do not need GitHub access:
+
+```text
+https://vpn.example.com/download/porta-client-linux-amd64
+https://vpn.example.com/download/porta-client-linux-arm64
+https://vpn.example.com/download/porta-client-windows-amd64.exe
+https://vpn.example.com/download/porta-android-arm64-v8a.apk
+https://vpn.example.com/download/porta-android-armeabi-v7a.apk
+https://vpn.example.com/download/porta-android-x86_64.apk
+https://vpn.example.com/download/SHA256SUMS
+```
+
+Include the configured port in the URL when Porta does not listen on 443.
+Only these exact filenames are served; the landing page does not advertise or
+link to them. Authenticated GitHub release downloads remain available as a
+fallback.
 
 ## Gateway
 

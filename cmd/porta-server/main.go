@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -75,6 +76,7 @@ func run() error {
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
 	landingPage := flag.Bool("landing-page", true, "serve the Porta landing page to ordinary browser requests")
 	enableForwardProxy := flag.Bool("forward-proxy", false, "enable the authenticated HTTP forward proxy on the public listener")
+	clientDownloads := flag.String("client-downloads", "", "absolute directory containing published client release artifacts (empty disables downloads)")
 	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for the admin UI, health, readiness, and metrics (empty disables)")
 	clientRegistryPath := flag.String("client-registry", "clients.json", "persistent client registry path")
 	interfaceName := flag.String("interface", "porta0", "Linux TUN interface name")
@@ -112,6 +114,18 @@ func run() error {
 	if *adminAddress != "" {
 		if err := validateLoopbackListenAddress(*adminAddress, "--admin-listen"); err != nil {
 			return err
+		}
+	}
+	if *clientDownloads != "" {
+		if !filepath.IsAbs(*clientDownloads) {
+			return errors.New("--client-downloads must be an absolute path")
+		}
+		info, err := os.Stat(*clientDownloads)
+		if err != nil {
+			return fmt.Errorf("open client downloads directory: %w", err)
+		}
+		if !info.IsDir() {
+			return errors.New("--client-downloads must name a directory")
 		}
 	}
 
@@ -181,6 +195,7 @@ func run() error {
 		return err
 	}
 	publicHandler := publicSiteHandler(handler, *landingPage)
+	publicHandler = clientDownloadHandler(publicHandler, *clientDownloads)
 	if *enableForwardProxy {
 		proxyHandler, err := forwardproxy.New(forwardproxy.Config{
 			Next: publicHandler,

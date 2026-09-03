@@ -190,11 +190,14 @@ fi
 
 server_binary=
 release_download_directory=
-if [[ $release == latest ]]; then
-  release_page_url=https://github.com/huangyingting/porta/releases/latest
-else
-  release_page_url=https://github.com/huangyingting/porta/releases/tag/$release
-fi
+client_release_assets=(
+  porta-client-linux-amd64
+  porta-client-linux-arm64
+  porta-client-windows-amd64.exe
+  porta-android-arm64-v8a.apk
+  porta-android-armeabi-v7a.apk
+  porta-android-x86_64.apk
+)
 if $build_local; then
   go_binary=$(command -v go || true)
   if [[ -z $go_binary ]]; then
@@ -220,11 +223,13 @@ else
     *) die "GitHub releases do not provide a server binary for $(uname -m)" ;;
   esac
   release_asset=porta-server-linux-$release_arch
+  release_artifacts=("$release_asset" SHA256SUMS "${client_release_assets[@]}")
   release_download_directory=$(mktemp -d)
   cleanup_release_download() {
-    rm -f "$release_download_directory/$release_asset" \
-      "$release_download_directory/SHA256SUMS" \
-      "$release_download_directory/release.json"
+    local artifact
+    for artifact in "${release_artifacts[@]}" release.json; do
+      rm -f "$release_download_directory/$artifact"
+    done
     rmdir "$release_download_directory"
   }
   trap cleanup_release_download EXIT
@@ -247,7 +252,7 @@ else
     --output "$release_download_directory/release.json" ||
     die "could not read GitHub release metadata; private repositories require GH_TOKEN"
   mapfile -t release_asset_urls < <(python3 - \
-    "$release_download_directory/release.json" "$release_asset" SHA256SUMS <<'PY'
+    "$release_download_directory/release.json" "${release_artifacts[@]}" <<'PY'
 import json
 import sys
 
@@ -261,25 +266,30 @@ for name in sys.argv[2:]:
     print(url)
 PY
   ) || die "release metadata is missing required assets"
-  [[ ${#release_asset_urls[@]} -eq 2 ]] ||
+  [[ ${#release_asset_urls[@]} -eq ${#release_artifacts[@]} ]] ||
     die "release metadata is missing required assets"
   github_api_headers[1]="Accept: application/octet-stream"
-  curl --fail --location --silent --show-error "${github_api_headers[@]}" \
-    "${release_asset_urls[0]}" \
-    --output "$release_download_directory/$release_asset"
-  curl --fail --location --silent --show-error "${github_api_headers[@]}" \
-    "${release_asset_urls[1]}" \
-    --output "$release_download_directory/SHA256SUMS"
-  expected_checksum=$(awk -v asset="$release_asset" '$2 == asset { print $1; exit }' \
-    "$release_download_directory/SHA256SUMS")
-  [[ $expected_checksum =~ ^[0-9a-f]{64}$ ]] ||
-    die "release checksum does not contain $release_asset"
-  actual_checksum=$(sha256sum "$release_download_directory/$release_asset" | awk '{ print $1 }')
-  [[ $actual_checksum == "$expected_checksum" ]] ||
-    die "checksum verification failed for $release_asset"
+  for index in "${!release_artifacts[@]}"; do
+    curl --fail --location --silent --show-error "${github_api_headers[@]}" \
+      "${release_asset_urls[$index]}" \
+      --output "$release_download_directory/${release_artifacts[$index]}"
+  done
+  for artifact in "$release_asset" "${client_release_assets[@]}"; do
+    expected_checksum=$(awk -v asset="$artifact" '$2 == asset { print $1; exit }' \
+      "$release_download_directory/SHA256SUMS")
+    [[ $expected_checksum =~ ^[0-9a-f]{64}$ ]] ||
+      die "release checksum does not contain $artifact"
+    actual_checksum=$(sha256sum "$release_download_directory/$artifact" | awk '{ print $1 }')
+    [[ $actual_checksum == "$expected_checksum" ]] ||
+      die "checksum verification failed for $artifact"
+  done
   server_binary="$release_download_directory/$release_asset"
 fi
 [[ -f $server_binary ]] || die "Porta server binary is missing"
+chmod 0755 "$server_binary"
+server_help=$("$server_binary" --help 2>&1)
+grep -q -- 'client-downloads' <<<"$server_help" ||
+  die "selected server release does not support published client downloads; use v0.9.0 or newer"
 
 lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'
@@ -306,6 +316,7 @@ then
 fi
 
 rollback_directory=$(mktemp -d)
+downloads_stage=
 deployment_complete=false
 had_active_service=false
 backup_file() {
@@ -320,6 +331,14 @@ backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
 backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
 backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
 backup_file /etc/sysctl.d/99-porta-quic.conf 99-porta-quic.conf
+backup_directory() {
+  local source=$1
+  local name=$2
+  if [[ -d $source ]]; then
+    cp -a "$source" "$rollback_directory/$name"
+  fi
+}
+backup_directory /var/lib/porta/downloads downloads
 for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
   backup_file "/etc/systemd/system/$unit" "$unit"
 done
@@ -335,6 +354,14 @@ restore_file() {
     rm -f "$destination"
   fi
 }
+restore_directory() {
+  local name=$1
+  local destination=$2
+  rm -rf "$destination"
+  if [[ -d $rollback_directory/$name ]]; then
+    cp -a "$rollback_directory/$name" "$destination"
+  fi
+}
 rollback() {
   local status=$?
   if [[ $status -ne 0 && $deployment_complete == false ]]; then
@@ -345,6 +372,7 @@ rollback() {
     restore_file server-down.sh /usr/local/libexec/porta/server-down.sh
     restore_file sync-cert.sh /usr/local/libexec/porta/sync-cert.sh
     restore_file 99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
+    restore_directory downloads /var/lib/porta/downloads
     for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
       restore_file "$unit" "/etc/systemd/system/$unit"
     done
@@ -357,6 +385,9 @@ rollback() {
   if [[ -n $release_download_directory ]]; then
     cleanup_release_download
   fi
+  if [[ -n $downloads_stage ]]; then
+    rm -rf "$downloads_stage"
+  fi
   rm -f "$rollback_directory/porta-server" \
     "$rollback_directory/server-up.sh" \
     "$rollback_directory/server-down.sh" \
@@ -365,17 +396,24 @@ rollback() {
     "$rollback_directory/porta.service" \
     "$rollback_directory/porta-cert-sync.service" \
     "$rollback_directory/porta-cert-sync.timer"
+  rm -rf "$rollback_directory/downloads"
   rmdir "$rollback_directory"
   exit "$status"
 }
 trap rollback EXIT
 
-install -d -m 0755 /usr/local/libexec/porta /etc/porta
+install -d -m 0755 /usr/local/libexec/porta /etc/porta /var/lib/porta/downloads
 install -m 0755 "$server_binary" /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
   /usr/local/libexec/porta/
 install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
 if ! $build_local; then
+  downloads_stage=$(mktemp -d /var/lib/porta/downloads.new.XXXXXX)
+  chmod 0755 "$downloads_stage"
+  for artifact in "${client_release_assets[@]}" SHA256SUMS; do
+    install -m 0644 "$release_download_directory/$artifact" \
+      "$downloads_stage/$artifact"
+  done
   cleanup_release_download
   release_download_directory=
 fi
@@ -401,6 +439,11 @@ client_registry=/var/lib/porta/clients.json
 
 if systemctl is-active --quiet porta.service; then
   systemctl stop porta.service
+fi
+if [[ -n $downloads_stage ]]; then
+  rm -rf /var/lib/porta/downloads
+  mv "$downloads_stage" /var/lib/porta/downloads
+  downloads_stage=
 fi
 if $reset_leases && [[ -s $lease_state ]]; then
   mv "$lease_state" "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).bak"
@@ -440,7 +483,7 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument --client-registry /var/lib/porta/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -522,8 +565,23 @@ ss -H -ltnp "sport = :$port" | grep -q '"porta-server"' ||
 ss -H -lunp "sport = :$port" | grep -q '"porta-server"' ||
   die "gateway is not listening on public UDP port $port"
 deployment_complete=true
-cat <<EOF
 
+if [[ -f /var/lib/porta/downloads/porta-android-arm64-v8a.apk ]]; then
+  public_origin=https://$domain
+  if (( port != 443 )); then
+    public_origin+=:$port
+  fi
+  client_download_summary="Client downloads:
+  Linux AMD64: $public_origin/download/porta-client-linux-amd64
+  Linux ARM64: $public_origin/download/porta-client-linux-arm64
+  Windows:     $public_origin/download/porta-client-windows-amd64.exe
+  Android:     $public_origin/download/porta-android-arm64-v8a.apk
+  Checksums:   $public_origin/download/SHA256SUMS"
+else
+  client_download_summary="Client downloads: unavailable until a release deployment publishes artifacts"
+fi
+
+cat <<EOF
 Porta is ready.
 
 Direct endpoint: https://$domain:$port
@@ -535,6 +593,6 @@ Admin endpoint:  http://127.0.0.1:$admin_port
 Admin access:    ssh -L $admin_port:127.0.0.1:$admin_port USER@$domain
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 Initial client:  sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
-Client downloads: $release_page_url
+$client_download_summary
 Ensure both TCP and UDP $port are allowed by the host and cloud firewalls.
 EOF
