@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"sync/atomic"
 
-	"github.com/htun-project/htun/internal/masque"
-	"github.com/htun-project/htun/internal/protocol"
+	"github.com/huangyingting/porta/internal/masque"
+	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -27,7 +27,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Capsule-Protocol: ?1 is required", http.StatusBadRequest)
 		return
 	}
-	clientID := r.Header.Get("X-HTun-Client-ID")
+	clientID := r.Header.Get("X-Porta-Client-ID")
 	if !validClientID.MatchString(clientID) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
 		return
@@ -35,7 +35,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	identity, err := c.authorizeClient(r.Header.Get("Authorization"), clientID)
 	if err != nil {
 		c.Metrics.authenticationFailed()
-		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
+		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -53,9 +53,9 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-HTun-MTU", strconv.Itoa(c.MTU))
+	w.Header().Set("X-Porta-MTU", strconv.Itoa(c.MTU))
 	if c.DNS != "" {
-		w.Header().Set("X-HTun-DNS", c.DNS)
+		w.Header().Set("X-Porta-DNS", c.DNS)
 	}
 	w.WriteHeader(http.StatusOK)
 

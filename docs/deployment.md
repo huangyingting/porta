@@ -1,17 +1,17 @@
 # Production deployment
 
-This guide deploys hTun directly on one TCP and UDP port. An existing web
+This guide deploys Porta directly on one TCP and UDP port. An existing web
 server may continue serving websites and renewing the certificate on port 443,
-but native HTTP/3/MASQUE traffic goes directly to hTun and does not pass
+but native HTTP/3/MASQUE traffic goes directly to Porta and does not pass
 through a reverse proxy.
 
 ## Choose a deployment mode
 
 | Environment | Command options | Tunnel port | Certificate renewal |
 |---|---|---:|---|
-| Standalone server | `--domain vpn.example.com` | 443 by default | hTun/Let's Encrypt |
+| Standalone server | `--domain vpn.example.com` | 443 by default | Porta/Let's Encrypt |
 | Another service uses 80/443 | `--domain`, `--cert`, `--key`, `--port 8443` | 8443 | External issuer |
-| Custom standalone port | `--domain`, `--port PORT` | Configured value | hTun/Let's Encrypt through TCP 80 |
+| Custom standalone port | `--domain`, `--port PORT` | Configured value | Porta/Let's Encrypt through TCP 80 |
 
 `--port` controls both the TCP HTTP/2 listener and UDP HTTP/3/QUIC listener.
 It defaults to 443. The Android gateway URL must include the port when it is
@@ -20,7 +20,7 @@ not 443.
 ## Prerequisites
 
 - Linux with systemd, nftables, `/dev/net/tun`, and IPv4 forwarding support
-- Go 1.26 or a prebuilt `bin/htun-server`
+- Go 1.26 or a prebuilt `bin/porta-server`
 - A DNS hostname pointing to the server
 - Either public TCP port 80 for automatic Let's Encrypt issuance, or an
   existing certificate and private key covering the hostname
@@ -28,7 +28,7 @@ not 443.
 
 ## One-command installation with Let's Encrypt
 
-When no certificate paths are supplied, hTun obtains and renews its own
+When no certificate paths are supplied, Porta obtains and renews its own
 Let's Encrypt certificate:
 
 ```sh
@@ -48,7 +48,7 @@ production web server merely to renew a second certificate is not recommended.
 
 ## One-command installation with an existing certificate
 
-From a checked-out hTun repository:
+From a checked-out Porta repository:
 
 ```sh
 sudo ./scripts/deploy.sh \
@@ -62,7 +62,7 @@ The default deployment:
 
 - listens on TCP and UDP 443;
 - uses HTTP/3 MASQUE with HTTP/2 fallback;
-- creates `htun0` and the `10.66.0.0/24` client network;
+- creates `porta0` and the `10.66.0.0/24` client network;
 - advertises `1.1.1.1` and an MTU of 1100;
 - installs narrowly scoped nftables NAT and forwarding rules;
 - installs hardened systemd services;
@@ -87,11 +87,11 @@ sudo ./scripts/deploy.sh \
 ```
 
 The script is idempotent. Re-running it rebuilds and upgrades the server while
-preserving `/etc/htun/htun.env`, `/var/lib/htun/clients.json`, and persistent leases.
+preserving `/etc/porta/porta.env`, `/var/lib/porta/clients.json`, and persistent leases.
 The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately. Use `--no-build` to
-deploy an existing `bin/htun-server`.
+deploy an existing `bin/porta-server`.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the
@@ -100,7 +100,7 @@ the previous gateway.
 
 ## Browser cover page and admin UI
 
-hTun serves a neutral HTML landing page to ordinary browser requests by
+Porta serves a neutral HTML landing page to ordinary browser requests by
 default, so visiting the tunnel origin does not identify the VPN service.
 The public listener does not route the admin UI, `/healthz`, `/readyz`, or
 `/metrics`; these are served only on `127.0.0.1:9090` by default. Tunnel
@@ -111,7 +111,7 @@ Open the admin UI without exposing it publicly:
 
 ```sh
 ssh -L 9090:127.0.0.1:9090 user@vpn.example.com
-sudo sed -n 's/^HTUN_ADMIN_TOKEN=//p' /etc/htun/htun.env
+sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 ```
 
 Then browse to `http://127.0.0.1:9090` and enter the admin token. The UI can
@@ -126,11 +126,11 @@ the loopback operational listener.
 ## Reverse proxies
 
 The deployment script deliberately does not edit or reload reverse-proxy
-configuration. When another service owns port 443, deploy hTun with
+configuration. When another service owns port 443, deploy Porta with
 `--port 8443`. A reverse proxy may forward HTTP/2 requests to that TLS
 listener for Android's four-lane fallback if it supports unbuffered duplex
 streaming, but native MASQUE clients should use `https://vpn.example.com:8443`
-directly so UDP traffic reaches hTun.
+directly so UDP traffic reaches Porta.
 
 ## Firewall
 
@@ -150,12 +150,12 @@ The first deployment creates a default client using the generated bootstrap
 token:
 
 ```sh
-sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
+sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 ```
 
 Use the admin UI for additional clients. Each client receives one random token
 that can enroll multiple unique device IDs up to its configured limit. The
-registry stores only token hashes in `/var/lib/htun/clients.json`. Disabling a
+registry stores only token hashes in `/var/lib/porta/clients.json`. Disabling a
 client or rotating its token blocks future connections immediately; existing
 tunnel connections end normally or when the service is restarted.
 
@@ -164,18 +164,18 @@ tunnel connections end normally or when the service is restarted.
 For a default port-443 deployment:
 
 ```sh
-sudo systemctl status htun
-sudo journalctl -u htun -f
+sudo systemctl status porta
+sudo journalctl -u porta -f
 curl http://127.0.0.1:9090/readyz
 sudo ss -lntup | grep ':443'
 ```
 
 For an existing-web-server deployment, replace 443 with 8443 and include
 `:8443` in the URL. Static-certificate deployments also install
-`htun-cert-sync.timer`:
+`porta-cert-sync.timer`:
 
 ```sh
-sudo systemctl status htun-cert-sync.timer
+sudo systemctl status porta-cert-sync.timer
 curl http://127.0.0.1:9090/readyz
 ```
 
@@ -183,9 +183,9 @@ The expected listeners are TCP and UDP on the configured port. Certificate
 synchronization replaces the copied files atomically; new TLS handshakes load
 the renewed certificate without disconnecting active tunnels.
 
-In automatic Let's Encrypt mode, hTun additionally listens on TCP 80 for
+In automatic Let's Encrypt mode, Porta additionally listens on TCP 80 for
 HTTP-01 challenges and stores its ACME account and certificates under
-`/var/lib/htun/acme`.
+`/var/lib/porta/acme`.
 
 ## Android
 
@@ -205,13 +205,13 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org/download/htun-android-0.5.4.apk
+APK:     https://htun.i-csu.org/download/porta-android-0.6.0.apk
 Gateway: https://htun.i-csu.org:8443
 ```
 
 The default APK is the optimized ARM64 build used by most current phones. Use
-`htun-android-0.5.4-armeabi-v7a.apk` for older 32-bit ARM devices or
-`htun-android-0.5.4-x86_64.apk` for an emulator. Each APK contains only its
+`porta-android-0.6.0-armeabi-v7a.apk` for older 32-bit ARM devices or
+`porta-android-0.6.0-x86_64.apk` for an emulator. Each APK contains only its
 required native Go runtime instead of bundling every Android CPU architecture.
 
 ## Removal
@@ -219,9 +219,9 @@ required native Go runtime instead of bundling every Android CPU architecture.
 Stop and disable the units before removing installed files:
 
 ```sh
-sudo systemctl disable --now htun.service
-sudo systemctl disable --now htun-cert-sync.timer 2>/dev/null || true
-sudo /usr/local/libexec/htun/server-down.sh htun0 eth0
+sudo systemctl disable --now porta.service
+sudo systemctl disable --now porta-cert-sync.timer 2>/dev/null || true
+sudo /usr/local/libexec/porta/server-down.sh porta0 eth0
 ```
 
 Credential and lease files are intentionally not removed automatically.

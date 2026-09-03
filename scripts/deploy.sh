@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Deploy or upgrade a direct hTun HTTP/2 + HTTP/3 gateway managed by systemd.
+Deploy or upgrade a direct Porta HTTP/2 + HTTP/3 gateway managed by systemd.
 
 Usage:
   sudo ./scripts/deploy.sh --domain DOMAIN [--cert CERTIFICATE --key PRIVATE_KEY] [options]
@@ -18,19 +18,19 @@ Options:
   --port PORT               Direct TCP and UDP port (default: 443)
   --admin-port PORT         Loopback admin UI and operations port (default: 9090)
   --external-interface IF   Internet-facing interface (auto-detected)
-  --tun-interface IF        TUN interface (default: htun0)
+  --tun-interface IF        TUN interface (default: porta0)
   --pool CIDR               Client pool (default: 10.66.0.0/24)
   --gateway-cidr CIDR       Gateway address and prefix (default: 10.66.0.1/24)
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU (default: 1100)
   --reset-leases            Archive leases incompatible with a changed pool
-  --no-build                Install the existing bin/htun-server
+  --no-build                Install the existing bin/porta-server
   --help                    Show this help
 
-The script preserves existing /etc/htun credentials. On a new installation it
+The script preserves existing /etc/porta credentials. On a new installation it
 creates random client, admin, and metrics tokens.
 
-When --cert and --key are omitted, hTun obtains and renews a Let's Encrypt
+When --cert and --key are omitted, Porta obtains and renews a Let's Encrypt
 certificate using HTTP-01. Public TCP port 80 must reach this server and must
 not already be owned by another process.
 EOF
@@ -52,7 +52,7 @@ acme_email=
 port=443
 admin_port=9090
 external_interface=
-tun_interface=htun0
+tun_interface=porta0
 pool=10.66.0.0/24
 gateway_cidr=
 dns=1.1.1.1
@@ -158,20 +158,20 @@ else
   (( port != 80 )) || die "--port 80 cannot be used with Let's Encrypt HTTP-01"
   port80_listeners=$(ss -H -ltnp 'sport = :80')
   if [[ -n $port80_listeners ]] &&
-    { grep -qv '"htun-server"' <<<"$port80_listeners" ||
-      ! systemctl cat htun.service 2>/dev/null | grep -q -- '--acme-domain'; }; then
+    { grep -qv '"porta-server"' <<<"$port80_listeners" ||
+      ! systemctl cat porta.service 2>/dev/null | grep -q -- '--acme-domain'; }; then
     die "TCP port 80 is already in use; provide --cert and --key or free port 80 for Let's Encrypt HTTP-01"
   fi
 fi
 
 tcp_listeners=$(ss -H -ltnp "sport = :$port")
 udp_listeners=$(ss -H -lunp "sport = :$port")
-if { [[ -n $tcp_listeners ]] && grep -qv '"htun-server"' <<<"$tcp_listeners"; } ||
-  { [[ -n $udp_listeners ]] && grep -qv '"htun-server"' <<<"$udp_listeners"; }; then
+if { [[ -n $tcp_listeners ]] && grep -qv '"porta-server"' <<<"$tcp_listeners"; } ||
+  { [[ -n $udp_listeners ]] && grep -qv '"porta-server"' <<<"$udp_listeners"; }; then
   die "TCP or UDP port $port is already used by another service"
 fi
 admin_listeners=$(ss -H -ltnp "sport = :$admin_port")
-if [[ -n $admin_listeners ]] && grep -qv '"htun-server"' <<<"$admin_listeners"; then
+if [[ -n $admin_listeners ]] && grep -qv '"porta-server"' <<<"$admin_listeners"; then
   die "TCP admin port $admin_port is already used by another service"
 fi
 
@@ -185,7 +185,7 @@ if $build; then
       fi
     done
   fi
-  [[ -n $go_binary ]] || die "Go is required to build hTun"
+  [[ -n $go_binary ]] || die "Go is required to build Porta"
   if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
     sudo -u "$SUDO_USER" env "HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)" \
       make GO="$go_binary" build
@@ -193,9 +193,9 @@ if $build; then
     make GO="$go_binary" build
   fi
 fi
-[[ -x bin/htun-server ]] || die "bin/htun-server is missing; remove --no-build or run make build"
+[[ -x bin/porta-server ]] || die "bin/porta-server is missing; remove --no-build or run make build"
 
-lease_state=/var/lib/htun/leases.json
+lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'
 import ipaddress
 import json
@@ -219,34 +219,34 @@ then
   fi
 fi
 
-install -d -m 0755 /usr/local/libexec/htun /etc/htun
-install -m 0755 bin/htun-server /usr/local/bin/htun-server
+install -d -m 0755 /usr/local/libexec/porta /etc/porta
+install -m 0755 bin/porta-server /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
-  /usr/local/libexec/htun/
-install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
+  /usr/local/libexec/porta/
+install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
 
-environment_file=/etc/htun/htun.env
+environment_file=/etc/porta/porta.env
 if [[ ! -f $environment_file ]]; then
   umask 077
   {
-    printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
-    printf 'HTUN_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)"
-    printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
+    printf 'PORTA_TOKEN=%s\n' "$(openssl rand -hex 32)"
+    printf 'PORTA_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)"
+    printf 'PORTA_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
   } >"$environment_file"
 fi
-if ! grep -q '^HTUN_TOKEN=' "$environment_file"; then
-  printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
+if ! grep -q '^PORTA_TOKEN=' "$environment_file"; then
+  printf 'PORTA_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
 fi
-if ! grep -q '^HTUN_ADMIN_TOKEN=' "$environment_file"; then
-  printf 'HTUN_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
+if ! grep -q '^PORTA_ADMIN_TOKEN=' "$environment_file"; then
+  printf 'PORTA_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
 fi
 chmod 0600 "$environment_file"
 
-client_registry=/var/lib/htun/clients.json
+client_registry=/var/lib/porta/clients.json
 migrated_client_file=false
-if [[ ! -f $client_registry && -s /etc/htun/clients ]]; then
-  install -d -m 0700 /var/lib/htun
-  python3 - "$environment_file" /etc/htun/clients "$client_registry" <<'PY' ||
+if [[ ! -f $client_registry && -s /etc/porta/clients ]]; then
+  install -d -m 0700 /var/lib/porta
+  python3 - "$environment_file" /etc/porta/clients "$client_registry" <<'PY' ||
     die "could not import existing client credentials"
 import datetime
 import hashlib
@@ -264,9 +264,9 @@ with open(environment_path, encoding="utf-8") as stream:
         key, separator, value = raw_line.strip().partition("=")
         if separator:
             environment[key] = value
-bootstrap = environment.get("HTUN_TOKEN", "")
+bootstrap = environment.get("PORTA_TOKEN", "")
 if len(bootstrap) < 16:
-    raise SystemExit("HTUN_TOKEN is missing or too short")
+    raise SystemExit("PORTA_TOKEN is missing or too short")
 
 now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 clients = [{
@@ -323,20 +323,20 @@ fi
 rollback_directory=$(mktemp -d)
 deployment_complete=false
 had_active_service=false
-for unit in htun.service htun-cert-sync.service htun-cert-sync.timer; do
+for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
   if [[ -f /etc/systemd/system/$unit ]]; then
     cp -a "/etc/systemd/system/$unit" "$rollback_directory/$unit"
   fi
 done
-if systemctl is-active --quiet htun.service; then
+if systemctl is-active --quiet porta.service; then
   had_active_service=true
 fi
 rollback() {
   local status=$?
   if [[ $status -ne 0 && $deployment_complete == false ]]; then
     set +e
-    systemctl stop htun.service
-    for unit in htun.service htun-cert-sync.service htun-cert-sync.timer; do
+    systemctl stop porta.service
+    for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
       if [[ -f $rollback_directory/$unit ]]; then
         cp -a "$rollback_directory/$unit" "/etc/systemd/system/$unit"
       else
@@ -345,35 +345,35 @@ rollback() {
     done
     systemctl daemon-reload
     if $had_active_service; then
-      systemctl restart htun.service
+      systemctl restart porta.service
     fi
-    echo "deploy: restored the previous hTun service after deployment failure" >&2
+    echo "deploy: restored the previous Porta service after deployment failure" >&2
   fi
-  rm -f "$rollback_directory/htun.service" \
-    "$rollback_directory/htun-cert-sync.service" \
-    "$rollback_directory/htun-cert-sync.timer"
+  rm -f "$rollback_directory/porta.service" \
+    "$rollback_directory/porta-cert-sync.service" \
+    "$rollback_directory/porta-cert-sync.timer"
   rmdir "$rollback_directory"
   exit "$status"
 }
 trap rollback EXIT
 
-if systemctl is-active --quiet htun.service; then
-  systemctl stop htun.service
+if systemctl is-active --quiet porta.service; then
+  systemctl stop porta.service
 fi
 if $reset_leases && [[ -s $lease_state ]]; then
   mv "$lease_state" "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).bak"
 fi
 
 if [[ $tls_mode == static ]]; then
-  unit_after="After=network-online.target htun-cert-sync.service"
-  unit_wants="Wants=network-online.target htun-cert-sync.service"
-  tls_arguments="--tls-cert /etc/htun/tls/server.crt --tls-key /etc/htun/tls/server.key"
-  tls_preflight="ExecStartPre=/bin/sh -c 'test -s /etc/htun/tls/server.crt && test -s /etc/htun/tls/server.key'"
+  unit_after="After=network-online.target porta-cert-sync.service"
+  unit_wants="Wants=network-online.target porta-cert-sync.service"
+  tls_arguments="--tls-cert /etc/porta/tls/server.crt --tls-key /etc/porta/tls/server.key"
+  tls_preflight="ExecStartPre=/bin/sh -c 'test -s /etc/porta/tls/server.crt && test -s /etc/porta/tls/server.key'"
   capabilities=CAP_NET_ADMIN
 else
   unit_after="After=network-online.target"
   unit_wants="Wants=network-online.target"
-  tls_arguments="--acme-domain $domain --acme-cache /var/lib/htun/acme --acme-http-listen :80"
+  tls_arguments="--acme-domain $domain --acme-cache /var/lib/porta/acme --acme-http-listen :80"
   if [[ -n $acme_email ]]; then
     tls_arguments+=" --acme-email $acme_email"
   fi
@@ -384,25 +384,25 @@ if (( port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
   capabilities+=" CAP_NET_BIND_SERVICE"
 fi
 
-cat >/etc/systemd/system/htun.service <<EOF
+cat >/etc/systemd/system/porta.service <<EOF
 [Unit]
-Description=hTun VPN gateway
+Description=Porta VPN gateway
 $unit_after
 $unit_wants
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/htun/htun.env
+EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/htun-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments --client-registry /var/lib/htun/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
-ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/htun/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
-ExecStopPost=/usr/local/libexec/htun/server-down.sh $tun_interface $external_interface
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments --client-registry /var/lib/porta/clients.json --interface $tun_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
+ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15
 LimitNOFILE=65536
 UMask=0077
-StateDirectory=htun
+StateDirectory=porta
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -427,33 +427,33 @@ WantedBy=multi-user.target
 EOF
 
 if [[ $tls_mode == static ]]; then
-  cat >/etc/systemd/system/htun-cert-sync.service <<EOF
+  cat >/etc/systemd/system/porta-cert-sync.service <<EOF
 [Unit]
-Description=Synchronize the hTun TLS certificate
+Description=Synchronize the Porta TLS certificate
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/htun/sync-cert.sh $certificate $private_key /etc/htun/tls
+ExecStart=/usr/local/libexec/porta/sync-cert.sh $certificate $private_key /etc/porta/tls
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  install -m 0644 deploy/htun-cert-sync.timer /etc/systemd/system/htun-cert-sync.timer
+  install -m 0644 deploy/porta-cert-sync.timer /etc/systemd/system/porta-cert-sync.timer
 else
-  systemctl disable --now htun-cert-sync.timer >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/htun-cert-sync.service /etc/systemd/system/htun-cert-sync.timer
+  systemctl disable --now porta-cert-sync.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/porta-cert-sync.service /etc/systemd/system/porta-cert-sync.timer
 fi
-sysctl -p /etc/sysctl.d/99-htun-quic.conf >/dev/null
+sysctl -p /etc/sysctl.d/99-porta-quic.conf >/dev/null
 systemctl daemon-reload
-systemctl enable htun.service >/dev/null
+systemctl enable porta.service >/dev/null
 if [[ $tls_mode == static ]]; then
-  systemctl enable htun-cert-sync.timer >/dev/null
-  systemctl start htun-cert-sync.service
+  systemctl enable porta-cert-sync.timer >/dev/null
+  systemctl start porta-cert-sync.service
 fi
-systemctl restart htun.service
+systemctl restart porta.service
 if [[ $tls_mode == static ]]; then
-  systemctl start htun-cert-sync.timer
+  systemctl start porta-cert-sync.timer
 fi
 
 for _ in $(seq 1 30); do
@@ -469,27 +469,27 @@ cover_page=$(curl --silent --show-error --fail \
   die "gateway admin endpoint is ready but public TLS is unavailable"
 grep -q '<title>Northline</title>' <<<"$cover_page" ||
   die "public endpoint did not return the expected landing page"
-systemctl is-active --quiet htun.service ||
+systemctl is-active --quiet porta.service ||
   die "gateway exited after its readiness check"
-ss -H -ltnp "sport = :$port" | grep -q '"htun-server"' ||
+ss -H -ltnp "sport = :$port" | grep -q '"porta-server"' ||
   die "gateway is not listening on public TCP port $port"
-ss -H -lunp "sport = :$port" | grep -q '"htun-server"' ||
+ss -H -lunp "sport = :$port" | grep -q '"porta-server"' ||
   die "gateway is not listening on public UDP port $port"
 if $migrated_client_file; then
-  rm -f /etc/htun/clients
+  rm -f /etc/porta/clients
 fi
 
 deployment_complete=true
 cat <<EOF
 
-hTun is ready.
+Porta is ready.
 
 Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
 TLS mode:        $tls_mode
 Admin endpoint:  http://127.0.0.1:$admin_port
 Admin access:    ssh -L $admin_port:127.0.0.1:$admin_port USER@$domain
-Admin token:     sudo sed -n 's/^HTUN_ADMIN_TOKEN=//p' /etc/htun/htun.env
-Initial client:  sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
+Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
+Initial client:  sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 Ensure both TCP and UDP $port are allowed by the host and cloud firewalls.
 EOF

@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/htun-project/htun/internal/gateway"
-	"github.com/htun-project/htun/internal/masque"
-	"github.com/htun-project/htun/internal/protocol"
+	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/masque"
+	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -290,10 +290,10 @@ func newMasqueClient(
 	header http.Header,
 ) *masqueClient {
 	lease := Lease{MTU: 1280}
-	if mtu, err := strconv.Atoi(header.Get("X-HTun-MTU")); err == nil && mtu >= 576 && mtu <= 9000 {
+	if mtu, err := strconv.Atoi(header.Get("X-Porta-MTU")); err == nil && mtu >= 576 && mtu <= 9000 {
 		lease.MTU = mtu
 	}
-	if value := header.Get("X-HTun-DNS"); value != "" {
+	if value := header.Get("X-Porta-DNS"); value != "" {
 		lease.DNS, _ = netip.ParseAddr(value)
 	}
 	return &masqueClient{
@@ -444,7 +444,7 @@ func (m *masqueClient) close() error {
 func setMasqueHeaders(request *http.Request, config Config) {
 	request.Header.Set("Authorization", "Bearer "+config.Token)
 	request.Header.Set(http3.CapsuleProtocolHeader, "?1")
-	request.Header.Set("X-HTun-Client-ID", config.ClientID)
+	request.Header.Set("X-Porta-Client-ID", config.ClientID)
 }
 
 func validateMasqueResponse(response *http.Response) error {

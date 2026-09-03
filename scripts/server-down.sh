@@ -9,9 +9,9 @@ fi
 tun_interface=$1
 external_interface=${2:-}
 if [[ -n "$external_interface" ]] && command -v iptables >/dev/null && iptables -w -S DOCKER-USER >/dev/null 2>&1; then
-  iptables -w -D DOCKER-USER -i "$tun_interface" -o "$external_interface" -m comment --comment htun -j ACCEPT 2>/dev/null || true
-  iptables -w -D DOCKER-USER -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment htun -j ACCEPT 2>/dev/null || true
+  iptables -w -D DOCKER-USER -i "$tun_interface" -o "$external_interface" -m comment --comment porta -j ACCEPT 2>/dev/null || true
+  iptables -w -D DOCKER-USER -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT 2>/dev/null || true
 fi
-nft delete table ip htun 2>/dev/null || true
+nft delete table ip porta 2>/dev/null || true
 ip link set dev "$tun_interface" down 2>/dev/null || true
-echo "removed nftables table 'ip htun' and lowered $tun_interface"
+echo "removed nftables table 'ip porta' and lowered $tun_interface"

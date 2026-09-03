@@ -3,7 +3,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val nativeMasqueAar = layout.buildDirectory.file("generated/aar/htunmobile.aar")
+val nativeMasqueAar = layout.buildDirectory.file("generated/aar/portamobile.aar")
 val buildNativeMasqueAar by tasks.registering(Exec::class) {
     group = "build"
     description = "Builds the Go HTTP/3 MASQUE Android bridge"
@@ -18,14 +18,14 @@ val buildNativeMasqueAar by tasks.registering(Exec::class) {
         rootProject.projectDir.parentFile.resolve("scripts/build-android-aar.sh"),
     )
     inputs.dir(rootProject.projectDir.parentFile.resolve("internal"))
-    inputs.dir(rootProject.projectDir.parentFile.resolve("mobile/htunmobile"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("mobile/portamobile"))
     outputs.file(nativeMasqueAar)
 }
 
-val releaseKeystorePath = providers.environmentVariable("HTUN_ANDROID_KEYSTORE").orNull
-val releaseKeystorePassword = providers.environmentVariable("HTUN_ANDROID_KEYSTORE_PASSWORD").orNull
-val releaseKeyAlias = providers.environmentVariable("HTUN_ANDROID_KEY_ALIAS").orNull
-val releaseKeyPassword = providers.environmentVariable("HTUN_ANDROID_KEY_PASSWORD").orNull
+val releaseKeystorePath = providers.environmentVariable("PORTA_ANDROID_KEYSTORE").orNull
+val releaseKeystorePassword = providers.environmentVariable("PORTA_ANDROID_KEYSTORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("PORTA_ANDROID_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("PORTA_ANDROID_KEY_PASSWORD").orNull
 val hasReleaseSigning = listOf(
     releaseKeystorePath,
     releaseKeystorePassword,
@@ -34,15 +34,15 @@ val hasReleaseSigning = listOf(
 ).all { !it.isNullOrBlank() }
 
 android {
-    namespace = "dev.htun.android"
+    namespace = "dev.porta.android"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.htun.android"
+        applicationId = "dev.porta.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.5.4"
+        versionCode = 14
+        versionName = "0.6.0"
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }

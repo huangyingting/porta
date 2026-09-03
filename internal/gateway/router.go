@@ -9,8 +9,8 @@ import (
 	"net/netip"
 	"sync"
 
-	"github.com/htun-project/htun/internal/device"
-	"github.com/htun-project/htun/internal/protocol"
+	"github.com/huangyingting/porta/internal/device"
+	"github.com/huangyingting/porta/internal/protocol"
 )
 
 var (

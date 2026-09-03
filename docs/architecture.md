@@ -1,6 +1,6 @@
-# hTun architecture
+# Porta architecture
 
-hTun is an authenticated IPv4 tunnel implementing MASQUE `CONNECT-IP` from
+Porta is an authenticated IPv4 tunnel implementing MASQUE `CONNECT-IP` from
 RFC 9484 and the Capsule Protocol/HTTP Datagram conventions from RFC 9297. It
 is intended for remote access to networks that the operator owns or is
 authorized to administer. It does not attempt to impersonate a browser or hide
@@ -11,7 +11,7 @@ its protocol fingerprint.
 ```text
 Windows Wintun                 Android VpnService
        |                               |
-MASQUE CONNECT-IP              four-lane hTun stream
+MASQUE CONNECT-IP              four-lane Porta stream
        |                               |
   +----+-------------------------------+
   |                                    |
@@ -19,7 +19,7 @@ HTTP/2 capsules             HTTP/3 QUIC Datagrams
   |                         (capsule fallback)
   +--------------------+---------------+
                        |
-                  hTun gateway
+                  Porta gateway
                        |
                    Linux TUN
                        |
@@ -38,8 +38,8 @@ HTTP/3 peers that do not negotiate Datagrams, carry the same Context-ID-plus-IP
 payload in RFC 9297 DATAGRAM capsules.
 
 RFC 9484 does not define DNS or link-MTU negotiation, so the gateway provides
-optional `X-HTun-DNS` and `X-HTun-MTU` response extensions. Authentication uses
-`Authorization: Bearer <token>`, and `X-HTun-Client-ID` provides stable lease
+optional `X-Porta-DNS` and `X-Porta-MTU` response extensions. Authentication uses
+`Authorization: Bearer <token>`, and `X-Porta-Client-ID` provides stable lease
 selection and reconnect replacement. The token identifies a client account,
 while the client ID identifies one enrolled device. Their combined identity
 prevents device-name collisions between accounts.
@@ -93,7 +93,7 @@ with this setting if it is absent. Tests set it before process startup.
 ## Android HTTP/2 fallback
 
 The Android fallback uses the private media type
-`application/x-htun-packets` and two-byte length-prefixed IPv4 packets over
+`application/x-porta-packets` and two-byte length-prefixed IPv4 packets over
 `POST /v1/tunnel`. Android opens four independent HTTP/2 connections for this
 fallback, reserves lane zero for DNS, and consistently distributes other IP
 flows across three data lanes. Each lane has its own TCP loss domain, reducing

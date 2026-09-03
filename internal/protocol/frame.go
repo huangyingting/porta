@@ -11,13 +11,13 @@ import (
 
 const (
 	Version     = "1"
-	ContentType = "application/x-htun-packets"
+	ContentType = "application/x-porta-packets"
 	MaxPacket   = 65535
 )
 
-var ErrFrameTooLarge = errors.New("htun frame exceeds maximum packet size")
+var ErrFrameTooLarge = errors.New("porta frame exceeds maximum packet size")
 
-// Encoder writes complete IP packets to an ordered hTun byte stream. Encoder
+// Encoder writes complete IP packets to an ordered Porta byte stream. Encoder
 // is safe for concurrent callers because keepalives and packet writes may be
 // emitted by different goroutines.
 type Encoder struct {
@@ -46,7 +46,7 @@ func (e *Encoder) WritePacket(packet []byte) error {
 	return writeAll(e.w, packet)
 }
 
-// Decoder reads complete IP packets from an ordered hTun byte stream. A nil
+// Decoder reads complete IP packets from an ordered Porta byte stream. A nil
 // packet represents a zero-length keepalive frame.
 type Decoder struct {
 	r *bufio.Reader

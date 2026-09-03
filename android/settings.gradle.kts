@@ -14,6 +14,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "hTunAndroid"
+rootProject.name = "PortaAndroid"
 include(":app")
 

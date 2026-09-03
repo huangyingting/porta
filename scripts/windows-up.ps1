@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$AddressCidr,
     [Parameter(Mandatory = $true)][string]$ServerIp,
-    [string]$InterfaceAlias = "hTun",
+    [string]$InterfaceAlias = "Porta",
     [string]$DnsServer = "1.1.1.1"
 )
 

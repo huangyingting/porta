@@ -17,7 +17,7 @@ vpn_is_active() {
 }
 
 if ! vpn_is_active; then
-	echo "connect hTun on the attached device before starting the soak test" >&2
+	echo "connect Porta on the attached device before starting the soak test" >&2
 	exit 1
 fi
 

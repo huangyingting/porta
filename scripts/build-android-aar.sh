@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANDROID_HOME="${ANDROID_HOME:-/home/azadmin/Android/Sdk}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_HOME}/ndk/27.2.12479018}"
 GOMOBILE="${GOMOBILE:-$(command -v gomobile || true)}"
-OUTPUT="${1:-${ROOT}/android/app/build/generated/aar/htunmobile.aar}"
+OUTPUT="${1:-${ROOT}/android/app/build/generated/aar/portamobile.aar}"
 
 if [[ -z "${GOMOBILE}" ]]; then
     GOPATH_BIN="$(go env GOPATH 2>/dev/null)/bin"
@@ -28,4 +28,4 @@ PATH="$(dirname "${GOMOBILE}"):${PATH}" \
     "${GOMOBILE}" bind \
     -target=android/arm,android/arm64,android/amd64 \
     -androidapi=26 -trimpath -ldflags="-s -w" \
-    -o "${OUTPUT}" ./mobile/htunmobile
+    -o "${OUTPUT}" ./mobile/portamobile

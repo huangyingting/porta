@@ -49,12 +49,12 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		help  string
 		value any
 	}{
-		{"htun_active_tunnels", "gauge", "Current authenticated tunnel connections.", m.activeTunnels.Load()},
-		{"htun_connections_total", "counter", "Authenticated tunnel connections accepted.", m.connectionsTotal.Load()},
-		{"htun_auth_failures_total", "counter", "Rejected tunnel authentication attempts.", m.authFailures.Load()},
-		{"htun_packets_from_client_total", "counter", "IPv4 packets accepted from tunnel clients.", m.packetsFromClient.Load()},
-		{"htun_packets_to_client_total", "counter", "IPv4 packets sent to tunnel clients.", m.packetsToClient.Load()},
-		{"htun_dropped_packets_from_client_total", "counter", "Invalid or source-mismatched packets dropped from tunnel clients.", m.droppedPacketsFromClient.Load()},
+		{"porta_active_tunnels", "gauge", "Current authenticated tunnel connections.", m.activeTunnels.Load()},
+		{"porta_connections_total", "counter", "Authenticated tunnel connections accepted.", m.connectionsTotal.Load()},
+		{"porta_auth_failures_total", "counter", "Rejected tunnel authentication attempts.", m.authFailures.Load()},
+		{"porta_packets_from_client_total", "counter", "IPv4 packets accepted from tunnel clients.", m.packetsFromClient.Load()},
+		{"porta_packets_to_client_total", "counter", "IPv4 packets sent to tunnel clients.", m.packetsToClient.Load()},
+		{"porta_dropped_packets_from_client_total", "counter", "Invalid or source-mismatched packets dropped from tunnel clients.", m.droppedPacketsFromClient.Load()},
 	}
 	for _, metric := range metrics {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", metric.name, metric.help, metric.name, metric.kind, metric.name, metric.value)

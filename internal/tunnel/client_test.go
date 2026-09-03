@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/htun-project/htun/internal/certutil"
-	"github.com/htun-project/htun/internal/gateway"
-	"github.com/htun-project/htun/internal/tunnel"
+	"github.com/huangyingting/porta/internal/certutil"
+	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 )

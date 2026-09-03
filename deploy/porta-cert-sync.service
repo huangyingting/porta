@@ -1,0 +1,15 @@
+[Unit]
+Description=Synchronize an externally managed Porta TLS certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/porta/sync-cert.sh /etc/ssl/porta/source.crt /etc/ssl/porta/source.key /etc/porta/tls
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/ssl/porta
+ReadWritePaths=/etc/porta/tls
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_UNIX

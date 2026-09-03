@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/htun-project/htun/internal/protocol"
+	"github.com/huangyingting/porta/internal/protocol"
 )
 
 const TunnelPath = "/v1/tunnel"
@@ -25,9 +25,9 @@ var validClientID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 var validLaneSessionID = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
 const (
-	laneSessionHeader = "X-HTun-Lane-Session"
-	laneIndexHeader   = "X-HTun-Lane"
-	laneCountHeader   = "X-HTun-Lanes"
+	laneSessionHeader = "X-Porta-Lane-Session"
+	laneIndexHeader   = "X-Porta-Lane"
+	laneCountHeader   = "X-Porta-Lanes"
 	tunnelLaneCount   = 4
 )
 
@@ -99,7 +99,7 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 	if config.MetricsToken != "" {
 		mux.Handle("GET /metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !authorized(r.Header.Get("Authorization"), config.MetricsToken) {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="htun-metrics"`)
+				w.Header().Set("WWW-Authenticate", `Bearer realm="porta-metrics"`)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -113,10 +113,10 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 
 func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	if r.ProtoMajor < 2 {
-		http.Error(w, "hTun requires HTTP/2 or HTTP/3", http.StatusHTTPVersionNotSupported)
+		http.Error(w, "Porta requires HTTP/2 or HTTP/3", http.StatusHTTPVersionNotSupported)
 		return
 	}
-	clientID := r.Header.Get("X-HTun-Client-ID")
+	clientID := r.Header.Get("X-Porta-Client-ID")
 	if !validClientID.MatchString(clientID) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
 		return
@@ -124,12 +124,12 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	identity, err := c.authorizeClient(r.Header.Get("Authorization"), clientID)
 	if err != nil {
 		c.Metrics.authenticationFailed()
-		w.Header().Set("WWW-Authenticate", `Bearer realm="htun"`)
+		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if r.Header.Get("X-HTun-Version") != protocol.Version {
-		http.Error(w, "unsupported hTun version", http.StatusUpgradeRequired)
+	if r.Header.Get("X-Porta-Version") != protocol.Version {
+		http.Error(w, "unsupported Porta version", http.StatusUpgradeRequired)
 		return
 	}
 	mediaType := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])
@@ -179,15 +179,15 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", protocol.ContentType)
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-HTun-Version", protocol.Version)
-	w.Header().Set("X-HTun-Address", lease.Prefix().String())
-	w.Header().Set("X-HTun-Gateway", lease.Gateway.String())
-	w.Header().Set("X-HTun-MTU", strconv.Itoa(c.MTU))
+	w.Header().Set("X-Porta-Version", protocol.Version)
+	w.Header().Set("X-Porta-Address", lease.Prefix().String())
+	w.Header().Set("X-Porta-Gateway", lease.Gateway.String())
+	w.Header().Set("X-Porta-MTU", strconv.Itoa(c.MTU))
 	w.Header().Set(laneSessionHeader, lanes.sessionID)
 	w.Header().Set(laneIndexHeader, strconv.Itoa(lanes.index))
 	w.Header().Set(laneCountHeader, strconv.Itoa(lanes.count))
 	if c.DNS != "" {
-		w.Header().Set("X-HTun-DNS", c.DNS)
+		w.Header().Set("X-Porta-DNS", c.DNS)
 	}
 
 	w.WriteHeader(http.StatusOK)

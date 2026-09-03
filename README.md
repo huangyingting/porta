@@ -1,6 +1,6 @@
-# hTun
+# Porta
 
-hTun is a small, auditable IPv4 VPN MVP implementing MASQUE `CONNECT-IP`
+Porta is a small, auditable IPv4 VPN MVP implementing MASQUE `CONNECT-IP`
 (RFC 9484). The gateway accepts HTTP/2 over TCP and HTTP/3 over QUIC/UDP on the
 same port. The repository includes a Linux gateway, a Windows Wintun client,
 and an Android `VpnService` client.
@@ -65,7 +65,7 @@ sudo ./scripts/deploy.sh \
   --acme-email admin@example.com
 ```
 
-Public TCP port 80 must reach hTun for the HTTP-01 challenge. If another web
+Public TCP port 80 must reach Porta for the HTTP-01 challenge. If another web
 server already owns ports 80 and 443, use an externally managed certificate
 and choose another direct port:
 
@@ -77,7 +77,7 @@ sudo ./scripts/deploy.sh \
   --port 8443
 ```
 
-The command builds and installs hTun, creates credentials on first use,
+The command builds and installs Porta, creates credentials on first use,
 configures systemd, TLS issuance or certificate synchronization, QUIC socket
 buffers, forwarding, and NAT, then verifies the TLS readiness endpoint. It
 preserves credentials and leases when run again for an upgrade and rolls back
@@ -98,50 +98,50 @@ domain's A/AAAA record at the gateway, expose TCP port 80 for the HTTP-01
 challenge, and expose TCP and UDP port 443:
 
 ```sh
-export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
-export HTUN_ADMIN_TOKEN="use-a-different-random-admin-secret"
-export HTUN_METRICS_TOKEN="use-a-different-random-secret"
-sudo --preserve-env=HTUN_TOKEN,HTUN_ADMIN_TOKEN,HTUN_METRICS_TOKEN ./bin/htun-server \
+export PORTA_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
+export PORTA_ADMIN_TOKEN="use-a-different-random-admin-secret"
+export PORTA_METRICS_TOKEN="use-a-different-random-secret"
+sudo --preserve-env=PORTA_TOKEN,PORTA_ADMIN_TOKEN,PORTA_METRICS_TOKEN ./bin/porta-server \
   --listen :443 \
   --admin-listen 127.0.0.1:9090 \
   --acme-domain vpn.example.com \
   --acme-email admin@example.com \
-  --acme-cache /var/lib/htun/acme \
+  --acme-cache /var/lib/porta/acme \
   --acme-http-listen :80 \
-  --client-registry /var/lib/htun/clients.json \
-  --interface htun0 \
+  --client-registry /var/lib/porta/clients.json \
+  --interface porta0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
   --mtu 1100
 ```
 
 The loopback admin UI manages client accounts, tokens, device limits, enabled
-state, and enrolled devices without restarting hTun. Tokens are generated with
+state, and enrolled devices without restarting Porta. Tokens are generated with
 32 random bytes, stored only as SHA-256 hashes, and displayed once when created
 or rotated. One client token may be used by several device IDs up to that
 client's configured limit.
 
-The daemon creates `htun0`, but deliberately does not modify forwarding or
+The daemon creates `porta0`, but deliberately does not modify forwarding or
 firewall state. In another root shell, after reviewing the script, configure
 the interface and NAT. Replace `eth0` with the real egress interface:
 
 ```sh
-sudo ./scripts/server-up.sh htun0 10.66.0.1/24 10.66.0.0/24 eth0
+sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0
 ```
 
 Open both TCP and UDP port 443 at the host and cloud firewalls. Tear down only
 the nftables table owned by this project with:
 
 ```sh
-sudo ./scripts/server-down.sh htun0 eth0
+sudo ./scripts/server-down.sh porta0 eth0
 ```
 
 When Docker's `DOCKER-USER` chain is present, the setup script also installs
-the two forwarding exceptions required for `htun0`. Passing the external
+the two forwarding exceptions required for `porta0`. Passing the external
 interface to the teardown script removes those exceptions.
 
 The current Go HTTP/2 implementation gates Extended CONNECT behind the
-official `GODEBUG=http2xconnect=1` compatibility switch. `htun-server` detects
+official `GODEBUG=http2xconnect=1` compatibility switch. `porta-server` detects
 its absence and re-executes itself once with that switch enabled while
 preserving existing `GODEBUG` values.
 
@@ -159,24 +159,24 @@ Ordinary browser requests receive a neutral HTML landing page by default.
 `/healthz`, `/readyz`, `/metrics`, and the admin UI are not exposed on the
 public tunnel listener. They are available only from the loopback listener at
 `127.0.0.1:9090` by default. Reach the UI through an SSH tunnel and open
-`http://127.0.0.1:9090`; API data requires `HTUN_ADMIN_TOKEN`. Use
+`http://127.0.0.1:9090`; API data requires `PORTA_ADMIN_TOKEN`. Use
 `--cover-site=false` only when an API-style 404 is preferred over the landing
 page. This is camouflage for casual visitors, not a security boundary.
 
 ### Direct HTTP/3 alongside an existing web server
 
-When another web server already owns port 443, run hTun directly on another
+When another web server already owns port 443, run Porta directly on another
 public port, such as 8443. The existing service can continue managing the
 domain certificate and serving web traffic on 443, while tunnel traffic
-connects directly to hTun over TCP and UDP 8443:
+connects directly to Porta over TCP and UDP 8443:
 
 ```sh
-sudo ./bin/htun-server \
+sudo ./bin/porta-server \
   --listen :8443 \
-  --tls-cert /etc/htun/tls/server.crt \
-  --tls-key /etc/htun/tls/server.key \
-  --client-registry /var/lib/htun/clients.json \
-  --interface htun0 \
+  --tls-cert /etc/porta/tls/server.crt \
+  --tls-key /etc/porta/tls/server.key \
+  --client-registry /var/lib/porta/clients.json \
+  --interface porta0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
   --mtu 1100
@@ -187,33 +187,33 @@ TCP listener and HTTP/3/MASQUE uses the UDP listener. For good QUIC throughput,
 install the included socket-buffer limits:
 
 ```sh
-sudo install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
+sudo install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
 sudo sysctl --system
 ```
 
 The static TLS loader detects atomically replaced certificate files during
 new TLS handshakes, so the gateway does not need a restart solely to load a
 renewed certificate. If another service owns certificate renewal, do not grant
-the hardened hTun process access to its private storage. Instead, use the
+the hardened Porta process access to its private storage. Instead, use the
 included root-run certificate synchronization timer:
 
 ```sh
-sudo install -d -m 0755 /usr/local/libexec/htun
-sudo install -m 0755 scripts/sync-cert.sh /usr/local/libexec/htun/
-sudo install -m 0644 deploy/htun-cert-sync.service deploy/htun-cert-sync.timer /etc/systemd/system/
+sudo install -d -m 0755 /usr/local/libexec/porta
+sudo install -m 0755 scripts/sync-cert.sh /usr/local/libexec/porta/
+sudo install -m 0644 deploy/porta-cert-sync.service deploy/porta-cert-sync.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl start htun-cert-sync.service
-sudo systemctl enable --now htun-cert-sync.timer
+sudo systemctl start porta-cert-sync.service
+sudo systemctl enable --now porta-cert-sync.timer
 ```
 
-Adjust the source certificate and key paths in `htun-cert-sync.service` for
+Adjust the source certificate and key paths in `porta-cert-sync.service` for
 the domain before installing it. The synchronization script validates that the
-certificate and private key match and replaces both destination files. hTun
+certificate and private key match and replaces both destination files. Porta
 loads the renewed pair on subsequent TLS handshakes without disconnecting
 active tunnels.
 
 An existing reverse proxy may retain a compatibility endpoint on 443 by
-forwarding HTTP/2 requests to hTun's TLS listener with response buffering
+forwarding HTTP/2 requests to Porta's TLS listener with response buffering
 disabled and TLS server name `vpn.example.com`. This carries only the HTTP/2
 fallback; native HTTP/3/MASQUE clients connect directly to UDP 8443.
 
@@ -223,26 +223,26 @@ verification:
 ```sh
 curl http://127.0.0.1:9090/readyz
 curl --resolve vpn.example.com:8443:127.0.0.1 \
-  -H "Authorization: Bearer $HTUN_METRICS_TOKEN" \
+  -H "Authorization: Bearer $PORTA_METRICS_TOKEN" \
   http://127.0.0.1:9090/metrics
 ```
 
 ### Behind a reverse proxy
 
 Use `--behind-proxy` when a reverse proxy terminates TLS and manages the public
-certificate. hTun then serves plaintext HTTP/2 (h2c) on its
+certificate. Porta then serves plaintext HTTP/2 (h2c) on its
 TCP listener and does not start ACME, TLS, or HTTP/3 listeners. Bind the
 backend to loopback so it cannot be reached directly:
 
 ```sh
-export HTUN_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
-export HTUN_ADMIN_TOKEN="use-a-different-random-admin-secret"
-sudo --preserve-env=HTUN_TOKEN,HTUN_ADMIN_TOKEN ./bin/htun-server \
+export PORTA_TOKEN="replace-with-a-random-32-byte-or-longer-secret"
+export PORTA_ADMIN_TOKEN="use-a-different-random-admin-secret"
+sudo --preserve-env=PORTA_TOKEN,PORTA_ADMIN_TOKEN ./bin/porta-server \
   --behind-proxy \
   --listen 127.0.0.1:8443 \
   --admin-listen 127.0.0.1:9090 \
-  --client-registry /var/lib/htun/clients.json \
-  --interface htun0 \
+  --client-registry /var/lib/porta/clients.json \
+  --interface porta0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
   --mtu 1100
@@ -251,29 +251,29 @@ sudo --preserve-env=HTUN_TOKEN,HTUN_ADMIN_TOKEN ./bin/htun-server \
 Configure the reverse proxy to use HTTP/2 cleartext for the loopback backend,
 disable response buffering, and keep `/metrics` inaccessible publicly.
 
-The repository includes `deploy/htun.service` for a persistent direct TLS
+The repository includes `deploy/porta.service` for a persistent direct TLS
 deployment on TCP and UDP 8443 using `eth0` as the external interface. Adjust
 the domain-specific certificate synchronization unit and network values before
 installing:
 
 ```sh
 make build
-sudo install -m 0755 bin/htun-server /usr/local/bin/htun-server
-sudo install -d -m 0755 /usr/local/libexec/htun /etc/htun
-sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh /usr/local/libexec/htun/
+sudo install -m 0755 bin/porta-server /usr/local/bin/porta-server
+sudo install -d -m 0755 /usr/local/libexec/porta /etc/porta
+sudo install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh /usr/local/libexec/porta/
 {
-  printf 'HTUN_TOKEN=%s\n' "$(openssl rand -hex 32)"
-  printf 'HTUN_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)"
-  printf 'HTUN_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
-} | sudo tee /etc/htun/htun.env >/dev/null
-sudo chmod 0600 /etc/htun/htun.env
-sudo install -m 0644 deploy/htun.service deploy/htun-cert-sync.service deploy/htun-cert-sync.timer /etc/systemd/system/
-sudo install -m 0644 deploy/99-htun-quic.conf /etc/sysctl.d/99-htun-quic.conf
+  printf 'PORTA_TOKEN=%s\n' "$(openssl rand -hex 32)"
+  printf 'PORTA_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)"
+  printf 'PORTA_METRICS_TOKEN=%s\n' "$(openssl rand -hex 32)"
+} | sudo tee /etc/porta/porta.env >/dev/null
+sudo chmod 0600 /etc/porta/porta.env
+sudo install -m 0644 deploy/porta.service deploy/porta-cert-sync.service deploy/porta-cert-sync.timer /etc/systemd/system/
+sudo install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
 sudo sysctl --system
 sudo systemctl daemon-reload
-sudo systemctl start htun-cert-sync.service
-sudo systemctl enable --now htun
-sudo systemctl enable --now htun-cert-sync.timer
+sudo systemctl start porta-cert-sync.service
+sudo systemctl enable --now porta
+sudo systemctl enable --now porta-cert-sync.timer
 ```
 
 Validate the direct listener after deployment:
@@ -285,12 +285,12 @@ curl http://127.0.0.1:9090/healthz
 Operational checks:
 
 ```sh
-systemctl status htun
-journalctl -u htun -f
+systemctl status porta
+journalctl -u porta -f
 curl http://127.0.0.1:9090/readyz
-ADMIN_TOKEN="$(sudo sed -n 's/^HTUN_ADMIN_TOKEN=//p' /etc/htun/htun.env)"
+ADMIN_TOKEN="$(sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env)"
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/api/clients
-METRICS_TOKEN="$(sudo sed -n 's/^HTUN_METRICS_TOKEN=//p' /etc/htun/htun.env)"
+METRICS_TOKEN="$(sudo sed -n 's/^PORTA_METRICS_TOKEN=//p' /etc/porta/porta.env)"
 # This loopback HTTP check applies only to the --behind-proxy h2c deployment.
 curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:9090/metrics
 ```
@@ -303,8 +303,8 @@ reconnect:
 
 ```sh
 make build
-sudo install -m 0755 bin/htun-server /usr/local/bin/htun-server
-sudo systemctl restart htun
+sudo install -m 0755 bin/porta-server /usr/local/bin/porta-server
+sudo systemctl restart porta
 ```
 
 Standard HTTP reverse proxies do not preserve MASQUE `CONNECT-IP` or proxy
@@ -319,7 +319,7 @@ would no longer be valid. Use `--reconnect=false` to retain one-shot behavior
 or `--reconnect-max-delay` to change the retry ceiling. Initial configuration
 or authentication failures still return immediately.
 
-Run hTun directly when HTTP/3 or standards-based MASQUE transport is required.
+Run Porta directly when HTTP/3 or standards-based MASQUE transport is required.
 
 ## Windows client
 
@@ -328,11 +328,11 @@ Download the signed `wintun.dll` for the target architecture from the official
 executable. Run the client in an elevated PowerShell session:
 
 ```powershell
-$env:HTUN_TOKEN = "replace-with-the-same-secret"
-./htun-client-windows-amd64.exe `
+$env:PORTA_TOKEN = "replace-with-the-same-secret"
+./porta-client-windows-amd64.exe `
   --server https://vpn.example.com:8443 `
   --transport h3 `
-  --interface hTun `
+  --interface Porta `
   --client-id my-windows-pc
 ```
 
@@ -341,7 +341,7 @@ SHA-256 thumbprint instead of disabling TLS verification. The value may contain
 colons or hyphens and may start with `sha256:`:
 
 ```powershell
-./htun-client-windows-amd64.exe `
+./porta-client-windows-amd64.exe `
   --server https://vpn.example.com:8443 `
   --thumbprint "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" `
   --client-id my-windows-pc
@@ -364,7 +364,7 @@ the script preserves a host route to it before adding VPN routes:
 ./scripts/windows-up.ps1 `
   -AddressCidr 10.66.0.2/32 `
   -ServerIp 203.0.113.10 `
-  -InterfaceAlias hTun `
+  -InterfaceAlias Porta `
   -DnsServer 1.1.1.1
 ```
 
@@ -373,7 +373,7 @@ using MASQUE and carry IP packets in DATAGRAM capsules. Remove client routes
 and DNS settings with:
 
 ```powershell
-./scripts/windows-down.ps1 -InterfaceAlias hTun
+./scripts/windows-down.ps1 -InterfaceAlias Porta
 ```
 
 The MVP keeps route changes explicit. It does not install a kill switch;
@@ -396,11 +396,11 @@ release build strips Go debug symbols, shrinks Kotlin/resources, and packages
 only one native runtime per APK. A local build uses the Android debug signing
 key unless release-signing environment variables are configured.
 
-Open hTun, tap **Add profile**, and enter:
+Open Porta, tap **Add profile**, and enter:
 
 - Profile name: any recognizable label, such as `Test gateway`
 - Gateway: `https://htun.i-csu.org:8443`
-- Token: the value after `HTUN_TOKEN=` in `/etc/htun/htun.env` on the server
+- Token: the value after `PORTA_TOKEN=` in `/etc/porta/porta.env` on the server
 - Client ID: a stable unique value such as `android-phone`
 
 Save the profile and use its switch to connect or disconnect. Approve Android's
@@ -421,7 +421,7 @@ is desired; Android must already have granted this app VPN permission. Retrieve
 the initial client token on the server when needed with:
 
 ```sh
-sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
+sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 ```
 
 The dashboard includes a 60-second real-time upload/download chart with current
@@ -436,7 +436,7 @@ interface active and reconnects with a delay that grows from about one second
 to a maximum of about 31 seconds. Authentication failures and invalid gateway
 responses stop immediately instead of retrying forever.
 
-With a device attached and an active hTun connection, exercise repeated Wi-Fi
+With a device attached and an active Porta connection, exercise repeated Wi-Fi
 loss and recovery:
 
 ```sh
@@ -454,10 +454,10 @@ For a signed release APK, provide signing credentials through environment
 variables and build the release variant:
 
 ```sh
-export HTUN_ANDROID_KEYSTORE=/secure/path/htun-release.jks
-export HTUN_ANDROID_KEYSTORE_PASSWORD='...'
-export HTUN_ANDROID_KEY_ALIAS=htun
-export HTUN_ANDROID_KEY_PASSWORD='...'
+export PORTA_ANDROID_KEYSTORE=/secure/path/porta-release.jks
+export PORTA_ANDROID_KEYSTORE_PASSWORD='...'
+export PORTA_ANDROID_KEY_ALIAS=porta
+export PORTA_ANDROID_KEY_PASSWORD='...'
 cd android
 ./gradlew testDebugUnitTest assembleRelease
 ```
@@ -469,10 +469,10 @@ GitHub Actions runs Go tests, race detection, vet, cross-platform builds, and
 Android builds on pushes and pull requests. Tags matching `v*` create a GitHub
 release. Configure these repository Actions secrets before tagging:
 
-- `HTUN_ANDROID_KEYSTORE_BASE64`
-- `HTUN_ANDROID_KEYSTORE_PASSWORD`
-- `HTUN_ANDROID_KEY_ALIAS`
-- `HTUN_ANDROID_KEY_PASSWORD`
+- `PORTA_ANDROID_KEYSTORE_BASE64`
+- `PORTA_ANDROID_KEYSTORE_PASSWORD`
+- `PORTA_ANDROID_KEY_ALIAS`
+- `PORTA_ANDROID_KEY_PASSWORD`
 
 ## Protocol endpoints
 
@@ -481,9 +481,9 @@ release. Configure these repository Actions secrets before tagging:
 - Admin-listener `GET /readyz` is unauthenticated and reports that the initialized
   gateway handler is ready to accept tunnel requests.
 - Admin-listener `GET /metrics` is enabled only when
-  `HTUN_METRICS_TOKEN` is set and requires that exact bearer token.
+  `PORTA_METRICS_TOKEN` is set and requires that exact bearer token.
 - Admin-listener `GET /` serves the client-management UI. Its `/api/*`
-  requests require `HTUN_ADMIN_TOKEN`.
+  requests require `PORTA_ADMIN_TOKEN`.
 - Ordinary public `GET` and `HEAD` requests receive only the neutral HTML cover
   page by default; operational endpoints are never routed on that listener.
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
@@ -491,12 +491,12 @@ release. Configure these repository Actions secrets before tagging:
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.
 - `POST /v1/tunnel` is Android's authenticated four-lane HTTP/2 fallback when
   HTTP/3 is unavailable. Requests missing valid lane metadata are rejected.
-- A token identifies a client account; `X-HTun-Client-ID` identifies one
+- A token identifies a client account; `X-Porta-Client-ID` identifies one
   enrolled device under that account. The account/device pair retains its
   lease and cannot collide with the same device ID in another account.
 
-RFC 9484 does not standardize DNS or link-MTU configuration. hTun sends these
-as optional `X-HTun-DNS` and `X-HTun-MTU` response extensions. The default MTU
+RFC 9484 does not standardize DNS or link-MTU configuration. Porta sends these
+as optional `X-Porta-DNS` and `X-Porta-MTU` response extensions. The default MTU
 is 1100 so complete tunneled IP packets fit conservative mobile QUIC Datagram
 limits before path-MTU discovery has increased the available payload size.
 

@@ -27,36 +27,36 @@ jobs:
       - name: Build Go release archives
         run: |
           mkdir -p dist/linux-amd64 dist/windows-amd64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/htun-server ./cmd/htun-server
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/htun-client ./cmd/htun-client
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o dist/windows-amd64/htun-client.exe ./cmd/htun-client
-          tar -C dist/linux-amd64 -czf dist/htun-linux-amd64.tar.gz .
-          zip -jq dist/htun-windows-amd64.zip dist/windows-amd64/htun-client.exe
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-server ./cmd/porta-server
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-amd64/porta-client ./cmd/porta-client
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o dist/windows-amd64/porta-client.exe ./cmd/porta-client
+          tar -C dist/linux-amd64 -czf dist/porta-linux-amd64.tar.gz .
+          zip -jq dist/porta-windows-amd64.zip dist/windows-amd64/porta-client.exe
       - name: Prepare Android signing key
         env:
-          KEYSTORE_BASE64: ${{ secrets.HTUN_ANDROID_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.HTUN_ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.HTUN_ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.HTUN_ANDROID_KEY_PASSWORD }}
+          KEYSTORE_BASE64: ${{ secrets.PORTA_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
         run: |
           test -n "$KEYSTORE_BASE64" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/htun-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.jks"
       - name: Build Android release
         working-directory: android
         env:
-          HTUN_ANDROID_KEYSTORE: ${{ runner.temp }}/htun-release.jks
-          HTUN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.HTUN_ANDROID_KEYSTORE_PASSWORD }}
-          HTUN_ANDROID_KEY_ALIAS: ${{ secrets.HTUN_ANDROID_KEY_ALIAS }}
-          HTUN_ANDROID_KEY_PASSWORD: ${{ secrets.HTUN_ANDROID_KEY_PASSWORD }}
+          PORTA_ANDROID_KEYSTORE: ${{ runner.temp }}/porta-release.jks
+          PORTA_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
+          PORTA_ANDROID_KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
+          PORTA_ANDROID_KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
         run: ./gradlew testDebugUnitTest assembleRelease --no-daemon
       - name: Collect artifacts
         run: |
-          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk dist/htun-android-arm64-v8a.apk
-          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk dist/htun-android-armeabi-v7a.apk
-          cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/htun-android-x86_64.apk
+          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk dist/porta-android-arm64-v8a.apk
+          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk dist/porta-android-armeabi-v7a.apk
+          cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/porta-android-x86_64.apk
           cd dist
-          sha256sum htun-linux-amd64.tar.gz htun-windows-amd64.zip *.apk > SHA256SUMS
+          sha256sum porta-linux-amd64.tar.gz porta-windows-amd64.zip *.apk > SHA256SUMS
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/htun-linux-amd64.tar.gz dist/htun-windows-amd64.zip dist/*.apk dist/SHA256SUMS --generate-notes --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" dist/porta-linux-amd64.tar.gz dist/porta-windows-amd64.zip dist/*.apk dist/SHA256SUMS --generate-notes --verify-tag

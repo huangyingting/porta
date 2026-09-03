@@ -32,7 +32,7 @@ func Generate(certPath, keyPath string, options Options) error {
 		options.ValidFor = 30 * 24 * time.Hour
 	}
 	if options.CommonName == "" {
-		options.CommonName = "hTun development gateway"
+		options.CommonName = "Porta development gateway"
 	}
 
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)

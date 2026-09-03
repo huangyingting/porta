@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <permission
-        android:name="dev.htun.android.permission.STATUS"
+        android:name="dev.porta.android.permission.STATUS"
         android:protectionLevel="signature" />
 
 	<uses-permission android:name="android.permission.INTERNET" />
@@ -10,16 +10,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 	<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="dev.htun.android.permission.STATUS" />
+    <uses-permission android:name="dev.porta.android.permission.STATUS" />
 
 	<application
 		android:allowBackup="false"
 		android:dataExtractionRules="@xml/data_extraction_rules"
 		android:fullBackupContent="false"
-		android:icon="@drawable/ic_htun"
-        android:label="hTun"
+		android:icon="@drawable/ic_porta"
+        android:label="Porta"
         android:supportsRtl="true"
-        android:theme="@style/Theme.HTun"
+        android:theme="@style/Theme.Porta"
         android:usesCleartextTraffic="false">
         <activity
             android:name=".MainActivity"
