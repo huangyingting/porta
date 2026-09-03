@@ -16,6 +16,7 @@ Options:
   --key PATH                Matching private key; required with --cert
   --acme-email EMAIL        Optional Let's Encrypt account contact
   --port PORT               Direct TCP and UDP port (default: 443)
+  --admin-port PORT         Loopback health and metrics port (default: 9090)
   --external-interface IF   Internet-facing interface (auto-detected)
   --tun-interface IF        TUN interface (default: htun0)
   --pool CIDR               Client pool (default: 10.66.0.0/24)
@@ -49,6 +50,7 @@ certificate=
 private_key=
 acme_email=
 port=443
+admin_port=9090
 external_interface=
 tun_interface=htun0
 pool=10.66.0.0/24
@@ -65,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --key) require_value "$@"; private_key=$2; shift 2 ;;
     --acme-email) require_value "$@"; acme_email=$2; shift 2 ;;
     --port) require_value "$@"; port=$2; shift 2 ;;
+    --admin-port) require_value "$@"; admin_port=$2; shift 2 ;;
     --external-interface) require_value "$@"; external_interface=$2; shift 2 ;;
     --tun-interface) require_value "$@"; tun_interface=$2; shift 2 ;;
     --pool) require_value "$@"; pool=$2; shift 2 ;;
@@ -96,6 +99,9 @@ email_pattern='^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
 [[ -z $acme_email || $acme_email =~ $email_pattern ]] ||
   die "invalid --acme-email"
 [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die "invalid --port"
+[[ $admin_port =~ ^[0-9]+$ && $admin_port -ge 1 && $admin_port -le 65535 ]] ||
+  die "invalid --admin-port"
+(( admin_port != port )) || die "--admin-port must differ from --port"
 [[ $mtu =~ ^[0-9]+$ && $mtu -ge 576 && $mtu -le 1400 ]] || die "invalid --mtu"
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
@@ -163,6 +169,10 @@ udp_listeners=$(ss -H -lunp "sport = :$port")
 if { [[ -n $tcp_listeners ]] && grep -qv '"htun-server"' <<<"$tcp_listeners"; } ||
   { [[ -n $udp_listeners ]] && grep -qv '"htun-server"' <<<"$udp_listeners"; }; then
   die "TCP or UDP port $port is already used by another service"
+fi
+admin_listeners=$(ss -H -ltnp "sport = :$admin_port")
+if [[ -n $admin_listeners ]] && grep -qv '"htun-server"' <<<"$admin_listeners"; then
+  die "TCP admin port $admin_port is already used by another service"
 fi
 
 if $build; then
@@ -304,7 +314,7 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/htun/htun.env
 $tls_preflight
-ExecStart=/usr/local/bin/htun-server --listen :$port $tls_arguments --client-token-file /etc/htun/clients --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/htun-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments --client-token-file /etc/htun/clients --interface $tun_interface --pool $pool --lease-state /var/lib/htun/leases.json --dns $dns --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/htun/server-up.sh $tun_interface $gateway_cidr $pool $external_interface; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/htun/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -367,15 +377,24 @@ if [[ $tls_mode == static ]]; then
 fi
 
 for _ in $(seq 1 30); do
-  if curl --silent --show-error --fail \
-    --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/readyz" >/dev/null; then
+  if curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/null; then
     break
   fi
   sleep 1
 done
-curl --silent --show-error --fail \
-  --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/readyz" >/dev/null ||
+curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
+cover_page=$(curl --silent --show-error --fail \
+  --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
+  die "gateway admin endpoint is ready but public TLS is unavailable"
+grep -q '<title>Welcome</title>' <<<"$cover_page" ||
+  die "public endpoint did not return the expected landing page"
+systemctl is-active --quiet htun.service ||
+  die "gateway exited after its readiness check"
+ss -H -ltnp "sport = :$port" | grep -q '"htun-server"' ||
+  die "gateway is not listening on public TCP port $port"
+ss -H -lunp "sport = :$port" | grep -q '"htun-server"' ||
+  die "gateway is not listening on public UDP port $port"
 
 deployment_complete=true
 cat <<EOF
@@ -385,6 +404,7 @@ hTun is ready.
 Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
 TLS mode:        $tls_mode
+Admin endpoint:  http://127.0.0.1:$admin_port
 Android token:   sudo sed -n 's/^HTUN_TOKEN=//p' /etc/htun/htun.env
 Ensure both TCP and UDP $port are allowed by the host and cloud firewalls.
 EOF

@@ -98,6 +98,19 @@ gateway. If the new service cannot obtain its certificate or pass the
 readiness check, it restores the previous systemd configuration and restarts
 the previous gateway.
 
+## Browser cover page
+
+hTun serves a neutral HTML landing page to ordinary browser requests by
+default, so visiting the tunnel origin does not identify the VPN service.
+The public listener does not route `/healthz`, `/readyz`, or `/metrics`;
+operational endpoints are served only on `127.0.0.1:9090` by default. Tunnel
+authentication remains the actual security boundary—the cover page only
+reduces casual service fingerprinting.
+
+For direct manual server runs, pass `--cover-site=false` to replace the landing
+page with normal API 404 responses. Use `--admin-listen` to change or disable
+the loopback operational listener.
+
 ## Reverse-proxy compatibility
 
 The deployment script deliberately does not edit or reload reverse-proxy
@@ -149,8 +162,7 @@ For a default port-443 deployment:
 ```sh
 sudo systemctl status htun
 sudo journalctl -u htun -f
-curl --resolve vpn.example.com:443:127.0.0.1 \
-  https://vpn.example.com/readyz
+curl http://127.0.0.1:9090/readyz
 sudo ss -lntup | grep ':443'
 ```
 
@@ -160,8 +172,7 @@ For an existing-web-server deployment, replace 443 with 8443 and include
 
 ```sh
 sudo systemctl status htun-cert-sync.timer
-curl --resolve vpn.example.com:8443:127.0.0.1 \
-  https://vpn.example.com:8443/readyz
+curl http://127.0.0.1:9090/readyz
 ```
 
 The expected listeners are TCP and UDP on the configured port. Certificate

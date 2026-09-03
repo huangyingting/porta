@@ -172,12 +172,12 @@ func TestProxyBackendHandlerServesH2C(t *testing.T) {
 }
 
 func TestValidateProxyListenAddress(t *testing.T) {
-	for _, address := range []string{"127.0.0.1:8443", "[::1]:8443", "localhost:8443"} {
+	for _, address := range []string{"127.0.0.1:8443", "[::1]:8443"} {
 		if err := validateProxyListenAddress(address); err != nil {
 			t.Fatalf("%s rejected: %v", address, err)
 		}
 	}
-	for _, address := range []string{":8443", "0.0.0.0:8443", "10.0.0.4:8443", "invalid"} {
+	for _, address := range []string{":8443", "0.0.0.0:8443", "10.0.0.4:8443", "localhost:8443", "127.0.0.1:0", "127.0.0.1:", "invalid"} {
 		if err := validateProxyListenAddress(address); err == nil {
 			t.Fatalf("%s accepted", address)
 		}

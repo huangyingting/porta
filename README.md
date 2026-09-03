@@ -6,9 +6,10 @@ same port. The repository includes a Linux gateway, a Windows Wintun client,
 and an Android `VpnService` client.
 
 It is designed for authorized remote access and compatibility with standard
-HTTP infrastructure. It does not impersonate browser traffic and cannot
-promise to be undetectable. Read [the threat model](docs/threat-model.md)
-before deployment.
+HTTP infrastructure. A neutral landing page prevents casual browser visits
+from identifying the service, but the tunnel does not impersonate browser
+traffic and cannot promise to be undetectable. Read
+[the threat model](docs/threat-model.md) before deployment.
 
 ## Current scope
 
@@ -21,8 +22,9 @@ before deployment.
 - Durable per-client lease state across planned gateway restarts
 - Per-device credentials with an optional migration fallback token
 - Authenticated Prometheus metrics
+- Neutral browser cover page for ordinary public HTTP requests
 - Windows Wintun client plus explicit route setup/teardown scripts
-- Android HTTP/2 `VpnService` client using protected sockets
+- Android native HTTP/3 MASQUE `VpnService` client with HTTP/2 fallback
 - Backward-compatible private stream protocol for Android and older clients
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
 
@@ -157,6 +159,13 @@ For production, use a service manager, an unprivileged process with narrowly
 scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
+Ordinary browser requests receive a neutral HTML landing page by default.
+`/healthz`, `/readyz`, and `/metrics` are not exposed on the public tunnel
+listener; they are available only from the loopback admin listener at
+`127.0.0.1:9090` by default. Use `--cover-site=false` only when an API-style
+404 is preferred over the landing page. This is camouflage for casual
+visitors, not an authentication or security boundary.
+
 ### Direct HTTP/3 alongside an existing web server
 
 When another web server already owns port 443, run hTun directly on another
@@ -215,10 +224,10 @@ Check the direct TLS listener locally without disabling certificate
 verification:
 
 ```sh
-curl --resolve vpn.example.com:8443:127.0.0.1 https://vpn.example.com:8443/readyz
+curl http://127.0.0.1:9090/readyz
 curl --resolve vpn.example.com:8443:127.0.0.1 \
   -H "Authorization: Bearer $HTUN_METRICS_TOKEN" \
-  https://vpn.example.com:8443/metrics
+  http://127.0.0.1:9090/metrics
 ```
 
 ### Behind a reverse proxy
@@ -270,8 +279,7 @@ sudo systemctl enable --now htun-cert-sync.timer
 Validate the direct listener after deployment:
 
 ```sh
-curl --resolve vpn.example.com:8443:127.0.0.1 \
-  https://vpn.example.com:8443/healthz
+curl http://127.0.0.1:9090/healthz
 ```
 
 Operational checks:
@@ -279,10 +287,10 @@ Operational checks:
 ```sh
 systemctl status htun
 journalctl -u htun -f
-curl https://vpn.example.com/readyz
+curl http://127.0.0.1:9090/readyz
 METRICS_TOKEN="$(sudo sed -n 's/^HTUN_METRICS_TOKEN=//p' /etc/htun/htun.env)"
 # This loopback HTTP check applies only to the --behind-proxy h2c deployment.
-curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:8443/metrics
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:9090/metrics
 ```
 
 To upgrade, build and install the new server binary, then restart the service.
@@ -465,17 +473,19 @@ release. Configure these repository Actions secrets before tagging:
 
 ## Protocol endpoints
 
-- `GET /healthz` is unauthenticated and returns only `{"status":"ok"}`.
-- `GET /readyz` is unauthenticated and reports that the initialized gateway
-  handler is ready to accept tunnel requests.
-- `GET /metrics` is enabled only when `HTUN_METRICS_TOKEN` is set and requires
-  that separate bearer token. Keep it blocked at the public reverse proxy and
-  scrape the loopback h2c backend.
+- Admin-listener `GET /healthz` is unauthenticated and returns only
+  `{"status":"ok"}`.
+- Admin-listener `GET /readyz` is unauthenticated and reports that the initialized
+  gateway handler is ready to accept tunnel requests.
+- Admin-listener `GET /metrics` is enabled only when
+  `HTUN_METRICS_TOKEN` is set and requires that exact bearer token.
+- Ordinary public `GET` and `HEAD` requests receive only the neutral HTML cover
+  page by default; operational endpoints are never routed on that listener.
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
   template for unrestricted IPv4 proxying. It requires `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.
 - `POST /v1/tunnel` is the authenticated private compatibility protocol used
-  by the current Android client.
+  by Android when HTTP/3 is unavailable.
 - A reconnect using the same client ID reuses its retained lease and replaces
   the older stream. When the pool is full, the oldest inactive lease is
   reclaimed for a new client.

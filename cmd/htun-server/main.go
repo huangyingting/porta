@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -71,6 +72,8 @@ func run() error {
 	tlsCert := flag.String("tls-cert", "", "static TLS certificate file (reloaded when replaced)")
 	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
+	coverSite := flag.Bool("cover-site", true, "serve a neutral HTML page to ordinary browser requests")
+	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for health, readiness, and metrics (empty disables)")
 	clientTokenFile := flag.String("client-token-file", "", "optional client-id=token credential file")
 	interfaceName := flag.String("interface", "htun0", "Linux TUN interface name")
 	poolCIDR := flag.String("pool", "10.66.0.0/24", "IPv4 client address pool")
@@ -102,6 +105,11 @@ func run() error {
 	}
 	if metricsToken != "" && len(metricsToken) < 16 {
 		return errors.New("HTUN_METRICS_TOKEN must contain at least 16 characters")
+	}
+	if *adminAddress != "" {
+		if err := validateLoopbackListenAddress(*adminAddress, "--admin-listen"); err != nil {
+			return err
+		}
 	}
 
 	var logHandler slog.Handler
@@ -170,10 +178,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	publicHandler := publicSiteHandler(handler, *coverSite)
 
-	tcpHandler := handler
+	tcpHandler := publicHandler
 	if *behindProxy {
-		tcpHandler = proxyBackendHandler(handler)
+		tcpHandler = proxyBackendHandler(publicHandler)
 	}
 	tcpServer := &http.Server{
 		Addr:              *address,
@@ -192,7 +201,7 @@ func run() error {
 	if !*behindProxy {
 		quicServer = &http3.Server{
 			Addr:            *address,
-			Handler:         handler,
+			Handler:         publicHandler,
 			TLSConfig:       http3TLSConfig(tlsConfig),
 			EnableDatagrams: true,
 			MaxHeaderBytes:  16 << 10,
@@ -203,6 +212,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var acmeHTTPServer *http.Server
+	var adminServer *http.Server
 	if certificateManager != nil && *acmeHTTPAddress != "" {
 		acmeHTTPServer = &http.Server{
 			Addr:              *acmeHTTPAddress,
@@ -211,8 +221,16 @@ func run() error {
 			IdleTimeout:       30 * time.Second,
 		}
 	}
+	if *adminAddress != "" {
+		adminServer = &http.Server{
+			Addr:              *adminAddress,
+			Handler:           adminHandler(handler),
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       30 * time.Second,
+		}
+	}
 
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	go func() { errCh <- router.Run(ctx) }()
 	if *behindProxy {
 		go func() { errCh <- tcpServer.ListenAndServe() }()
@@ -223,12 +241,16 @@ func run() error {
 	if acmeHTTPServer != nil {
 		go func() { errCh <- acmeHTTPServer.ListenAndServe() }()
 	}
+	if adminServer != nil {
+		go func() { errCh <- adminServer.ListenAndServe() }()
+	}
 
 	attributes := []any{
 		"listen", *address,
 		"interface", tunDevice.Name(),
 		"pool", *poolCIDR,
 		"gateway", pool.Gateway(),
+		"admin_listen", *adminAddress,
 	}
 	if *behindProxy {
 		attributes = append(attributes, "transports", "h2c", "tls", "reverse-proxy")
@@ -257,6 +279,9 @@ func run() error {
 	_ = tcpServer.Shutdown(shutdownCtx)
 	if acmeHTTPServer != nil {
 		_ = acmeHTTPServer.Shutdown(shutdownCtx)
+	}
+	if adminServer != nil {
+		_ = adminServer.Shutdown(shutdownCtx)
 	}
 	return nil
 }
@@ -295,16 +320,21 @@ func proxyBackendHandler(handler http.Handler) http.Handler {
 }
 
 func validateProxyListenAddress(address string) error {
-	host, _, err := net.SplitHostPort(address)
+	return validateLoopbackListenAddress(address, "--listen for --behind-proxy")
+}
+
+func validateLoopbackListenAddress(address, option string) error {
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return fmt.Errorf("parse --listen for --behind-proxy: %w", err)
+		return fmt.Errorf("parse %s: %w", option, err)
 	}
-	if strings.EqualFold(host, "localhost") {
-		return nil
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("%s requires a numeric port in 1..65535", option)
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return errors.New("--behind-proxy requires --listen to use a loopback address")
+		return fmt.Errorf("%s requires a loopback address", option)
 	}
 	return nil
 }
