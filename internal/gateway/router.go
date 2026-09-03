@@ -15,7 +15,6 @@ import (
 
 var (
 	ErrSourceSpoofed = errors.New("packet source does not match tunnel lease")
-	ErrSlowClient    = errors.New("client receive queue is full")
 )
 
 type Session struct {
@@ -29,6 +28,25 @@ type Session struct {
 
 func (s *Session) Close() {
 	s.once.Do(func() { s.cancel() })
+}
+
+func (s *Session) enqueue(packet []byte) {
+	select {
+	case s.outgoing <- packet:
+		return
+	default:
+	}
+
+	// VPN traffic is packet-oriented. Drop stale congestion rather than
+	// disconnecting the whole tunnel when a client briefly falls behind.
+	select {
+	case <-s.outgoing:
+	default:
+	}
+	select {
+	case s.outgoing <- packet:
+	default:
+	}
 }
 
 type Router struct {
@@ -106,13 +124,9 @@ func (r *Router) Run(ctx context.Context) error {
 			continue
 		}
 		copyOfPacket := append([]byte(nil), packet...)
-		select {
-		case session.outgoing <- copyOfPacket:
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		default:
-			r.logger.Warn("closing slow tunnel client", "address", session.Address)
-			session.Close()
 		}
+		session.enqueue(copyOfPacket)
 	}
 }
