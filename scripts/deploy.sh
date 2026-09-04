@@ -571,7 +571,7 @@ if [[ -f /var/lib/porta/downloads/porta-android-arm64-v8a.apk ]]; then
   if (( port != 443 )); then
     public_origin+=:$port
   fi
-  client_download_summary="Client downloads:
+  client_download_summary="Client downloads after portal sign-in:
   Linux AMD64: $public_origin/download/porta-client-linux-amd64
   Linux ARM64: $public_origin/download/porta-client-linux-arm64
   Windows:     $public_origin/download/porta-client-windows-amd64.zip
@@ -590,7 +590,7 @@ Forward proxy:   $([[ $forward_proxy == true ]] && echo "enabled (HTTPS CONNECT 
 TLS mode:        $tls_mode
 Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "GitHub release $release")
 Admin endpoint:  http://127.0.0.1:$admin_port
-Admin access:    ssh -L $admin_port:127.0.0.1:$admin_port USER@$domain
+Browser portal:  https://$domain:$port
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 Initial client:  sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 $client_download_summary

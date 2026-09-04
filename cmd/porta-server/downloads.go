@@ -49,7 +49,7 @@ func clientDownloadHandler(next http.Handler, directory string) http.Handler {
 		}
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
-		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Cache-Control", "private, no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		http.ServeContent(w, r, name, info.ModTime(), file)
 	})

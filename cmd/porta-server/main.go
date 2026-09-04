@@ -110,8 +110,11 @@ func run() error {
 		return errors.New("PORTA_METRICS_TOKEN must contain at least 16 characters")
 	}
 	adminToken := os.Getenv("PORTA_ADMIN_TOKEN")
-	if *adminAddress != "" && len(adminToken) < 24 {
-		return errors.New("PORTA_ADMIN_TOKEN must contain at least 24 characters when the admin listener is enabled")
+	if adminToken != "" && len(adminToken) < 24 {
+		return errors.New("PORTA_ADMIN_TOKEN must contain at least 24 characters")
+	}
+	if *adminAddress != "" && adminToken == "" {
+		return errors.New("PORTA_ADMIN_TOKEN is required when the admin listener is enabled")
 	}
 	if *adminAddress != "" {
 		if err := validateLoopbackListenAddress(*adminAddress, "--admin-listen"); err != nil {
@@ -205,7 +208,18 @@ func run() error {
 		return err
 	}
 	publicHandler := publicSiteHandler(handler, *landingPage)
-	publicHandler = clientDownloadHandler(publicHandler, *clientDownloads)
+	publicHandler, err = newPortalHandler(portalConfig{
+		Next:               publicHandler,
+		Registry:           registry,
+		AdminToken:         adminToken,
+		Admin:              adminHandlerWithUsage(http.NotFoundHandler(), registry, usageStore, adminToken),
+		DownloadsDirectory: *clientDownloads,
+		TrustProxyHeaders:  *behindProxy,
+		Logger:             logger,
+	})
+	if err != nil {
+		return err
+	}
 	if !*disableForwardProxy {
 		proxyHandler, err := forwardproxy.New(forwardproxy.Config{
 			Next: publicHandler,

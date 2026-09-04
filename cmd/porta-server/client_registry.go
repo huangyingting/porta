@@ -90,6 +90,11 @@ type deviceSummary struct {
 	Target            string     `json:"target,omitempty"`
 }
 
+type clientPortalIdentity struct {
+	ID   string
+	Name string
+}
+
 func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("client registry path is required")
@@ -183,6 +188,34 @@ func (r *clientRegistry) Authenticate(token, deviceID string) (gateway.ClientIde
 		return registryIdentity(*client, deviceID), nil
 	}
 	return gateway.ClientIdentity{}, errClientUnauthorized
+}
+
+func (r *clientRegistry) AuthenticatePortal(token string) (clientPortalIdentity, error) {
+	tokenHash := hashToken(token)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, client := range r.clients {
+		if subtle.ConstantTimeCompare([]byte(client.TokenHash), []byte(tokenHash)) != 1 {
+			continue
+		}
+		if !client.Enabled {
+			return clientPortalIdentity{}, errClientDisabled
+		}
+		return clientPortalIdentity{ID: client.ID, Name: client.Name}, nil
+	}
+	return clientPortalIdentity{}, errClientUnauthorized
+}
+
+func (r *clientRegistry) PortalClientActive(clientID, tokenHash string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, client := range r.clients {
+		if client.ID == clientID {
+			return client.Enabled &&
+				subtle.ConstantTimeCompare([]byte(client.TokenHash), []byte(tokenHash)) == 1
+		}
+	}
+	return false
 }
 
 func (r *clientRegistry) List(usageSnapshot ...usage.Snapshot) []clientSummary {

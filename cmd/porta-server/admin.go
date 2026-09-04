@@ -63,7 +63,7 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !adminAuthorized(r.Header.Get("Authorization"), a.adminToken) {
+	if !adminAuthorized(r.Header.Get("Authorization"), a.adminToken) && !portalAdminAuthorized(r.Context()) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="porta-admin"`)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid admin token"})
 		return

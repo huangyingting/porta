@@ -120,7 +120,7 @@ The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately.
 
-## Client downloads
+## Token portal and client downloads
 
 Release clients are mirrored from the private GitHub release to the deployed
 Porta server:
@@ -134,18 +134,25 @@ porta-android-armeabi-v7a.apk
 porta-android-x86_64.apk
 ```
 
-Download an artifact and its checksum directly, including the configured port
-when it is not 443:
+The neutral landing page accepts either an administrator token or a client
+token. Client tokens open the protected downloads page. For scripted downloads,
+create a session cookie before requesting a fixed artifact path:
 
 ```sh
-curl -fLO https://vpn.example.com:8443/download/porta-android-arm64-v8a.apk
-curl -fLO https://vpn.example.com:8443/download/SHA256SUMS
+curl -fsS -c porta.cookies \
+  --data-urlencode "token=$PORTA_TOKEN" \
+  https://vpn.example.com:8443/access >/dev/null
+curl -fsSLO -b porta.cookies \
+  https://vpn.example.com:8443/download/porta-android-arm64-v8a.apk
+curl -fsSLO -b porta.cookies \
+  https://vpn.example.com:8443/download/SHA256SUMS
 grep ' porta-android-arm64-v8a.apk$' SHA256SUMS | sha256sum -c -
 ```
 
 Only the listed release filenames are served. There is no directory listing,
-and the camouflage landing page does not link to the downloads. Authenticated
-GitHub release downloads remain available as an operator fallback.
+and unauthenticated requests retain the camouflage landing behavior.
+Authenticated GitHub release downloads remain available as an operator
+fallback.
 
 ## Forward proxy
 
@@ -181,22 +188,20 @@ gateway. If the new service cannot obtain its certificate or pass the
 readiness check, it restores the previous systemd configuration and restarts
 the previous gateway.
 
-## Landing page and admin UI
+## Landing page and role-based portal
 
 Porta serves a compact, neutral studio landing page to ordinary browser
 requests by default. The page contains no VPN, tunnel, gateway, or transport
-language.
-The public listener does not route the admin UI, `/healthz`, `/readyz`, or
-`/metrics`; these are served only on `127.0.0.1:9090` by default.
-
-Open the admin UI without exposing it publicly:
+language. Its single token field routes administrator tokens to the admin
+console and active client tokens to the download page. The resulting
+role-scoped session expires after eight hours and uses a `Secure`, `HttpOnly`,
+`SameSite=Strict` cookie. Tokens are not placed in URLs or browser storage.
 
 ```sh
-ssh -L 9090:127.0.0.1:9090 user@vpn.example.com
 sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 ```
 
-Then browse to `http://127.0.0.1:9090` and enter the admin token. The compact
+Browse to the public Porta URL and enter that token. The compact
 operations table shows live sessions, persisted traffic and connection totals,
 transport/address details, recent activity, capacity pressure, and stale or
 unused clients. It can create, edit, disable, and delete clients; rotate tokens;
@@ -205,9 +210,13 @@ checkpointed every 30 seconds to `/var/lib/porta/usage.json` by release
 deployments. A device that still has the shared
 client token can enroll again. Tokens are shown only when created or rotated.
 
+Public admin API calls require the administrator session. Loopback admin API
+calls continue to accept `Authorization: Bearer <PORTA_ADMIN_TOKEN>`.
+`/healthz`, `/readyz`, and `/metrics` remain loopback-only.
+
 For direct manual server runs, pass `--landing-page=false` to replace the landing
 page with normal API 404 responses. Use `--admin-listen` to change or disable
-the loopback operational listener.
+the loopback health, readiness, metrics, and API listener.
 
 ## Reverse proxies
 
@@ -291,7 +300,7 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-APK:     https://htun.i-csu.org:8443/download/porta-android-arm64-v8a.apk
+Portal:  https://htun.i-csu.org:8443
 Gateway: https://htun.i-csu.org:8443
 ```
 

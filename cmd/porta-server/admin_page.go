@@ -28,24 +28,14 @@ var adminHTML = `<!doctype html>
   </style>
 </head>
 <body>
-  <section id="login" class="login-page">
-    <div class="login-panel"><div class="login-box">
-      <div class="logo"><img class="logo-mark" src="/assets/porta-mark.svg" alt="">Porta Control</div>
-      <h1>Welcome back.</h1><p>Manage client access from a private control surface designed to stay out of the way.</p>
-      <div class="field"><label for="admin-token">Admin token</label><input id="admin-token" type="password" autocomplete="current-password" placeholder="Paste your admin token" onkeydown="if(event.key==='Enter')login()"></div>
-      <button class="primary wide" onclick="login()">Open dashboard <span aria-hidden="true">→</span></button>
-      <div class="login-note"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg><span>Your token is kept only in this browser tab and is never embedded in the page.</span></div>
-    </div></div>
-    <div class="login-art"><div class="art-grid"></div><div class="art-copy"><small>Private gateway management</small><h2>Simple access.<br>Clear control.</h2><p>Create client credentials, define device capacity, and keep every connection organized.</p></div></div>
-  </section>
-  <main id="app" class="app hidden">
+  <main id="app" class="app">
     <aside class="sidebar">
       <div class="logo"><img class="logo-mark" src="/assets/porta-mark.svg" alt="">Porta Control</div>
       <nav class="side-nav"><div class="nav-item active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>Client access</div></nav>
       <div class="side-footer"><div class="connection">Gateway available</div></div>
     </aside>
     <section class="content">
-      <header class="topbar"><div class="crumb">Control panel <span aria-hidden="true">/</span> Clients</div><div class="admin-chip"><span class="avatar">AD</span>Administrator</div></header>
+      <header class="topbar"><div class="crumb">Control panel <span aria-hidden="true">/</span> Clients</div><form method="post" action="/portal/logout"><button class="ghost" type="submit">Sign out</button></form></header>
       <section class="hero"><div><div class="eyebrow">Access management</div><h1>Client overview</h1><p>Issue individual credentials, control device capacity, and review enrollments from one focused workspace.</p></div><button class="primary" onclick="openCreate()">＋ New client</button></section>
       <section class="stats">
         <article class="stat"><div class="stat-head">Total clients<span class="stat-icon">◎</span></div><strong id="client-count">0</strong><small>Managed access groups</small></article>
@@ -64,10 +54,9 @@ var adminHTML = `<!doctype html>
   <dialog id="token-dialog"><div class="modal"><div class="modal-mark">✓</div><h2>Client token ready</h2><p>Copy this token now. For security, only its hash is stored and it cannot be displayed again.</p><div id="token-value" class="token"></div><div class="modal-actions"><button class="secondary" onclick="copyToken()">Copy token</button><button class="primary" onclick="document.getElementById('token-dialog').close()">Done</button></div></div></dialog>
   <div id="notice" class="notice" role="status"></div>
   <script>
-    let token=sessionStorage.getItem('porta-admin-token')||'',clients=[],filter='all',expanded=new Set(),refreshTimer;
+    let clients=[],filter='all',expanded=new Set(),refreshTimer;
     const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const api=async(path,options={})=>{const r=await fetch(path,{...options,headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json',...(options.headers||{})}});if(r.status===204)return null;const body=await r.json().catch(()=>({error:'Request failed'}));if(!r.ok)throw new Error(body.error||'Request failed');return body};
-    async function login(){const entered=document.getElementById('admin-token').value.trim();if(entered)token=entered;if(!token){show('Enter the admin token');return}try{await load();sessionStorage.setItem('porta-admin-token',token);document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');clearInterval(refreshTimer);refreshTimer=setInterval(()=>load(true),15000)}catch(e){sessionStorage.removeItem('porta-admin-token');show(e.message)}}
+    const api=async(path,options={})=>{const r=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});if(r.status===204)return null;const body=await r.json().catch(()=>({error:'Request failed'}));if(!r.ok)throw new Error(body.error||'Request failed');return body};
     async function load(silent=false){try{const data=await api('/api/clients');clients=data.clients;render()}catch(e){if(!silent)throw e;show('Automatic refresh failed')}}
     const initials=name=>name.split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase();
     const relative=value=>{const seconds=Math.max(0,(Date.now()-new Date(value))/1000);if(seconds<60)return'just now';if(seconds<3600)return Math.floor(seconds/60)+'m ago';if(seconds<86400)return Math.floor(seconds/3600)+'h ago';return Math.floor(seconds/86400)+'d ago'};
@@ -90,7 +79,7 @@ var adminHTML = `<!doctype html>
     function show(message){const n=document.getElementById('notice');n.textContent=message;n.classList.add('show');clearTimeout(show.timer);show.timer=setTimeout(()=>n.classList.remove('show'),3200)}
     document.querySelector('.filters').addEventListener('click',e=>{const b=e.target.closest('[data-filter]');if(!b)return;filter=b.dataset.filter;document.querySelectorAll('[data-filter]').forEach(x=>x.classList.toggle('active',x===b));render()});
     document.getElementById('clients').addEventListener('click',e=>{const b=e.target.closest('button[data-action]');if(!b)return;const id=b.dataset.client;({expand:()=>{expanded.has(id)?expanded.delete(id):expanded.add(id);render()},edit:()=>openEdit(id),rotate:()=>rotate(id),toggle:()=>toggle(id),delete:()=>removeClient(id),device:()=>removeDevice(id,b.dataset.device)}[b.dataset.action]||(()=>{}))()});
-    if(token)login();
+    load().catch(e=>show(e.message));refreshTimer=setInterval(()=>load(true),15000);
   </script>
 </body>
 </html>`

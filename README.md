@@ -7,8 +7,8 @@ Linux gateway, a Windows Wintun client, and an Android `VpnService` client.
 
 It is designed for authorized remote access and compatibility with standard
 HTTP infrastructure. Ordinary browser visits receive a compact, neutral Porta
-studio page, while operational endpoints remain isolated on the loopback admin
-listener. Read
+studio page with one token entry for client downloads or administration, while
+health and metrics remain isolated on the loopback operations listener. Read
 [the threat model](docs/threat-model.md) before deployment.
 
 ## Production capabilities
@@ -23,7 +23,7 @@ listener. Read
 - Client accounts with hashed tokens and configurable multi-device limits
 - Authenticated Prometheus metrics
 - Compact neutral Porta studio page for ordinary public HTTP requests
-- Optional authenticated HTTPS CONNECT proxy on the same TLS listener
+- Authenticated HTTPS CONNECT proxy on the same TLS listener
 - Windows Wintun client plus explicit route setup/teardown scripts
 - Android native HTTP/3 MASQUE `VpnService` client with four-lane HTTP/2 fallback
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
@@ -146,9 +146,15 @@ stable device ID such as `chrome-zeroomega` as the username, and use the
 client token as the password. ZeroOmega supplies those credentials after
 Porta's CONNECT-only authentication challenge.
 
-## Client downloads
+## Browser portal and client downloads
 
-The same release publishes direct client downloads:
+The public landing page accepts either an administrator token or a client
+token. Administrator tokens open the management console; active client tokens
+open the protected downloads page. The token is exchanged for an eight-hour
+`Secure`, `HttpOnly`, `SameSite=Strict` session cookie and is never placed in a
+URL or browser storage.
+
+The same release publishes these client downloads:
 
 - Linux x86-64: `porta-client-linux-amd64`
 - Linux ARM64: `porta-client-linux-arm64`
@@ -157,7 +163,7 @@ The same release publishes direct client downloads:
   `porta-android-x86_64.apk`
 
 Release deployments also mirror these files onto the Porta server, so clients
-do not need GitHub access:
+do not need GitHub access. The fixed paths require a portal session:
 
 ```text
 https://vpn.example.com/download/porta-client-linux-amd64
@@ -170,9 +176,9 @@ https://vpn.example.com/download/SHA256SUMS
 ```
 
 Include the configured port in the URL when Porta does not listen on 443.
-Only these exact filenames are served; the landing page does not advertise or
-link to them. Authenticated GitHub release downloads remain available as a
-fallback.
+Only these exact filenames are served. Requests without a valid session retain
+the neutral landing behavior. Authenticated GitHub release downloads remain
+available as a fallback.
 
 ## Gateway
 
@@ -202,7 +208,7 @@ sudo --preserve-env=PORTA_TOKEN,PORTA_ADMIN_TOKEN,PORTA_METRICS_TOKEN ./bin/port
   --mtu 1100
 ```
 
-The loopback admin UI is a compact operational console for client accounts and
+The admin portal is a compact operational console for client accounts and
 devices. It shows live logical sessions, persisted upload/download totals,
 connection counts, current transport and assigned address, recent activity,
 capacity and stale-account warnings, with search, filters, sorting, and
@@ -248,10 +254,11 @@ scoped TUN and low-port capabilities, credential rotation, and gateway egress
 controls.
 
 Ordinary browser requests receive a neutral Porta studio page by default.
-`/healthz`, `/readyz`, `/metrics`, and the admin UI are not exposed on the
-public tunnel listener. They are available only from the loopback listener at
-`127.0.0.1:9090` by default. Reach the UI through an SSH tunnel and open
-`http://127.0.0.1:9090`; API data requires `PORTA_ADMIN_TOKEN`. Use
+Entering `PORTA_ADMIN_TOKEN` opens the admin portal; entering an active client
+token opens the protected download page. `/healthz`, `/readyz`, and `/metrics`
+remain available only from the loopback listener at `127.0.0.1:9090` by
+default. Loopback API automation can continue using `PORTA_ADMIN_TOKEN` as a
+bearer token. Use
 `--landing-page=false` only when an API-style 404 is preferred over the landing
 page.
 
@@ -571,8 +578,9 @@ cd android
 Do not commit the keystore or passwords. Prefer managed Play App Signing for
 public distribution and protect the upload key separately.
 
-GitHub Actions runs Go tests, race detection, vet, cross-platform builds, and
-Android builds on pushes and pull requests. Tags matching `v*` create a GitHub
+GitHub Actions provides a manually triggered workflow for Go tests, race
+detection, vet, cross-platform builds, and Android builds. Tags matching `v*`
+create a GitHub
 release containing Linux AMD64/ARM64 servers, clients and key generators, the
 Windows client, Android APKs, deployment tools, and `SHA256SUMS`. Configure
 these repository Actions secrets before tagging to use production Android
@@ -591,10 +599,13 @@ signing; without them, the existing development signing fallback is used:
   gateway handler is ready to accept tunnel requests.
 - Admin-listener `GET /metrics` is enabled only when
   `PORTA_METRICS_TOKEN` is set and requires that exact bearer token.
-- Admin-listener `GET /` serves the client-management UI. Its `/api/*`
-  requests require `PORTA_ADMIN_TOKEN`.
+- Public `POST /access` exchanges an administrator or client token for a
+  short-lived, role-scoped browser session.
+- Public `/portal/admin` and `/api/*` require an administrator session. Public
+  `/portal/downloads` and `/download/*` require an administrator or active
+  client session.
 - Ordinary public `GET` and `HEAD` requests receive the Porta landing page by
-  default; operational endpoints are never routed on that listener.
+  default; health and metrics are never routed on that listener.
 - `CONNECT /.well-known/masque/ip/*/*/` implements the RFC 9484 default URI
   template for unrestricted IPv4 proxying. It requires `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, and a stable client ID.
