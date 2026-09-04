@@ -121,6 +121,15 @@ The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately.
 
+The generated unit carries an inert ordering rule for `docker.service`. If
+Docker is installed, deployment also adds it as a weak startup dependency so
+Porta starts only after Docker has initialized its firewall chains. Porta then
+installs its two forwarding exceptions in `DOCKER-USER`. Without Docker, no
+Docker service is started and no iptables rules are added; Porta uses only its
+isolated nftables table. If Docker is installed later, restart Porta once after
+Docker starts, or rerun deployment, to add the live exceptions; subsequent
+boots retain the correct ordering.
+
 ## Token portal and client downloads
 
 Release clients are mirrored from the private GitHub release to the deployed

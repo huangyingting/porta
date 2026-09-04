@@ -464,13 +464,13 @@ if $reset_leases && [[ -s $lease_state ]]; then
 fi
 
 if [[ $tls_mode == static ]]; then
-  unit_after="After=network-online.target porta-cert-sync.service"
+  unit_after="After=network-online.target porta-cert-sync.service docker.service"
   unit_wants="Wants=network-online.target porta-cert-sync.service"
   tls_arguments="--tls-cert /etc/porta/tls/server.crt --tls-key /etc/porta/tls/server.key"
   tls_preflight="ExecStartPre=/bin/sh -c 'test -s /etc/porta/tls/server.crt && test -s /etc/porta/tls/server.key'"
   capabilities=CAP_NET_ADMIN
 else
-  unit_after="After=network-online.target"
+  unit_after="After=network-online.target docker.service"
   unit_wants="Wants=network-online.target"
   tls_arguments="--acme-domain $domain --acme-cache /var/lib/porta/acme --acme-http-listen :80"
   if [[ -n $acme_email ]]; then
@@ -485,6 +485,10 @@ fi
 forward_proxy_argument=
 if ! $forward_proxy; then
   forward_proxy_argument="--disable-forward-proxy"
+fi
+
+if systemctl cat docker.service >/dev/null 2>&1; then
+  unit_wants+=" docker.service"
 fi
 
 cat >/etc/systemd/system/porta.service <<EOF
