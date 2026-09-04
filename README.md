@@ -6,7 +6,21 @@ the same port, with clients for Linux, Windows, and Android.
 
 ## Deploy
 
-### 1. Download the release bundle
+Porta can be deployed from either:
+
+- the small release bundle, recommended for production; or
+- a full Git checkout.
+
+In both cases, `scripts/deploy.sh` downloads and verifies the selected release
+artifacts by default. Add `--build-local` only when deploying binaries built
+from a full source checkout.
+
+Do not copy `deploy.sh` by itself. It also requires the helper scripts in
+`scripts/` and service assets in `deploy/`.
+
+### 1. Get the deployment files
+
+**Release bundle:**
 
 ```sh
 gh release download latest --repo huangyingting/porta \
@@ -18,6 +32,14 @@ export GH_TOKEN=$(gh auth token)
 ```
 
 The repository is private, so `gh` must be authenticated with read access.
+
+**Full Git checkout:**
+
+```sh
+git clone https://github.com/huangyingting/porta.git
+cd porta
+export GH_TOKEN=$(gh auth token)
+```
 
 ### 2. Install the gateway
 
