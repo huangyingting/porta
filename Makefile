@@ -1,12 +1,16 @@
 GO ?= go
 
-.PHONY: check-version test test-race vet build build-windows android clean
+.PHONY: check-version test test-automation test-race vet build build-windows android clean
 
 check-version:
 	./scripts/check-version.sh
 
 test:
 	GODEBUG=http2xconnect=1 $(GO) test ./...
+
+test-automation:
+	python3 scripts/test_automation.py
+	$(GO) test ./scripts/package-windows.go ./scripts/package-windows_test.go
 
 test-race:
 	GODEBUG=http2xconnect=1 $(GO) test -race ./...

@@ -10,8 +10,9 @@ import (
 var ErrUnknownContext = errors.New("unknown MASQUE context ID")
 
 func EncodeIPPacket(packet []byte) []byte {
-	value := quicvarint.Append(nil, 0)
-	return append(value, packet...)
+	value := make([]byte, 1+len(packet))
+	copy(value[1:], packet)
+	return value
 }
 
 func DecodeIPPacket(value []byte) ([]byte, error) {

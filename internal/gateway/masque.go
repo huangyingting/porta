@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/usage"
@@ -110,17 +112,33 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	encoder := masque.NewEncoder(writer)
 	var assigned atomic.Bool
 	inboundDone := make(chan error, 2)
-	go c.readMasqueCapsules(sessionCtx, reader, encoder, w, lease, &assigned, usageSession, inboundDone)
+	var readers sync.WaitGroup
+	defer func() {
+		session.Close()
+		// Unblock control-stream writes before waiting for the reader to exit.
+		if stream != nil {
+			stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+		} else {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+			_ = r.Body.Close()
+		}
+		readers.Wait()
+	}()
+	readers.Go(func() {
+		c.readMasqueCapsules(sessionCtx, reader, encoder, lease, &assigned, usageSession, inboundDone)
+	})
 	if useDatagrams {
-		go c.readMasqueDatagrams(sessionCtx, stream, lease, &assigned, usageSession, inboundDone)
+		readers.Go(func() {
+			c.readMasqueDatagrams(sessionCtx, stream, lease, &assigned, usageSession, inboundDone)
+		})
 	}
 
 	for {
 		select {
 		case packet := <-session.Outgoing:
-			value := masque.EncodeIPPacket(packet)
 			if useDatagrams {
-				if err := stream.SendDatagram(value); err != nil {
+				if err := stream.SendDatagram(masque.EncodeIPPacket(packet)); err != nil {
 					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 					return
 				}
@@ -129,7 +147,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 			} else {
 			drain:
 				for count := 0; ; count++ {
-					if err := encoder.Write(masque.CapsuleDatagram, value); err != nil {
+					if err := encoder.WriteIPPacket(packet); err != nil {
 						c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 						return
 					}
@@ -140,12 +158,11 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 					}
 					select {
 					case packet = <-session.Outgoing:
-						value = masque.EncodeIPPacket(packet)
 					default:
 						break drain
 					}
 				}
-				flush(w)
+				encoder.Flush()
 			}
 		case err := <-inboundDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
@@ -162,7 +179,6 @@ func (c HandlerConfig) readMasqueCapsules(
 	ctx context.Context,
 	reader io.Reader,
 	encoder *masque.Encoder,
-	w http.ResponseWriter,
 	lease Lease,
 	assigned *atomic.Bool,
 	usageSession *usage.Session,
@@ -178,7 +194,7 @@ func (c HandlerConfig) readMasqueCapsules(
 		}
 		switch capsule.Type {
 		case masque.CapsuleAddressRequest:
-			if err := c.answerAddressRequest(encoder, w, lease, assigned, capsule.Value); err != nil {
+			if err := c.answerAddressRequest(encoder, lease, assigned, capsule.Value); err != nil {
 				done <- err
 				return
 			}
@@ -250,7 +266,6 @@ func (c HandlerConfig) readMasqueDatagrams(
 
 func (c HandlerConfig) answerAddressRequest(
 	encoder *masque.Encoder,
-	w http.ResponseWriter,
 	lease Lease,
 	assigned *atomic.Bool,
 	value []byte,
@@ -301,7 +316,7 @@ func (c HandlerConfig) answerAddressRequest(
 		}
 		assigned.Store(true)
 	}
-	flush(w)
+	encoder.Flush()
 	return nil
 }
 

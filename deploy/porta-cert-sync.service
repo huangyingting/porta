@@ -3,6 +3,8 @@ Description=Synchronize an externally managed Porta TLS certificate
 
 [Service]
 Type=oneshot
+ConfigurationDirectory=porta/tls
+ConfigurationDirectoryMode=0700
 ExecStart=/usr/local/libexec/porta/sync-cert.sh /etc/ssl/porta/source.crt /etc/ssl/porta/source.key /etc/porta/tls
 UMask=0077
 NoNewPrivileges=true

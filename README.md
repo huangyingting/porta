@@ -23,7 +23,7 @@ Do not copy `deploy.sh` by itself. It also requires the helper scripts in
 **Release bundle:**
 
 ```sh
-gh release download latest --repo huangyingting/porta \
+gh release download --repo huangyingting/porta \
   --pattern porta-deploy.tar.gz --pattern SHA256SUMS
 grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf porta-deploy.tar.gz

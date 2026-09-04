@@ -77,6 +77,16 @@ Linux forwarding and NAT are deliberately outside the daemon. The supplied
 setup script makes these changes explicit and reversible. The daemon itself can
 run with only access to `/dev/net/tun` plus the configured TCP/UDP port.
 
+Packet-device reads transfer ownership of their buffers to the caller. The
+router and client receive queues pass those buffers onward without another
+payload copy. Reusable decoder buffers are used only where TUN writes finish
+before the next read; they must never be queued for asynchronous consumers.
+Stream encoders reuse header storage and serialize capsule writes and flushes.
+Android HTTP/2 uploads flush bounded batches of packets already in the queue,
+without waiting to fill a batch. Fragmented IPv4 datagrams hash only their
+protocol and addresses so all fragments remain on the same data lane; only
+unfragmented DNS traffic receives the dedicated DNS lane.
+
 ## Transport behavior
 
 HTTP/3 enables both the HTTP/3 Datagram setting and QUIC Datagram transport.
@@ -94,10 +104,11 @@ with this setting if it is absent. Tests set it before process startup.
 
 ## Platform clients
 
-- Windows uses the WireGuard project's Wintun bindings. Interface address,
-  DNS, and default routes are configured by a separate PowerShell script so a
-  mistaken server address cannot silently cut off the host. MASQUE is the
-  default protocol.
+- Windows uses the WireGuard project's Wintun bindings. The desktop client
+  configures addresses, DNS and routes through a journaled PowerShell helper;
+  the CLI leaves this to the operator's separate up/down scripts. Gateway
+  escape routes are established before default tunnel routes, and cleanup
+  removes only escape routes created by Porta. MASQUE is the default protocol.
 - Android uses `VpnService` with a native Go HTTP/3 MASQUE bridge. The UDP
   socket is protected from the VPN routing loop and bound to Android's selected
   underlying network. Four-lane HTTP/2 remains an automatic fallback.

@@ -176,10 +176,11 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target st
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	clientWriter := &flushWriter{writer: w, controller: http.NewResponseController(w)}
+	if _, err := clientWriter.Write(nil); err != nil {
+		return
 	}
-	copyStreamTunnel(r.Context(), upstream, r.Body, flushWriter{writer: w})
+	copyStreamTunnel(r.Context(), upstream, r.Body, clientWriter)
 }
 
 func (h *Handler) serveHijackedConnect(ctx context.Context, w http.ResponseWriter, upstream net.Conn) {
@@ -199,7 +200,7 @@ func (h *Handler) serveHijackedConnect(ctx context.Context, w http.ResponseWrite
 	if err := buffered.Flush(); err != nil {
 		return
 	}
-	copyStreamTunnel(ctx, upstream, buffered.Reader, client)
+	copyStreamTunnel(ctx, upstream, buffered.Reader, &writeTimeoutConn{Conn: client})
 }
 
 func (h *Handler) dialPublic(ctx context.Context, network, address string) (net.Conn, error) {
@@ -330,25 +331,31 @@ func requestTargetsProxy(r *http.Request) bool {
 }
 
 func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Reader, clientWriter io.Writer) {
-	done := make(chan int, 2)
+	type result struct {
+		direction int
+		err       error
+	}
+	done := make(chan result, 2)
 	go func() {
-		copyTunnelStream(upstream, clientReader)
-		if closer, ok := upstream.(interface{ CloseWrite() error }); ok {
-			_ = closer.CloseWrite()
+		err := copyTunnelStream(upstream, clientReader)
+		if err == nil {
+			if closer, ok := upstream.(interface{ CloseWrite() error }); ok {
+				err = closer.CloseWrite()
+			}
 		}
-		done <- 0
+		done <- result{direction: 0, err: err}
 	}()
 	go func() {
-		copyTunnelStream(clientWriter, upstream)
-		done <- 1
+		err := copyTunnelStream(clientWriter, upstream)
+		done <- result{direction: 1, err: err}
 	}()
 	select {
 	case <-ctx.Done():
 		closeTunnelEndpoints(upstream, clientReader, clientWriter)
 		<-done
 		<-done
-	case direction := <-done:
-		if direction == 1 {
+	case completed := <-done:
+		if completed.direction == 1 || completed.err != nil {
 			closeTunnelEndpoints(upstream, clientReader, clientWriter)
 			<-done
 			return
@@ -363,24 +370,29 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 	}
 }
 
-func copyTunnelStream(destination io.Writer, source io.Reader) {
+func copyTunnelStream(destination io.Writer, source io.Reader) error {
 	buffer := copyBufferPool.Get().(*[]byte)
 	defer copyBufferPool.Put(buffer)
-	_, _ = io.CopyBuffer(destination, source, *buffer)
+	_, err := io.CopyBuffer(destination, source, *buffer)
+	return err
 }
 
 func closeTunnelEndpoints(upstream net.Conn, clientReader io.Reader, clientWriter io.Writer) {
-	_ = upstream.SetDeadline(time.Now())
-	if closer, ok := clientReader.(io.Closer); ok {
+	// Closing is terminal: an in-flight idle deadline refresh cannot undo it.
+	_ = upstream.Close()
+	if closer, ok := clientWriter.(io.Closer); ok {
 		_ = closer.Close()
 	}
-	if closer, ok := clientWriter.(io.Closer); ok {
+	if closer, ok := clientReader.(io.Closer); ok {
 		_ = closer.Close()
 	}
 }
 
 type flushWriter struct {
-	writer io.Writer
+	writer     http.ResponseWriter
+	controller *http.ResponseController
+	mu         sync.Mutex
+	closed     bool
 }
 
 type idleConn struct {
@@ -389,10 +401,18 @@ type idleConn struct {
 	nextDeadlineRefresh atomic.Int64
 }
 
+type writeTimeoutConn struct {
+	net.Conn
+}
+
+func (c *writeTimeoutConn) Write(data []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
+	return c.Conn.Write(data)
+}
+
 type meteredConn struct {
 	net.Conn
 	session *usage.Session
-	once    sync.Once
 }
 
 func (c *meteredConn) Read(data []byte) (int, error) {
@@ -429,7 +449,6 @@ func (c *idleConn) Write(data []byte) (int, error) {
 }
 
 func (c *idleConn) refreshDeadline() {
-	now := time.Now()
 	refreshInterval := c.timeout / 4
 	if refreshInterval <= 0 || refreshInterval > 30*time.Second {
 		refreshInterval = 30 * time.Second
@@ -440,7 +459,7 @@ func (c *idleConn) refreshDeadline() {
 		!c.nextDeadlineRefresh.CompareAndSwap(nextRefresh, nowTick+refreshInterval.Nanoseconds()) {
 		return
 	}
-	if err := c.Conn.SetDeadline(now.Add(c.timeout + refreshInterval)); err != nil {
+	if err := c.Conn.SetDeadline(time.Now().Add(c.timeout + refreshInterval)); err != nil {
 		c.nextDeadlineRefresh.Store(0)
 	}
 }
@@ -452,12 +471,34 @@ func (c *idleConn) CloseWrite() error {
 	return nil
 }
 
-func (w flushWriter) Write(data []byte) (int, error) {
-	n, err := w.writer.Write(data)
-	if flusher, ok := w.writer.(http.Flusher); ok {
-		flusher.Flush()
+func (w *flushWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return 0, net.ErrClosed
 	}
+	_ = w.controller.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
+	w.mu.Unlock()
+	n, err := w.writer.Write(data)
+	if err == nil {
+		if flushErr := w.controller.Flush(); !errors.Is(flushErr, http.ErrNotSupported) {
+			err = flushErr
+		}
+	}
+	w.mu.Lock()
+	if !w.closed {
+		// Bound only a blocked write, not a healthy upload-only tunnel.
+		_ = w.controller.SetWriteDeadline(time.Time{})
+	}
+	w.mu.Unlock()
 	return n, err
+}
+
+func (w *flushWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	return w.controller.SetWriteDeadline(time.Now())
 }
 
 func writeProxyError(w http.ResponseWriter, err error) {

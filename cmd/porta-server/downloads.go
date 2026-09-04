@@ -61,9 +61,18 @@ func openDownloadFile(directory, name string) (*os.File, error) {
 		return nil, err
 	}
 	defer unix.Close(directoryFD)
-	fileFD, err := unix.Openat(directoryFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fileFD, err := unix.Openat(directoryFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
-	return os.NewFile(uintptr(fileFD), name), nil
+	file := os.NewFile(uintptr(fileFD), name)
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = file.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%s is not a regular download file", name)
+	}
+	return file, nil
 }

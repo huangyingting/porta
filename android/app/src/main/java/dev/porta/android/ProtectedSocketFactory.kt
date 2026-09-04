@@ -2,6 +2,7 @@ package dev.porta.android
 
 import android.net.Network
 import android.net.VpnService
+import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -11,39 +12,51 @@ class ProtectedSocketFactory(
     private val service: VpnService,
     private val network: () -> Network?,
 ) : SocketFactory() {
-    private fun protectedSocket(): Socket {
-        val socket = Socket()
+    private fun protectedSocket(connect: Socket.() -> Unit = {}): Socket = configureSocket(Socket()) {
         val underlyingNetwork = network()
-            ?: throw IllegalStateException("No underlying network is available")
-        underlyingNetwork.bindSocket(socket)
-        if (!service.protect(socket)) {
-            socket.close()
-            throw IllegalStateException("Android refused to protect the tunnel socket")
+            ?: throw IOException("No underlying network is available")
+        underlyingNetwork.bindSocket(it)
+        if (!service.protect(it)) {
+            throw IOException("Android refused to protect the tunnel socket")
         }
-        return socket
+        it.connect()
     }
 
     override fun createSocket(): Socket = protectedSocket()
 
     override fun createSocket(host: String, port: Int): Socket =
-        protectedSocket().apply { connect(InetSocketAddress(host, port)) }
+        protectedSocket { connect(InetSocketAddress(host, port)) }
 
     override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
-        protectedSocket().apply {
+        protectedSocket {
             bind(InetSocketAddress(localHost, localPort))
             connect(InetSocketAddress(host, port))
         }
 
     override fun createSocket(host: InetAddress, port: Int): Socket =
-        protectedSocket().apply { connect(InetSocketAddress(host, port)) }
+        protectedSocket { connect(InetSocketAddress(host, port)) }
 
     override fun createSocket(
         address: InetAddress,
         port: Int,
         localAddress: InetAddress,
         localPort: Int,
-    ): Socket = protectedSocket().apply {
+    ): Socket = protectedSocket {
         bind(InetSocketAddress(localAddress, localPort))
         connect(InetSocketAddress(address, port))
+    }
+}
+
+internal fun configureSocket(socket: Socket, configure: (Socket) -> Unit): Socket {
+    try {
+        configure(socket)
+        return socket
+    } catch (error: Exception) {
+        try {
+            socket.close()
+        } catch (closeError: Exception) {
+            error.addSuppressed(closeError)
+        }
+        throw error
     }
 }

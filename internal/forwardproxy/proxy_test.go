@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -274,6 +276,124 @@ func TestIdleConnectionThrottlesDeadlineRefreshes(t *testing.T) {
 	}
 	if calls := counting.deadlineCalls.Load(); calls != 1 {
 		t.Fatalf("SetDeadline called %d times for %d writes, want 1", calls, writes)
+	}
+}
+
+func TestTunnelShutdownCannotBeUndoneByDeadlineRefresh(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	delayed := &delayedDeadlineConn{Conn: client, entered: make(chan struct{}), release: make(chan struct{})}
+	wrapped := &idleConn{Conn: delayed, timeout: time.Minute}
+	refreshed := make(chan struct{})
+	go func() {
+		wrapped.refreshDeadline()
+		close(refreshed)
+	}()
+	<-delayed.entered
+	closeTunnelEndpoints(wrapped, strings.NewReader(""), io.Discard)
+	close(delayed.release)
+	<-refreshed
+	_ = peer.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("upstream reopened after shutdown: %v", err)
+	}
+}
+
+type delayedDeadlineConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *delayedDeadlineConn) SetDeadline(deadline time.Time) error {
+	if deadline.After(time.Now()) {
+		close(c.entered)
+		<-c.release
+	}
+	return c.Conn.SetDeadline(deadline)
+}
+
+func TestStreamCancellationUnblocksResponseWrite(t *testing.T) {
+	upstream, peer := net.Pipe()
+	defer upstream.Close()
+	defer peer.Close()
+	body, bodyWriter := io.Pipe()
+	defer body.Close()
+	defer bodyWriter.Close()
+	response := &blockedResponseWriter{started: make(chan struct{}), unblocked: make(chan struct{})}
+	writer := &flushWriter{writer: response, controller: http.NewResponseController(response)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		copyStreamTunnel(ctx, upstream, body, writer)
+		close(done)
+	}()
+	if _, err := peer.Write([]byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	<-response.started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = writer.Close()
+		t.Fatal("stream cancellation left the response writer blocked")
+	}
+	if _, err := writer.Write([]byte("late")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after cancellation = %v", err)
+	}
+}
+
+type blockedResponseWriter struct {
+	started   chan struct{}
+	unblocked chan struct{}
+	once      sync.Once
+}
+
+func (w *blockedResponseWriter) Header() http.Header { return make(http.Header) }
+func (w *blockedResponseWriter) WriteHeader(int)     {}
+func (w *blockedResponseWriter) Write([]byte) (int, error) {
+	close(w.started)
+	<-w.unblocked
+	return 0, net.ErrClosed
+}
+func (w *blockedResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() && !deadline.After(time.Now()) {
+		w.once.Do(func() { close(w.unblocked) })
+	}
+	return nil
+}
+
+func TestUploadFailureClosesBothTunnelDirections(t *testing.T) {
+	upstream, peer := net.Pipe()
+	defer upstream.Close()
+	defer peer.Close()
+	done := make(chan struct{})
+	go func() {
+		copyStreamTunnel(context.Background(), upstream, failingReader{}, io.Discard)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = peer.Close()
+		t.Fatal("failed upload left downstream copying blocked")
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func BenchmarkIdleDeadlineRefresh(b *testing.B) {
+	connection := &idleConn{Conn: &deadlineCountingConn{}, timeout: time.Minute}
+	// Avoid an actual network call: the benchmark measures the throttled hot path.
+	connection.nextDeadlineRefresh.Store((time.Since(idleDeadlineClockStart) + time.Hour).Nanoseconds())
+	b.ReportAllocs()
+	for b.Loop() {
+		connection.refreshDeadline()
 	}
 }
 

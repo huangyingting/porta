@@ -1,9 +1,9 @@
-//go:build windows
-
 package winnetwork
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,16 +11,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
 type Runner struct {
-	mu        sync.Mutex
-	statePath string
-	state     networkState
+	mu         sync.Mutex
+	statePath  string
+	state      networkState
+	runCommand func(context.Context, ...string) (string, error)
 }
 
 type networkState struct {
@@ -32,6 +36,9 @@ type networkState struct {
 }
 
 func NewRunner(statePath string) (*Runner, error) {
+	if strings.TrimSpace(statePath) == "" {
+		return nil, errors.New("network state path is required")
+	}
 	runner := &Runner{
 		statePath: statePath,
 	}
@@ -50,11 +57,9 @@ func (r *Runner) Up(ctx context.Context, interfaceName string, remoteAddr net.Ad
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.state.Interface != "" {
-		if _, err := r.invoke(ctx, downArguments(r.state)...); err != nil {
+		if err := r.downLocked(ctx); err != nil {
 			return fmt.Errorf("clean stale network state: %w", err)
 		}
-		r.state = networkState{}
-		_ = os.Remove(r.statePath)
 	}
 	if remoteAddr == nil {
 		return errors.New("tunnel did not report its remote address")
@@ -74,31 +79,29 @@ func (r *Runner) Up(ctx context.Context, interfaceName string, remoteAddr net.Ad
 	if lease.DNS.IsValid() {
 		dns = lease.DNS.String()
 	}
-	output, err := r.invoke(ctx, "up", interfaceName, lease.Address.String(), serverIP, dns)
-	if err != nil {
-		return err
-	}
-	var created struct {
-		CreatedEscapeRoute   bool   `json:"created_escape_route"`
-		EscapeInterfaceIndex int    `json:"escape_interface_index"`
-		EscapeNextHop        string `json:"escape_next_hop"`
-	}
-	if err := json.Unmarshal([]byte(output), &created); err != nil {
-		return fmt.Errorf("decode network helper result: %w", err)
-	}
-	r.state = networkState{
-		Interface:            interfaceName,
-		ServerIP:             serverIP,
-		CreatedEscapeRoute:   created.CreatedEscapeRoute,
-		EscapeInterfaceIndex: created.EscapeInterfaceIndex,
-		EscapeNextHop:        created.EscapeNextHop,
-	}
+	r.state = networkState{Interface: interfaceName, ServerIP: serverIP}
 	if err := r.persistLocked(); err != nil {
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		_, _ = r.invoke(rollbackCtx, downArguments(r.state)...)
 		r.state = networkState{}
 		return err
+	}
+	_, upErr := r.invoke(ctx, "up", interfaceName, lease.Address.String(), serverIP, dns, r.statePath)
+	// The helper journals route ownership before changing the network, including
+	// when CommandContext terminates PowerShell before its catch block can run.
+	data, readErr := os.ReadFile(r.statePath)
+	if readErr == nil {
+		var saved networkState
+		readErr = json.Unmarshal(data, &saved)
+		if readErr == nil {
+			r.state = saved
+		}
+	}
+	if readErr != nil {
+		return errors.Join(upErr, fmt.Errorf("read network helper state: %w", readErr))
+	}
+	if upErr != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		return errors.Join(upErr, r.downLocked(rollbackCtx))
 	}
 	return nil
 }
@@ -106,20 +109,27 @@ func (r *Runner) Up(ctx context.Context, interfaceName string, remoteAddr net.Ad
 func (r *Runner) Down(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.downLocked(ctx)
+}
+
+func (r *Runner) downLocked(ctx context.Context) error {
 	if r.state.Interface == "" {
 		return nil
 	}
 	if _, err := r.invoke(ctx, downArguments(r.state)...); err != nil {
 		return err
 	}
-	r.state = networkState{}
 	if err := os.Remove(r.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove network state: %w", err)
 	}
+	r.state = networkState{}
 	return nil
 }
 
 func (r *Runner) invoke(ctx context.Context, arguments ...string) (string, error) {
+	if r.runCommand != nil {
+		return r.runCommand(ctx, arguments...)
+	}
 	if len(arguments) == 0 {
 		return "", errors.New("network operation is required")
 	}
@@ -132,26 +142,43 @@ func (r *Runner) invoke(ctx context.Context, arguments ...string) (string, error
 	default:
 		return "", errors.New("unsupported network operation")
 	}
+	if runtime.GOOS != "windows" {
+		return "", errors.New("Windows network configuration is unavailable on this platform")
+	}
 	systemRoot := os.Getenv("SystemRoot")
 	if systemRoot == "" {
 		return "", errors.New("SystemRoot is unavailable")
 	}
 	powerShell := filepath.Join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-	commandArgs := []string{"-NoProfile", "-NonInteractive", "-Command", script}
-	commandArgs = append(commandArgs, arguments[1:]...)
+	commandArgs := []string{"-NoProfile", "-NonInteractive", "-EncodedCommand", encodeCommand(script, arguments[1:])}
 	output, err := exec.CommandContext(ctx, powerShell, commandArgs...).CombinedOutput()
 	if err != nil {
 		message := string(output)
 		if message == "" {
 			message = err.Error()
 		}
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("network helper: %w", ctx.Err())
+		}
 		return "", fmt.Errorf("network helper failed: %s", message)
 	}
 	return string(output), nil
 }
 
+func encodeCommand(script string, arguments []string) string {
+	for _, argument := range arguments {
+		script += " '" + strings.ReplaceAll(argument, "'", "''") + "'"
+	}
+	words := utf16.Encode([]rune(script))
+	encoded := make([]byte, len(words)*2)
+	for index, word := range words {
+		binary.LittleEndian.PutUint16(encoded[index*2:], word)
+	}
+	return base64.StdEncoding.EncodeToString(encoded)
+}
+
 const upScript = `& {
-param($interfaceName, $addressCidr, $serverIP, $dnsServer)
+param($interfaceName, $addressCidr, $serverIP, $dnsServer, $statePath)
 $ErrorActionPreference = "Stop"
 $parts = $addressCidr.Split("/")
 if ($parts.Count -ne 2) { throw "Invalid tunnel address" }
@@ -165,13 +192,17 @@ $escapeInterface = 0
 $escapeNextHop = ""
 try {
   if ($serverIP -and -not $existingHostRoute) {
-    $existingRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -AddressFamily IPv4 |
-      Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
+    $existingRoute = Find-NetRoute -RemoteIPAddress $serverIP |
+      Where-Object { $_.DestinationPrefix } | Select-Object -First 1
     if (-not $existingRoute) { throw "Could not determine the gateway escape route" }
-    New-NetRoute -DestinationPrefix "$serverIP/32" -InterfaceIndex $existingRoute.InterfaceIndex -NextHop $existingRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-    $createdEscape = $true
     $escapeInterface = $existingRoute.InterfaceIndex
     $escapeNextHop = [string]$existingRoute.NextHop
+    $state = [ordered]@{interface=$interfaceName;server_ip=$serverIP;created_escape_route=$true;escape_interface_index=$escapeInterface;escape_next_hop=$escapeNextHop}
+    $json = $state | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText("$statePath.pending", $json, (New-Object Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath "$statePath.pending" -Destination $statePath -Force -ErrorAction Stop
+    New-NetRoute -DestinationPrefix "$serverIP/32" -InterfaceIndex $existingRoute.InterfaceIndex -NextHop $existingRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+    $createdEscape = $true
   }
   Get-NetRoute -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.DestinationPrefix -in @("0.0.0.0/1", "128.0.0.0/1") } |
@@ -182,7 +213,6 @@ try {
   if ($dnsServer) { Set-DnsClientServerAddress -InterfaceAlias $interfaceName -ServerAddresses $dnsServer -ErrorAction Stop }
   New-NetRoute -DestinationPrefix "0.0.0.0/1" -InterfaceAlias $interfaceName -NextHop "0.0.0.0" -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
   New-NetRoute -DestinationPrefix "128.0.0.0/1" -InterfaceAlias $interfaceName -NextHop "0.0.0.0" -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-  [pscustomobject]@{created_escape_route=$createdEscape;escape_interface_index=$escapeInterface;escape_next_hop=$escapeNextHop} | ConvertTo-Json -Compress
 } catch {
   Get-NetRoute -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.DestinationPrefix -in @("0.0.0.0/1", "128.0.0.0/1") } |
@@ -204,15 +234,17 @@ param($interfaceName, $serverIP, $createdEscape, $escapeInterface, $escapeNextHo
 $ErrorActionPreference = "Stop"
 Get-NetRoute -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
   Where-Object { $_.DestinationPrefix -in @("0.0.0.0/1", "128.0.0.0/1") } |
-  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-NetRoute -Confirm:$false -ErrorAction Stop
 if ($createdEscape -eq "true" -and $serverIP) {
   Get-NetRoute -DestinationPrefix "$serverIP/32" -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.InterfaceIndex -eq [int]$escapeInterface -and [string]$_.NextHop -eq $escapeNextHop } |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-NetRoute -Confirm:$false -ErrorAction Stop
 }
-Set-DnsClientServerAddress -InterfaceAlias $interfaceName -ResetServerAddresses -ErrorAction SilentlyContinue
-Get-NetIPAddress -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+if (Get-NetIPInterface -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue) {
+  Set-DnsClientServerAddress -InterfaceAlias $interfaceName -ResetServerAddresses -ErrorAction Stop
+  Get-NetIPAddress -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+}
 }`
 
 func downArguments(state networkState) []string {
@@ -235,6 +267,7 @@ func (r *Runner) persistLocked() error {
 		return fmt.Errorf("create network state directory: %w", err)
 	}
 	temp := r.statePath + ".tmp"
+	defer os.Remove(temp)
 	if err := os.WriteFile(temp, data, 0o600); err != nil {
 		return fmt.Errorf("write network state: %w", err)
 	}

@@ -26,8 +26,9 @@ var ErrFrameTooLarge = errors.New("porta frame exceeds maximum packet size")
 // is safe for concurrent callers because keepalives and packet writes may be
 // emitted by different goroutines.
 type Encoder struct {
-	w  io.Writer
-	mu sync.Mutex
+	w      io.Writer
+	mu     sync.Mutex
+	header [2]byte
 }
 
 func NewEncoder(w io.Writer) *Encoder { return &Encoder{w: w} }
@@ -40,9 +41,8 @@ func (e *Encoder) WritePacket(packet []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	var header [2]byte
-	binary.BigEndian.PutUint16(header[:], uint16(len(packet)))
-	if err := writeAll(e.w, header[:]); err != nil {
+	binary.BigEndian.PutUint16(e.header[:], uint16(len(packet)))
+	if err := writeAll(e.w, e.header[:]); err != nil {
 		return err
 	}
 	if len(packet) == 0 {
@@ -54,7 +54,8 @@ func (e *Encoder) WritePacket(packet []byte) error {
 // Decoder reads complete IP packets from an ordered Porta byte stream. A nil
 // packet represents a zero-length keepalive frame.
 type Decoder struct {
-	r *bufio.Reader
+	r      *bufio.Reader
+	header [2]byte
 }
 
 func NewDecoder(r io.Reader) *Decoder { return &Decoder{r: bufio.NewReader(r)} }
@@ -66,11 +67,10 @@ func (d *Decoder) ReadPacket() ([]byte, error) {
 // ReadPacketInto reads a packet into buffer when it has sufficient capacity.
 // The returned slice is only valid until buffer is reused by the caller.
 func (d *Decoder) ReadPacketInto(buffer []byte) ([]byte, error) {
-	var header [2]byte
-	if _, err := io.ReadFull(d.r, header[:]); err != nil {
+	if _, err := io.ReadFull(d.r, d.header[:]); err != nil {
 		return nil, err
 	}
-	size := int(binary.BigEndian.Uint16(header[:]))
+	size := int(binary.BigEndian.Uint16(d.header[:]))
 	if size == 0 {
 		return nil, nil
 	}

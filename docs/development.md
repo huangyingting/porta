@@ -10,6 +10,7 @@ binaries on `PATH`.
 
 ```sh
 make check-version
+make test-automation
 make test
 make test-race
 make vet
@@ -20,10 +21,31 @@ make android
 
 `make test` enables the official `GODEBUG=http2xconnect=1` switch required by
 the HTTP/2 Extended CONNECT integration tests.
+`make test-automation` uses Python 3's standard library and Go tests to exercise
+deployment, certificate sync, firewall cleanup and packaging with isolated
+fixtures and mocked system commands. It does not change host services or
+network settings.
 
 Linux binaries are written to `bin/`. The Windows target creates
 `bin/porta-client-windows-amd64.zip`. Optimized per-architecture Android APKs
 are written under `android/app/build/outputs/apk/release/`.
+
+## Performance measurements
+
+Use the existing Go benchmark runner to measure framing, packet delivery and
+allocation costs:
+
+```sh
+go test ./internal/masque ./internal/protocol ./internal/tunnel \
+  ./internal/usage ./internal/forwardproxy \
+  -run '^$' -bench . -benchmem -count=3
+```
+
+Keep payload sizes and concurrency identical for before/after comparisons.
+These in-process microbenchmarks isolate hot-path overhead; their throughput
+is not a prediction of end-to-end VPN speed. Network tests should compare
+HTTP/3, HTTP/2 fallback and CONNECT separately under the same latency, loss,
+client count and server load.
 
 ## Android signing
 
@@ -70,6 +92,11 @@ workflow and publishes:
 - per-architecture Android APKs;
 - the deployment bundle;
 - `SHA256SUMS`.
+
+Artifacts are uploaded to a draft release before it becomes visible as a
+published release. A failed upload leaves the draft unpublished and can be
+retried. Published artifacts are not overwritten on workflow reruns; changes
+require a new version and tag.
 
 The release version supplies the Android application version name and a
 monotonic Android version code. Configure these repository Actions secrets for

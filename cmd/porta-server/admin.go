@@ -160,7 +160,7 @@ func (a *adminAPI) writeError(w http.ResponseWriter, err error) {
 }
 
 func decodeJSON(r *http.Request, target any) error {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 16<<10))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return errors.New("Invalid request body")

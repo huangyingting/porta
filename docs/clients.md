@@ -81,6 +81,13 @@ Remove those settings with:
 ./scripts/windows-down.ps1 -InterfaceAlias Porta
 ```
 
+The helpers journal owned routes in
+`%LOCALAPPDATA%\Porta\manual-network-state.json`. Keep this file until cleanup
+succeeds; it lets the down helper remove the gateway escape route without
+deleting an existing route owned by another application. If a cleanup command
+fails, its state is retained for retry. An alternate `-StatePath` must be
+supplied consistently to both helpers.
+
 For a private certificate, prefer `--ca` or an exact SHA-256 `--thumbprint`.
 Do not pin an automatically renewed Let's Encrypt leaf certificate because its
 thumbprint changes at renewal.

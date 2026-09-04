@@ -27,34 +27,36 @@ import (
 const trayMessage co.WM = co.WM_APP + 1
 
 type application struct {
-	window      *ui.Main
-	profiles    *ui.ComboBox
-	name        *ui.Edit
-	server      *ui.Edit
-	clientID    *ui.Edit
-	transport   *ui.ComboBox
-	token       *ui.Edit
-	status      *ui.Static
-	address     *ui.Static
-	duration    *ui.Static
-	upload      *ui.Static
-	download    *ui.Static
-	logs        *ui.Edit
-	connect     *ui.Button
-	save        *ui.Button
-	remove      *ui.Button
-	store       *clientprofile.Store
-	network     *winnetwork.Runner
-	items       []clientprofile.Profile
-	selectedID  string
-	cancel      context.CancelFunc
-	running     bool
-	closing     bool
-	connectedAt time.Time
-	logLines    []string
-	logPath     string
-	tray        win.NOTIFYICONDATA
-	mu          sync.Mutex
+	window        *ui.Main
+	profiles      *ui.ComboBox
+	name          *ui.Edit
+	server        *ui.Edit
+	clientID      *ui.Edit
+	transport     *ui.ComboBox
+	token         *ui.Edit
+	status        *ui.Static
+	address       *ui.Static
+	duration      *ui.Static
+	upload        *ui.Static
+	download      *ui.Static
+	logs          *ui.Edit
+	connect       *ui.Button
+	save          *ui.Button
+	remove        *ui.Button
+	store         *clientprofile.Store
+	network       *winnetwork.Runner
+	items         []clientprofile.Profile
+	selectedID    string
+	cancel        context.CancelFunc
+	running       bool
+	disconnecting bool
+	closing       bool
+	connectedAt   time.Time
+	logLines      []string
+	logPath       string
+	tray          win.NOTIFYICONDATA
+	trayAvailable bool
+	mu            sync.Mutex
 }
 
 func main() {
@@ -214,15 +216,20 @@ func (a *application) profileFromFields() clientprofile.Profile {
 	if a.transport.SelectedIndex() == 1 {
 		transport = tunnel.TransportHTTP2
 	}
-	return clientprofile.Profile{
-		ID:                a.selectedID,
-		Name:              strings.TrimSpace(a.name.Text()),
-		ServerURL:         strings.TrimSpace(a.server.Text()),
-		ClientID:          strings.TrimSpace(a.clientID.Text()),
-		Transport:         transport,
-		Reconnect:         true,
-		ReconnectMaxDelay: 30 * time.Second,
+	var original clientprofile.Profile
+	for _, profile := range a.items {
+		if profile.ID == a.selectedID {
+			original = profile
+			break
+		}
 	}
+	return profileWithFields(original, clientprofile.Profile{
+		ID:        a.selectedID,
+		Name:      strings.TrimSpace(a.name.Text()),
+		ServerURL: strings.TrimSpace(a.server.Text()),
+		ClientID:  strings.TrimSpace(a.clientID.Text()),
+		Transport: transport,
+	})
 }
 
 func (a *application) saveProfile() bool {
@@ -266,10 +273,12 @@ func (a *application) toggleConnection() {
 	a.mu.Lock()
 	if a.running {
 		cancel := a.cancel
+		a.disconnecting = true
 		a.mu.Unlock()
 		setText(a.status, "Disconnecting")
 		a.connect.SetText("Disconnecting…")
 		a.connect.Hwnd().EnableWindow(false)
+		a.updateTray("Disconnecting")
 		cancel()
 		return
 	}
@@ -287,18 +296,26 @@ func (a *application) toggleConnection() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.mu.Lock()
 	a.running = true
+	a.disconnecting = false
 	a.cancel = cancel
 	a.mu.Unlock()
 	a.setEditing(false)
 	a.connect.SetText("Cancel")
+	setText(a.address, "Address  —")
+	setText(a.duration, "Duration  —")
+	setText(a.upload, "Upload  0 B")
+	setText(a.download, "Download  0 B")
 	a.appendLog("Connecting to " + profile.ServerURL)
 	go func() {
+		defer cancel()
 		err := clientapp.Run(ctx, clientapp.Config{
 			ServerURL:         profile.ServerURL,
 			Token:             token,
 			ClientID:          profile.ClientID,
 			Transport:         profile.Transport,
 			InterfaceName:     "Porta",
+			CAPath:            profile.CAPath,
+			Thumbprint:        profile.Thumbprint,
 			Reconnect:         profile.Reconnect,
 			ReconnectMaxDelay: profile.ReconnectMaxDelay,
 			Network:           a.network,
@@ -306,6 +323,7 @@ func (a *application) toggleConnection() {
 		a.window.UiThread(func() {
 			a.mu.Lock()
 			a.running = false
+			a.disconnecting = false
 			a.cancel = nil
 			closing := a.closing
 			a.mu.Unlock()
@@ -315,9 +333,12 @@ func (a *application) toggleConnection() {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				a.appendLog("Error: " + err.Error())
 				setText(a.status, "Error")
+				a.updateTray("Error")
 			} else {
 				setText(a.status, "Disconnected")
+				a.updateTray("Disconnected")
 			}
+			setText(a.address, "Address  —")
 			if closing {
 				a.window.Hwnd().DestroyWindow()
 			}
@@ -327,6 +348,9 @@ func (a *application) toggleConnection() {
 
 func (a *application) handleEvent(event clientapp.Event) {
 	a.window.UiThread(func() {
+		if a.disconnecting && event.State != clientapp.StateError && event.State != clientapp.StateDisconnected {
+			return
+		}
 		setText(a.status, event.Message)
 		a.updateTray(event.Message)
 		if event.State == clientapp.StateConnected {
@@ -397,7 +421,7 @@ func (a *application) showError(err error) {
 
 func (a *application) close() {
 	a.mu.Lock()
-	if !a.closing {
+	if !a.closing && a.trayAvailable {
 		a.mu.Unlock()
 		a.window.Hwnd().ShowWindow(co.SW_HIDE)
 		return
@@ -408,9 +432,12 @@ func (a *application) close() {
 		return
 	}
 	a.closing = true
+	a.disconnecting = true
 	cancel := a.cancel
 	a.mu.Unlock()
 	setText(a.status, "Disconnecting")
+	a.connect.Hwnd().EnableWindow(false)
+	a.updateTray("Disconnecting")
 	cancel()
 }
 
@@ -432,10 +459,13 @@ func (a *application) addTray() {
 	}
 	a.tray.SetCbSize()
 	a.tray.SetSzTip("Porta — Disconnected")
-	_ = win.Shell_NotifyIcon(co.NIM_ADD, &a.tray)
+	a.trayAvailable = win.Shell_NotifyIcon(co.NIM_ADD, &a.tray) == nil
 }
 
 func (a *application) updateTray(status string) {
+	if !a.trayAvailable {
+		return
+	}
 	a.tray.SetSzTip("Porta — " + status)
 	_ = win.Shell_NotifyIcon(co.NIM_MODIFY, &a.tray)
 }

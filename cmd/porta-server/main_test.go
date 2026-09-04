@@ -56,7 +56,7 @@ func TestStaticTLSConfigReloadsCertificate(t *testing.T) {
 	if err := certutil.Generate(certPath, keyPath, certutil.Options{Hosts: []string{"vpn.example.com"}}); err != nil {
 		t.Fatal(err)
 	}
-	config, err := staticTLSConfig(certPath, keyPath)
+	config, err := staticTLSConfig(certPath, keyPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestStaticTLSConfigKeepsCertificateDuringPartialReplacement(t *testing.T) {
 	if err := certutil.Generate(certPath, keyPath, certutil.Options{Hosts: []string{"vpn.example.com"}}); err != nil {
 		t.Fatal(err)
 	}
-	config, err := staticTLSConfig(certPath, keyPath)
+	config, err := staticTLSConfig(certPath, keyPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

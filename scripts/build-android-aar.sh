@@ -22,6 +22,7 @@ if [[ ! -d "${ANDROID_NDK_HOME}" ]]; then
 fi
 
 mkdir -p "$(dirname "${OUTPUT}")"
+OUTPUT="$(cd "$(dirname "${OUTPUT}")" && pwd)/$(basename "${OUTPUT}")"
 cd "${ROOT}"
 PATH="$(dirname "${GOMOBILE}"):${PATH}" \
     ANDROID_HOME="${ANDROID_HOME}" ANDROID_NDK_HOME="${ANDROID_NDK_HOME}" \

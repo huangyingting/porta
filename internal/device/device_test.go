@@ -3,6 +3,7 @@ package device
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -85,5 +86,52 @@ func TestNativeWritePacketUsesHeadroom(t *testing.T) {
 	}
 	if firstBuffer != &device.writeBuffer[0] {
 		t.Fatal("write buffer was reallocated")
+	}
+}
+
+func TestNativeReadHonorsCancellationWithPendingPackets(t *testing.T) {
+	dev := newNative(&fakeTUN{readPackets: [][]byte{{1}, {2}}}, "fake0", 1300)
+	defer dev.Close()
+	if _, err := dev.ReadPacket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := dev.ReadPacket(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled read returned %v", err)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dev.ReadPacket(context.Background()); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("closed read returned %v", err)
+	}
+	if err := dev.WritePacket(context.Background(), []byte{1}); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("closed write returned %v", err)
+	}
+	select {
+	case <-dev.readDone:
+	default:
+		t.Fatal("Close returned before reader stopped")
+	}
+}
+
+type discardTUN struct{ fakeTUN }
+
+func (*discardTUN) Write(bufs [][]byte, offset int) (int, error) { return len(bufs), nil }
+
+func TestNativeWriteBufferHasNoSteadyStateAllocations(t *testing.T) {
+	dev := newNative(&discardTUN{}, "fake0", 1300)
+	defer dev.Close()
+	packet := make([]byte, 1100)
+	var writeErr error
+	allocations := testing.AllocsPerRun(1000, func() {
+		writeErr = dev.WritePacket(context.Background(), packet)
+	})
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if allocations != 0 {
+		t.Fatalf("write allocated %v objects per packet", allocations)
 	}
 }

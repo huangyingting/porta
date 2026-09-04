@@ -78,6 +78,9 @@ func (d *Dialer) Close() {
 }
 
 func dial(ctx context.Context, serverURL, token, clientID, remoteIP string, protector Protector) (*Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	endpoint, address, err := endpointAddress(serverURL, remoteIP)
 	if err != nil {
 		return nil, err
@@ -87,6 +90,10 @@ func dial(ctx context.Context, serverURL, token, clientID, remoteIP string, prot
 	}
 	packetConn, err := protectedPacketConn(address.Addr(), protector)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = packetConn.Close()
 		return nil, err
 	}
 
@@ -182,7 +189,8 @@ func endpointAddress(serverURL, remoteIP string) (*url.URL, netip.AddrPort, erro
 		return nil, netip.AddrPort{}, errors.New("configuration: gateway URL must be an HTTPS origin")
 	}
 	ip, err := netip.ParseAddr(remoteIP)
-	if err != nil || ip.IsUnspecified() {
+	ip = ip.Unmap()
+	if err != nil || ip.IsUnspecified() || ip.IsMulticast() || ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
 		return nil, netip.AddrPort{}, errors.New("configuration: remote IP must be a numeric unicast address")
 	}
 	port := uint64(443)
@@ -231,6 +239,9 @@ func protectedPacketConn(remote netip.Addr, protector Protector) (*net.UDPConn, 
 
 func classifyDialError(err error) error {
 	message := err.Error()
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
 	var responseError *tunnel.GatewayResponseError
 	if errors.As(err, &responseError) {
 		switch responseError.StatusCode {
@@ -255,13 +266,13 @@ func classifyDialError(err error) error {
 		return err
 	}
 	if strings.Contains(message, "ADDRESS_ASSIGN") {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("%s%w", retryablePrefix, err)
+		}
 		return err
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%s%w", transportUnavailablePrefix, err)
-	}
-	if errors.Is(err, context.Canceled) {
-		return err
 	}
 	var networkError net.Error
 	if errors.As(err, &networkError) {

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -76,6 +77,24 @@ type counters struct {
 }
 
 func Run(ctx context.Context, config Config, observer Observer) error {
+	return run(ctx, config, observer, func(ctx context.Context, config tunnel.Config) (*clientConnection, error) {
+		connection, err := tunnel.Dial(ctx, config)
+		if err != nil {
+			return nil, err
+		}
+		return &clientConnection{packetConnection: connection, lease: connection.Lease, remoteAddr: connection.RemoteAddr}, nil
+	}, func(name string, mtu int) (device.PacketDevice, error) {
+		return device.OpenNative(name, mtu)
+	})
+}
+
+type clientConnection struct {
+	packetConnection
+	lease      tunnel.Lease
+	remoteAddr net.Addr
+}
+
+func run(ctx context.Context, config Config, observer Observer, dial func(context.Context, tunnel.Config) (*clientConnection, error), openDevice func(string, int) (device.PacketDevice, error)) (runErr error) {
 	if strings.TrimSpace(config.ServerURL) == "" || config.Token == "" {
 		return errors.New("server URL and token are required")
 	}
@@ -111,12 +130,21 @@ func Run(ctx context.Context, config Config, observer Observer) error {
 		Timeout:   15 * time.Second,
 	}
 	emit(observer, Event{State: StateConnecting, Message: "Connecting", Transport: config.Transport})
-	connection, err := tunnel.Dial(ctx, tunnelConfig)
+	connection, err := dial(ctx, tunnelConfig)
 	if err != nil {
+		if ctx.Err() != nil {
+			emit(observer, Event{State: StateDisconnected, Message: "Disconnected", Transport: config.Transport})
+			return ctx.Err()
+		}
 		emit(observer, Event{State: StateError, Message: err.Error(), Transport: config.Transport})
 		return err
 	}
-	tunDevice, err := device.OpenNative(config.InterfaceName, connection.Lease.MTU)
+	if ctx.Err() != nil {
+		_ = connection.Close()
+		emit(observer, Event{State: StateDisconnected, Message: "Disconnected", Transport: config.Transport})
+		return ctx.Err()
+	}
+	tunDevice, err := openDevice(config.InterfaceName, connection.lease.MTU)
 	if err != nil {
 		_ = connection.Close()
 		emit(observer, Event{State: StateError, Message: err.Error(), Transport: config.Transport})
@@ -125,42 +153,68 @@ func Run(ctx context.Context, config Config, observer Observer) error {
 	defer tunDevice.Close()
 
 	if config.Network != nil {
-		emit(observer, Event{State: StateConfiguring, Message: "Configuring Windows network", Lease: connection.Lease, Transport: config.Transport})
-		if err := config.Network.Up(ctx, config.InterfaceName, connection.RemoteAddr, connection.Lease); err != nil {
-			_ = connection.Close()
-			emit(observer, Event{State: StateError, Message: err.Error(), Lease: connection.Lease, Transport: config.Transport})
-			return fmt.Errorf("configure network: %w", err)
-		}
 		defer func() {
 			downCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			if err := config.Network.Down(downCtx); err != nil {
 				config.Logger.Error("restore Windows network", "error", err)
+				cleanupErr := fmt.Errorf("restore network: %w", err)
+				if errors.Is(runErr, context.Canceled) {
+					runErr = cleanupErr
+				} else {
+					runErr = errors.Join(runErr, cleanupErr)
+				}
 			}
 		}()
+		emit(observer, Event{State: StateConfiguring, Message: "Configuring Windows network", Lease: connection.lease, Transport: config.Transport})
+		if err := config.Network.Up(ctx, tunDevice.Name(), connection.remoteAddr, connection.lease); err != nil {
+			_ = connection.Close()
+			if ctx.Err() != nil {
+				emit(observer, Event{State: StateDisconnected, Message: "Disconnected", Transport: config.Transport})
+				return ctx.Err()
+			}
+			emit(observer, Event{State: StateError, Message: err.Error(), Lease: connection.lease, Transport: config.Transport})
+			return fmt.Errorf("configure network: %w", err)
+		}
 	}
 
 	var totals counters
-	var connected atomic.Bool
 	connectedAt := time.Now()
-	connected.Store(true)
-	emitSnapshot(observer, StateConnected, "Connected", connection.Lease, config.Transport, connectedAt, &totals)
-	trafficCtx, stopTraffic := context.WithCancel(ctx)
-	defer stopTraffic()
-	go reportTraffic(trafficCtx, observer, connection.Lease, config.Transport, connectedAt, &totals, &connected)
+	emitSnapshot(observer, StateConnected, "Connected", connection.lease, config.Transport, connectedAt, &totals)
 
 	outbound := make(chan []byte, 256)
 	deviceErrors := make(chan error, 1)
-	go readDevice(ctx, tunDevice, outbound, deviceErrors)
+	readCtx, stopReading := context.WithCancel(ctx)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		readDevice(readCtx, tunDevice, outbound, deviceErrors)
+	}()
+	defer func() {
+		stopReading()
+		<-readDone
+	}()
 
-	initialLease := connection.Lease
-	initialRemote := remoteHost(connection.RemoteAddr)
+	initialLease := connection.lease
+	initialRemote := remoteHost(connection.remoteAddr)
 	failures := 0
 	connectionStarted := time.Now()
+	waitForReconnect := func(delay time.Duration) error {
+		err := wait(ctx, delay, deviceErrors)
+		if err != nil {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
+			} else {
+				emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
+			}
+		}
+		return err
+	}
 	for {
-		err := runConnection(ctx, tunDevice, connection, outbound, deviceErrors, &totals)
-		connected.Store(false)
-		_ = connection.Close()
+		err := runConnection(ctx, tunDevice, connection, outbound, deviceErrors, &totals, func() {
+			emitSnapshot(observer, StateConnected, "Connected", initialLease, config.Transport, connectedAt, &totals)
+		})
 		if ctx.Err() != nil {
 			emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
 			return ctx.Err()
@@ -176,12 +230,11 @@ func Run(ctx context.Context, config Config, observer Observer) error {
 		delay := ReconnectDelay(failures, config.ReconnectMaxDelay)
 		failures++
 		emitSnapshot(observer, StateReconnecting, fmt.Sprintf("Reconnecting in %s", delay), initialLease, config.Transport, connectedAt, &totals)
-		if err := wait(ctx, delay); err != nil {
-			emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
+		if err := waitForReconnect(delay); err != nil {
 			return err
 		}
 		for {
-			connection, err = tunnel.Dial(ctx, tunnelConfig)
+			connection, err = dial(ctx, tunnelConfig)
 			if err == nil {
 				break
 			}
@@ -192,25 +245,29 @@ func Run(ctx context.Context, config Config, observer Observer) error {
 			delay = ReconnectDelay(failures, config.ReconnectMaxDelay)
 			failures++
 			emitSnapshot(observer, StateReconnecting, fmt.Sprintf("Reconnect failed; retrying in %s", delay), initialLease, config.Transport, connectedAt, &totals)
-			if err := wait(ctx, delay); err != nil {
+			if err := waitForReconnect(delay); err != nil {
 				return err
 			}
 		}
-		if connection.Lease != initialLease {
+		if ctx.Err() != nil {
 			_ = connection.Close()
-			err := fmt.Errorf("gateway lease changed from %+v to %+v", initialLease, connection.Lease)
+			emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
+			return ctx.Err()
+		}
+		if connection.lease != initialLease {
+			_ = connection.Close()
+			err := fmt.Errorf("gateway lease changed from %+v to %+v", initialLease, connection.lease)
 			emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
 			return err
 		}
-		if remoteHost(connection.RemoteAddr) != initialRemote {
+		if remoteHost(connection.remoteAddr) != initialRemote {
 			_ = connection.Close()
-			err := fmt.Errorf("gateway address changed from %s to %s; reconnect to refresh the escape route", initialRemote, remoteHost(connection.RemoteAddr))
+			err := fmt.Errorf("gateway address changed from %s to %s; reconnect to refresh the escape route", initialRemote, remoteHost(connection.remoteAddr))
 			emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
 			return err
 		}
 		connectionStarted = time.Now()
-		connected.Store(true)
-		emitSnapshot(observer, StateConnected, "Connected", connection.Lease, config.Transport, connectedAt, &totals)
+		emitSnapshot(observer, StateConnected, "Connected", connection.lease, config.Transport, connectedAt, &totals)
 	}
 }
 
@@ -240,21 +297,38 @@ type clientDeviceError struct{ err error }
 func (e clientDeviceError) Error() string { return e.err.Error() }
 func (e clientDeviceError) Unwrap() error { return e.err }
 
+type packetConnection interface {
+	Send([]byte) error
+	Receive() ([]byte, error)
+	Close() error
+}
+
 func runConnection(
 	ctx context.Context,
 	tunDevice device.PacketDevice,
-	connection *tunnel.Conn,
+	connection packetConnection,
 	outbound <-chan []byte,
 	deviceErrors <-chan error,
 	totals *counters,
+	progress func(),
 ) error {
 	connectionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		_ = connection.Close()
+		workers.Wait()
+	}()
 	errCh := make(chan error, 2)
+	workers.Add(2)
 	go func() {
+		defer workers.Done()
 		for {
 			select {
 			case packet := <-outbound:
+				if connectionCtx.Err() != nil {
+					return
+				}
 				if err := connection.Send(packet); err != nil {
 					errCh <- err
 					return
@@ -267,6 +341,7 @@ func runConnection(
 		}
 	}()
 	go func() {
+		defer workers.Done()
 		for {
 			packet, err := connection.Receive()
 			if err != nil {
@@ -281,26 +356,19 @@ func runConnection(
 			totals.packetsDownloaded.Add(1)
 		}
 	}()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-deviceErrors:
-		return clientDeviceError{err}
-	case err := <-errCh:
-		return err
-	}
-}
-
-func reportTraffic(ctx context.Context, observer Observer, lease tunnel.Lease, transport tunnel.Transport, connectedAt time.Time, totals *counters, connected *atomic.Bool) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
+		case err := <-deviceErrors:
+			return clientDeviceError{err}
+		case err := <-errCh:
+			return err
 		case <-ticker.C:
-			if connected.Load() {
-				emitSnapshot(observer, StateConnected, "Connected", lease, transport, connectedAt, totals)
+			if progress != nil {
+				progress()
 			}
 		}
 	}
@@ -326,12 +394,14 @@ func emit(observer Observer, event Event) {
 	}
 }
 
-func wait(ctx context.Context, duration time.Duration) error {
+func wait(ctx context.Context, duration time.Duration, deviceErrors <-chan error) error {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case err := <-deviceErrors:
+		return clientDeviceError{err}
 	case <-timer.C:
 		return nil
 	}
@@ -354,6 +424,9 @@ func ReconnectDelay(failures int, maximum time.Duration) time.Duration {
 	}
 	if failures > 5 {
 		failures = 5
+	}
+	if failures < 0 {
+		failures = 0
 	}
 	delay := time.Second << failures
 	if delay > maximum {

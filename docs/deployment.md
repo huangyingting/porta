@@ -19,8 +19,8 @@ not 443.
 
 ## Prerequisites
 
-- Linux with `curl`, `sha256sum`, systemd, nftables, `/dev/net/tun`, and IPv4
-  forwarding support
+- Linux with `curl`, `sha256sum`, `flock` (util-linux), systemd, nftables,
+  `/dev/net/tun`, and IPv4 forwarding support
 - A DNS hostname pointing to the server
 - Either public TCP port 80 for automatic Let's Encrypt issuance, or an
   existing certificate and private key covering the hostname
@@ -32,7 +32,7 @@ Each tagged GitHub release contains a deployment bundle plus standalone server
 and client binaries. Download and verify the latest bundle:
 
 ```sh
-gh release download latest --repo huangyingting/porta \
+gh release download --repo huangyingting/porta \
   --pattern porta-deploy.tar.gz --pattern SHA256SUMS
 grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf porta-deploy.tar.gz
@@ -115,8 +115,9 @@ sudo ./scripts/deploy.sh \
   --gateway-cidr 10.77.0.1/24
 ```
 
-The script is idempotent. Re-running it downloads and upgrades the server while
-preserving `/etc/porta/porta.env`, `/var/lib/porta/clients.json`, and persistent leases.
+The script serializes deployments with a lock and is idempotent. Re-running it
+downloads and upgrades the server while preserving `/etc/porta/porta.env`,
+`/var/lib/porta/clients.json`, and persistent leases.
 The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately.
@@ -195,8 +196,12 @@ does not serve a public PAC file and does not cache proxy responses.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the
-readiness check, it restores the previous systemd configuration and restarts
-the previous gateway.
+readiness check, it restores the previous binary, helpers, configuration and
+TLS files, downloads, leases, client registry, usage state, sysctl values, and
+service enablement/activity. Snapshots are taken after the old gateway and
+certificate synchronization have stopped. If a rollback step fails, the script
+reports the error and retains its recovery directory rather than deleting the
+backups.
 
 ## Landing page and role-based portal
 
@@ -285,8 +290,11 @@ curl http://127.0.0.1:9090/readyz
 ```
 
 The expected listeners are TCP and UDP on the configured port. Certificate
-synchronization replaces the copied files atomically; new TLS handshakes load
-the renewed certificate without disconnecting active tunnels.
+synchronization serializes updates, validates the certificate/key pair, and
+restores the previous pair if publication fails. New TLS handshakes load the
+renewed certificate without disconnecting active tunnels. During a missing or
+incomplete replacement, the server retains its last-good certificate and logs
+the reload failure and subsequent recovery.
 
 In automatic Let's Encrypt mode, Porta additionally listens on TCP 80 for
 HTTP-01 challenges and stores its ACME account and certificates under
@@ -310,8 +318,8 @@ across three data lanes to limit TCP head-of-line blocking.
 For the public test deployment:
 
 ```text
-Portal:  https://htun.i-csu.org:8443
-Gateway: https://htun.i-csu.org:8443
+Portal:  https://porta-dev.i-csu.org:8443
+Gateway: https://porta-dev.i-csu.org:8443
 ```
 
 The default APK is the optimized ARM64 build used by most current phones. Use

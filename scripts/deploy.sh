@@ -105,18 +105,23 @@ fi
 email_pattern='^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
 [[ -z $acme_email || $acme_email =~ $email_pattern ]] ||
   die "invalid --acme-email"
-[[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die "invalid --port"
-[[ $admin_port =~ ^[0-9]+$ && $admin_port -ge 1 && $admin_port -le 65535 ]] ||
-  die "invalid --admin-port"
+[[ $port =~ ^[0-9]{1,5}$ ]] || die "invalid --port"
+[[ $admin_port =~ ^[0-9]{1,5}$ ]] || die "invalid --admin-port"
+port=$((10#$port))
+admin_port=$((10#$admin_port))
+(( port >= 1 && port <= 65535 )) || die "invalid --port"
+(( admin_port >= 1 && admin_port <= 65535 )) || die "invalid --admin-port"
 (( admin_port != port )) || die "--admin-port must differ from --port"
-[[ $mtu =~ ^[0-9]+$ && $mtu -ge 576 && $mtu -le 1400 ]] || die "invalid --mtu"
-[[ $tun_interface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "invalid --tun-interface"
+[[ $mtu =~ ^[0-9]{1,4}$ ]] || die "invalid --mtu"
+mtu=$((10#$mtu))
+(( mtu >= 576 && mtu <= 1400 )) || die "invalid --mtu"
+[[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
 
-for command in install systemctl ip nft openssl curl sed awk sysctl python3 ss grep sha256sum uname; do
+for command in install systemctl ip nft openssl curl sed awk sysctl python3 ss grep sha256sum uname flock; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 if $build_local; then
@@ -128,7 +133,8 @@ fi
 if [[ -z $external_interface ]]; then
   external_interface=$(ip -4 route show default | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
 fi
-[[ $external_interface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "could not determine a valid external interface"
+[[ $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "could not determine a valid external interface"
+[[ $external_interface != "$tun_interface" ]] || die "TUN and external interfaces must differ"
 ip link show dev "$external_interface" >/dev/null 2>&1 ||
   die "external interface does not exist: $external_interface"
 
@@ -159,6 +165,9 @@ fi
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repository_root"
 
+exec 9>/run/lock/porta-deploy.lock
+flock -n 9 || die "another deployment is already running"
+
 if [[ $tls_mode == static ]]; then
   certificate_public_key=$(openssl x509 -in "$certificate" -pubkey -noout) ||
     die "could not read certificate"
@@ -169,7 +178,8 @@ if [[ $tls_mode == static ]]; then
   openssl x509 -in "$certificate" -checkhost "$domain" -noout >/dev/null ||
     die "certificate does not cover $domain"
 else
-  (( port != 80 )) || die "--port 80 cannot be used with Let's Encrypt HTTP-01"
+  (( port != 80 && admin_port != 80 )) ||
+    die "public and admin ports must differ from Let's Encrypt HTTP-01 port 80"
   port80_listeners=$(ss -H -ltnp 'sport = :80')
   if [[ -n $port80_listeners ]] &&
     { grep -qv '"porta-server"' <<<"$port80_listeners" ||
@@ -327,10 +337,28 @@ then
   fi
 fi
 
-rollback_directory=$(mktemp -d)
 downloads_stage=
 deployment_complete=false
 had_active_service=false
+had_active_timer=false
+services_paused=false
+deployment_started=false
+leases_archive=
+service_enabled=$(systemctl is-enabled porta.service 2>/dev/null || true)
+timer_enabled=$(systemctl is-enabled porta-cert-sync.timer 2>/dev/null || true)
+[[ $service_enabled != masked* && $timer_enabled != masked* ]] ||
+  die "unmask Porta services before deploying"
+if systemctl is-active --quiet porta.service; then
+  had_active_service=true
+fi
+if systemctl is-active --quiet porta-cert-sync.timer; then
+  had_active_timer=true
+fi
+sysctl_keys=(net.core.rmem_max net.core.wmem_max net.ipv4.ip_forward)
+sysctl_values=()
+for key in "${sysctl_keys[@]}"; do
+  sysctl_values+=("$(sysctl -n "$key")")
+done
 backup_file() {
   local source=$1
   local name=$2
@@ -338,11 +366,6 @@ backup_file() {
     cp -a "$source" "$rollback_directory/$name"
   fi
 }
-backup_file /usr/local/bin/porta-server porta-server
-backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
-backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
-backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
-backup_file /etc/sysctl.d/99-porta-quic.conf 99-porta-quic.conf
 backup_directory() {
   local source=$1
   local name=$2
@@ -350,13 +373,6 @@ backup_directory() {
     cp -a "$source" "$rollback_directory/$name"
   fi
 }
-backup_directory /var/lib/porta/downloads downloads
-for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
-  backup_file "/etc/systemd/system/$unit" "$unit"
-done
-if systemctl is-active --quiet porta.service; then
-  had_active_service=true
-fi
 restore_file() {
   local name=$1
   local destination=$2
@@ -369,30 +385,70 @@ restore_file() {
 restore_directory() {
   local name=$1
   local destination=$2
-  rm -rf "$destination"
+  rm -rf "$destination" || return
   if [[ -d $rollback_directory/$name ]]; then
     cp -a "$rollback_directory/$name" "$destination"
   fi
 }
+restore_enablement() {
+  local unit=$1
+  local state=$2
+  case "$state" in
+    enabled) systemctl enable "$unit" >/dev/null ;;
+    enabled-runtime) systemctl enable --runtime "$unit" >/dev/null ;;
+  esac
+}
+rollback_run() {
+  if ! "$@"; then
+    echo "deploy: rollback step failed: $*" >&2
+    rollback_failed=true
+  fi
+}
 rollback() {
   local status=$?
+  local rollback_failed=false
+  set +e
   if [[ $status -ne 0 && $deployment_complete == false ]]; then
-    set +e
-    systemctl stop porta.service
-    restore_file porta-server /usr/local/bin/porta-server
-    restore_file server-up.sh /usr/local/libexec/porta/server-up.sh
-    restore_file server-down.sh /usr/local/libexec/porta/server-down.sh
-    restore_file sync-cert.sh /usr/local/libexec/porta/sync-cert.sh
-    restore_file 99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
-    restore_directory downloads /var/lib/porta/downloads
-    for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
-      restore_file "$unit" "/etc/systemd/system/$unit"
-    done
-    systemctl daemon-reload
-    if $had_active_service; then
-      systemctl restart porta.service
+    if $deployment_started; then
+      rollback_run systemctl stop porta.service
+      systemctl stop porta-cert-sync.timer porta-cert-sync.service >/dev/null 2>&1
+      systemctl disable porta.service porta-cert-sync.timer >/dev/null 2>&1
+      rollback_run restore_file porta-server /usr/local/bin/porta-server
+      rollback_run restore_file server-up.sh /usr/local/libexec/porta/server-up.sh
+      rollback_run restore_file server-down.sh /usr/local/libexec/porta/server-down.sh
+      rollback_run restore_file sync-cert.sh /usr/local/libexec/porta/sync-cert.sh
+      rollback_run restore_file 99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
+      rollback_run restore_directory configuration /etc/porta
+      rollback_run restore_directory downloads /var/lib/porta/downloads
+      for state in leases clients usage; do
+        rollback_run restore_file "$state.json" "/var/lib/porta/$state.json"
+      done
+      if [[ -n $leases_archive ]]; then
+        rollback_run rm -f "$leases_archive"
+      fi
+      for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
+        rollback_run restore_file "$unit" "/etc/systemd/system/$unit"
+      done
+      rollback_run systemctl daemon-reload
+      rollback_run restore_enablement porta.service "$service_enabled"
+      rollback_run restore_enablement porta-cert-sync.timer "$timer_enabled"
+      for index in "${!sysctl_keys[@]}"; do
+        rollback_run sysctl -w "${sysctl_keys[$index]}=${sysctl_values[$index]}"
+      done
     fi
-    echo "deploy: restored the previous Porta installation after deployment failure" >&2
+    if $services_paused; then
+      if $had_active_service; then
+        rollback_run systemctl restart porta.service
+      fi
+      if $had_active_timer; then
+        rollback_run systemctl start porta-cert-sync.timer
+      fi
+    fi
+    if $rollback_failed; then
+      echo "deploy: rollback incomplete; recovery files retained in $rollback_directory" >&2
+    else
+      echo "deploy: restored the previous Porta installation after deployment failure" >&2
+    fi
   fi
   if [[ -n $release_download_directory ]]; then
     cleanup_release_download
@@ -400,20 +456,40 @@ rollback() {
   if [[ -n $downloads_stage ]]; then
     rm -rf "$downloads_stage"
   fi
-  rm -f "$rollback_directory/porta-server" \
-    "$rollback_directory/server-up.sh" \
-    "$rollback_directory/server-down.sh" \
-    "$rollback_directory/sync-cert.sh" \
-    "$rollback_directory/99-porta-quic.conf" \
-    "$rollback_directory/porta.service" \
-    "$rollback_directory/porta-cert-sync.service" \
-    "$rollback_directory/porta-cert-sync.timer"
-  rm -rf "$rollback_directory/downloads"
-  rmdir "$rollback_directory"
+  if ! $rollback_failed; then
+    rm -rf "$rollback_directory"
+  fi
   exit "$status"
 }
+rollback_directory=$(mktemp -d)
 trap rollback EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
+services_paused=true
+# Quiesce writers and run the old unit's cleanup with its original helpers.
+systemctl stop porta-cert-sync.timer porta-cert-sync.service >/dev/null 2>&1 || {
+  if $had_active_timer || systemctl is-active --quiet porta-cert-sync.service; then
+    die "could not stop certificate synchronization"
+  fi
+}
+if $had_active_service; then
+  systemctl stop porta.service
+fi
+backup_file /usr/local/bin/porta-server porta-server
+backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
+backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
+backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
+backup_file /etc/sysctl.d/99-porta-quic.conf 99-porta-quic.conf
+backup_directory /etc/porta configuration
+backup_directory /var/lib/porta/downloads downloads
+for state in leases clients usage; do
+  backup_file "/var/lib/porta/$state.json" "$state.json"
+done
+for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
+  backup_file "/etc/systemd/system/$unit" "$unit"
+done
+deployment_started=true
 install -d -m 0755 /usr/local/libexec/porta /etc/porta /var/lib/porta/downloads
 install -m 0755 "$server_binary" /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
@@ -449,18 +525,14 @@ if ! grep -q '^PORTA_ADMIN_TOKEN=' "$environment_file"; then
 fi
 chmod 0600 "$environment_file"
 
-client_registry=/var/lib/porta/clients.json
-
-if systemctl is-active --quiet porta.service; then
-  systemctl stop porta.service
-fi
 if [[ -n $downloads_stage ]]; then
   rm -rf /var/lib/porta/downloads
   mv "$downloads_stage" /var/lib/porta/downloads
   downloads_stage=
 fi
 if $reset_leases && [[ -s $lease_state ]]; then
-  mv "$lease_state" "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).bak"
+  leases_archive=$(mktemp "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX.bak")
+  mv "$lease_state" "$leases_archive"
 fi
 
 if [[ $tls_mode == static ]]; then
@@ -479,7 +551,7 @@ else
   tls_preflight=
   capabilities="CAP_NET_ADMIN CAP_NET_BIND_SERVICE"
 fi
-if (( port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
+if (( port < 1024 || admin_port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
   capabilities+=" CAP_NET_BIND_SERVICE"
 fi
 forward_proxy_argument=
@@ -564,14 +636,14 @@ if [[ $tls_mode == static ]]; then
 fi
 
 for _ in $(seq 1 30); do
-  if curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/null; then
+  if curl --silent --show-error --fail --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null; then
     break
   fi
   sleep 1
 done
-curl --silent --show-error --fail "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
+curl --silent --show-error --fail --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
-landing_page=$(curl --silent --show-error --fail \
+landing_page=$(curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
   die "gateway admin endpoint is ready but public TLS is unavailable"
 grep -q '<title>Porta · Digital product studio</title>' <<<"$landing_page" ||

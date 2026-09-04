@@ -32,6 +32,9 @@ func packageWindows(outputPath, inputDirectory string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("validate %s: not a regular file", name)
 		}
+		if info.Size() == 0 {
+			return fmt.Errorf("validate %s: file is empty", name)
+		}
 	}
 
 	outputDirectory := filepath.Dir(outputPath)

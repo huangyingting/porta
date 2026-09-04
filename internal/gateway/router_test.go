@@ -90,3 +90,27 @@ func testIPv4UDP() []byte {
 	packet[23] = 0xbb
 	return packet
 }
+
+func TestPacketLaneKeepsFragmentsTogether(t *testing.T) {
+	packet := testIPv4UDP()
+	packet[6] = 0x20
+	packet[22], packet[23] = 0, 53
+	first := packetLane(packet, 4)
+	if first == 0 {
+		t.Fatal("fragmented traffic must not depend on transport ports")
+	}
+	for _, flags := range [][2]byte{{0x20, 1}, {0, 2}} {
+		packet[6], packet[7] = flags[0], flags[1]
+		for value := 0; value < 256; value++ {
+			packet[20], packet[22] = byte(value), byte(255-value)
+			if lane := packetLane(packet, 4); lane != first {
+				t.Fatalf("fragment payload changed lane from %d to %d", first, lane)
+			}
+		}
+	}
+	packet[6], packet[7] = 0x40, 0
+	packet[22], packet[23] = 0, 53
+	if lane := packetLane(packet, 4); lane != 0 {
+		t.Fatal("Don't Fragment flag prevented DNS prioritization")
+	}
+}

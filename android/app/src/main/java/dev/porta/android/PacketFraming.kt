@@ -11,9 +11,24 @@ object PacketFraming {
 
     fun write(sink: BufferedSink, packet: ByteArray) {
         require(packet.size <= MAX_PACKET) { "packet is too large" }
+        writeFrame(sink, packet)
+        sink.flush()
+    }
+
+    internal fun writeBatch(sink: BufferedSink, packets: List<ByteArray>): Long {
+        require(packets.all { it.size <= MAX_PACKET }) { "packet is too large" }
+        var bytes = 0L
+        for (packet in packets) {
+            writeFrame(sink, packet)
+            bytes += packet.size
+        }
+        if (packets.isNotEmpty()) sink.flush()
+        return bytes
+    }
+
+    private fun writeFrame(sink: BufferedSink, packet: ByteArray) {
         sink.writeShort(packet.size)
         if (packet.isNotEmpty()) sink.write(packet)
-        sink.flush()
     }
 
     @Throws(EOFException::class)

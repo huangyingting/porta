@@ -235,7 +235,10 @@ func packetLane(packet []byte, laneCount int) int {
 		return 0
 	}
 	protocolNumber := packet[9]
-	if (protocolNumber == 6 || protocolNumber == 17) && len(packet) >= headerLength+4 {
+	// Every fragment must hash alike; only the first contains transport ports.
+	fragmented := (uint16(packet[6])<<8|uint16(packet[7]))&0x3fff != 0
+	hasPorts := !fragmented && (protocolNumber == 6 || protocolNumber == 17) && len(packet) >= headerLength+4
+	if hasPorts {
 		sourcePort := int(packet[headerLength])<<8 | int(packet[headerLength+1])
 		destinationPort := int(packet[headerLength+2])<<8 | int(packet[headerLength+3])
 		if sourcePort == 53 || destinationPort == 53 {
@@ -249,7 +252,7 @@ func packetLane(packet []byte, laneCount int) int {
 		hash ^= uint32(value)
 		hash *= 16777619
 	}
-	if (protocolNumber == 6 || protocolNumber == 17) && len(packet) >= headerLength+4 {
+	if hasPorts {
 		for _, value := range packet[headerLength : headerLength+4] {
 			hash ^= uint32(value)
 			hash *= 16777619

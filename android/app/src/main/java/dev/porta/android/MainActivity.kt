@@ -30,8 +30,6 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import java.net.URI
-import java.net.URISyntaxException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -121,11 +119,15 @@ class MainActivity : Activity() {
     @Deprecated("VpnService preparation still uses the activity-result contract")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_VPN && resultCode == RESULT_OK) {
-            val profileId = pendingProfileId
-            profileStore.profiles().firstOrNull { it.id == profileId }?.let(::startProfile)
+        if (requestCode == REQUEST_VPN) {
+            if (resultCode == RESULT_OK) {
+                val profileId = pendingProfileId
+                profileStore.profiles().firstOrNull { it.id == profileId }?.let(::startProfile)
+            } else {
+                render(TunnelService.currentStatus())
+            }
+            pendingProfileId = null
         }
-        pendingProfileId = null
     }
 
     private fun buildContent(): View {
@@ -675,15 +677,10 @@ class MainActivity : Activity() {
 
     private fun profileValidationError(profile: VpnProfile): Int? {
         if (profile.name.isBlank()) return R.string.profile_name_required
-        val validServer = try {
-            val uri = URI(profile.server)
-            uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.userInfo == null &&
-                (uri.path.isNullOrEmpty() || uri.path == "/") && uri.query == null && uri.fragment == null
-        } catch (_: URISyntaxException) {
-            false
+        if (!isHttpsOrigin(profile.server)) return R.string.https_required
+        if (!isValidToken(profile.token) || !CLIENT_ID.matches(profile.clientId)) {
+            return R.string.credentials_required
         }
-        if (!validServer) return R.string.https_required
-        if (profile.token.isBlank() || !CLIENT_ID.matches(profile.clientId)) return R.string.credentials_required
         return null
     }
 

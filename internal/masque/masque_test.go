@@ -3,6 +3,9 @@ package masque
 import (
 	"bytes"
 	"net/netip"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -88,5 +91,63 @@ func TestCapsuleDecoderReusesBuffer(t *testing.T) {
 	}
 	if &capsule.Value[0] != &buffer[:cap(buffer)][0] {
 		t.Fatal("decoder did not reuse the supplied buffer")
+	}
+}
+
+type overlapWriter struct {
+	active  atomic.Int32
+	overlap atomic.Bool
+}
+
+func (w *overlapWriter) touch() {
+	if w.active.Add(1) != 1 {
+		w.overlap.Store(true)
+	}
+	runtime.Gosched()
+	w.active.Add(-1)
+}
+
+func (w *overlapWriter) Write(data []byte) (int, error) {
+	w.touch()
+	return len(data), nil
+}
+func (w *overlapWriter) Flush() { w.touch() }
+
+func TestEncoderSerializesFlushAndWrite(t *testing.T) {
+	writer := &overlapWriter{}
+	encoder := NewEncoder(writer)
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for range 1000 {
+			if err := encoder.Write(CapsuleDatagram, []byte{0, 1}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	workers.Go(func() {
+		for range 1000 {
+			encoder.Flush()
+		}
+	})
+	workers.Wait()
+	if writer.overlap.Load() {
+		t.Fatal("response writer was flushed concurrently with a capsule write")
+	}
+}
+
+func TestWriteIPPacketMatchesCapsuleEncoding(t *testing.T) {
+	for _, size := range []int{1, 20, 63, 1100, 9000} {
+		packet := bytes.Repeat([]byte{0x45}, size)
+		var want, got bytes.Buffer
+		if err := NewEncoder(&want).Write(CapsuleDatagram, EncodeIPPacket(packet)); err != nil {
+			t.Fatal(err)
+		}
+		if err := NewEncoder(&got).WriteIPPacket(packet); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(want.Bytes(), got.Bytes()) {
+			t.Fatalf("IP capsule changed wire encoding for size %d", size)
+		}
 	}
 }

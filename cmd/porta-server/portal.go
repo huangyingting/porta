@@ -287,14 +287,17 @@ func (p *portalHandler) session(r *http.Request) (portalSession, bool) {
 	}
 	now := time.Now()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	session, ok := p.sessions[cookie.Value]
 	if !ok || !session.ExpiresAt.After(now) {
 		delete(p.sessions, cookie.Value)
+		p.mu.Unlock()
 		return portalSession{}, false
 	}
+	p.mu.Unlock()
 	if session.Role == portalRoleClient && !p.registry.PortalClientActive(session.ClientID, session.TokenHash) {
+		p.mu.Lock()
 		delete(p.sessions, cookie.Value)
+		p.mu.Unlock()
 		return portalSession{}, false
 	}
 	return session, true

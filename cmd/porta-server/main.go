@@ -169,7 +169,7 @@ func run() error {
 		if normalizeDomain(*acmeDomain) != "" || strings.TrimSpace(*acmeEmail) != "" {
 			return errors.New("static TLS cannot be combined with --acme-domain or --acme-email")
 		}
-		tlsConfig, err = staticTLSConfig(*tlsCert, *tlsKey)
+		tlsConfig, err = staticTLSConfig(*tlsCert, *tlsKey, logger)
 		if err != nil {
 			return err
 		}
@@ -245,6 +245,9 @@ func run() error {
 		publicHandler = proxyHandler
 	}
 
+	draining := newDrainingHandler(publicHandler)
+	defer draining.stop()
+	publicHandler = draining
 	tcpHandler := publicHandler
 	if *behindProxy {
 		tcpHandler = proxyBackendHandler(publicHandler)
@@ -344,19 +347,24 @@ func run() error {
 			runErr = err
 		}
 	}
+	draining.stop()
 	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	servers := []shutdownServer{tcpServer}
 	if quicServer != nil {
-		_ = quicServer.Shutdown(shutdownCtx)
+		servers = append(servers, quicServer)
 	}
-	_ = tcpServer.Shutdown(shutdownCtx)
 	if acmeHTTPServer != nil {
-		_ = acmeHTTPServer.Shutdown(shutdownCtx)
+		servers = append(servers, acmeHTTPServer)
 	}
 	if adminServer != nil {
-		_ = adminServer.Shutdown(shutdownCtx)
+		servers = append(servers, adminServer)
+	}
+	shutdownServers(shutdownCtx, servers...)
+	if err := draining.wait(shutdownCtx); err != nil {
+		logger.Warn("handlers still active during shutdown", "error", err)
 	}
 	stopUsage()
 	<-usageDone

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -23,18 +24,20 @@ type readResult struct {
 }
 
 type Native struct {
-	device      tun.Device
-	name        string
-	mtu         int
-	read        sync.Mutex
-	pending     [][]byte
-	readErr     error
-	readResults chan readResult
-	done        chan struct{}
-	write       sync.Mutex
-	writeBuffer []byte
-	closeOnce   sync.Once
-	closeErr    error
+	device       tun.Device
+	name         string
+	mtu          int
+	read         sync.Mutex
+	pending      [][]byte
+	readErr      error
+	readResults  chan readResult
+	readDone     chan struct{}
+	done         chan struct{}
+	write        sync.Mutex
+	writeBuffer  []byte
+	writeBuffers [1][]byte
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 const packetOffset = 16
@@ -66,6 +69,7 @@ func newNative(dev tun.Device, name string, mtu int) *Native {
 		name:        name,
 		mtu:         mtu,
 		readResults: make(chan readResult),
+		readDone:    make(chan struct{}),
 		done:        make(chan struct{}),
 		writeBuffer: make([]byte, packetOffset+mtu+256),
 	}
@@ -74,6 +78,7 @@ func newNative(dev tun.Device, name string, mtu int) *Native {
 }
 
 func (n *Native) readLoop() {
+	defer close(n.readDone)
 	batchSize := n.device.BatchSize()
 	if batchSize < 1 {
 		batchSize = 1
@@ -84,6 +89,11 @@ func (n *Native) readLoop() {
 		buffers[index] = make([]byte, packetOffset+n.mtu+256)
 	}
 	for {
+		select {
+		case <-n.done:
+			return
+		default:
+		}
 		count, err := n.device.Read(buffers, sizes, packetOffset)
 		result := readResult{err: err}
 		if err == nil {
@@ -117,11 +127,19 @@ func (n *Native) readLoop() {
 func (n *Native) ReadPacket(ctx context.Context) ([]byte, error) {
 	n.read.Lock()
 	defer n.read.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-n.done:
+		return nil, os.ErrClosed
+	default:
+	}
 	if n.readErr != nil {
 		return nil, n.readErr
 	}
 	if len(n.pending) > 0 {
 		packet := n.pending[0]
+		n.pending[0] = nil
 		n.pending = n.pending[1:]
 		return packet, nil
 	}
@@ -130,7 +148,7 @@ func (n *Native) ReadPacket(ctx context.Context) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.done:
-		return nil, errors.New("TUN device is closed")
+		return nil, os.ErrClosed
 	case got := <-n.readResults:
 		if got.err != nil {
 			n.readErr = got.err
@@ -138,6 +156,7 @@ func (n *Native) ReadPacket(ctx context.Context) ([]byte, error) {
 		}
 		n.pending = got.packets
 		packet := n.pending[0]
+		n.pending[0] = nil
 		n.pending = n.pending[1:]
 		return packet, nil
 	}
@@ -149,14 +168,25 @@ func (n *Native) WritePacket(ctx context.Context, packet []byte) error {
 		return ctx.Err()
 	default:
 	}
+	if len(packet) == 0 {
+		return errors.New("cannot write an empty TUN packet")
+	}
 	if len(packet) > n.mtu {
 		return fmt.Errorf("packet length %d exceeds TUN MTU %d", len(packet), n.mtu)
 	}
 	n.write.Lock()
 	defer n.write.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.done:
+		return os.ErrClosed
+	default:
+	}
 	buffer := n.writeBuffer[:packetOffset+len(packet)]
 	copy(buffer[packetOffset:], packet)
-	count, err := n.device.Write([][]byte{buffer}, packetOffset)
+	n.writeBuffers[0] = buffer
+	count, err := n.device.Write(n.writeBuffers[:], packetOffset)
 	if err != nil {
 		return err
 	}
@@ -170,6 +200,7 @@ func (n *Native) Close() error {
 	n.closeOnce.Do(func() {
 		close(n.done)
 		n.closeErr = n.device.Close()
+		<-n.readDone
 	})
 	return n.closeErr
 }

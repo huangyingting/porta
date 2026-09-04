@@ -27,8 +27,9 @@ type Capsule struct {
 }
 
 type Encoder struct {
-	w  io.Writer
-	mu sync.Mutex
+	w      io.Writer
+	mu     sync.Mutex
+	header [16]byte
 }
 
 func NewEncoder(w io.Writer) *Encoder { return &Encoder{w: w} }
@@ -37,15 +38,39 @@ func (e *Encoder) Write(capsuleType uint64, value []byte) error {
 	if len(value) > MaxCapsuleSize {
 		return ErrCapsuleTooLarge
 	}
-	header := quicvarint.Append(nil, capsuleType)
-	header = quicvarint.Append(header, uint64(len(value)))
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	header := quicvarint.Append(e.header[:0], capsuleType)
+	header = quicvarint.Append(header, uint64(len(value)))
 	if err := writeAll(e.w, header); err != nil {
 		return err
 	}
 	return writeAll(e.w, value)
+}
+
+// WriteIPPacket writes Context ID 0 and the packet without copying its payload.
+func (e *Encoder) WriteIPPacket(packet []byte) error {
+	if len(packet) >= MaxCapsuleSize {
+		return ErrCapsuleTooLarge
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	header := quicvarint.Append(e.header[:0], CapsuleDatagram)
+	header = quicvarint.Append(header, uint64(len(packet)+1))
+	header = append(header, 0)
+	if err := writeAll(e.w, header); err != nil {
+		return err
+	}
+	return writeAll(e.w, packet)
+}
+
+// Flush serializes response flushing with capsule writes.
+func (e *Encoder) Flush() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if flusher, ok := e.w.(interface{ Flush() }); ok {
+		flusher.Flush()
+	}
 }
 
 type Decoder struct {

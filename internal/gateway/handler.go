@@ -215,7 +215,14 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inboundDone := make(chan error, 1)
+	inboundFinished := make(chan struct{})
+	defer func() {
+		session.Close()
+		_ = r.Body.Close()
+		<-inboundFinished
+	}()
 	go func() {
+		defer close(inboundFinished)
 		decoder := protocol.NewDecoder(r.Body)
 		packetBuffer := make([]byte, c.MTU)
 		for {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/huangyingting/porta/internal/buildinfo"
@@ -45,7 +46,7 @@ func run() error {
 	if token == "" {
 		token = *tokenFlag
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return clientapp.Run(ctx, clientapp.Config{
 		ServerURL:         *serverURL,

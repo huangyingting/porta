@@ -36,6 +36,7 @@ jobs:
             previous_revision=$BEFORE_REVISION
           fi
           ./scripts/check-version.sh "$previous_revision"
+      - run: make test-automation
       - run: make test
       - run: make test-race
       - run: make vet

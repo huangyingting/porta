@@ -391,9 +391,9 @@ func (m *masqueClient) readDatagrams() {
 }
 
 func (m *masqueClient) deliver(packet []byte) {
-	copyOfPacket := append([]byte(nil), packet...)
+	// Both capsule decoding and QUIC datagram reception transfer owned storage.
 	select {
-	case m.packets <- copyOfPacket:
+	case m.packets <- packet:
 	case <-m.ctx.Done():
 	}
 }
@@ -409,11 +409,10 @@ func (m *masqueClient) send(packet []byte) error {
 	if info.Source != m.lease.Address.Addr() {
 		return fmt.Errorf("packet source %s does not match lease %s", info.Source, m.lease.Address)
 	}
-	value := masque.EncodeIPPacket(packet)
 	if m.sendDatagram != nil {
-		return m.sendDatagram(value)
+		return m.sendDatagram(masque.EncodeIPPacket(packet))
 	}
-	return m.encoder.Write(masque.CapsuleDatagram, value)
+	return m.encoder.WriteIPPacket(packet)
 }
 
 func (m *masqueClient) receive() ([]byte, error) {
@@ -512,21 +511,51 @@ func timedRoundTrip(ctx context.Context, transport http.RoundTripper, request *h
 		response *http.Response
 		err      error
 	}
-	completed := make(chan result, 1)
+	requestCtx, cancel := context.WithCancel(ctx)
+	request = request.WithContext(requestCtx)
+	completed := make(chan result)
+	abandoned := make(chan struct{})
+	defer close(abandoned)
 	go func() {
 		response, err := transport.RoundTrip(request)
-		completed <- result{response: response, err: err}
+		select {
+		case completed <- result{response: response, err: err}:
+		case <-abandoned:
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+		}
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case got := <-completed:
+		if got.err != nil {
+			cancel()
+			if got.response != nil && got.response.Body != nil {
+				_ = got.response.Body.Close()
+			}
+		} else {
+			got.response.Body = &cancelOnCloseBody{ReadCloser: got.response.Body, cancel: cancel}
+		}
 		return got.response, got.err
 	case <-timer.C:
+		cancel()
 		return nil, context.DeadlineExceeded
 	case <-ctx.Done():
+		cancel()
 		return nil, ctx.Err()
 	}
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
 }
 
 func masqueEndpoint(origin string) (*url.URL, error) {
@@ -534,12 +563,19 @@ func masqueEndpoint(origin string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse gateway URL: %w", err)
 	}
-	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+	if parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
 		return nil, errors.New("gateway URL must be an https origin without user information")
 	}
 	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, errors.New("gateway URL must not contain a path, query, or fragment")
 	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	} else if number, err := strconv.Atoi(port); err != nil || number < 1 || number > 65535 {
+		return nil, errors.New("gateway URL has an invalid port")
+	}
+	parsed.Host = net.JoinHostPort(parsed.Hostname(), port)
 	parsed.Path = gateway.MasquePath
 	return parsed, nil
 }
