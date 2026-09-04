@@ -20,6 +20,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.view.WindowInsets
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -130,7 +131,6 @@ class MainActivity : Activity() {
     private fun buildContent(): View {
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(24), dp(20), dp(36))
         }
 
         val header = LinearLayout(this).apply {
@@ -217,7 +217,40 @@ class MainActivity : Activity() {
             setBackgroundColor(COLOR_BACKGROUND)
             isFillViewport = true
             addView(page)
+            setOnApplyWindowInsetsListener { _, insets ->
+                applyPageInsets(page, insets)
+                insets
+            }
+            requestApplyInsets()
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyPageInsets(page: View, insets: WindowInsets) {
+        val left: Int
+        val top: Int
+        val right: Int
+        val bottom: Int
+        if (Build.VERSION.SDK_INT >= 30) {
+            val safeInsets = insets.getInsets(
+                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+            )
+            left = safeInsets.left
+            top = safeInsets.top
+            right = safeInsets.right
+            bottom = safeInsets.bottom
+        } else {
+            left = insets.systemWindowInsetLeft
+            top = insets.systemWindowInsetTop
+            right = insets.systemWindowInsetRight
+            bottom = insets.systemWindowInsetBottom
+        }
+        page.setPadding(
+            dp(20) + left,
+            dp(24) + top,
+            dp(20) + right,
+            dp(36) + bottom,
+        )
     }
 
     private fun connectionSummary(): View {
