@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 
 	"github.com/huangyingting/porta/internal/masque"
-	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/usage"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -125,15 +124,29 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 					return
 				}
+				c.Metrics.sentToClient()
+				usageSession.AddDownloaded(uint64(len(packet)), 1)
 			} else {
-				if err := encoder.Write(masque.CapsuleDatagram, value); err != nil {
-					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
-					return
+			drain:
+				for count := 0; ; count++ {
+					if err := encoder.Write(masque.CapsuleDatagram, value); err != nil {
+						c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
+						return
+					}
+					c.Metrics.sentToClient()
+					usageSession.AddDownloaded(uint64(len(packet)), 1)
+					if count+1 >= streamPacketBatch {
+						break
+					}
+					select {
+					case packet = <-session.Outgoing:
+						value = masque.EncodeIPPacket(packet)
+					default:
+						break drain
+					}
 				}
 				flush(w)
 			}
-			c.Metrics.sentToClient()
-			usageSession.AddDownloaded(uint64(len(packet)), 1)
 		case err := <-inboundDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				c.Logger.Warn("MASQUE receive stopped", "client_id", clientID, "error", err)
@@ -156,8 +169,9 @@ func (c HandlerConfig) readMasqueCapsules(
 	done chan<- error,
 ) {
 	decoder := masque.NewDecoder(reader)
+	valueBuffer := make([]byte, c.MTU+16)
 	for {
-		capsule, err := decoder.Read()
+		capsule, err := decoder.ReadInto(valueBuffer)
 		if err != nil {
 			done <- err
 			return
@@ -294,9 +308,6 @@ func (c HandlerConfig) answerAddressRequest(
 func (c HandlerConfig) injectMasquePacket(ctx context.Context, address netip.Addr, packet []byte) error {
 	if len(packet) > c.MTU {
 		return fmt.Errorf("packet length %d exceeds tunnel MTU %d", len(packet), c.MTU)
-	}
-	if _, err := protocol.ParseIPv4(packet); err != nil {
-		return err
 	}
 	if err := c.Router.Inject(ctx, address, packet); err != nil {
 		return err

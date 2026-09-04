@@ -174,6 +174,10 @@ func (r *Router) Inject(ctx context.Context, lease netip.Addr, packet []byte) er
 	if info.Source != lease {
 		return fmt.Errorf("%w: got %s want %s", ErrSourceSpoofed, info.Source, lease)
 	}
+	return r.injectValidated(ctx, packet)
+}
+
+func (r *Router) injectValidated(ctx context.Context, packet []byte) error {
 	return r.device.WritePacket(ctx, packet)
 }
 
@@ -199,11 +203,10 @@ func (r *Router) Run(ctx context.Context) error {
 		if session == nil {
 			continue
 		}
-		copyOfPacket := append([]byte(nil), packet...)
 		if ctx.Err() != nil {
 			return nil
 		}
-		session.enqueue(copyOfPacket)
+		session.enqueue(packet)
 	}
 }
 

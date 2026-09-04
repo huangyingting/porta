@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/huangyingting/porta/internal/usage"
@@ -21,9 +22,17 @@ import (
 const (
 	defaultMaxConnections = 128
 	tunnelIdleTimeout     = 5 * time.Minute
+	copyBufferSize        = 64 << 10
 )
 
 var errDestinationDenied = errors.New("proxy destination denied")
+var idleDeadlineClockStart = time.Now()
+var copyBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, copyBufferSize)
+		return &buffer
+	},
+}
 
 type Identity struct {
 	AccountID string
@@ -323,14 +332,14 @@ func requestTargetsProxy(r *http.Request) bool {
 func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Reader, clientWriter io.Writer) {
 	done := make(chan int, 2)
 	go func() {
-		_, _ = io.Copy(upstream, clientReader)
+		copyTunnelStream(upstream, clientReader)
 		if closer, ok := upstream.(interface{ CloseWrite() error }); ok {
 			_ = closer.CloseWrite()
 		}
 		done <- 0
 	}()
 	go func() {
-		_, _ = io.Copy(clientWriter, upstream)
+		copyTunnelStream(clientWriter, upstream)
 		done <- 1
 	}()
 	select {
@@ -354,6 +363,12 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 	}
 }
 
+func copyTunnelStream(destination io.Writer, source io.Reader) {
+	buffer := copyBufferPool.Get().(*[]byte)
+	defer copyBufferPool.Put(buffer)
+	_, _ = io.CopyBuffer(destination, source, *buffer)
+}
+
 func closeTunnelEndpoints(upstream net.Conn, clientReader io.Reader, clientWriter io.Writer) {
 	_ = upstream.SetDeadline(time.Now())
 	if closer, ok := clientReader.(io.Closer); ok {
@@ -370,7 +385,8 @@ type flushWriter struct {
 
 type idleConn struct {
 	net.Conn
-	timeout time.Duration
+	timeout             time.Duration
+	nextDeadlineRefresh atomic.Int64
 }
 
 type meteredConn struct {
@@ -403,13 +419,30 @@ func (c *meteredConn) CloseWrite() error {
 }
 
 func (c *idleConn) Read(data []byte) (int, error) {
-	_ = c.Conn.SetDeadline(time.Now().Add(c.timeout))
+	c.refreshDeadline()
 	return c.Conn.Read(data)
 }
 
 func (c *idleConn) Write(data []byte) (int, error) {
-	_ = c.Conn.SetDeadline(time.Now().Add(c.timeout))
+	c.refreshDeadline()
 	return c.Conn.Write(data)
+}
+
+func (c *idleConn) refreshDeadline() {
+	now := time.Now()
+	refreshInterval := c.timeout / 4
+	if refreshInterval <= 0 || refreshInterval > 30*time.Second {
+		refreshInterval = 30 * time.Second
+	}
+	nowTick := time.Since(idleDeadlineClockStart).Nanoseconds()
+	nextRefresh := c.nextDeadlineRefresh.Load()
+	if nowTick < nextRefresh ||
+		!c.nextDeadlineRefresh.CompareAndSwap(nextRefresh, nowTick+refreshInterval.Nanoseconds()) {
+		return
+	}
+	if err := c.Conn.SetDeadline(now.Add(c.timeout + refreshInterval)); err != nil {
+		c.nextDeadlineRefresh.Store(0)
+	}
 }
 
 func (c *idleConn) CloseWrite() error {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -71,15 +72,17 @@ type sessionState struct {
 	accountID       string
 	deviceID        string
 	refs            int
-	closed          bool
+	closed          atomic.Bool
+	snapshotting    atomic.Bool
+	writers         atomic.Int64
 	transport       string
 	assignedAddress string
 	target          string
 	connectedAt     time.Time
-	uploaded        uint64
-	downloaded      uint64
-	packetsUp       uint64
-	packetsDown     uint64
+	uploaded        atomic.Uint64
+	downloaded      atomic.Uint64
+	packetsUp       atomic.Uint64
+	packetsDown     atomic.Uint64
 }
 
 type persistentState struct {
@@ -163,24 +166,74 @@ func (s *Session) AddUploaded(bytes, packets uint64) {
 	if s == nil || s.state == nil {
 		return
 	}
-	s.state.mu.Lock()
-	defer s.state.mu.Unlock()
-	if !s.state.closed {
-		s.state.uploaded += bytes
-		s.state.packetsUp += packets
-	}
+	s.state.add(&s.state.uploaded, bytes, &s.state.packetsUp, packets)
 }
 
 func (s *Session) AddDownloaded(bytes, packets uint64) {
 	if s == nil || s.state == nil {
 		return
 	}
-	s.state.mu.Lock()
-	defer s.state.mu.Unlock()
-	if !s.state.closed {
-		s.state.downloaded += bytes
-		s.state.packetsDown += packets
+	s.state.add(&s.state.downloaded, bytes, &s.state.packetsDown, packets)
+}
+
+func (s *sessionState) add(
+	byteCounter *atomic.Uint64,
+	bytes uint64,
+	packetCounter *atomic.Uint64,
+	packets uint64,
+) {
+	for {
+		if s.closed.Load() {
+			return
+		}
+		if s.snapshotting.Load() {
+			runtime.Gosched()
+			continue
+		}
+		s.writers.Add(1)
+		if s.closed.Load() {
+			s.writers.Add(-1)
+			return
+		}
+		if s.snapshotting.Load() {
+			s.writers.Add(-1)
+			runtime.Gosched()
+			continue
+		}
+		byteCounter.Add(bytes)
+		packetCounter.Add(packets)
+		s.writers.Add(-1)
+		return
 	}
+}
+
+func (s *sessionState) closeCounters() {
+	s.closed.Store(true)
+	for s.writers.Load() != 0 {
+		runtime.Gosched()
+	}
+}
+
+type counterSnapshot struct {
+	uploaded    uint64
+	downloaded  uint64
+	packetsUp   uint64
+	packetsDown uint64
+}
+
+func (s *sessionState) counters() counterSnapshot {
+	s.snapshotting.Store(true)
+	for s.writers.Load() != 0 {
+		runtime.Gosched()
+	}
+	snapshot := counterSnapshot{
+		uploaded:    s.uploaded.Load(),
+		downloaded:  s.downloaded.Load(),
+		packetsUp:   s.packetsUp.Load(),
+		packetsDown: s.packetsDown.Load(),
+	}
+	s.snapshotting.Store(false)
+	return snapshot
 }
 
 func (s *Session) Close() {
@@ -204,17 +257,18 @@ func (s *Store) finish(key string) {
 	}
 	delete(s.sessions, key)
 	state.mu.Lock()
-	state.closed = true
+	state.closeCounters()
+	counters := state.counters()
 	now := time.Now().UTC()
 	deviceKey := deviceKey(state.accountID, state.deviceID)
 	device := s.devices[deviceKey]
 	device.AccountID = state.accountID
 	device.DeviceID = state.deviceID
 	device.ConnectionsTotal++
-	device.BytesUploaded += state.uploaded
-	device.BytesDownloaded += state.downloaded
-	device.PacketsUploaded += state.packetsUp
-	device.PacketsDownloaded += state.packetsDown
+	device.BytesUploaded += counters.uploaded
+	device.BytesDownloaded += counters.downloaded
+	device.PacketsUploaded += counters.packetsUp
+	device.PacketsDownloaded += counters.packetsDown
 	device.LastConnected = timePointer(state.connectedAt)
 	device.LastDisconnected = timePointer(now)
 	device.Transport = state.transport
@@ -240,16 +294,17 @@ func (s *Store) Snapshot() Snapshot {
 	}
 	for _, session := range s.sessions {
 		session.mu.Lock()
+		counters := session.counters()
 		key := deviceKey(session.accountID, session.deviceID)
 		device := result.Devices[key]
 		device.AccountID = session.accountID
 		device.DeviceID = session.deviceID
 		device.ActiveSessions++
 		device.ConnectionsTotal++
-		device.BytesUploaded += session.uploaded
-		device.BytesDownloaded += session.downloaded
-		device.PacketsUploaded += session.packetsUp
-		device.PacketsDownloaded += session.packetsDown
+		device.BytesUploaded += counters.uploaded
+		device.BytesDownloaded += counters.downloaded
+		device.PacketsUploaded += counters.packetsUp
+		device.PacketsDownloaded += counters.packetsDown
 		device.LastConnected = timePointer(session.connectedAt)
 		device.Transport = session.transport
 		device.AssignedAddress = session.assignedAddress
@@ -301,9 +356,7 @@ func (s *Store) DeleteClient(accountID string) {
 	}
 	for key, session := range s.sessions {
 		if session.accountID == accountID {
-			session.mu.Lock()
-			session.closed = true
-			session.mu.Unlock()
+			session.closeCounters()
 			delete(s.sessions, key)
 		}
 	}
@@ -318,9 +371,7 @@ func (s *Store) DeleteDevice(accountID, deviceID string) {
 	delete(s.devices, deviceKey(accountID, deviceID))
 	for key, session := range s.sessions {
 		if session.accountID == accountID && session.deviceID == deviceID {
-			session.mu.Lock()
-			session.closed = true
-			session.mu.Unlock()
+			session.closeCounters()
 			delete(s.sessions, key)
 		}
 	}
@@ -372,15 +423,16 @@ func (s *Store) persist() error {
 	}
 	for _, session := range s.sessions {
 		session.mu.Lock()
+		counters := session.counters()
 		key := deviceKey(session.accountID, session.deviceID)
 		device := checkpoint[key]
 		device.AccountID = session.accountID
 		device.DeviceID = session.deviceID
 		device.ConnectionsTotal++
-		device.BytesUploaded += session.uploaded
-		device.BytesDownloaded += session.downloaded
-		device.PacketsUploaded += session.packetsUp
-		device.PacketsDownloaded += session.packetsDown
+		device.BytesUploaded += counters.uploaded
+		device.BytesDownloaded += counters.downloaded
+		device.PacketsUploaded += counters.packetsUp
+		device.PacketsDownloaded += counters.packetsDown
 		device.LastConnected = timePointer(session.connectedAt)
 		device.Transport = session.transport
 		device.AssignedAddress = session.assignedAddress

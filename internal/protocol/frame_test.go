@@ -31,6 +31,24 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReadPacketIntoReusesBuffer(t *testing.T) {
+	var stream bytes.Buffer
+	if err := NewEncoder(&stream).WritePacket([]byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 0, 16)
+	packet, err := NewDecoder(&stream).ReadPacketInto(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(packet, []byte{1, 2, 3}) {
+		t.Fatalf("packet = %v", packet)
+	}
+	if &packet[0] != &buffer[:cap(buffer)][0] {
+		t.Fatal("decoder did not reuse the supplied buffer")
+	}
+}
+
 func TestParseIPv4(t *testing.T) {
 	packet := testIPv4Packet([4]byte{10, 66, 0, 2}, [4]byte{1, 1, 1, 1})
 	info, err := ParseIPv4(packet)

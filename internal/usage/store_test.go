@@ -2,6 +2,7 @@ package usage
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -87,5 +88,34 @@ func TestStoreCheckpointIncludesActiveTraffic(t *testing.T) {
 		device.BytesUploaded != 4096 || device.PacketsUploaded != 8 {
 		t.Fatalf("checkpointed usage = %#v", device)
 	}
+	session.Close()
+}
+
+func TestSnapshotKeepsByteAndPacketCountersConsistent(t *testing.T) {
+	store, err := Open("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := store.Begin("", "account", "phone", "masque-h3-datagram", "10.66.0.2", "")
+	const updates = 10_000
+	var wait sync.WaitGroup
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for range updates {
+			session.AddUploaded(2, 1)
+		}
+	}()
+	for range updates {
+		device := Device(store.Snapshot(), "account", "phone")
+		if device.BytesUploaded != device.PacketsUploaded*2 {
+			t.Fatalf(
+				"inconsistent snapshot: bytes=%d packets=%d",
+				device.BytesUploaded,
+				device.PacketsUploaded,
+			)
+		}
+	}
+	wait.Wait()
 	session.Close()
 }

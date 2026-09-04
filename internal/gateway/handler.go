@@ -30,6 +30,7 @@ const (
 	laneIndexHeader   = "X-Porta-Lane"
 	laneCountHeader   = "X-Porta-Lanes"
 	tunnelLaneCount   = 4
+	streamPacketBatch = 32
 )
 
 type laneConfig struct {
@@ -216,8 +217,9 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	inboundDone := make(chan error, 1)
 	go func() {
 		decoder := protocol.NewDecoder(r.Body)
+		packetBuffer := make([]byte, c.MTU)
 		for {
-			packet, err := decoder.ReadPacket()
+			packet, err := decoder.ReadPacketInto(packetBuffer)
 			if err != nil {
 				inboundDone <- err
 				return
@@ -234,7 +236,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 				c.Metrics.droppedFromClient()
 				continue
 			}
-			if err := c.Router.Inject(sessionCtx, lease.Address, packet); err != nil {
+			if err := c.Router.injectValidated(sessionCtx, packet); err != nil {
 				inboundDone <- err
 				return
 			}
@@ -248,11 +250,22 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case packet := <-session.Outgoing:
-			if err := encoder.WritePacket(packet); err != nil {
-				return
+		drain:
+			for count := 0; ; count++ {
+				if err := encoder.WritePacket(packet); err != nil {
+					return
+				}
+				c.Metrics.sentToClient()
+				usageSession.AddDownloaded(uint64(len(packet)), 1)
+				if count+1 >= streamPacketBatch {
+					break
+				}
+				select {
+				case packet = <-session.Outgoing:
+				default:
+					break drain
+				}
 			}
-			c.Metrics.sentToClient()
-			usageSession.AddDownloaded(uint64(len(packet)), 1)
 			flush(w)
 		case <-keepalive.C:
 			if err := encoder.WritePacket(nil); err != nil {

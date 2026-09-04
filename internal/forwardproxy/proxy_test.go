@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -249,6 +250,41 @@ func TestIdleConnectionPreservesTCPHalfClose(t *testing.T) {
 	if string(body) != "request" {
 		t.Fatalf("half-closed body = %q", body)
 	}
+}
+
+func TestIdleConnectionThrottlesDeadlineRefreshes(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	counting := &deadlineCountingConn{Conn: client}
+	wrapped := &idleConn{Conn: counting, timeout: time.Minute}
+	const writes = 100
+	received := make(chan error, 1)
+	go func() {
+		_, err := io.CopyN(io.Discard, peer, writes)
+		received <- err
+	}()
+	for range writes {
+		if _, err := wrapped.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := <-received; err != nil {
+		t.Fatal(err)
+	}
+	if calls := counting.deadlineCalls.Load(); calls != 1 {
+		t.Fatalf("SetDeadline called %d times for %d writes, want 1", calls, writes)
+	}
+}
+
+type deadlineCountingConn struct {
+	net.Conn
+	deadlineCalls atomic.Int32
+}
+
+func (c *deadlineCountingConn) SetDeadline(deadline time.Time) error {
+	c.deadlineCalls.Add(1)
+	return c.Conn.SetDeadline(deadline)
 }
 
 func newTestHandler(t *testing.T) *Handler {

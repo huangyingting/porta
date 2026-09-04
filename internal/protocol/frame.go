@@ -60,6 +60,12 @@ type Decoder struct {
 func NewDecoder(r io.Reader) *Decoder { return &Decoder{r: bufio.NewReader(r)} }
 
 func (d *Decoder) ReadPacket() ([]byte, error) {
+	return d.ReadPacketInto(nil)
+}
+
+// ReadPacketInto reads a packet into buffer when it has sufficient capacity.
+// The returned slice is only valid until buffer is reused by the caller.
+func (d *Decoder) ReadPacketInto(buffer []byte) ([]byte, error) {
 	var header [2]byte
 	if _, err := io.ReadFull(d.r, header[:]); err != nil {
 		return nil, err
@@ -71,7 +77,12 @@ func (d *Decoder) ReadPacket() ([]byte, error) {
 	if size > MaxPacket {
 		return nil, ErrFrameTooLarge
 	}
-	packet := make([]byte, size)
+	var packet []byte
+	if size <= cap(buffer) {
+		packet = buffer[:size]
+	} else {
+		packet = make([]byte, size)
+	}
 	if _, err := io.ReadFull(d.r, packet); err != nil {
 		return nil, fmt.Errorf("read packet payload: %w", err)
 	}

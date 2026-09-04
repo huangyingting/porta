@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -11,7 +12,7 @@ import (
 
 type fakeTUN struct {
 	readPackets [][]byte
-	readCalls   int
+	readCalls   atomic.Int32
 	writeOffset int
 	written     []byte
 	writeResult int
@@ -20,7 +21,7 @@ type fakeTUN struct {
 func (f *fakeTUN) File() *os.File { return nil }
 
 func (f *fakeTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
-	f.readCalls++
+	f.readCalls.Add(1)
 	for index, packet := range f.readPackets {
 		copy(bufs[index][offset:], packet)
 		sizes[index] = len(packet)
@@ -42,7 +43,8 @@ func (f *fakeTUN) BatchSize() int           { return len(f.readPackets) }
 
 func TestNativeReadPacketBuffersBatch(t *testing.T) {
 	fake := &fakeTUN{readPackets: [][]byte{{0x45, 1}, {0x45, 2}}}
-	device := &Native{device: fake, name: "fake0", mtu: 1300}
+	device := newNative(fake, "fake0", 1300)
+	defer device.Close()
 
 	first, err := device.ReadPacket(context.Background())
 	if err != nil {
@@ -55,15 +57,17 @@ func TestNativeReadPacketBuffersBatch(t *testing.T) {
 	if !bytes.Equal(first, fake.readPackets[0]) || !bytes.Equal(second, fake.readPackets[1]) {
 		t.Fatalf("packets = %x, %x; want %x, %x", first, second, fake.readPackets[0], fake.readPackets[1])
 	}
-	if fake.readCalls != 1 {
-		t.Fatalf("Read called %d times, want 1", fake.readCalls)
+	readCalls := fake.readCalls.Load()
+	if readCalls < 1 || readCalls > 2 {
+		t.Fatalf("Read called %d times while consuming one batch", readCalls)
 	}
 }
 
 func TestNativeWritePacketUsesHeadroom(t *testing.T) {
 	packet := []byte{0x45, 0, 0, 20}
 	fake := &fakeTUN{writeResult: len(packet) + 10}
-	device := &Native{device: fake, name: "fake0", mtu: 1300}
+	device := newNative(fake, "fake0", 1300)
+	defer device.Close()
 
 	if err := device.WritePacket(context.Background(), packet); err != nil {
 		t.Fatal(err)
@@ -73,5 +77,13 @@ func TestNativeWritePacketUsesHeadroom(t *testing.T) {
 	}
 	if !bytes.Equal(fake.written, packet) {
 		t.Fatalf("written packet = %x, want %x", fake.written, packet)
+	}
+
+	firstBuffer := &device.writeBuffer[0]
+	if err := device.WritePacket(context.Background(), packet); err != nil {
+		t.Fatal(err)
+	}
+	if firstBuffer != &device.writeBuffer[0] {
+		t.Fatal("write buffer was reallocated")
 	}
 }

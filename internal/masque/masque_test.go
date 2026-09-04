@@ -72,3 +72,21 @@ func TestIPPacketContextZero(t *testing.T) {
 		t.Fatalf("decoded packet = %x", decoded)
 	}
 }
+
+func TestCapsuleDecoderReusesBuffer(t *testing.T) {
+	var stream bytes.Buffer
+	if err := NewEncoder(&stream).Write(CapsuleDatagram, []byte{0, 1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 0, 16)
+	capsule, err := NewDecoder(&stream).ReadInto(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(capsule.Value, []byte{0, 1, 2, 3}) {
+		t.Fatalf("capsule value = %v", capsule.Value)
+	}
+	if &capsule.Value[0] != &buffer[:cap(buffer)][0] {
+		t.Fatal("decoder did not reuse the supplied buffer")
+	}
+}

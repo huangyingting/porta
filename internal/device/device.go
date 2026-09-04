@@ -10,21 +10,31 @@ import (
 )
 
 type PacketDevice interface {
+	// ReadPacket transfers ownership of the returned packet to the caller.
 	ReadPacket(context.Context) ([]byte, error)
 	WritePacket(context.Context, []byte) error
 	Name() string
 	Close() error
 }
 
+type readResult struct {
+	packets [][]byte
+	err     error
+}
+
 type Native struct {
-	device  tun.Device
-	name    string
-	mtu     int
-	read    sync.Mutex
-	pending [][]byte
-	buffers [][]byte
-	sizes   []int
-	write   sync.Mutex
+	device      tun.Device
+	name        string
+	mtu         int
+	read        sync.Mutex
+	pending     [][]byte
+	readErr     error
+	readResults chan readResult
+	done        chan struct{}
+	write       sync.Mutex
+	writeBuffer []byte
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 const packetOffset = 16
@@ -45,59 +55,88 @@ func OpenNative(name string, mtu int) (*Native, error) {
 		_ = dev.Close()
 		return nil, fmt.Errorf("read TUN name: %w", err)
 	}
-	return &Native{device: dev, name: actualName, mtu: mtu}, nil
+	return newNative(dev, actualName, mtu), nil
 }
 
 func (n *Native) Name() string { return n.name }
 
+func newNative(dev tun.Device, name string, mtu int) *Native {
+	n := &Native{
+		device:      dev,
+		name:        name,
+		mtu:         mtu,
+		readResults: make(chan readResult),
+		done:        make(chan struct{}),
+		writeBuffer: make([]byte, packetOffset+mtu+256),
+	}
+	go n.readLoop()
+	return n
+}
+
+func (n *Native) readLoop() {
+	batchSize := n.device.BatchSize()
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	buffers := make([][]byte, batchSize)
+	sizes := make([]int, batchSize)
+	for index := range buffers {
+		buffers[index] = make([]byte, packetOffset+n.mtu+256)
+	}
+	for {
+		count, err := n.device.Read(buffers, sizes, packetOffset)
+		result := readResult{err: err}
+		if err == nil {
+			if count < 1 || count > len(buffers) {
+				result.err = fmt.Errorf("TUN returned invalid packet count=%d", count)
+			} else {
+				result.packets = make([][]byte, count)
+				for index := 0; index < count; index++ {
+					if sizes[index] < 1 || sizes[index] > len(buffers[index])-packetOffset {
+						result.err = fmt.Errorf("TUN returned invalid packet size=%d at index=%d", sizes[index], index)
+						break
+					}
+					result.packets[index] = append(
+						[]byte(nil),
+						buffers[index][packetOffset:packetOffset+sizes[index]]...,
+					)
+				}
+			}
+		}
+		select {
+		case n.readResults <- result:
+		case <-n.done:
+			return
+		}
+		if result.err != nil {
+			return
+		}
+	}
+}
+
 func (n *Native) ReadPacket(ctx context.Context) ([]byte, error) {
 	n.read.Lock()
 	defer n.read.Unlock()
+	if n.readErr != nil {
+		return nil, n.readErr
+	}
 	if len(n.pending) > 0 {
 		packet := n.pending[0]
 		n.pending = n.pending[1:]
 		return packet, nil
 	}
 
-	batchSize := n.device.BatchSize()
-	if batchSize < 1 {
-		batchSize = 1
-	}
-	if len(n.buffers) != batchSize {
-		n.buffers = make([][]byte, batchSize)
-		n.sizes = make([]int, batchSize)
-		for index := range n.buffers {
-			n.buffers[index] = make([]byte, packetOffset+n.mtu+256)
-		}
-	}
-	type result struct {
-		count int
-		err   error
-	}
-	completed := make(chan result, 1)
-	go func() {
-		count, err := n.device.Read(n.buffers, n.sizes, packetOffset)
-		completed <- result{count: count, err: err}
-	}()
-
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case got := <-completed:
+	case <-n.done:
+		return nil, errors.New("TUN device is closed")
+	case got := <-n.readResults:
 		if got.err != nil {
+			n.readErr = got.err
 			return nil, got.err
 		}
-		if got.count < 1 || got.count > len(n.buffers) {
-			return nil, fmt.Errorf("TUN returned invalid packet count=%d", got.count)
-		}
-		for index := 0; index < got.count; index++ {
-			if n.sizes[index] < 1 || n.sizes[index] > len(n.buffers[index])-packetOffset {
-				return nil, fmt.Errorf("TUN returned invalid packet size=%d at index=%d", n.sizes[index], index)
-			}
-			packet := make([]byte, n.sizes[index])
-			copy(packet, n.buffers[index][packetOffset:packetOffset+n.sizes[index]])
-			n.pending = append(n.pending, packet)
-		}
+		n.pending = got.packets
 		packet := n.pending[0]
 		n.pending = n.pending[1:]
 		return packet, nil
@@ -110,9 +149,12 @@ func (n *Native) WritePacket(ctx context.Context, packet []byte) error {
 		return ctx.Err()
 	default:
 	}
+	if len(packet) > n.mtu {
+		return fmt.Errorf("packet length %d exceeds TUN MTU %d", len(packet), n.mtu)
+	}
 	n.write.Lock()
 	defer n.write.Unlock()
-	buffer := make([]byte, packetOffset+len(packet))
+	buffer := n.writeBuffer[:packetOffset+len(packet)]
 	copy(buffer[packetOffset:], packet)
 	count, err := n.device.Write([][]byte{buffer}, packetOffset)
 	if err != nil {
@@ -124,4 +166,10 @@ func (n *Native) WritePacket(ctx context.Context, packet []byte) error {
 	return nil
 }
 
-func (n *Native) Close() error { return n.device.Close() }
+func (n *Native) Close() error {
+	n.closeOnce.Do(func() {
+		close(n.done)
+		n.closeErr = n.device.Close()
+	})
+	return n.closeErr
+}
