@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,6 +64,18 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 	if downloads.Code != http.StatusOK || !strings.Contains(downloads.Body.String(), "/download/SHA256SUMS") ||
 		!strings.Contains(downloads.Body.String(), "v1.2.3") {
 		t.Fatalf("downloads page = %d %q", downloads.Code, downloads.Body.String())
+	}
+	ticketURL := regexp.MustCompile(`href="(/download/SHA256SUMS\?ticket=[^"]+)"`).FindStringSubmatch(downloads.Body.String())
+	if len(ticketURL) != 2 {
+		t.Fatalf("downloads page has no signed checksum URL: %q", downloads.Body.String())
+	}
+	externalDownload := portalRequest(handler, http.MethodGet, ticketURL[1], nil)
+	if externalDownload.Code != http.StatusOK || externalDownload.Body.String() != "checksums" {
+		t.Fatalf("ticket download = %d %q", externalDownload.Code, externalDownload.Body.String())
+	}
+	tamperedDownload := portalRequest(handler, http.MethodGet, ticketURL[1]+"x", nil)
+	if tamperedDownload.Code != http.StatusNotFound {
+		t.Fatalf("tampered ticket status = %d, want 404", tamperedDownload.Code)
 	}
 	artifact := portalRequest(handler, http.MethodGet, "/download/SHA256SUMS", clientCookie)
 	if artifact.Code != http.StatusOK || artifact.Body.String() != "checksums" {

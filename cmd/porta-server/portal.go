@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"html"
@@ -21,6 +24,7 @@ const (
 	portalSessionTTL          = 8 * time.Hour
 	maxPortalSessions         = 4096
 	maxPortalSessionsPerLogin = 8
+	downloadTicketTTL         = 10 * time.Minute
 )
 
 type portalRole uint8
@@ -57,6 +61,7 @@ type portalHandler struct {
 	adminToken         string
 	logger             *slog.Logger
 	trustProxyHeaders  bool
+	downloadTicketKey  [32]byte
 	mu                 sync.Mutex
 	sessions           map[string]portalSession
 }
@@ -70,6 +75,10 @@ func newPortalHandler(config portalConfig) (http.Handler, error) {
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
+	var downloadTicketKey [32]byte
+	if _, err := rand.Read(downloadTicketKey[:]); err != nil {
+		return nil, fmt.Errorf("generate download ticket key: %w", err)
+	}
 	return &portalHandler{
 		next:               config.Next,
 		registry:           config.Registry,
@@ -79,6 +88,7 @@ func newPortalHandler(config portalConfig) (http.Handler, error) {
 		adminToken:         config.AdminToken,
 		logger:             config.Logger,
 		trustProxyHeaders:  config.TrustProxyHeaders,
+		downloadTicketKey:  downloadTicketKey,
 		sessions:           make(map[string]portalSession),
 	}, nil
 }
@@ -216,21 +226,58 @@ func (p *portalHandler) serveDownloadsPage(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodGet {
+		artifacts := availableDownloads(p.downloadsDirectory)
+		tickets := make(map[string]string, len(artifacts))
+		for _, artifact := range artifacts {
+			tickets[artifact.Name] = p.issueDownloadTicket(artifact.Name, time.Now().Add(downloadTicketTTL))
+		}
+		tickets["SHA256SUMS"] = p.issueDownloadTicket("SHA256SUMS", time.Now().Add(downloadTicketTTL))
 		_, _ = io.WriteString(w, downloadsPageHTML(
 			name,
 			portalRequestHost(r, p.trustProxyHeaders),
 			readDownloadVersion(p.downloadsDirectory),
-			availableDownloads(p.downloadsDirectory),
+			artifacts,
+			tickets,
 		))
 	}
 }
 
 func (p *portalHandler) serveDownload(w http.ResponseWriter, r *http.Request) {
 	if _, ok := p.session(r); !ok {
-		p.next.ServeHTTP(w, r)
-		return
+		name := strings.TrimPrefix(r.URL.Path, clientDownloadPrefix)
+		if !p.validDownloadTicket(name, r.URL.Query().Get("ticket"), time.Now()) {
+			p.next.ServeHTTP(w, r)
+			return
+		}
 	}
 	p.downloads.ServeHTTP(w, r)
+}
+
+func (p *portalHandler) issueDownloadTicket(name string, expiresAt time.Time) string {
+	var expires [8]byte
+	binary.BigEndian.PutUint64(expires[:], uint64(expiresAt.Unix()))
+	mac := hmac.New(sha256.New, p.downloadTicketKey[:])
+	_, _ = mac.Write([]byte(name))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(expires[:])
+	payload := append(expires[:], mac.Sum(nil)...)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func (p *portalHandler) validDownloadTicket(name, ticket string, now time.Time) bool {
+	payload, err := base64.RawURLEncoding.DecodeString(ticket)
+	if err != nil || len(payload) != 8+sha256.Size {
+		return false
+	}
+	expiresAt := int64(binary.BigEndian.Uint64(payload[:8]))
+	if now.Unix() > expiresAt {
+		return false
+	}
+	mac := hmac.New(sha256.New, p.downloadTicketKey[:])
+	_, _ = mac.Write([]byte(name))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(payload[:8])
+	return hmac.Equal(payload[8:], mac.Sum(nil))
 }
 
 func (p *portalHandler) session(r *http.Request) (portalSession, bool) {
@@ -433,20 +480,20 @@ func formatDownloadSize(size int64) string {
 	return fmt.Sprintf("%d B", size)
 }
 
-func downloadsPageHTML(clientName, host, version string, artifacts []downloadArtifact) string {
+func downloadsPageHTML(clientName, host, version string, artifacts []downloadArtifact, tickets map[string]string) string {
 	var rows strings.Builder
 	for _, artifact := range artifacts {
 		recommended := ""
 		if artifact.Recommended {
 			recommended = `<span class="recommended">Recommended</span>`
 		}
-		fmt.Fprintf(&rows, `<article class="download-row"><div class="platform-icon">%s</div><div class="package"><div class="platform-line"><h2>%s</h2>%s</div><p>%s</p></div><div class="meta"><span>%s</span><span>%s</span></div><a class="download-button" href="/download/%s">Download <span>↓</span></a></article>`,
+		fmt.Fprintf(&rows, `<article class="download-row"><div class="platform-icon">%s</div><div class="package"><div class="platform-line"><h2>%s</h2>%s</div><p>%s</p></div><div class="meta"><span>%s</span><span>%s</span></div><a class="download-button" href="/download/%s?ticket=%s" download>Download <span>↓</span></a></article>`,
 			string([]rune(artifact.Platform)[0]), artifact.Platform, recommended, artifact.Description,
-			artifact.Architecture, formatDownloadSize(artifact.Size), artifact.Name)
+			artifact.Architecture, formatDownloadSize(artifact.Size), artifact.Name, html.EscapeString(tickets[artifact.Name]))
 	}
 	if len(artifacts) == 0 {
 		rows.WriteString(`<div class="empty"><strong>Downloads are being prepared.</strong><span>Check back shortly.</span></div>`)
 	}
 	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml"><title>Porta downloads</title><style>
-	@font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-weight:200 900;font-display:swap}:root{font-family:"Mona Sans",sans-serif;color:#171923;background:#f5f6fa;--violet:#6558ed;--line:#e2e4ea}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 85% 0,rgba(115,217,208,.3),transparent 25rem),#f5f6fa}.page{width:min(900px,calc(100% - 28px));margin:auto;padding:24px 0 44px}.top{display:flex;justify-content:space-between;align-items:center}.brand{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:800}.brand img{width:29px}.logout{border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.8);padding:8px 11px;font-size:11px;cursor:pointer}.hero{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:end;margin:38px 0 22px}.eyebrow{color:var(--violet);font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.version{display:inline-flex;margin-left:7px;padding:3px 7px;border-radius:999px;background:#ece9ff;color:#594ed6;letter-spacing:0;text-transform:none}h1{margin:8px 0 8px;font-size:clamp(36px,5vw,48px);line-height:1;letter-spacing:-.05em}.lead{max-width:560px;margin:0;color:#747987;font-size:13px;line-height:1.6}.endpoint{min-width:240px;padding:12px 14px;border:1px solid rgba(255,255,255,.95);border-radius:11px;background:rgba(255,255,255,.78)}.endpoint small{display:block;margin-bottom:4px;color:#969aa5;font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.endpoint code{font-size:12px}.files{display:grid;gap:8px}.download-row{display:grid;grid-template-columns:40px minmax(0,1fr) auto 118px;gap:13px;align-items:center;padding:13px 14px;border:1px solid rgba(255,255,255,.96);border-radius:13px;background:rgba(255,255,255,.88);box-shadow:0 5px 18px rgba(35,40,68,.035)}.platform-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:11px;background:linear-gradient(145deg,#ece9ff,#e5f8f5);color:#584bd7;font-size:13px;font-weight:850}.platform-line{display:flex;align-items:center;gap:7px}.platform-line h2{margin:0;font-size:15px;letter-spacing:-.02em}.package p{margin:3px 0 0;color:#7d828f;font-size:11px;line-height:1.4}.recommended{padding:3px 6px;border-radius:5px;background:#e6f7f2;color:#218568;font-size:9px;font-weight:800}.meta{display:flex;gap:5px}.meta span{padding:5px 7px;border-radius:6px;background:#f1f2f6;color:#686e7b;font-size:10px;white-space:nowrap}.download-button{display:flex;align-items:center;justify-content:space-between;border-radius:8px;background:#171923;color:white;padding:9px 10px;text-decoration:none;font-size:11px;font-weight:750}.download-button span{font-size:13px}.support{display:flex;justify-content:space-between;gap:18px;margin-top:15px;padding-top:15px;border-top:1px solid rgba(25,29,45,.1);color:#7d828f;font-size:11px}.support a{color:#665cf6;text-decoration:none}.empty{padding:34px;border:1px dashed #ccd0da;border-radius:13px;text-align:center}.empty strong,.empty span{display:block}.empty span{margin-top:5px;color:#888d99}@media(max-width:680px){.hero{grid-template-columns:1fr;margin-top:32px}.endpoint{min-width:0}.download-row{grid-template-columns:40px minmax(0,1fr) 104px}.meta{display:none}}@media(max-width:430px){.page{width:min(100% - 20px,900px)}.download-row{grid-template-columns:36px minmax(0,1fr)}.platform-icon{width:36px;height:36px}.download-button{grid-column:1/-1}.support{align-items:flex-start;flex-direction:column}}</style></head><body><main class="page"><div class="top"><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><form method="post" action="/portal/logout"><button class="logout">Sign out</button></form></div><section class="hero"><div><div class="eyebrow">Client version <span class="version">` + html.EscapeString(version) + `</span></div><h1>Downloads</h1><p class="lead">Welcome, ` + html.EscapeString(clientName) + `. Choose the package for your device and use your existing Porta token to connect.</p></div><div class="endpoint"><small>Server address</small><code>https://` + html.EscapeString(host) + `</code></div></section><section class="files">` + rows.String() + `</section><div class="support"><span>Verify package integrity before installation.</span><a href="/download/SHA256SUMS">SHA256 checksums</a></div></main></body></html>`
+	@font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-weight:200 900;font-display:swap}:root{font-family:"Mona Sans",sans-serif;color:#171923;background:#f5f6fa;--violet:#6558ed;--line:#e2e4ea}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 85% 0,rgba(115,217,208,.3),transparent 25rem),#f5f6fa}.page{width:min(900px,calc(100% - 28px));margin:auto;padding:24px 0 44px}.top{display:flex;justify-content:space-between;align-items:center}.brand{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:800}.brand img{width:29px}.logout{border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.8);padding:8px 11px;font-size:11px;cursor:pointer}.hero{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:end;margin:38px 0 22px}.eyebrow{color:var(--violet);font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.version{display:inline-flex;margin-left:7px;padding:3px 7px;border-radius:999px;background:#ece9ff;color:#594ed6;letter-spacing:0;text-transform:none}h1{margin:8px 0 8px;font-size:clamp(36px,5vw,48px);line-height:1;letter-spacing:-.05em}.lead{max-width:560px;margin:0;color:#747987;font-size:13px;line-height:1.6}.endpoint{min-width:240px;padding:12px 14px;border:1px solid rgba(255,255,255,.95);border-radius:11px;background:rgba(255,255,255,.78)}.endpoint small{display:block;margin-bottom:4px;color:#969aa5;font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.endpoint code{font-size:12px}.files{display:grid;gap:8px}.download-row{display:grid;grid-template-columns:40px minmax(0,1fr) auto 118px;gap:13px;align-items:center;padding:13px 14px;border:1px solid rgba(255,255,255,.96);border-radius:13px;background:rgba(255,255,255,.88);box-shadow:0 5px 18px rgba(35,40,68,.035)}.platform-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:11px;background:linear-gradient(145deg,#ece9ff,#e5f8f5);color:#584bd7;font-size:13px;font-weight:850}.platform-line{display:flex;align-items:center;gap:7px}.platform-line h2{margin:0;font-size:15px;letter-spacing:-.02em}.package p{margin:3px 0 0;color:#7d828f;font-size:11px;line-height:1.4}.recommended{padding:3px 6px;border-radius:5px;background:#e6f7f2;color:#218568;font-size:9px;font-weight:800}.meta{display:flex;gap:5px}.meta span{padding:5px 7px;border-radius:6px;background:#f1f2f6;color:#686e7b;font-size:10px;white-space:nowrap}.download-button{display:flex;align-items:center;justify-content:space-between;border-radius:8px;background:#171923;color:white;padding:9px 10px;text-decoration:none;font-size:11px;font-weight:750}.download-button span{font-size:13px}.support{display:flex;justify-content:space-between;gap:18px;margin-top:15px;padding-top:15px;border-top:1px solid rgba(25,29,45,.1);color:#7d828f;font-size:11px}.support a{color:#665cf6;text-decoration:none}.empty{padding:34px;border:1px dashed #ccd0da;border-radius:13px;text-align:center}.empty strong,.empty span{display:block}.empty span{margin-top:5px;color:#888d99}@media(max-width:680px){.hero{grid-template-columns:1fr;margin-top:32px}.endpoint{min-width:0}.download-row{grid-template-columns:40px minmax(0,1fr) 104px}.meta{display:none}}@media(max-width:430px){.page{width:min(100% - 20px,900px)}.download-row{grid-template-columns:36px minmax(0,1fr)}.platform-icon{width:36px;height:36px}.download-button{grid-column:1/-1}.support{align-items:flex-start;flex-direction:column}}</style></head><body><main class="page"><div class="top"><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><form method="post" action="/portal/logout"><button class="logout">Sign out</button></form></div><section class="hero"><div><div class="eyebrow">Client version <span class="version">` + html.EscapeString(version) + `</span></div><h1>Downloads</h1><p class="lead">Welcome, ` + html.EscapeString(clientName) + `. Choose the package for your device and use your existing Porta token to connect.</p></div><div class="endpoint"><small>Server address</small><code>https://` + html.EscapeString(host) + `</code></div></section><section class="files">` + rows.String() + `</section><div class="support"><span>Verify package integrity before installation.</span><a href="/download/SHA256SUMS?ticket=` + html.EscapeString(tickets["SHA256SUMS"]) + `" download>SHA256 checksums</a></div></main></body></html>`
 }
