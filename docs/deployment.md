@@ -81,13 +81,15 @@ sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --port 8443
 ```
 
-Add `--forward-proxy` to expose Porta's authenticated HTTPS CONNECT proxy
-on the same TLS port. It remains disabled unless explicitly requested.
+Porta's authenticated HTTPS CONNECT proxy is enabled on the same TLS port by
+default. Add `--disable-forward-proxy` only when the deployment should provide
+VPN service without the proxy.
 
 The default deployment:
 
 - listens on TCP and UDP 443;
 - uses HTTP/3 MASQUE with HTTP/2 fallback;
+- enables authenticated HTTPS CONNECT proxying;
 - creates `porta0` and the `10.66.0.0/24` client network;
 - advertises `1.1.1.1` and an MTU of 1100;
 - installs narrowly scoped nftables NAT and forwarding rules;

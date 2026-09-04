@@ -23,7 +23,7 @@ Options:
   --gateway-cidr CIDR       Gateway address and prefix (default: 10.66.0.1/24)
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU (default: 1100)
-  --forward-proxy           Enable authenticated HTTPS CONNECT proxying
+  --disable-forward-proxy   Disable authenticated HTTPS CONNECT proxying
   --reset-leases            Archive leases incompatible with a changed pool
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
@@ -59,7 +59,7 @@ pool=10.66.0.0/24
 gateway_cidr=
 dns=1.1.1.1
 mtu=1100
-forward_proxy=false
+forward_proxy=true
 release=latest
 build_local=false
 reset_leases=false
@@ -78,7 +78,7 @@ while [[ $# -gt 0 ]]; do
     --gateway-cidr) require_value "$@"; gateway_cidr=$2; shift 2 ;;
     --dns) require_value "$@"; dns=$2; shift 2 ;;
     --mtu) require_value "$@"; mtu=$2; shift 2 ;;
-    --forward-proxy) forward_proxy=true; shift ;;
+    --disable-forward-proxy) forward_proxy=false; shift ;;
     --reset-leases) reset_leases=true; shift ;;
     --release) require_value "$@"; release=$2; shift 2 ;;
     --build-local) build_local=true; shift ;;
@@ -469,8 +469,8 @@ if (( port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
   capabilities+=" CAP_NET_BIND_SERVICE"
 fi
 forward_proxy_argument=
-if $forward_proxy; then
-  forward_proxy_argument="--forward-proxy"
+if ! $forward_proxy; then
+  forward_proxy_argument="--disable-forward-proxy"
 fi
 
 cat >/etc/systemd/system/porta.service <<EOF

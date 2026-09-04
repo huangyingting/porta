@@ -109,16 +109,18 @@ validation, Android setup, and removal.
 
 ## Forward proxy
 
-Enable the forward proxy during deployment:
+The authenticated HTTPS CONNECT proxy is enabled by default:
 
 ```sh
 sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --domain vpn.example.com \
   --cert /absolute/path/vpn.example.com.crt \
   --key /absolute/path/vpn.example.com.key \
-  --port 8443 \
-  --forward-proxy
+  --port 8443
 ```
+
+Pass `--disable-forward-proxy` only when the deployment should provide VPN
+service without the proxy.
 
 The proxy reuses Porta client accounts. Use a stable device ID as the Basic
 username and that client's token as the password:
