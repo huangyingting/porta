@@ -1,6 +1,9 @@
 GO ?= go
 
-.PHONY: test test-race vet build build-windows android clean
+.PHONY: check-version test test-race vet build build-windows android clean
+
+check-version:
+	./scripts/check-version.sh
 
 test:
 	GODEBUG=http2xconnect=1 $(GO) test ./...

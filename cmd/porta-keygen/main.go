@@ -7,10 +7,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/certutil"
 )
 
 func main() {
+	if buildinfo.IsVersionRequest(os.Args[1:]) {
+		fmt.Println(buildinfo.Version)
+		return
+	}
 	certPath := flag.String("cert", "server.crt", "output certificate path (must not exist)")
 	keyPath := flag.String("key", "server.key", "output private-key path (must not exist)")
 	hosts := flag.String("hosts", "localhost,127.0.0.1", "comma-separated certificate DNS names and IP addresses")

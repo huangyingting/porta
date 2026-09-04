@@ -1,6 +1,10 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - "**"
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -11,10 +15,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify application version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          BEFORE_REVISION: ${{ github.event.before }}
+        run: |
+          previous_revision=
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            previous_revision=$BASE_REVISION
+          elif [[ "$EVENT_NAME" == push && "$REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+            previous_revision=$BEFORE_REVISION
+          fi
+          ./scripts/check-version.sh "$previous_revision"
       - run: make test
       - run: make test-race
       - run: make vet

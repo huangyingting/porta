@@ -9,6 +9,7 @@ binaries on `PATH`.
 ## Local validation
 
 ```sh
+make check-version
 make test
 make test-race
 make vet
@@ -40,10 +41,29 @@ make android
 Do not commit a keystore or its passwords. Prefer managed Play App Signing for
 public distribution.
 
-## GitHub releases
+## Version policy
 
-The CI workflow is currently manual. Tags matching `vMAJOR.MINOR.PATCH` run the
-release workflow and publish:
+The application version is stored in `internal/buildinfo/VERSION` and currently
+starts at `0.1.0`. The server, command-line clients, Windows desktop client,
+Android application, mobile bridge, release metadata, and download portal all
+use this application version.
+
+During the current development series, every merged change increments exactly
+the patch component:
+
+```text
+0.1.0 -> 0.1.1 -> 0.1.2
+```
+
+Keep major and minor fixed at `0.1`. CI checks the version against the pull
+request base or previous pushed revision. The wire-protocol version remains
+independent and changes only for compatibility-breaking protocol changes.
+
+## Continuous integration and releases
+
+CI runs automatically for pushes and pull requests and can also be started
+manually. A tag matching the source version, such as `v0.1.0`, runs the release
+workflow and publishes:
 
 - Linux AMD64 and ARM64 servers, clients, and key generators;
 - the Windows desktop and CLI ZIP;
@@ -51,8 +71,8 @@ release workflow and publish:
 - the deployment bundle;
 - `SHA256SUMS`.
 
-The release tag supplies the Android application version name and a monotonic
-Android version code. Configure these repository Actions secrets for
+The release version supplies the Android application version name and a
+monotonic Android version code. Configure these repository Actions secrets for
 production Android signing:
 
 - `PORTA_ANDROID_KEYSTORE_BASE64`

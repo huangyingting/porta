@@ -11,12 +11,17 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/clientapp"
 	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
 func main() {
+	if buildinfo.IsVersionRequest(os.Args[1:]) {
+		fmt.Println(buildinfo.Version)
+		return
+	}
 	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, "porta-client:", err)
 		os.Exit(1)

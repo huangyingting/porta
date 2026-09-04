@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/clientapp"
 	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/clientprofile"
@@ -86,7 +87,7 @@ func run() error {
 func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logPath string) *application {
 	window := ui.NewMain(
 		ui.OptsMain().
-			Title("Porta").
+			Title("Porta " + buildinfo.Version).
 			Size(ui.Dpi(620, 650)).
 			ClassIconId(101).
 			Style(co.WS_CAPTION | co.WS_SYSMENU | co.WS_CLIPCHILDREN | co.WS_BORDER |
@@ -95,7 +96,7 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 	app := &application{window: window, store: store, network: network, logPath: logPath}
 
 	ui.NewStatic(window, ui.OptsStatic().Text("PORTA").Position(ui.Dpi(24, 20)).Size(ui.Dpi(100, 24)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Secure connection profiles").Position(ui.Dpi(24, 45)).Size(ui.Dpi(240, 20)))
+	ui.NewStatic(window, ui.OptsStatic().Text("Secure connection profiles · v"+buildinfo.Version).Position(ui.Dpi(24, 45)).Size(ui.Dpi(240, 20)))
 	app.profiles = ui.NewComboBox(window, ui.OptsComboBox().
 		Position(ui.Dpi(24, 78)).Width(ui.DpiX(390)).Texts("New profile").Select(0))
 	newButton := ui.NewButton(window, ui.OptsButton().Text("New").Position(ui.Dpi(426, 77)).Width(ui.DpiX(74)))

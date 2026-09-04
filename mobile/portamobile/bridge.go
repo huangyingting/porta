@@ -16,8 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
+
+func Version() string {
+	return buildinfo.Version
+}
 
 const transportUnavailablePrefix = "transport unavailable: "
 const retryablePrefix = "retryable: "

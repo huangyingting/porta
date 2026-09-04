@@ -26,10 +26,16 @@ val releaseKeystorePath = providers.environmentVariable("PORTA_ANDROID_KEYSTORE"
 val releaseKeystorePassword = providers.environmentVariable("PORTA_ANDROID_KEYSTORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("PORTA_ANDROID_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("PORTA_ANDROID_KEY_PASSWORD").orNull
-val applicationVersionName = providers.environmentVariable("PORTA_ANDROID_VERSION_NAME").orNull ?: "1.0.0"
+val sourceVersion = rootProject.projectDir.parentFile
+    .resolve("internal/buildinfo/VERSION")
+    .readText()
+    .trim()
+val applicationVersionName = providers.environmentVariable("PORTA_ANDROID_VERSION_NAME").orNull ?: sourceVersion
+val applicationVersionMatch = Regex("""0\.1\.([0-9]{1,3})""").matchEntire(applicationVersionName)
+    ?: error("Porta application version must use 0.1.PATCH")
 val configuredVersionCode = providers.environmentVariable("PORTA_ANDROID_VERSION_CODE").orNull
 val applicationVersionCode = configuredVersionCode?.toIntOrNull() ?: if (configuredVersionCode == null) {
-    23
+    1000 + applicationVersionMatch.groupValues[1].toInt()
 } else {
     error("PORTA_ANDROID_VERSION_CODE must be an integer")
 }

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/device"
 	"github.com/huangyingting/porta/internal/forwardproxy"
 	"github.com/huangyingting/porta/internal/gateway"
@@ -28,6 +29,10 @@ import (
 )
 
 func main() {
+	if buildinfo.IsVersionRequest(os.Args[1:]) {
+		fmt.Println(buildinfo.Version)
+		return
+	}
 	if err := ensureExtendedConnect(); err != nil {
 		fmt.Fprintln(os.Stderr, "porta-server:", err)
 		os.Exit(1)
@@ -328,6 +333,7 @@ func run() error {
 			attributes = append(attributes, "acme_http_listen", *acmeHTTPAddress)
 		}
 	}
+	attributes = append(attributes, "version", buildinfo.Version)
 	logger.Info("gateway ready", attributes...)
 
 	var runErr error
