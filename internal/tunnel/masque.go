@@ -458,26 +458,52 @@ func setMasqueHeaders(request *http.Request, config Config) {
 	request.Header.Set("Authorization", "Bearer "+config.Token)
 	request.Header.Set(http3.CapsuleProtocolHeader, "?1")
 	request.Header.Set("X-Porta-Client-ID", config.ClientID)
+	request.Header.Set(protocol.HeaderVersion, protocol.Version)
 }
 
 func validateMasqueResponse(response *http.Response) error {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_ = response.Body.Close()
-		return &GatewayResponseError{StatusCode: response.StatusCode, Status: response.Status}
+		return &GatewayResponseError{
+			StatusCode:       response.StatusCode,
+			Status:           response.Status,
+			ServerVersion:    response.Header.Get(protocol.HeaderVersion),
+			ServerMinVersion: response.Header.Get(protocol.HeaderMinVersion),
+			ServerMaxVersion: response.Header.Get(protocol.HeaderMaxVersion),
+			ClientVersion:    protocol.Version,
+		}
 	}
 	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
 		return errors.New("gateway response did not enable the Capsule Protocol")
+	}
+	if response.Header.Get(protocol.HeaderVersion) != protocol.Version {
+		return fmt.Errorf(
+			"gateway selected Porta protocol %q, client requires %q",
+			response.Header.Get(protocol.HeaderVersion),
+			protocol.Version,
+		)
 	}
 	return nil
 }
 
 // GatewayResponseError reports a non-success response from a tunnel endpoint.
 type GatewayResponseError struct {
-	StatusCode int
-	Status     string
+	StatusCode       int
+	Status           string
+	ServerVersion    string
+	ServerMinVersion string
+	ServerMaxVersion string
+	ClientVersion    string
 }
 
 func (e *GatewayResponseError) Error() string {
+	if e.StatusCode == http.StatusUpgradeRequired && (e.ServerMinVersion != "" || e.ServerMaxVersion != "") {
+		supported := e.ServerMinVersion
+		if e.ServerMaxVersion != "" && e.ServerMaxVersion != e.ServerMinVersion {
+			supported += "-" + e.ServerMaxVersion
+		}
+		return fmt.Sprintf("gateway requires Porta protocol %s; client uses %s", supported, e.ClientVersion)
+	}
 	return fmt.Sprintf("gateway returned %s", e.Status)
 }
 

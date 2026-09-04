@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/huangyingting/porta/internal/protocol"
 )
 
 func TestClientAddressTrustsProxyHeadersOnlyFromLoopback(t *testing.T) {
@@ -112,6 +114,29 @@ func TestParseLaneConfig(t *testing.T) {
 	request.Header.Set(laneCountHeader, "2")
 	if _, err := parseLaneConfig(request); err == nil {
 		t.Fatal("non-four-lane configuration accepted")
+	}
+}
+
+func TestRequireProtocolVersion(t *testing.T) {
+	request := httptest.NewRequest(http.MethodConnect, "/", nil)
+	recorder := httptest.NewRecorder()
+	if requireProtocolVersion(recorder, request) {
+		t.Fatal("missing protocol version was accepted")
+	}
+	if recorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUpgradeRequired)
+	}
+	if got := recorder.Header().Get(protocol.HeaderMinVersion); got != protocol.MinVersion {
+		t.Fatalf("minimum protocol version = %q, want %q", got, protocol.MinVersion)
+	}
+	if got := recorder.Header().Get(protocol.HeaderMaxVersion); got != protocol.MaxVersion {
+		t.Fatalf("maximum protocol version = %q, want %q", got, protocol.MaxVersion)
+	}
+
+	request.Header.Set(protocol.HeaderVersion, protocol.Version)
+	recorder = httptest.NewRecorder()
+	if !requireProtocolVersion(recorder, request) {
+		t.Fatal("current protocol version was rejected")
 	}
 }
 

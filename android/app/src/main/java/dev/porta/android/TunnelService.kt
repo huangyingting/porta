@@ -533,6 +533,18 @@ class TunnelService : VpnService() {
         try {
             activeCall.execute().use { response ->
                 if (!response.isSuccessful) {
+                    if (response.code == 426) {
+                        val minimum = response.header(HEADER_PROTOCOL_MIN_VERSION).orEmpty()
+                        val maximum = response.header(HEADER_PROTOCOL_MAX_VERSION).orEmpty()
+                        val supported = if (maximum.isNotEmpty() && maximum != minimum) {
+                            "$minimum-$maximum"
+                        } else {
+                            minimum.ifEmpty { "an incompatible version" }
+                        }
+                        throw PermanentTunnelException(
+                            "Gateway requires Porta protocol $supported; client uses ${PacketFraming.VERSION}",
+                        )
+                    }
                     val message = "Gateway returned HTTP ${response.code} for HTTP/2 lane $laneIndex"
                     if (response.code in 400..499 && response.code !in RETRYABLE_HTTP_CODES) {
                         throw PermanentTunnelException(message)
@@ -541,6 +553,9 @@ class TunnelService : VpnService() {
                 }
                 if (response.protocol != Protocol.HTTP_2) {
                     throw PermanentTunnelException("Gateway did not negotiate HTTP/2")
+                }
+                if (response.header(HEADER_PROTOCOL_VERSION) != PacketFraming.VERSION) {
+                    throw PermanentTunnelException("Gateway selected an incompatible Porta protocol")
                 }
                 if (response.header(HEADER_LANE_SESSION) != sessionId ||
                     response.header(HEADER_LANE_INDEX) != laneIndex.toString() ||
@@ -1012,6 +1027,9 @@ class TunnelService : VpnService() {
         private const val NO_SESSION = 0L
         private const val HTTP2_LANE_COUNT = 4
         private const val HTTP2_LANE_CONNECT_TIMEOUT_SECONDS = 20L
+        private const val HEADER_PROTOCOL_VERSION = "X-Porta-Version"
+        private const val HEADER_PROTOCOL_MIN_VERSION = "X-Porta-Min-Version"
+        private const val HEADER_PROTOCOL_MAX_VERSION = "X-Porta-Max-Version"
         private const val HEADER_LANE_SESSION = "X-Porta-Lane-Session"
         private const val HEADER_LANE_INDEX = "X-Porta-Lane"
         private const val HEADER_LANE_COUNT = "X-Porta-Lanes"

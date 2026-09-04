@@ -133,8 +133,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if r.Header.Get("X-Porta-Version") != protocol.Version {
-		http.Error(w, "unsupported Porta version", http.StatusUpgradeRequired)
+	if !requireProtocolVersion(w, r) {
 		return
 	}
 	mediaType := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])
@@ -193,7 +192,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", protocol.ContentType)
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Porta-Version", protocol.Version)
+	setProtocolVersionHeaders(w.Header())
 	w.Header().Set("X-Porta-Address", lease.Prefix().String())
 	w.Header().Set("X-Porta-Gateway", lease.Gateway.String())
 	w.Header().Set("X-Porta-MTU", strconv.Itoa(c.MTU))
@@ -269,6 +268,21 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func requireProtocolVersion(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get(protocol.HeaderVersion) == protocol.Version {
+		return true
+	}
+	setProtocolVersionHeaders(w.Header())
+	http.Error(w, "unsupported Porta protocol version", http.StatusUpgradeRequired)
+	return false
+}
+
+func setProtocolVersionHeaders(header http.Header) {
+	header.Set(protocol.HeaderVersion, protocol.Version)
+	header.Set(protocol.HeaderMinVersion, protocol.MinVersion)
+	header.Set(protocol.HeaderMaxVersion, protocol.MaxVersion)
 }
 
 func parseLaneConfig(r *http.Request) (laneConfig, error) {

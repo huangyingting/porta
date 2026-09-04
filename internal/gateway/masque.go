@@ -40,6 +40,9 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if !requireProtocolVersion(w, r) {
+		return
+	}
 
 	lease, err := c.Pool.Acquire(identity.LeaseID)
 	if err != nil {
@@ -52,6 +55,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 	w.Header().Set("Cache-Control", "no-store")
+	setProtocolVersionHeaders(w.Header())
 	w.Header().Set("X-Porta-MTU", strconv.Itoa(c.MTU))
 	if c.DNS != "" {
 		w.Header().Set("X-Porta-DNS", c.DNS)

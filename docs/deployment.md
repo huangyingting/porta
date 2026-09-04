@@ -46,8 +46,9 @@ the token is not written to Porta's configuration.
 
 By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
 `porta-server` from that release and verifies it with `SHA256SUMS`. Pass
-`--release vX.Y.Z` to pin release `v0.9.0` or newer. Developers working from a
-full source checkout can pass `--build-local` instead.
+`--release vX.Y.Z` to pin a release that includes the client download portal.
+Developers working from a full source checkout can pass `--build-local`
+instead.
 
 ## One-command installation with Let's Encrypt
 

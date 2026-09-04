@@ -6,7 +6,7 @@ import java.io.EOFException
 
 object PacketFraming {
     const val CONTENT_TYPE = "application/x-porta-packets"
-    const val VERSION = "1"
+    const val VERSION = "2"
     private const val MAX_PACKET = 65_535
 
     fun write(sink: BufferedSink, packet: ByteArray) {
@@ -23,4 +23,3 @@ object PacketFraming {
         return source.readByteArray(size.toLong())
     }
 }
-

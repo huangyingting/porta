@@ -8,16 +8,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"regexp"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/huangyingting/porta/internal/clientapp"
+	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
-
-var invalidClientID = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 func main() {
 	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
@@ -84,16 +81,5 @@ func defaultInterfaceName() string {
 }
 
 func defaultClientID() string {
-	hostname, err := os.Hostname()
-	if err != nil || hostname == "" {
-		return "porta-client"
-	}
-	value := strings.Trim(invalidClientID.ReplaceAllString(hostname, "-"), "-._")
-	if value == "" {
-		return "porta-client"
-	}
-	if len(value) > 64 {
-		value = value[:64]
-	}
-	return value
+	return clientid.Default("porta-client")
 }

@@ -37,7 +37,9 @@ func NewRunner(statePath string) (*Runner, error) {
 	}
 	data, err := os.ReadFile(statePath)
 	if err == nil {
-		_ = json.Unmarshal(data, &runner.state)
+		if err := json.Unmarshal(data, &runner.state); err != nil {
+			return nil, fmt.Errorf("decode network state: %w", err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read network state: %w", err)
 	}

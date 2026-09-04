@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/huangyingting/porta/internal/clientapp"
+	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/clientprofile"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/huangyingting/porta/internal/winnetwork"
@@ -22,8 +22,6 @@ import (
 	"github.com/rodrigocfd/windigo/ui"
 	"github.com/rodrigocfd/windigo/win"
 )
-
-var invalidClientID = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 const trayMessage co.WM = co.WM_APP + 1
 
@@ -489,16 +487,5 @@ func formatDuration(value time.Duration) string {
 }
 
 func defaultClientID() string {
-	hostname, err := os.Hostname()
-	if err != nil || hostname == "" {
-		return "porta-windows"
-	}
-	value := strings.Trim(invalidClientID.ReplaceAllString(hostname, "-"), "-._")
-	if value == "" {
-		return "porta-windows"
-	}
-	if len(value) > 64 {
-		value = value[:64]
-	}
-	return value
+	return clientid.Default("porta-windows")
 }

@@ -44,6 +44,22 @@ selection and reconnect replacement. The token identifies a client account,
 while the client ID identifies one enrolled device. Their combined identity
 prevents device-name collisions between accounts.
 
+## Protocol compatibility
+
+Porta application releases and the Porta wire protocol are versioned
+independently. Every MASQUE and HTTP/2 fallback tunnel request sends
+`X-Porta-Version`. The gateway accepts only a supported wire version and
+returns `X-Porta-Version`, `X-Porta-Min-Version`, and `X-Porta-Max-Version` on
+successful tunnel responses. An incompatible or missing version receives
+`426 Upgrade Required` with the same supported-range headers.
+
+The current development protocol is version `2`, and the gateway currently
+supports only that version. Client and server release numbers do not need to
+match when their supported protocol ranges overlap. A breaking framing,
+authentication, lease, or routing change increments the protocol version;
+additive behavior should use negotiated capabilities where possible rather
+than forcing an application release lockstep.
+
 The persistent client registry stores only SHA-256 token hashes. Each account
 has an enabled state and a device limit. The loopback-only admin API manages
 accounts, token rotation, and device enrollment without restarting the tunnel

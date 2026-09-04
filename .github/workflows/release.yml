@@ -60,6 +60,27 @@ jobs:
             printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.jks"
             echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.jks" >> "$GITHUB_ENV"
           fi
+      - name: Set Android release version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^([0-9]{1,4})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+            echo "release tag must use vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          major=$((10#${BASH_REMATCH[1]}))
+          minor=$((10#${BASH_REMATCH[2]}))
+          patch=$((10#${BASH_REMATCH[3]}))
+          if ((minor > 999 || patch > 999)); then
+            echo "release minor and patch versions must not exceed 999" >&2
+            exit 1
+          fi
+          version_code=$((major * 1000000 + minor * 1000 + patch))
+          if ((version_code < 1 || version_code > 2100000000)); then
+            echo "release version is outside Android's version-code range" >&2
+            exit 1
+          fi
+          echo "PORTA_ANDROID_VERSION_NAME=$version" >> "$GITHUB_ENV"
+          echo "PORTA_ANDROID_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
       - name: Build Android release
         working-directory: android
         env:

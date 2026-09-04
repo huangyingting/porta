@@ -26,6 +26,16 @@ val releaseKeystorePath = providers.environmentVariable("PORTA_ANDROID_KEYSTORE"
 val releaseKeystorePassword = providers.environmentVariable("PORTA_ANDROID_KEYSTORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("PORTA_ANDROID_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("PORTA_ANDROID_KEY_PASSWORD").orNull
+val applicationVersionName = providers.environmentVariable("PORTA_ANDROID_VERSION_NAME").orNull ?: "1.0.0"
+val configuredVersionCode = providers.environmentVariable("PORTA_ANDROID_VERSION_CODE").orNull
+val applicationVersionCode = configuredVersionCode?.toIntOrNull() ?: if (configuredVersionCode == null) {
+    23
+} else {
+    error("PORTA_ANDROID_VERSION_CODE must be an integer")
+}
+require(applicationVersionCode in 1..2_100_000_000) {
+    "PORTA_ANDROID_VERSION_CODE must be between 1 and 2100000000"
+}
 val hasReleaseSigning = listOf(
     releaseKeystorePath,
     releaseKeystorePassword,
@@ -41,8 +51,8 @@ android {
         applicationId = "dev.porta.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 23
-        versionName = "1.0.0"
+        versionCode = applicationVersionCode
+        versionName = applicationVersionName
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }

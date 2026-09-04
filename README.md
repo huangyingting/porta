@@ -33,6 +33,11 @@ available and a required four-lane `POST /v1/tunnel` transport over HTTP/2
 because OkHttp does not expose the Extended CONNECT pseudo-header required by
 `CONNECT-IP`. Details are in [the architecture document](docs/architecture.md).
 
+Client and server application releases are compatible when they support the
+same Porta wire-protocol version; their release numbers do not need to match.
+Both tunnel transports enforce the version header and return
+`426 Upgrade Required` with the gateway's supported range when incompatible.
+
 ## Build and test
 
 Requirements are Go 1.26 or newer. Android builds additionally require JDK 17,

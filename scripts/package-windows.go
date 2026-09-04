@@ -23,23 +23,55 @@ func main() {
 }
 
 func packageWindows(outputPath, inputDirectory string) error {
-	output, err := os.Create(outputPath)
+	required := []string{"porta.exe", "porta-cli.exe", "wintun.dll"}
+	for _, name := range required {
+		info, err := os.Stat(filepath.Join(inputDirectory, name))
+		if err != nil {
+			return fmt.Errorf("validate %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("validate %s: not a regular file", name)
+		}
+	}
+
+	outputDirectory := filepath.Dir(outputPath)
+	output, err := os.CreateTemp(outputDirectory, "."+filepath.Base(outputPath)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	temporaryPath := output.Name()
+	committed := false
+	defer func() {
+		_ = output.Close()
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
 	archive := zip.NewWriter(output)
-	for _, name := range []string{"porta.exe", "porta-cli.exe", "wintun.dll"} {
+	for _, name := range required {
 		if err := addFile(archive, filepath.Join(inputDirectory, name), name); err != nil {
 			_ = archive.Close()
-			_ = output.Close()
 			return err
 		}
 	}
 	if err := archive.Close(); err != nil {
-		_ = output.Close()
 		return err
 	}
-	return output.Close()
+	if err := output.Sync(); err != nil {
+		return err
+	}
+	if err := output.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(temporaryPath, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, outputPath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func addFile(archive *zip.Writer, path, name string) error {

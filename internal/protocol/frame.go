@@ -10,9 +10,14 @@ import (
 )
 
 const (
-	Version     = "1"
-	ContentType = "application/x-porta-packets"
-	MaxPacket   = 65535
+	Version          = "2"
+	MinVersion       = Version
+	MaxVersion       = Version
+	HeaderVersion    = "X-Porta-Version"
+	HeaderMinVersion = "X-Porta-Min-Version"
+	HeaderMaxVersion = "X-Porta-Max-Version"
+	ContentType      = "application/x-porta-packets"
+	MaxPacket        = 65535
 )
 
 var ErrFrameTooLarge = errors.New("porta frame exceeds maximum packet size")

@@ -301,7 +301,7 @@ fi
 chmod 0755 "$server_binary"
 server_help=$("$server_binary" --help 2>&1)
 grep -q -- 'client-downloads' <<<"$server_help" ||
-  die "selected server release does not support published client downloads; use v0.9.0 or newer"
+  die "selected server release does not support the required client download portal"
 
 lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'

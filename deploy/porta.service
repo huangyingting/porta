@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
-ExecStart=/usr/local/bin/porta-server --listen :8443 --admin-listen 127.0.0.1:9090 --tls-cert /etc/porta/tls/server.crt --tls-key /etc/porta/tls/server.key --client-registry /var/lib/porta/clients.json --interface porta0 --pool 10.66.0.0/24 --lease-state /var/lib/porta/leases.json --dns 1.1.1.1 --mtu 1100 --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :8443 --admin-listen 127.0.0.1:9090 --tls-cert /etc/porta/tls/server.crt --tls-key /etc/porta/tls/server.key --client-registry /var/lib/porta/clients.json --client-downloads /var/lib/porta/downloads --usage-state /var/lib/porta/usage.json --interface porta0 --pool 10.66.0.0/24 --lease-state /var/lib/porta/leases.json --dns 1.1.1.1 --mtu 1100 --json-logs
 ExecStartPost=/bin/bash -c 'for i in $(seq 1 50); do /usr/sbin/ip link show dev porta0 >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh porta0 eth0
 Restart=on-failure
