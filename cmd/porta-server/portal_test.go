@@ -21,6 +21,9 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, "SHA256SUMS"), []byte("checksums"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(directory, "VERSION"), []byte("v1.2.3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	handler, err := newPortalHandler(portalConfig{
 		Next:               http.NotFoundHandler(),
 		Registry:           registry,
@@ -30,6 +33,10 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	accessPage := portalRequest(handler, http.MethodGet, "/access", nil)
+	if accessPage.Code != http.StatusOK || !strings.Contains(accessPage.Body.String(), `action="/access"`) {
+		t.Fatalf("access page = %d %q", accessPage.Code, accessPage.Body.String())
 	}
 
 	adminCookie := portalSignIn(t, handler, testAdminToken, "/portal/admin")
@@ -53,7 +60,8 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 
 	clientCookie := portalSignIn(t, handler, "client-token-0123456789", "/portal/downloads")
 	downloads := portalRequest(handler, http.MethodGet, "/portal/downloads", clientCookie)
-	if downloads.Code != http.StatusOK || !strings.Contains(downloads.Body.String(), "/download/SHA256SUMS") {
+	if downloads.Code != http.StatusOK || !strings.Contains(downloads.Body.String(), "/download/SHA256SUMS") ||
+		!strings.Contains(downloads.Body.String(), "v1.2.3") {
 		t.Fatalf("downloads page = %d %q", downloads.Code, downloads.Body.String())
 	}
 	artifact := portalRequest(handler, http.MethodGet, "/download/SHA256SUMS", clientCookie)

@@ -44,6 +44,9 @@ func TestPublicSiteServesPortaLandingPage(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `src="/assets/porta-mark.svg"`) {
 		t.Fatal("landing page does not use the Porta mark")
 	}
+	if !strings.Contains(response.Body.String(), `class="access-link" href="/access">Get access</a>`) {
+		t.Fatal("landing page does not expose the hero access action")
+	}
 	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "font-src 'self'") {
 		t.Fatalf("landing CSP = %q", policy)
 	}
