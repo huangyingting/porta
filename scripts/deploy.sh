@@ -63,7 +63,7 @@ forward_proxy=true
 release=latest
 build_local=false
 reset_leases=false
-deployed_version=development
+client_version=
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -216,9 +216,6 @@ if $build_local; then
   else
     make GO="$go_binary" build
   fi
-  if command -v git >/dev/null 2>&1; then
-    deployed_version=$(git describe --tags --always --dirty 2>/dev/null || printf 'development')
-  fi
   server_binary=bin/porta-server
 else
   case "$(uname -m)" in
@@ -255,7 +252,7 @@ else
     "$release_api_url" \
     --output "$release_download_directory/release.json" ||
     die "could not read GitHub release metadata; private repositories require GH_TOKEN"
-  deployed_version=$(python3 - "$release_download_directory/release.json" <<'PY'
+  client_version=$(python3 - "$release_download_directory/release.json" <<'PY'
 import json
 import sys
 
@@ -429,6 +426,8 @@ if ! $build_local; then
     install -m 0644 "$release_download_directory/$artifact" \
       "$downloads_stage/$artifact"
   done
+  printf '%s\n' "$client_version" >"$downloads_stage/CLIENT_VERSION"
+  chmod 0644 "$downloads_stage/CLIENT_VERSION"
   cleanup_release_download
   release_download_directory=
 fi
@@ -460,8 +459,6 @@ if [[ -n $downloads_stage ]]; then
   mv "$downloads_stage" /var/lib/porta/downloads
   downloads_stage=
 fi
-printf '%s\n' "$deployed_version" >/var/lib/porta/downloads/VERSION
-chmod 0644 /var/lib/porta/downloads/VERSION
 if $reset_leases && [[ -s $lease_state ]]; then
   mv "$lease_state" "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).bak"
 fi

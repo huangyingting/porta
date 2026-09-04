@@ -21,7 +21,7 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, "SHA256SUMS"), []byte("checksums"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, "VERSION"), []byte("v1.2.3\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(directory, "CLIENT_VERSION"), []byte("v1.2.3\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	handler, err := newPortalHandler(portalConfig{
