@@ -164,13 +164,14 @@ metadata, multicast, documentation, or benchmark address rejects the request.
 Proxy credentials and client-supplied forwarding identity headers are never
 sent to the destination.
 
-Valid preemptive Basic credentials activate the proxy. Proxy-shaped traffic
-without valid credentials falls through to the ordinary landing or
-unsupported-request behavior without a recognizable `407` challenge.
+Valid Basic credentials activate the proxy. Porta returns a standard `407`
+challenge only for CONNECT requests so browser extensions can supply stored
+credentials. Ordinary unauthenticated requests still fall through to the
+landing or unsupported-request behavior.
 Configure ZeroOmega with type **HTTPS**, the Porta hostname and port, a stable
 device ID such as `chrome-zeroomega` as the username, and the client token as
-the password. The extension must send the stored credentials preemptively;
-Porta intentionally does not trigger the browser authentication dialog. Porta
+the password. ZeroOmega supplies the stored credentials after the CONNECT-only
+authentication challenge. Porta
 does not serve a public PAC file and does not cache proxy responses.
 
 The installer validates port availability before stopping an existing

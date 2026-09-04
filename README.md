@@ -132,17 +132,17 @@ curl --proxy https://vpn.example.com:8443 \
 Only HTTPS `CONNECT` is supported, including HTTP/2 CONNECT streams. Porta
 rejects ordinary HTTP proxy requests and every destination port except 443.
 Loopback, private, link-local, metadata, multicast, documentation, benchmark,
-and other non-public addresses are rejected after DNS resolution. Valid
-preemptive Basic credentials activate the proxy. Missing or invalid credentials
-fall through to the normal landing or unsupported-request behavior without a
-recognizable `407` proxy challenge. Porta does not publish a PAC file and does
-not cache responses.
+and other non-public addresses are rejected after DNS resolution. Porta returns
+a standard `407 Proxy Authentication Required` challenge only for CONNECT
+requests so browser extensions can supply stored credentials. Ordinary requests
+without valid credentials still fall through to the normal landing or
+unsupported-request behavior. Porta does not publish a PAC file and does not
+cache responses.
 
 For ZeroOmega, select an **HTTPS proxy**, use the Porta hostname and port, set a
 stable device ID such as `chrome-zeroomega` as the username, and use the
-client token as the password. ZeroOmega must send those credentials
-preemptively; Porta intentionally does not trigger the browser authentication
-dialog.
+client token as the password. ZeroOmega supplies those credentials after
+Porta's CONNECT-only authentication challenge.
 
 ## Client downloads
 

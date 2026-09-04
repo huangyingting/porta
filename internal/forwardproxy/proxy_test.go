@@ -153,6 +153,31 @@ func TestCamouflagePassesInvalidProxyRequestsToWebsite(t *testing.T) {
 	}
 }
 
+func TestCamouflageChallengesUnauthenticatedConnect(t *testing.T) {
+	handler, err := New(Config{
+		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTeapot)
+		}),
+		Authorize: func(string, string) (Identity, error) {
+			return Identity{}, context.Canceled
+		},
+		Camouflage: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
+	request.Host = "example.com:443"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusProxyAuthRequired {
+		t.Fatalf("CONNECT status = %d, want %d", response.Code, http.StatusProxyAuthRequired)
+	}
+	if challenge := response.Header().Get("Proxy-Authenticate"); challenge != `Basic realm="Porta"` {
+		t.Fatalf("Proxy-Authenticate = %q", challenge)
+	}
+}
+
 func TestPublicDestinationPolicy(t *testing.T) {
 	for _, address := range []string{
 		"127.0.0.1",

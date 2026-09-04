@@ -90,7 +90,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	identity, ok := h.authenticate(r.Header.Get("Proxy-Authorization"))
 	if !ok {
-		if h.camouflage {
+		if h.camouflage && r.Method != http.MethodConnect {
 			h.next.ServeHTTP(w, r)
 			return
 		}
