@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/huangyingting/porta/internal/usage"
 )
 
 const testAdminToken = "admin-token-01234567890123456789"
@@ -77,6 +79,48 @@ func TestAdminPageIsProfessionalAndDoesNotEmbedSecrets(t *testing.T) {
 	if !strings.Contains(body, `font-family:"Mona Sans"`) {
 		t.Fatal("admin page does not use the bundled Mona Sans font")
 	}
+	if !strings.Contains(body, `class="client-table"`) ||
+		!strings.Contains(body, "Active sessions") ||
+		!strings.Contains(body, "Highest traffic") ||
+		strings.Contains(body, `class="card"`) {
+		t.Fatal("admin page does not provide the compact operational table")
+	}
+}
+
+func TestAdminAPIIncludesLiveClientAndDeviceUsage(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), "bootstrap-token-0123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := registry.Authenticate("bootstrap-token-0123456789", "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usageStore, err := usage.Open("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := usageStore.Begin("vpn:test", identity.AccountID, "phone", "masque-h3-datagram", "10.66.0.2", "")
+	session.AddUploaded(512, 2)
+	session.AddDownloaded(1024, 4)
+	handler := adminHandlerWithUsage(http.NotFoundHandler(), registry, usageStore, testAdminToken)
+
+	response := adminRequest(t, handler, http.MethodGet, "/api/clients", "")
+	var payload struct {
+		Clients []clientSummary `json:"clients"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	client := payload.Clients[0]
+	if client.ActiveSessions != 1 || client.BytesUploaded != 512 || client.BytesDownloaded != 1024 {
+		t.Fatalf("client usage = %#v", client)
+	}
+	if len(client.Devices) != 1 || client.Devices[0].Transport != "masque-h3-datagram" ||
+		client.Devices[0].AssignedAddress != "10.66.0.2" {
+		t.Fatalf("device usage = %#v", client.Devices)
+	}
+	session.Close()
 }
 
 func adminRequest(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {

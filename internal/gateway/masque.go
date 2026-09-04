@@ -12,6 +12,7 @@ import (
 
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
+	"github.com/huangyingting/porta/internal/usage"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -48,8 +49,6 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	defer c.Pool.Release(lease)
 	session, sessionCtx := c.Router.Register(r.Context(), lease.Address)
 	defer session.Close()
-	c.Metrics.connected()
-	defer c.Metrics.disconnected()
 
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 	w.Header().Set("Cache-Control", "no-store")
@@ -91,15 +90,26 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	} else {
 		flush(w)
 	}
+	usageSession := c.Usage.Begin(
+		"",
+		identity.AccountID,
+		clientID,
+		transportName,
+		lease.Address.String(),
+		"",
+	)
+	defer usageSession.Close()
+	c.Metrics.connected()
+	defer c.Metrics.disconnected()
 	c.Logger.Info("tunnel connected", "client_id", clientID, "account_id", identity.AccountID, "address", lease.Address, "transport", transportName, "remote", remoteHost)
 	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
 
 	encoder := masque.NewEncoder(writer)
 	var assigned atomic.Bool
 	inboundDone := make(chan error, 2)
-	go c.readMasqueCapsules(sessionCtx, reader, encoder, w, lease, &assigned, inboundDone)
+	go c.readMasqueCapsules(sessionCtx, reader, encoder, w, lease, &assigned, usageSession, inboundDone)
 	if useDatagrams {
-		go c.readMasqueDatagrams(sessionCtx, stream, lease, &assigned, inboundDone)
+		go c.readMasqueDatagrams(sessionCtx, stream, lease, &assigned, usageSession, inboundDone)
 	}
 
 	for {
@@ -119,6 +129,7 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 				flush(w)
 			}
 			c.Metrics.sentToClient()
+			usageSession.AddDownloaded(uint64(len(packet)), 1)
 		case err := <-inboundDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				c.Logger.Warn("MASQUE receive stopped", "client_id", clientID, "error", err)
@@ -137,6 +148,7 @@ func (c HandlerConfig) readMasqueCapsules(
 	w http.ResponseWriter,
 	lease Lease,
 	assigned *atomic.Bool,
+	usageSession *usage.Session,
 	done chan<- error,
 ) {
 	decoder := masque.NewDecoder(reader)
@@ -168,6 +180,7 @@ func (c HandlerConfig) readMasqueCapsules(
 				done <- err
 				return
 			}
+			usageSession.AddUploaded(uint64(len(packet)), 1)
 		case masque.CapsuleAddressAssign:
 			if _, err := masque.DecodeAddressAssign(capsule.Value); err != nil {
 				done <- err
@@ -189,6 +202,7 @@ func (c HandlerConfig) readMasqueDatagrams(
 	stream *http3.Stream,
 	lease Lease,
 	assigned *atomic.Bool,
+	usageSession *usage.Session,
 	done chan<- error,
 ) {
 	for {
@@ -212,6 +226,7 @@ func (c HandlerConfig) readMasqueDatagrams(
 			done <- err
 			return
 		}
+		usageSession.AddUploaded(uint64(len(packet)), 1)
 	}
 }
 

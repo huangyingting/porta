@@ -14,7 +14,7 @@ const clientDownloadPrefix = "/download/"
 var clientDownloadTypes = map[string]string{
 	"porta-client-linux-amd64":       "application/octet-stream",
 	"porta-client-linux-arm64":       "application/octet-stream",
-	"porta-client-windows-amd64.exe": "application/vnd.microsoft.portable-executable",
+	"porta-client-windows-amd64.zip": "application/zip",
 	"porta-android-arm64-v8a.apk":    "application/vnd.android.package-archive",
 	"porta-android-armeabi-v7a.apk":  "application/vnd.android.package-archive",
 	"porta-android-x86_64.apk":       "application/vnd.android.package-archive",

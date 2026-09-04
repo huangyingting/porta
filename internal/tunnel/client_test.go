@@ -166,6 +166,9 @@ func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = connection.Close() })
+	if connection.RemoteAddr == nil {
+		t.Fatal("tunnel did not expose its remote address")
+	}
 
 	clientPacket := ipv4Packet(connection.Lease.Address.Addr().As4(), [4]byte{1, 1, 1, 1})
 	if err := connection.Send(clientPacket); err != nil {

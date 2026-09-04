@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/usage"
 )
 
 const clientRegistryVersion = 1
@@ -55,13 +56,38 @@ type registryState struct {
 }
 
 type clientSummary struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	MaxDevices  int            `json:"max_devices"`
-	Enabled     bool           `json:"enabled"`
-	CreatedAt   time.Time      `json:"created_at"`
-	DeviceCount int            `json:"device_count"`
-	Devices     []deviceRecord `json:"devices"`
+	ID                string          `json:"id"`
+	Name              string          `json:"name"`
+	MaxDevices        int             `json:"max_devices"`
+	Enabled           bool            `json:"enabled"`
+	CreatedAt         time.Time       `json:"created_at"`
+	DeviceCount       int             `json:"device_count"`
+	ActiveSessions    int             `json:"active_sessions"`
+	ConnectionsTotal  uint64          `json:"connections_total"`
+	BytesUploaded     uint64          `json:"bytes_uploaded"`
+	BytesDownloaded   uint64          `json:"bytes_downloaded"`
+	PacketsUploaded   uint64          `json:"packets_uploaded"`
+	PacketsDownloaded uint64          `json:"packets_downloaded"`
+	LastConnected     *time.Time      `json:"last_connected,omitempty"`
+	LastDisconnected  *time.Time      `json:"last_disconnected,omitempty"`
+	Devices           []deviceSummary `json:"devices"`
+}
+
+type deviceSummary struct {
+	ID                string     `json:"id"`
+	FirstSeen         time.Time  `json:"first_seen"`
+	LastSeen          time.Time  `json:"last_seen"`
+	ActiveSessions    int        `json:"active_sessions"`
+	ConnectionsTotal  uint64     `json:"connections_total"`
+	BytesUploaded     uint64     `json:"bytes_uploaded"`
+	BytesDownloaded   uint64     `json:"bytes_downloaded"`
+	PacketsUploaded   uint64     `json:"packets_uploaded"`
+	PacketsDownloaded uint64     `json:"packets_downloaded"`
+	LastConnected     *time.Time `json:"last_connected,omitempty"`
+	LastDisconnected  *time.Time `json:"last_disconnected,omitempty"`
+	Transport         string     `json:"transport,omitempty"`
+	AssignedAddress   string     `json:"assigned_address,omitempty"`
+	Target            string     `json:"target,omitempty"`
 }
 
 func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
@@ -159,14 +185,18 @@ func (r *clientRegistry) Authenticate(token, deviceID string) (gateway.ClientIde
 	return gateway.ClientIdentity{}, errClientUnauthorized
 }
 
-func (r *clientRegistry) List() []clientSummary {
+func (r *clientRegistry) List(usageSnapshot ...usage.Snapshot) []clientSummary {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	var snapshot usage.Snapshot
+	if len(usageSnapshot) > 0 {
+		snapshot = usageSnapshot[0]
+	}
 	summaries := make([]clientSummary, 0, len(r.clients))
 	for _, client := range r.clients {
 		devices := append([]deviceRecord(nil), client.Devices...)
 		sort.Slice(devices, func(i, j int) bool { return devices[i].LastSeen.After(devices[j].LastSeen) })
-		summaries = append(summaries, summarizeClient(client, devices))
+		summaries = append(summaries, summarizeClient(client, devices, snapshot))
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return strings.ToLower(summaries[i].Name) < strings.ToLower(summaries[j].Name)
@@ -202,7 +232,7 @@ func (r *clientRegistry) Create(name string, maxDevices int) (clientSummary, str
 		r.clients = r.clients[:len(r.clients)-1]
 		return clientSummary{}, "", err
 	}
-	return summarizeClient(client, nil), token, nil
+	return summarizeClient(client, nil, usage.Snapshot{}), token, nil
 }
 
 func (r *clientRegistry) Update(id, name string, maxDevices int, enabled bool) (clientSummary, error) {
@@ -227,7 +257,7 @@ func (r *clientRegistry) Update(id, name string, maxDevices int, enabled bool) (
 		*client = previous
 		return clientSummary{}, err
 	}
-	return summarizeClient(*client, append([]deviceRecord(nil), client.Devices...)), nil
+	return summarizeClient(*client, append([]deviceRecord(nil), client.Devices...), usage.Snapshot{}), nil
 }
 
 func (r *clientRegistry) RotateToken(id string) (string, error) {
@@ -381,19 +411,48 @@ func validateClientInput(name string, maxDevices int) (string, error) {
 	return name, nil
 }
 
-func summarizeClient(client clientRecord, devices []deviceRecord) clientSummary {
+func summarizeClient(client clientRecord, devices []deviceRecord, snapshot usage.Snapshot) clientSummary {
 	if devices == nil {
 		devices = []deviceRecord{}
 	}
-	return clientSummary{
-		ID:          client.ID,
-		Name:        client.Name,
-		MaxDevices:  client.MaxDevices,
-		Enabled:     client.Enabled,
-		CreatedAt:   client.CreatedAt,
-		DeviceCount: len(devices),
-		Devices:     devices,
+	clientUsage := snapshot.Clients[client.ID]
+	summary := clientSummary{
+		ID:                client.ID,
+		Name:              client.Name,
+		MaxDevices:        client.MaxDevices,
+		Enabled:           client.Enabled,
+		CreatedAt:         client.CreatedAt,
+		DeviceCount:       len(devices),
+		ActiveSessions:    clientUsage.ActiveSessions,
+		ConnectionsTotal:  clientUsage.ConnectionsTotal,
+		BytesUploaded:     clientUsage.BytesUploaded,
+		BytesDownloaded:   clientUsage.BytesDownloaded,
+		PacketsUploaded:   clientUsage.PacketsUploaded,
+		PacketsDownloaded: clientUsage.PacketsDownloaded,
+		LastConnected:     clientUsage.LastConnected,
+		LastDisconnected:  clientUsage.LastDisconnected,
+		Devices:           make([]deviceSummary, 0, len(devices)),
 	}
+	for _, device := range devices {
+		deviceUsage := usage.Device(snapshot, client.ID, device.ID)
+		summary.Devices = append(summary.Devices, deviceSummary{
+			ID:                device.ID,
+			FirstSeen:         device.FirstSeen,
+			LastSeen:          device.LastSeen,
+			ActiveSessions:    deviceUsage.ActiveSessions,
+			ConnectionsTotal:  deviceUsage.ConnectionsTotal,
+			BytesUploaded:     deviceUsage.BytesUploaded,
+			BytesDownloaded:   deviceUsage.BytesDownloaded,
+			PacketsUploaded:   deviceUsage.PacketsUploaded,
+			PacketsDownloaded: deviceUsage.PacketsDownloaded,
+			LastConnected:     deviceUsage.LastConnected,
+			LastDisconnected:  deviceUsage.LastDisconnected,
+			Transport:         deviceUsage.Transport,
+			AssignedAddress:   deviceUsage.AssignedAddress,
+			Target:            deviceUsage.Target,
+		})
+	}
+	return summary
 }
 
 func registryIdentity(client clientRecord, deviceID string) gateway.ClientIdentity {

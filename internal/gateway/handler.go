@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/protocol"
+	"github.com/huangyingting/porta/internal/usage"
 )
 
 const TunnelPath = "/v1/tunnel"
@@ -52,6 +53,7 @@ type HandlerConfig struct {
 	AuthorizeClient   AuthorizeClientFunc
 	MetricsToken      string
 	Metrics           *Metrics
+	Usage             *usage.Store
 	Pool              *Pool
 	Router            *Router
 	DNS               string
@@ -71,6 +73,9 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 	}
 	if config.Metrics == nil {
 		config.Metrics = &Metrics{}
+	}
+	if config.Usage == nil {
+		config.Usage, _ = usage.Open("", config.Logger)
 	}
 	if config.Pool == nil || config.Router == nil {
 		return nil, errors.New("gateway pool and router are required")
@@ -162,6 +167,15 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer session.Close()
+	usageSession := c.Usage.Begin(
+		"vpn:"+identity.AccountID+":"+clientID+":"+lanes.sessionID,
+		identity.AccountID,
+		clientID,
+		r.Proto,
+		lease.Address.String(),
+		"",
+	)
+	defer usageSession.Close()
 	c.Metrics.connected()
 	defer c.Metrics.disconnected()
 	remoteHost := clientAddress(r, c.TrustProxyHeaders)
@@ -226,6 +240,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			c.Metrics.receivedFromClient()
+			usageSession.AddUploaded(uint64(len(packet)), 1)
 		}
 	}()
 
@@ -238,6 +253,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			c.Metrics.sentToClient()
+			usageSession.AddDownloaded(uint64(len(packet)), 1)
 			flush(w)
 		case <-keepalive.C:
 			if err := encoder.WritePacket(nil); err != nil {

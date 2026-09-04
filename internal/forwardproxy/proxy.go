@@ -12,7 +12,10 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/huangyingting/porta/internal/usage"
 )
 
 const (
@@ -35,6 +38,7 @@ type Config struct {
 	Logger         *slog.Logger
 	Camouflage     bool
 	MaxConnections int
+	Usage          *usage.Store
 }
 
 type Handler struct {
@@ -43,7 +47,7 @@ type Handler struct {
 	logger     *slog.Logger
 	camouflage bool
 	slots      chan struct{}
-	transport  http.RoundTripper
+	usage      *usage.Store
 	dial       func(context.Context, string, string) (net.Conn, error)
 }
 
@@ -60,24 +64,18 @@ func New(config Config) (*Handler, error) {
 	if config.MaxConnections <= 0 {
 		config.MaxConnections = defaultMaxConnections
 	}
+	if config.Usage == nil {
+		config.Usage, _ = usage.Open("", config.Logger)
+	}
 	handler := &Handler{
 		next:       config.Next,
 		authorize:  config.Authorize,
 		logger:     config.Logger,
 		camouflage: config.Camouflage,
 		slots:      make(chan struct{}, config.MaxConnections),
+		usage:      config.Usage,
 	}
 	handler.dial = handler.dialPublic
-	handler.transport = &http.Transport{
-		Proxy:                 nil,
-		DialContext:           handler.dial,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       60 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: time.Second,
-	}
 	return handler, nil
 }
 
@@ -100,6 +98,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
+	if r.Method != http.MethodConnect {
+		http.Error(w, "HTTPS CONNECT is required", http.StatusForbidden)
+		return
+	}
 	select {
 	case h.slots <- struct{}{}:
 		defer func() { <-h.slots }()
@@ -117,11 +119,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"target", target,
 		"remote", remoteHost(r.RemoteAddr),
 	)
-	if r.Method == http.MethodConnect {
-		h.serveConnect(w, r, target)
-	} else {
-		h.serveHTTP(w, r)
-	}
+	h.serveConnect(w, r, target, identity)
 	h.logger.Info("forward proxy request complete",
 		"account_id", identity.AccountID,
 		"device_id", identity.DeviceID,
@@ -148,7 +146,7 @@ func (h *Handler) authenticate(header string) (Identity, bool) {
 	return identity, err == nil
 }
 
-func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target string) {
+func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target string, identity Identity) {
 	if _, _, err := splitTarget(target, ""); err != nil {
 		http.Error(w, "invalid proxy target", http.StatusBadRequest)
 		return
@@ -159,7 +157,10 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target st
 		return
 	}
 	defer upstream.Close()
+	usageSession := h.usage.Begin("", identity.AccountID, identity.DeviceID, "https-connect", "", target)
+	defer usageSession.Close()
 	upstream = &idleConn{Conn: upstream, timeout: tunnelIdleTimeout}
+	upstream = &meteredConn{Conn: upstream, session: usageSession}
 
 	if r.ProtoMajor == 1 {
 		h.serveHijackedConnect(r.Context(), w, upstream)
@@ -192,51 +193,12 @@ func (h *Handler) serveHijackedConnect(ctx context.Context, w http.ResponseWrite
 	copyStreamTunnel(ctx, upstream, buffered.Reader, client)
 }
 
-func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
-		http.Error(w, "unsupported proxy scheme", http.StatusBadRequest)
-		return
-	}
-	if r.URL.User != nil {
-		http.Error(w, "proxy target credentials are not supported", http.StatusBadRequest)
-		return
-	}
-	defaultPort := "80"
-	if r.URL.Scheme == "https" {
-		defaultPort = "443"
-	}
-	if _, _, err := splitTarget(r.URL.Host, defaultPort); err != nil {
-		http.Error(w, "invalid proxy target", http.StatusBadRequest)
-		return
-	}
-
-	outbound := r.Clone(r.Context())
-	outbound.RequestURI = ""
-	outbound.Host = outbound.URL.Host
-	removeHopHeaders(outbound.Header)
-	outbound.Header.Del("Forwarded")
-	outbound.Header.Del("X-Forwarded-For")
-	outbound.Header.Del("X-Forwarded-Host")
-	outbound.Header.Del("X-Forwarded-Proto")
-
-	response, err := h.transport.RoundTrip(outbound)
-	if err != nil {
-		writeProxyError(w, err)
-		return
-	}
-	defer response.Body.Close()
-	removeHopHeaders(response.Header)
-	copyHeaders(w.Header(), response.Header)
-	w.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(w, response.Body)
-}
-
 func (h *Handler) dialPublic(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := splitTarget(address, "")
 	if err != nil {
 		return nil, err
 	}
-	if port != "80" && port != "443" {
+	if port != "443" {
 		return nil, fmt.Errorf("%w: port %s", errDestinationDenied, port)
 	}
 	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -411,6 +373,35 @@ type idleConn struct {
 	timeout time.Duration
 }
 
+type meteredConn struct {
+	net.Conn
+	session *usage.Session
+	once    sync.Once
+}
+
+func (c *meteredConn) Read(data []byte) (int, error) {
+	n, err := c.Conn.Read(data)
+	if n > 0 {
+		c.session.AddDownloaded(uint64(n), 0)
+	}
+	return n, err
+}
+
+func (c *meteredConn) Write(data []byte) (int, error) {
+	n, err := c.Conn.Write(data)
+	if n > 0 {
+		c.session.AddUploaded(uint64(n), 0)
+	}
+	return n, err
+}
+
+func (c *meteredConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
+}
+
 func (c *idleConn) Read(data []byte) (int, error) {
 	_ = c.Conn.SetDeadline(time.Now().Add(c.timeout))
 	return c.Conn.Read(data)
@@ -434,35 +425,6 @@ func (w flushWriter) Write(data []byte) (int, error) {
 		flusher.Flush()
 	}
 	return n, err
-}
-
-func removeHopHeaders(header http.Header) {
-	for _, value := range header.Values("Connection") {
-		for _, name := range strings.Split(value, ",") {
-			header.Del(strings.TrimSpace(name))
-		}
-	}
-	for _, name := range []string{
-		"Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"Proxy-Connection",
-		"TE",
-		"Trailer",
-		"Transfer-Encoding",
-		"Upgrade",
-	} {
-		header.Del(name)
-	}
-}
-
-func copyHeaders(destination, source http.Header) {
-	for name, values := range source {
-		for _, value := range values {
-			destination.Add(name, value)
-		}
-	}
 }
 
 func writeProxyError(w http.ResponseWriter, err error) {

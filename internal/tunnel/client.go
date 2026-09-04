@@ -40,7 +40,8 @@ type Lease struct {
 }
 
 type Conn struct {
-	Lease Lease
+	Lease      Lease
+	RemoteAddr net.Addr
 
 	sendPacket    func([]byte) error
 	receivePacket func() ([]byte, error)

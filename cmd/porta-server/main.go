@@ -20,6 +20,7 @@ import (
 	"github.com/huangyingting/porta/internal/device"
 	"github.com/huangyingting/porta/internal/forwardproxy"
 	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/usage"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
@@ -79,6 +80,7 @@ func run() error {
 	clientDownloads := flag.String("client-downloads", "", "absolute directory containing published client release artifacts (empty disables downloads)")
 	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for the admin UI, health, readiness, and metrics (empty disables)")
 	clientRegistryPath := flag.String("client-registry", "clients.json", "persistent client registry path")
+	usageStatePath := flag.String("usage-state", "", "persistent client usage state path (defaults beside the client registry)")
 	interfaceName := flag.String("interface", "porta0", "Linux TUN interface name")
 	poolCIDR := flag.String("pool", "10.66.0.0/24", "IPv4 client address pool")
 	leaseState := flag.String("lease-state", "", "optional persistent client lease state file")
@@ -136,6 +138,13 @@ func run() error {
 		logHandler = slog.NewTextHandler(os.Stderr, nil)
 	}
 	logger := slog.New(logHandler)
+	if *usageStatePath == "" {
+		*usageStatePath = filepath.Join(filepath.Dir(*clientRegistryPath), "usage.json")
+	}
+	usageStore, err := usage.Open(*usageStatePath, logger)
+	if err != nil {
+		return err
+	}
 
 	var (
 		tlsConfig          *tls.Config
@@ -183,6 +192,7 @@ func run() error {
 		AuthorizeClient:   registry.Authenticate,
 		MetricsToken:      metricsToken,
 		Metrics:           metrics,
+		Usage:             usageStore,
 		Pool:              pool,
 		Router:            router,
 		DNS:               *dns,
@@ -208,6 +218,7 @@ func run() error {
 			},
 			Logger:     logger,
 			Camouflage: true,
+			Usage:      usageStore,
 		})
 		if err != nil {
 			return err
@@ -246,6 +257,14 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	usageCtx, stopUsage := context.WithCancel(context.Background())
+	defer stopUsage()
+	usageDone := make(chan struct{})
+	go func() {
+		defer close(usageDone)
+		usageStore.Run(usageCtx, 30*time.Second)
+	}()
+	tcpServer.BaseContext = func(net.Listener) context.Context { return ctx }
 	var acmeHTTPServer *http.Server
 	var adminServer *http.Server
 	if certificateManager != nil && *acmeHTTPAddress != "" {
@@ -259,7 +278,7 @@ func run() error {
 	if *adminAddress != "" {
 		adminServer = &http.Server{
 			Addr:              *adminAddress,
-			Handler:           adminHandler(handler, registry, adminToken),
+			Handler:           adminHandlerWithUsage(handler, registry, usageStore, adminToken),
 			ReadHeaderTimeout: 5 * time.Second,
 			IdleTimeout:       30 * time.Second,
 		}
@@ -297,14 +316,15 @@ func run() error {
 	}
 	logger.Info("gateway ready", attributes...)
 
+	var runErr error
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			stop()
-			return err
+			runErr = err
 		}
 	}
+	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -318,7 +338,9 @@ func run() error {
 	if adminServer != nil {
 		_ = adminServer.Shutdown(shutdownCtx)
 	}
-	return nil
+	stopUsage()
+	<-usageDone
+	return runErr
 }
 
 func serverTLSConfig(acmeDomain, acmeEmail, acmeCache string) (*tls.Config, *autocert.Manager, error) {

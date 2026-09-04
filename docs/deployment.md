@@ -81,7 +81,7 @@ sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --port 8443
 ```
 
-Add `--forward-proxy` to expose Porta's authenticated HTTP/HTTPS forward proxy
+Add `--forward-proxy` to expose Porta's authenticated HTTPS CONNECT proxy
 on the same TLS port. It remains disabled unless explicitly requested.
 
 The default deployment:
@@ -126,7 +126,7 @@ Porta server:
 ```text
 porta-client-linux-amd64
 porta-client-linux-arm64
-porta-client-windows-amd64.exe
+porta-client-windows-amd64.zip
 porta-android-arm64-v8a.apk
 porta-android-armeabi-v7a.apk
 porta-android-x86_64.apk
@@ -156,8 +156,9 @@ curl --proxy https://vpn.example.com:8443 \
   https://example.com/
 ```
 
-Porta supports absolute-form HTTP requests and HTTPS `CONNECT`, including
-CONNECT over HTTP/2. It permits only public destinations on ports 80 and 443.
+Porta supports HTTPS `CONNECT`, including CONNECT over HTTP/2. Ordinary HTTP
+proxy requests are rejected, and only public destinations on port 443 are
+permitted.
 DNS results are checked before dialing, and any private, loopback, link-local,
 metadata, multicast, documentation, or benchmark address rejects the request.
 Proxy credentials and client-supplied forwarding identity headers are never
@@ -192,9 +193,13 @@ ssh -L 9090:127.0.0.1:9090 user@vpn.example.com
 sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 ```
 
-Then browse to `http://127.0.0.1:9090` and enter the admin token. The UI can
-create, edit, disable, and delete clients; rotate tokens; set device limits;
-and forget enrolled devices to free a slot. A device that still has the shared
+Then browse to `http://127.0.0.1:9090` and enter the admin token. The compact
+operations table shows live sessions, persisted traffic and connection totals,
+transport/address details, recent activity, capacity pressure, and stale or
+unused clients. It can create, edit, disable, and delete clients; rotate tokens;
+set device limits; and forget enrolled devices to free a slot. Usage is
+checkpointed every 30 seconds to `/var/lib/porta/usage.json` by release
+deployments. A device that still has the shared
 client token can enroll again. Tokens are shown only when created or rotated.
 
 For direct manual server runs, pass `--landing-page=false` to replace the landing

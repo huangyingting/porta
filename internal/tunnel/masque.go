@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -29,6 +30,7 @@ type masqueClient struct {
 	encoder    *masque.Encoder
 	decoder    *masque.Decoder
 	lease      Lease
+	remoteAddr net.Addr
 	leaseReady chan netip.Prefix
 	packets    chan []byte
 	errors     chan error
@@ -104,6 +106,7 @@ func dialMasque(ctx context.Context, config Config) (*Conn, error) {
 
 	return &Conn{
 		Lease:         client.lease,
+		RemoteAddr:    client.remoteAddr,
 		sendPacket:    client.send,
 		receivePacket: client.receive,
 		closePacket:   client.close,
@@ -122,6 +125,14 @@ func dialMasqueHTTP2(
 		TLSClientConfig: tlsConfig,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     10 * time.Second,
+	}
+	var remoteAddr net.Addr
+	transport.DialTLSContext = func(ctx context.Context, network, address string, config *tls.Config) (net.Conn, error) {
+		connection, err := (&tls.Dialer{Config: config}).DialContext(ctx, network, address)
+		if err == nil {
+			remoteAddr = connection.RemoteAddr()
+		}
+		return connection, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodConnect, endpoint.String(), reader)
 	if err != nil {
@@ -148,6 +159,7 @@ func dialMasqueHTTP2(
 	}
 
 	client := newMasqueClient(ctx, cancel, masque.NewEncoder(writer), masque.NewDecoder(response.Body), response.Header)
+	client.remoteAddr = remoteAddr
 	client.closeTransport = func() error {
 		_ = writer.Close()
 		_ = response.Body.Close()
@@ -270,6 +282,7 @@ func dialMasqueHTTP3(
 	}
 
 	client := newMasqueClient(ctx, cancel, masque.NewEncoder(stream), masque.NewDecoder(stream), response.Header)
+	client.remoteAddr = connection.RemoteAddr()
 	if settings.EnableDatagrams {
 		client.sendDatagram = stream.SendDatagram
 		client.receiveDatagram = stream.ReceiveDatagram

@@ -40,7 +40,8 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-client-linux-$arch" ./cmd/porta-client
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-keygen-linux-$arch" ./cmd/porta-keygen
           done
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/porta-client-windows-amd64.exe ./cmd/porta-client
+          make build-windows
+          cp bin/porta-client-windows-amd64.zip dist/
       - name: Package deployment tools
         run: |
           mkdir -p dist/deploy-bundle/porta/scripts dist/deploy-bundle/porta/deploy

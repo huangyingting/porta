@@ -23,7 +23,7 @@ listener. Read
 - Client accounts with hashed tokens and configurable multi-device limits
 - Authenticated Prometheus metrics
 - Compact neutral Porta studio page for ordinary public HTTP requests
-- Optional authenticated HTTP/HTTPS forward proxy on the same TLS listener
+- Optional authenticated HTTPS CONNECT proxy on the same TLS listener
 - Windows Wintun client plus explicit route setup/teardown scripts
 - Android native HTTP/3 MASQUE `VpnService` client with four-lane HTTP/2 fallback
 - Real bidirectional HTTP/2 Extended CONNECT and HTTP/3 Datagram tests
@@ -129,8 +129,8 @@ curl --proxy https://vpn.example.com:8443 \
   https://example.com/
 ```
 
-Both ordinary HTTP forwarding and HTTPS `CONNECT` are supported, including
-HTTP/2 CONNECT streams. Only destination ports 80 and 443 are allowed.
+Only HTTPS `CONNECT` is supported, including HTTP/2 CONNECT streams. Porta
+rejects ordinary HTTP proxy requests and every destination port except 443.
 Loopback, private, link-local, metadata, multicast, documentation, benchmark,
 and other non-public addresses are rejected after DNS resolution. Valid
 preemptive Basic credentials activate the proxy. Missing or invalid credentials
@@ -150,7 +150,7 @@ The same release publishes direct client downloads:
 
 - Linux x86-64: `porta-client-linux-amd64`
 - Linux ARM64: `porta-client-linux-arm64`
-- Windows x86-64: `porta-client-windows-amd64.exe`
+- Windows x86-64: `porta-client-windows-amd64.zip` (desktop UI, CLI, and elevated network helper)
 - Android: `porta-android-arm64-v8a.apk`, `porta-android-armeabi-v7a.apk`, or
   `porta-android-x86_64.apk`
 
@@ -160,7 +160,7 @@ do not need GitHub access:
 ```text
 https://vpn.example.com/download/porta-client-linux-amd64
 https://vpn.example.com/download/porta-client-linux-arm64
-https://vpn.example.com/download/porta-client-windows-amd64.exe
+https://vpn.example.com/download/porta-client-windows-amd64.zip
 https://vpn.example.com/download/porta-android-arm64-v8a.apk
 https://vpn.example.com/download/porta-android-armeabi-v7a.apk
 https://vpn.example.com/download/porta-android-x86_64.apk
@@ -193,14 +193,20 @@ sudo --preserve-env=PORTA_TOKEN,PORTA_ADMIN_TOKEN,PORTA_METRICS_TOKEN ./bin/port
   --acme-cache /var/lib/porta/acme \
   --acme-http-listen :80 \
   --client-registry /var/lib/porta/clients.json \
+  --usage-state /var/lib/porta/usage.json \
   --interface porta0 \
   --pool 10.66.0.0/24 \
   --dns 1.1.1.1 \
   --mtu 1100
 ```
 
-The loopback admin UI manages client accounts, tokens, device limits, enabled
-state, and enrolled devices without restarting Porta. Tokens are generated with
+The loopback admin UI is a compact operational console for client accounts and
+devices. It shows live logical sessions, persisted upload/download totals,
+connection counts, current transport and assigned address, recent activity,
+capacity and stale-account warnings, with search, filters, sorting, and
+expandable device diagnostics. It also manages tokens, device limits, enabled
+state, and enrolled devices without restarting Porta. Usage is checkpointed to
+`usage.json` beside the client registry by default. Tokens are generated with
 32 random bytes, stored only as SHA-256 hashes, and displayed once when created
 or rotated. One client token may be used by several device IDs up to that
 client's configured limit.
@@ -407,13 +413,26 @@ Run Porta directly when HTTP/3 or standards-based MASQUE transport is required.
 
 ## Windows client
 
-Download the signed `wintun.dll` for the target architecture from the official
-[Wintun site](https://www.wintun.net/) and place it next to the client
-executable. Run the client in an elevated PowerShell session:
+The Windows release ZIP includes the official signed AMD64 `wintun.dll` from
+[Wintun](https://www.wintun.net/) beside `porta.exe` and `porta-cli.exe`. The
+build verifies the pinned upstream archive checksum before
+packaging it.
+
+Launch `porta.exe` for the default desktop experience. It stores multiple
+profiles under the current Windows account, protects client tokens with DPAPI,
+shows connection state, assigned address, duration, traffic totals, reconnect
+activity, and a bounded diagnostic log. Windows requests administrator access
+when the desktop client starts because Wintun adapter ownership and route
+changes require elevation. Route ownership state is recorded so disconnect or
+a later connection removes only Porta-created routes and can clean up an
+interrupted process.
+
+Use `porta-cli.exe` for terminal automation. The CLI retains explicit network
+configuration so scripts and managed environments remain in control:
 
 ```powershell
 $env:PORTA_TOKEN = "replace-with-the-same-secret"
-./porta-client-windows-amd64.exe `
+./porta-cli.exe `
   --server https://vpn.example.com:8443 `
   --transport h3 `
   --interface Porta `
@@ -425,7 +444,7 @@ SHA-256 thumbprint instead of disabling TLS verification. The value may contain
 colons or hyphens and may start with `sha256:`:
 
 ```powershell
-./porta-client-windows-amd64.exe `
+./porta-cli.exe `
   --server https://vpn.example.com:8443 `
   --thumbprint "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" `
   --client-id my-windows-pc
@@ -439,7 +458,7 @@ Do not pin an automatically managed Let's Encrypt leaf certificate: its
 thumbprint changes on renewal. Let the client validate those certificates
 against its normal system trust store.
 
-The client prints its RFC 9484 assigned address, for example `10.66.0.2/32`.
+The CLI prints its RFC 9484 assigned address, for example `10.66.0.2/32`.
 While it is still running, use another elevated PowerShell session to install
 explicit routes. `ServerIp` must be the gateway's resolved public IPv4 address;
 the script preserves a host route to it before adding VPN routes:
@@ -460,10 +479,10 @@ and DNS settings with:
 ./scripts/windows-down.ps1 -InterfaceAlias Porta
 ```
 
-Windows route changes remain explicit so operators can preserve access to the
-gateway and apply organization-specific routing policy. Deployments requiring
-a kill switch should enforce it with Windows Filtering Platform or managed
-firewall policy.
+CLI route changes remain explicit so operators can apply organization-specific
+routing policy. The desktop UI uses the bundled elevated helper for the same
+operations. Deployments requiring a kill switch should enforce it with Windows
+Filtering Platform or managed firewall policy.
 
 ## Android client
 

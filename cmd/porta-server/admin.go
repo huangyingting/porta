@@ -9,11 +9,14 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/huangyingting/porta/internal/usage"
 )
 
 type adminAPI struct {
 	next       http.Handler
 	registry   *clientRegistry
+	usage      *usage.Store
 	adminToken string
 }
 
@@ -24,7 +27,12 @@ type clientInput struct {
 }
 
 func adminHandler(next http.Handler, registry *clientRegistry, adminToken string) http.Handler {
-	return &adminAPI{next: next, registry: registry, adminToken: adminToken}
+	usageStore, _ := usage.Open("", nil)
+	return adminHandlerWithUsage(next, registry, usageStore, adminToken)
+}
+
+func adminHandlerWithUsage(next http.Handler, registry *clientRegistry, usageStore *usage.Store, adminToken string) http.Handler {
+	return &adminAPI{next: next, registry: registry, usage: usageStore, adminToken: adminToken}
 }
 
 func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +70,7 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/api/clients" && r.Method == http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"clients": a.registry.List()})
+		writeJSON(w, http.StatusOK, map[string]any{"clients": a.registry.List(a.usage.Snapshot())})
 	case r.URL.Path == "/api/clients" && r.Method == http.MethodPost:
 		var input clientInput
 		if err := decodeJSON(r, &input); err != nil {
@@ -109,6 +117,7 @@ func (a *adminAPI) serveClientAction(w http.ResponseWriter, r *http.Request) {
 			a.writeError(w, err)
 			return
 		}
+		a.usage.DeleteClient(clientID)
 		w.WriteHeader(http.StatusNoContent)
 	case len(parts) == 2 && parts[1] == "token" && r.Method == http.MethodPost:
 		token, err := a.registry.RotateToken(clientID)
@@ -127,6 +136,7 @@ func (a *adminAPI) serveClientAction(w http.ResponseWriter, r *http.Request) {
 			a.writeError(w, err)
 			return
 		}
+		a.usage.DeleteDevice(clientID, deviceID)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.NotFound(w, r)

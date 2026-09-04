@@ -24,6 +24,29 @@ jobs:
       - run: make build
       - run: make build-windows
 
+  windows-ui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test Windows packages
+        run: go test ./internal/clientapp ./internal/clientprofile ./cmd/porta-client
+      - name: Build Windows applications
+        shell: pwsh
+        run: |
+          go build -trimpath -ldflags="-s -w -H=windowsgui" -o porta.exe ./cmd/porta-windows
+          go build -trimpath -ldflags="-s -w" -o porta-cli.exe ./cmd/porta-client
+      - name: Smoke test desktop startup
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\porta.exe -PassThru
+          Start-Sleep -Seconds 3
+          if ($process.HasExited) { throw "Porta desktop client exited during startup" }
+          Stop-Process -Id $process.Id
+
   android:
     runs-on: ubuntu-latest
     steps:

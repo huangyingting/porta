@@ -2,15 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"regexp"
@@ -18,8 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/huangyingting/porta/internal/device"
-	"github.com/huangyingting/porta/internal/protocol"
+	"github.com/huangyingting/porta/internal/clientapp"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
@@ -49,248 +43,37 @@ func run() error {
 	if token == "" {
 		token = *tokenFlag
 	}
-	if *serverURL == "" || token == "" {
-		return errors.New("--server and PORTA_TOKEN are required")
-	}
-	tlsConfig, err := clientTLSConfig(*caPath, *thumbprint, *insecure)
-	if err != nil {
-		return err
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	config := tunnel.Config{
-		URL:       *serverURL,
-		Token:     token,
-		ClientID:  *clientID,
-		Transport: tunnel.Transport(*transportName),
-		TLSConfig: tlsConfig,
-		Timeout:   15 * time.Second,
-	}
-	connection, err := tunnel.Dial(ctx, config)
-	if err != nil {
-		return err
-	}
-
-	tunDevice, err := device.OpenNative(*interfaceName, connection.Lease.MTU)
-	if err != nil {
-		_ = connection.Close()
-		return err
-	}
-	defer tunDevice.Close()
-	attributes := []any{
-		"interface", tunDevice.Name(),
-		"address", connection.Lease.Address,
-		"dns", connection.Lease.DNS,
-		"mtu", connection.Lease.MTU,
-		"transport", *transportName,
-		"protocol", "masque",
-	}
-	if connection.Lease.Gateway.IsValid() {
-		attributes = append(attributes, "gateway", connection.Lease.Gateway)
-	}
-	slog.Info("tunnel ready", attributes...)
-	if runtime.GOOS == "windows" {
-		slog.Info("configure routes in another elevated terminal with scripts/windows-up.ps1")
-	} else {
-		slog.Info("configure the interface and routes explicitly; see README.md")
-	}
-
-	outbound := make(chan []byte, 256)
-	deviceErrors := make(chan error, 1)
-	go func() {
-		for {
-			packet, err := tunDevice.ReadPacket(ctx)
-			if err != nil {
-				deviceErrors <- err
-				return
-			}
-			if _, err := protocol.ParseIPv4(packet); err != nil {
-				continue
-			}
-			select {
-			case outbound <- packet:
-			case <-ctx.Done():
-				return
-			}
+	return clientapp.Run(ctx, clientapp.Config{
+		ServerURL:         *serverURL,
+		Token:             token,
+		ClientID:          *clientID,
+		Transport:         tunnel.Transport(*transportName),
+		InterfaceName:     *interfaceName,
+		CAPath:            *caPath,
+		Thumbprint:        *thumbprint,
+		Insecure:          *insecure,
+		Reconnect:         *reconnect,
+		ReconnectMaxDelay: *reconnectMaxDelay,
+	}, func(event clientapp.Event) {
+		if event.State == clientapp.StateConnected {
+			fmt.Fprintf(os.Stderr, "porta-client: connected address=%s transport=%s uploaded=%d downloaded=%d\n",
+				event.Lease.Address, event.Transport, event.BytesUploaded, event.BytesDownloaded)
 		}
-	}()
-
-	initialLease := connection.Lease
-	failures := 0
-	connectionStarted := time.Now()
-	for {
-		err := runConnection(ctx, tunDevice, connection, outbound, deviceErrors)
-		_ = connection.Close()
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		var deviceErr clientDeviceError
-		if errors.As(err, &deviceErr) || !*reconnect {
-			return err
-		}
-		if time.Since(connectionStarted) >= 30*time.Second {
-			failures = 0
-		}
-		delay := reconnectDelay(failures, *reconnectMaxDelay)
-		failures++
-		slog.Warn("tunnel interrupted; reconnecting", "error", err, "delay", delay)
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-		for {
-			connection, err = tunnel.Dial(ctx, config)
-			if err == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			delay = reconnectDelay(failures, *reconnectMaxDelay)
-			failures++
-			slog.Warn("reconnect failed", "error", err, "delay", delay)
-			timer.Reset(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-		if connection.Lease != initialLease {
-			_ = connection.Close()
-			return fmt.Errorf("gateway lease changed from %+v to %+v; reconfigure the interface and routes", initialLease, connection.Lease)
-		}
-		connectionStarted = time.Now()
-		slog.Info("tunnel reconnected", "address", connection.Lease.Address)
-	}
-}
-
-type clientDeviceError struct{ err error }
-
-func (e clientDeviceError) Error() string { return e.err.Error() }
-func (e clientDeviceError) Unwrap() error { return e.err }
-
-func runConnection(
-	ctx context.Context,
-	tunDevice device.PacketDevice,
-	connection *tunnel.Conn,
-	outbound <-chan []byte,
-	deviceErrors <-chan error,
-) error {
-	connectionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	errCh := make(chan error, 2)
-	go func() {
-		for {
-			select {
-			case packet := <-outbound:
-				if err := connection.Send(packet); err != nil {
-					errCh <- err
-					return
-				}
-			case <-connectionCtx.Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		for {
-			packet, err := connection.Receive()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			if err := tunDevice.WritePacket(connectionCtx, packet); err != nil {
-				errCh <- clientDeviceError{err}
-				return
-			}
-		}
-	}()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-deviceErrors:
-		return clientDeviceError{err}
-	case err := <-errCh:
-		return err
-	}
+	})
 }
 
 func reconnectDelay(failures int, maximum time.Duration) time.Duration {
-	if maximum < time.Second {
-		maximum = time.Second
-	}
-	if failures > 5 {
-		failures = 5
-	}
-	delay := time.Second << failures
-	if delay > maximum {
-		return maximum
-	}
-	return delay
+	return clientapp.ReconnectDelay(failures, maximum)
 }
 
 func clientTLSConfig(caPath, thumbprint string, insecure bool) (*tls.Config, error) {
-	if insecure && thumbprint != "" {
-		return nil, errors.New("--insecure and --thumbprint cannot be used together")
-	}
-	pinnedThumbprint, err := parseThumbprint(thumbprint)
-	if err != nil {
-		return nil, err
-	}
-	config := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecure} // #nosec G402 -- explicit development flag
-	if pinnedThumbprint != nil {
-		if caPath == "" {
-			config.InsecureSkipVerify = true // #nosec G402 -- the pinned certificate is verified below
-		}
-		config.VerifyConnection = func(state tls.ConnectionState) error {
-			if len(state.PeerCertificates) == 0 {
-				return errors.New("gateway did not provide a certificate")
-			}
-			actual := sha256.Sum256(state.PeerCertificates[0].Raw)
-			if subtle.ConstantTimeCompare(actual[:], pinnedThumbprint) != 1 {
-				return fmt.Errorf("gateway certificate SHA-256 thumbprint mismatch: got %s", hex.EncodeToString(actual[:]))
-			}
-			return nil
-		}
-	}
-	if caPath == "" {
-		return config, nil
-	}
-	pemBytes, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("read CA file: %w", err)
-	}
-	roots, err := x509.SystemCertPool()
-	if err != nil || roots == nil {
-		roots = x509.NewCertPool()
-	}
-	if !roots.AppendCertsFromPEM(pemBytes) {
-		return nil, errors.New("CA file contains no certificates")
-	}
-	config.RootCAs = roots
-	return config, nil
+	return clientapp.TLSConfig(caPath, thumbprint, insecure)
 }
 
 func parseThumbprint(value string) ([]byte, error) {
-	if value == "" {
-		return nil, nil
-	}
-	normalized := strings.TrimSpace(value)
-	if len(normalized) >= len("sha256:") && strings.EqualFold(normalized[:len("sha256:")], "sha256:") {
-		normalized = normalized[len("sha256:"):]
-	}
-	normalized = strings.NewReplacer(":", "", "-", "").Replace(normalized)
-	decoded, err := hex.DecodeString(normalized)
-	if err != nil || len(decoded) != sha256.Size {
-		return nil, errors.New("thumbprint must be a 64-digit SHA-256 value (separators and a sha256: prefix are optional)")
-	}
-	return decoded, nil
+	return clientapp.ParseThumbprint(value)
 }
 
 func defaultInterfaceName() string {

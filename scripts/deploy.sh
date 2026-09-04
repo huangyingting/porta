@@ -23,7 +23,7 @@ Options:
   --gateway-cidr CIDR       Gateway address and prefix (default: 10.66.0.1/24)
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU (default: 1100)
-  --forward-proxy           Enable authenticated HTTP/HTTPS forward proxying
+  --forward-proxy           Enable authenticated HTTPS CONNECT proxying
   --reset-leases            Archive leases incompatible with a changed pool
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
@@ -193,7 +193,7 @@ release_download_directory=
 client_release_assets=(
   porta-client-linux-amd64
   porta-client-linux-arm64
-  porta-client-windows-amd64.exe
+  porta-client-windows-amd64.zip
   porta-android-arm64-v8a.apk
   porta-android-armeabi-v7a.apk
   porta-android-x86_64.apk
@@ -574,7 +574,7 @@ if [[ -f /var/lib/porta/downloads/porta-android-arm64-v8a.apk ]]; then
   client_download_summary="Client downloads:
   Linux AMD64: $public_origin/download/porta-client-linux-amd64
   Linux ARM64: $public_origin/download/porta-client-linux-arm64
-  Windows:     $public_origin/download/porta-client-windows-amd64.exe
+  Windows:     $public_origin/download/porta-client-windows-amd64.zip
   Android:     $public_origin/download/porta-android-arm64-v8a.apk
   Checksums:   $public_origin/download/SHA256SUMS"
 else
@@ -586,7 +586,7 @@ Porta is ready.
 
 Direct endpoint: https://$domain:$port
 Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
-Forward proxy:   $([[ $forward_proxy == true ]] && echo "enabled (ports 80 and 443)" || echo "disabled")
+Forward proxy:   $([[ $forward_proxy == true ]] && echo "enabled (HTTPS CONNECT on port 443 only)" || echo "disabled")
 TLS mode:        $tls_mode
 Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "GitHub release $release")
 Admin endpoint:  http://127.0.0.1:$admin_port

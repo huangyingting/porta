@@ -16,38 +16,14 @@ import (
 
 const testToken = "proxy-token-0123456789"
 
-func TestHTTPForwardingAuthenticatesAndStripsProxyHeaders(t *testing.T) {
-	var outbound *http.Request
+func TestPlainHTTPForwardingIsRejected(t *testing.T) {
 	handler := newTestHandler(t)
-	handler.transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		outbound = request
-		return &http.Response{
-			StatusCode: http.StatusCreated,
-			Header:     http.Header{"X-Upstream": {"ok"}, "Proxy-Authenticate": {"secret"}},
-			Body:       io.NopCloser(strings.NewReader("forwarded")),
-			Request:    request,
-		}, nil
-	})
-
 	request := httptest.NewRequest(http.MethodGet, "http://example.com/resource", nil)
 	request.Header.Set("Proxy-Authorization", basicProxyAuth("phone", testToken))
-	request.Header.Set("Forwarded", "for=192.0.2.1")
-	request.Header.Set("X-Forwarded-For", "192.0.2.1")
-	request.Header.Set("Connection", "X-Remove")
-	request.Header.Set("X-Remove", "value")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusCreated || response.Body.String() != "forwarded" {
-		t.Fatalf("response = %d %q", response.Code, response.Body.String())
-	}
-	if response.Header().Get("X-Upstream") != "ok" || response.Header().Get("Proxy-Authenticate") != "" {
-		t.Fatalf("unexpected response headers: %v", response.Header())
-	}
-	for _, name := range []string{"Proxy-Authorization", "Forwarded", "X-Forwarded-For", "X-Remove"} {
-		if outbound.Header.Get(name) != "" {
-			t.Fatalf("outbound %s = %q", name, outbound.Header.Get(name))
-		}
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("response = %d, want %d", response.Code, http.StatusForbidden)
 	}
 }
 
@@ -270,10 +246,4 @@ func newTestHandler(t *testing.T) *Handler {
 
 func basicProxyAuth(username, password string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
-}
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return f(request)
 }
