@@ -19,6 +19,43 @@ Available packages:
 - `porta-android-armeabi-v7a.apk`
 - `porta-android-x86_64.apk`
 
+## Automatic device identity
+
+Native clients obtain device identity from the OS, independently of profiles:
+
+| Client | OS source | Sent identifier |
+| --- | --- | --- |
+| Linux | `/etc/machine-id` | `l-` plus 22 Base64URL characters (24 total) |
+| Windows desktop and CLI | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (64-bit registry view) | `w-` plus 22 Base64URL characters (24 total) |
+| Android | App-scoped `Settings.Secure.ANDROID_ID` | `a-` plus 11 Base64URL characters (13 total) |
+
+Desktop IDs use a stable, Porta-specific HMAC-SHA-256 derivation truncated to
+128 bits. Unpadded Base64URL preserves all 128 desktop identity bits and all
+64 Android ID bits; the compact encoding does not truncate them further.
+The raw desktop machine ID/GUID is not transmitted. No hostname or randomly
+generated fallback is used; an unavailable or invalid OS ID stops connection
+with an explicit error. Network cleanup remains available without an ID.
+
+There is no editable native device-ID field or `--client-id` override. The
+Windows GUI and CLI, different profiles, and normal reconnects reuse one device
+enrollment per account on the same OS installation. Linux and Windows identities
+are machine-wide, including across local users; Android identity is scoped to
+the Android user, signing key, and device. Renaming a desktop does not change its
+ID. Reinstall/reset or changing the underlying OS identifier can change it;
+cloned OS installations can share an ID.
+
+Existing Windows profiles are upgraded atomically without their old device-ID
+fields, preserving settings and the original DPAPI-protected tokens. Existing
+Android profiles also retain their encrypted credentials during migration.
+Old server enrollments are not automatically removed. An administrator may
+need to forget an old entry if an account is full when upgrading.
+The compact text format introduced in 0.1.15 changes the IDs sent by earlier
+clients once, without changing saved credentials or the underlying identity bits.
+
+These IDs are stable enrollment labels, **not hardware attestation**. The device
+limit counts claimed identities, not provably distinct physical machines.
+Direct forward-proxy clients retain user-chosen labels as described below.
+
 ## Linux CLI
 
 Automatic Linux networking requires root, `iproute2`, `nftables`, and a running
@@ -31,8 +68,7 @@ Make the downloaded binary executable, then run:
 ```sh
 chmod +x porta-client-linux-amd64
 sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
-  --server https://vpn.example.com:8443 \
-  --client-id my-linux-pc
+  --server https://vpn.example.com:8443
 ```
 
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
@@ -85,8 +121,7 @@ $env:PORTA_TOKEN = "CLIENT_TOKEN"
 ./porta-cli.exe `
   --server https://vpn.example.com:8443 `
   --manual-network=false `
-  --interface Porta `
-  --client-id my-windows-pc
+  --interface Porta
 ```
 
 The desktop and automatic CLI journal is
@@ -236,34 +271,69 @@ routing and firewall/kill-switch rules.
 Use `porta-android-arm64-v8a.apk` for most current physical devices,
 `armeabi-v7a` for older 32-bit ARM devices, or `x86_64` for an emulator.
 
-For QR setup, create a client or rotate its token in **Porta Control**. The
-one-time token dialog displays a QR code containing the server address, token,
-and profile name. The server address defaults to the public HTTPS origin of the
-control panel, including its port. If you administer Porta through another
-address, edit **VPN server** and select **Update QR** before scanning.
+QR onboarding has two steps:
 
-On Android, tap **Add profile** (the **+** button), then **Scan QR code**. Allow
-camera access, scan the code, review the HTTPS server address and profile name,
-and tap **Save**. Scanning runs entirely on-device without Google Play Services
-or a network lookup. It creates a new profile with a fresh device ID; it does
-not overwrite existing profiles, change TLS verification, enable auto-connect,
-or start a tunnel without your approval. Manual entry remains available if
-the camera is unavailable or permission is denied.
+1. In **Porta Control**, create a client or rotate its token. The compact
+   token dialog provides **Copy access link** and **Save access QR**, without
+   displaying a profile QR. Share the link or downloaded image privately.
+   The user scans this first QR with their phone's ordinary camera or opens
+   the link; Porta automatically opens the authenticated client download page,
+   with no access-key entry. Install the appropriate client from that page.
+2. The download page displays a separate profile QR. In the Android app, tap
+   **Add profile** (the **+** button), then **Scan QR code**. Allow camera access,
+   scan this second code, review the HTTPS server address and profile name,
+   and tap **Save**. On the same phone, select **Copy setup** on the download
+   page, then **Add profile > Paste setup** in Porta instead.
 
-**Treat the QR code like the token itself.** Anyone who obtains it can use the
-account, subject to its device limit. Share it privately and scan only codes
-from an administrator you trust. Porta does not retain the QR image or
-recoverable token; once the token dialog closes, it cannot display that code
-again. Rotating a token invalidates previous codes and disconnects existing
-sessions, so do not rotate merely to redisplay a code if you already have the
-original token.
+Scanning and parsing run entirely on-device without Google Play Services or a
+network lookup. Clipboard text is read only when **Paste setup** is selected.
+Both import methods create a new local profile; they do not
+overwrite existing profiles, change TLS verification, enable auto-connect, or
+start a tunnel without your approval. Manual server/token copy controls on the
+download page and **Enter manually** in the app remain available.
+
+**Treat both QR codes and their copied links like credentials.** The first
+access link is encrypted, valid for eight hours, and reusable during that
+period; encryption does not make public sharing safe. It works only on the
+HTTPS origin for which it was issued and survives a server restart if the
+administrator token is unchanged. Redemption creates an eight-hour client
+browser session. The second profile QR contains the actual client token and
+has no independent expiry. Anyone who obtains either can access the account,
+subject to its device limit.
+
+Rotating the client token, disabling the account, or deleting it revokes access
+through existing invitations and browser sessions. Changing the administrator
+token invalidates invitations. Already imported profiles follow the account's
+current token and enabled state. The registry persists token hashes only;
+bounded client browser sessions retain encrypted token material in server
+memory to render setup. Administrator browser sessions never display a client
+profile QR. If you already have the client token, sign in with it to view the
+setup page again instead of rotating solely to redisplay a profile QR.
 
 For manual setup, tap **Add profile**, then **Enter manually**, and enter:
 
 - a recognizable profile name;
 - the direct gateway URL, including the port when it is not 443;
-- the client token;
-- a stable, unique device ID.
+- the client token.
+
+Android supplies device identity automatically from `Settings.Secure.ANDROID_ID`.
+Porta sends `a-<Base64URL-encoded Android ID>` for every profile on the same Android user and
+app-signing identity. There is no editable device-ID field, no device ID in
+QR/paste configuration, and no random/model-name fallback. If Android cannot
+provide a usable ID, connection is refused with a visible error.
+
+This OS identifier is scoped to the signing key, Android user, and device.
+Repeated imports and normal reconnects reuse the same enrollment within an
+account instead of consuming new slots. Factory reset, another Android user/work
+profile, or a signing-key change can produce another ID. It is **not hardware
+attestation**: emulators also have IDs, and modified clients can spoof the value.
+
+On upgrade, existing encrypted profiles are authenticated using their previous
+storage binding and rewritten without per-profile device IDs. Server addresses,
+tokens, selected profiles, and reconnect preferences are preserved. Connections
+use the OS ID immediately, rather than retaining an old editable/UUID identity.
+Old server-side enrollments are not automatically removed; an administrator may
+need to forget an old entry to make room for this one-time identity transition.
 
 Approve Android's VPN prompt and enable the profile. Android prefers native
 HTTP/3 MASQUE. If UDP or HTTP/3 is unavailable, it automatically falls back to
@@ -275,10 +345,27 @@ only one profile can be active. The app supports bounded reconnects, optional
 reconnect after device restart, live traffic statistics, and a local diagnostic
 log that excludes tokens and authorization headers.
 
+Swipe an inactive profile **right to edit** or **left to delete**. Separate
+**Edit** and **Delete** buttons provide the same actions without gestures.
+Deletion requires confirmation and is no longer part of the editor. Disconnect
+an active or reconnecting profile before editing or deleting it. Deleting a
+local profile does not revoke its token or free its server-side device slot;
+an administrator must forget the enrollment separately when needed.
+
+The connection summary shows the effective tunnel MTU. **Log** updates while
+open and includes connection setup details, MTU selection, assigned address,
+DNS, transport, and fallback/retry information. Automatic selection is
+distinguished from a server-configured MTU; the value stays fixed until the
+next connection. The log retains the latest 200 events, includes millisecond
+timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but
+logs can contain server/network addresses and the OS-provided device ID, so
+share them privately.
+
 ## Forward proxy clients
 
-The HTTPS forward proxy uses a stable device ID as the Basic-auth username and
-the client token as the password:
+The HTTPS forward proxy uses a stable, user-chosen device label as the Basic-auth
+username and the client token as the password. Ordinary proxy clients do not
+automatically obtain Porta's native OS-derived identity:
 
 ```sh
 curl --proxy https://vpn.example.com:8443 \
@@ -287,6 +374,6 @@ curl --proxy https://vpn.example.com:8443 \
 ```
 
 For ZeroOmega, select an **HTTPS proxy**, enter the Porta hostname and port,
-use a stable device ID as the username, and use the client token as the
+use a stable device label as the username, and use the client token as the
 password. Porta supports only HTTPS `CONNECT` to public destinations on port
 443; it does not provide a PAC file or cache responses.

@@ -93,8 +93,7 @@ sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 ```sh
 chmod +x porta-client-linux-amd64
 sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
-  --server https://vpn.example.com:8443 \
-  --client-id my-linux-pc
+  --server https://vpn.example.com:8443
 ```
 
 Linux configures routes, DNS, and an owned fail-closed firewall automatically;
@@ -102,6 +101,8 @@ root, iproute2, nftables, and systemd-resolved's local stub are required.
 Desktop clients default to HTTP/3 with safe HTTP/2 fallback. See the
 [client guide](docs/clients.md) for protection boundaries, manual networking,
 and `--cleanup-network` recovery after a crash.
+Native clients supply OS-derived device IDs automatically; device identity is
+not an editable profile setting or CLI option.
 
 ### Windows client
 
@@ -111,12 +112,18 @@ device ID.
 
 ### Android client
 
-Install the APK matching the device architecture. In Porta, tap **Add profile**
-then **Scan QR code** to import the code shown when an administrator creates or
-rotates a client token. Review the server and save; a fresh device ID is generated
-locally. Keep the QR code private because it contains the access token.
-**Enter manually** remains available. Android uses HTTP/3 when available and
-falls back to HTTP/2 automatically.
+Scan the private access QR shared by your administrator with your phone's camera,
+or open the access link. It opens the client download page without asking for an
+access key. Install the APK matching your device architecture.
+
+The download page has a separate profile QR: in Porta, choose **Add profile**
+then **Scan QR code**, review the server, and save. On the same phone, use
+**Copy setup** on the download page, then **Add profile > Paste setup** in Porta.
+Imports create a local profile and do not connect automatically. Android supplies
+the device ID automatically; it is not imported or editable.
+**Enter manually** remains available. Keep both codes private; access links
+expire after eight hours, while profile codes contain the client token.
+Android uses HTTP/3 when available and falls back to HTTP/2 automatically.
 
 ### Forward proxy
 

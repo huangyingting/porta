@@ -5,6 +5,11 @@
 - `GET /` serves the neutral Porta landing page.
 - `POST /access` exchanges an administrator or active client token for a
   short-lived, role-scoped browser session.
+- `GET /join#invite=...` opens QR onboarding. The fragment is handled only by
+  the browser, cleared from its address before redemption, and never sent in
+  the initial HTTP request.
+- `POST /join/redeem` exchanges the encrypted invitation for a client browser
+  session and redirects to `/portal/downloads`, without access-key entry.
 - `/portal/admin` and public `/api/*` require an administrator session.
 - `/portal/downloads` and `/download/*` require an administrator or active
   client session.
@@ -48,15 +53,40 @@ The operations listener defaults to `127.0.0.1:9090`:
 Keep this listener private. Public browser sessions are handled separately on
 the main Porta listener.
 
+## Download access invitations
+
+`POST /api/client-access` requires an administrator browser session (with the
+existing same-origin checks) or a loopback API administrator bearer token.
+Send `{"origin":"https://porta.example.com:8443","token":"CLIENT_TOKEN"}`.
+The token must identify an active client. The response contains `url`, a PNG
+data URI in `image`, and an RFC3339 `expires_at`, with `Cache-Control: no-store`.
+The image encodes the HTTPS access URL, not an Android profile.
+
+Invitations contain an AES-256-GCM encrypted client account ID, token, and eight-hour
+expiry. They are bound to the normalized HTTPS origin (including non-default
+ports) and a purpose-separated key derived from the administrator token.
+Unexpired invitations survive restarts with the same key and can be shared
+with multiple intended devices. Rotation, disabling, or deletion is checked
+against the current client registry at redemption; administrator-key changes
+also invalidate invitations. Invitations never grant administrator access.
+
+`POST /join/redeem` accepts exactly one form field, `ticket`, with a 4 KiB
+body limit and same-origin enforcement. A valid invitation creates a secure,
+HttpOnly, SameSite=Strict client session and returns HTTP 303 to
+`/portal/downloads`. Failed redemption shows a generic error without echoing
+credentials. The initial invitation is carried in the URL fragment, not its
+query; the page removes it before posting. Links remain bearer credentials
+and must be shared privately. No external QR service is used.
+
 ## Android profile QR codes
 
-`POST /api/profile/qr` requires an administrator browser session (with the
-existing same-origin checks) or a loopback API administrator bearer token.
-Send a JSON body with `server`, `token`, and optional `name`. It returns
-`{"image":"data:image/png;base64,..."}` with `Cache-Control: no-store`.
-Credentials stay in the POST body and response, never URL query parameters,
-external QR services, or persistent QR storage. The endpoint encodes the
-supplied configuration; it does not redeem or authenticate the client token.
+Only the authenticated **client download page** displays the profile QR,
+alongside **Copy setup** and manual server/token controls. The old
+`/api/profile/qr` endpoint is removed. Client sessions retain encrypted token
+material in bounded server memory; the registry still persists hashes only.
+Current account status and token hash are rechecked before rendering setup.
+Administrator sessions can download artifacts but never expose administrator
+credentials as client configuration.
 
 The QR text format is:
 
@@ -74,10 +104,15 @@ must be between 1 and 65535. Limits are 2048 bytes for the whole QR URI,
 80 UTF-8 bytes for the name. Leading/trailing whitespace and control
 characters are rejected.
 
-This URI is consumed only by Porta's in-app scanner; it is not an HTTP
+This URI is consumed by Porta's in-app scanner or explicit **Paste setup**
+action; it is not an HTTP
 endpoint or an exported Android deep link. Import always requires reviewing
 and saving a new profile, and does not import a device ID or auto-connect/TLS
 override settings.
+
+Android resolves its device ID from `Settings.Secure.ANDROID_ID` when starting
+the VPN, independently of profile storage, QR/paste payloads, and Intent extras.
+The ID is an OS-provided enrollment label, not proof of genuine physical hardware.
 
 ## Session administration
 

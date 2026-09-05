@@ -5,14 +5,33 @@
 - TLS 1.3 protects HTTP/3 traffic; the TLS configuration also permits the TLS
   version required by HTTP/2 implementations.
 - A bearer token hash is checked in constant time before a lease is allocated.
-- Client tokens are stored only as SHA-256 hashes; newly generated tokens are
-  displayed once. A separate admin token protects the loopback management API.
+- The client registry persists SHA-256 token hashes only; newly generated
+  tokens are displayed once to the administrator. Bounded eight-hour client
+  browser sessions retain encrypted token material in server memory so the
+  authenticated download page can display profile setup. The session key is
+  process-local, with client identity and token hash authenticated as binding
+  data. A separate admin token protects the loopback management API.
+- Shared download invitations encrypt the client token and ID using
+  AES-256-GCM, a purpose-separated administrator-derived key, an eight-hour
+  expiry, and HTTPS-origin binding. They survive restart with the same admin
+  token, but are reusable bearer credentials, not public or single-use links.
+  Client rotation, disable, and deletion are checked on redemption and on
+  subsequent authenticated page access. Changing the admin token invalidates
+  outstanding invitations.
 - The gateway rejects packets whose IPv4 source does not equal the session's
   lease, preventing one client from spoofing another client address.
 - Packet lengths, IP versions, header lengths, total lengths, and destinations
   are validated before packets cross trust boundaries.
 - Tokens are accepted through environment variables or the admin UI and are
   never intentionally logged.
+- The access invitation travels in a URL fragment, which is removed before
+  same-origin POST redemption. Pages use no-store, restrictive CSP, and secure
+  HttpOnly session cookies. The join page uses `Referrer-Policy: same-origin`
+  so browsers preserve the POST's Origin for validation; other portal pages use
+  `no-referrer`. Neither sends cross-origin referrers. Profile QR payloads contain the
+  client token; protect screenshots, downloaded access QR images, copied
+  setup text, clipboard history, and messages as credentials. These controls
+  do not protect a compromised browser, server process, or recipient device.
 
 ## Operator responsibilities
 
@@ -42,6 +61,15 @@ transport fingerprints from network inspection.
 
 - Client accounts identify administrative access groups, not human users.
   Devices sharing one token have equal network privileges.
+- Native clients use OS-derived identity: app-scoped `ANDROID_ID` on Android,
+  a Porta-specific digest of `MachineGuid` on Windows, and a Porta-specific
+  digest of `/etc/machine-id` on Linux. Native IDs are not editable profile
+  settings; direct Basic-auth proxy clients still use user-chosen labels.
+  Device IDs are still client-reported
+  enrollment labels: emulators and modified clients can supply IDs, and sharing
+  or spoofing an ID cannot be prevented by this mechanism. Device quotas do not
+  constitute hardware attestation or count provably distinct physical machines.
+  A genuine-device guarantee requires a separate verifiable attestation design.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.
