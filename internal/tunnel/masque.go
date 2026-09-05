@@ -25,15 +25,16 @@ import (
 const masqueRequestID uint64 = 1
 
 type masqueClient struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	encoder    *masque.Encoder
-	decoder    *masque.Decoder
-	lease      Lease
-	remoteAddr net.Addr
-	leaseReady chan netip.Prefix
-	packets    chan []byte
-	errors     chan error
+	ctx          context.Context
+	cancel       context.CancelFunc
+	encoder      *masque.Encoder
+	decoder      *masque.Decoder
+	lease        Lease
+	remoteAddr   net.Addr
+	leaseReady   chan netip.Prefix
+	packets      chan []byte
+	errors       chan error
+	mtuDiscovery *clientMTUDiscovery
 
 	sendDatagram    func([]byte) error
 	receiveDatagram func(context.Context) ([]byte, error)
@@ -42,18 +43,70 @@ type masqueClient struct {
 }
 
 func dialMasque(ctx context.Context, config Config) (*Conn, error) {
+	if config.Timeout <= 0 {
+		config.Timeout = 15 * time.Second
+	}
+	return establishWithTimeout(ctx, config.Timeout, func(ctx context.Context) (*Conn, error) {
+		return establishMasque(ctx, config)
+	})
+}
+
+// Bound the complete handshake without imposing a lifetime on the tunnel.
+func establishWithTimeout(ctx context.Context, timeout time.Duration, establish func(context.Context) (*Conn, error)) (*Conn, error) {
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, timeout)
+	defer cancelStartup()
+	stop := context.AfterFunc(startupCtx, cancelSession)
+	connection, err := establish(sessionCtx)
+	stopped := stop()
+	if !stopped || startupCtx.Err() != nil {
+		cancelSession()
+		if connection != nil {
+			_ = connection.Close()
+		}
+		deadlineErr := fmt.Errorf("initialize CONNECT-IP: %w", startupCtx.Err())
+		if err != nil {
+			deadlineErr = fmt.Errorf("initialize CONNECT-IP (%v): %w", err, startupCtx.Err())
+		}
+		if IsTransportUnavailable(err) {
+			return nil, TransportUnavailableError{Err: deadlineErr}
+		}
+		if isPermanent(err) {
+			return nil, PermanentError{Err: deadlineErr}
+		}
+		return nil, deadlineErr
+	}
+	if err != nil {
+		cancelSession()
+		return nil, err
+	}
+	closeTransport := connection.closePacket
+	connection.closePacket = func() error {
+		cancelSession()
+		return closeTransport()
+	}
+	return connection, nil
+}
+
+func establishMasque(ctx context.Context, config Config) (*Conn, error) {
 	if config.URL == "" || config.Token == "" || config.ClientID == "" {
-		return nil, errors.New("URL, token, and client ID are required")
+		return nil, PermanentError{Err: errors.New("URL, token, and client ID are required")}
 	}
 	if config.Transport == "" {
 		config.Transport = TransportHTTP3
 	}
-	if config.Timeout <= 0 {
-		config.Timeout = 15 * time.Second
-	}
 	endpoint, err := masqueEndpoint(config.URL)
 	if err != nil {
-		return nil, err
+		return nil, PermanentError{Err: err}
+	}
+	if config.DialAddress != "" {
+		address, err := netip.ParseAddrPort(config.DialAddress)
+		if err != nil || address.Port() == 0 || address.Addr().IsUnspecified() || address.Addr().IsMulticast() {
+			return nil, PermanentError{Err: errors.New("dial address must be a numeric unicast IP and port")}
+		}
+		if config.PacketConn != nil {
+			return nil, PermanentError{Err: errors.New("dial address cannot be combined with a caller-owned packet connection")}
+		}
 	}
 	tlsConfig := config.TLSConfig
 	if tlsConfig == nil {
@@ -75,6 +128,10 @@ func dialMasque(ctx context.Context, config Config) (*Conn, error) {
 		return nil, err
 	}
 	client.start()
+	if err := client.selectMTU(ctx); err != nil {
+		_ = client.close()
+		return nil, sessionFailure(fmt.Errorf("negotiate tunnel MTU: %w", err))
+	}
 	request, err := masque.EncodeAddressRequest([]masque.Address{{
 		RequestID: masqueRequestID,
 		Prefix:    netip.PrefixFrom(netip.IPv4Unspecified(), 32),
@@ -95,13 +152,13 @@ func dialMasque(ctx context.Context, config Config) (*Conn, error) {
 		client.lease.Address = prefix
 	case err := <-client.errors:
 		_ = client.close()
-		return nil, err
+		return nil, sessionFailure(err)
 	case <-timer.C:
 		_ = client.close()
 		return nil, fmt.Errorf("wait for ADDRESS_ASSIGN: %w", context.DeadlineExceeded)
 	case <-ctx.Done():
 		_ = client.close()
-		return nil, ctx.Err()
+		return nil, fmt.Errorf("wait for ADDRESS_ASSIGN: %w", ctx.Err())
 	}
 
 	return &Conn{
@@ -127,8 +184,11 @@ func dialMasqueHTTP2(
 		PingTimeout:     10 * time.Second,
 	}
 	var remoteAddr net.Addr
-	transport.DialTLSContext = func(ctx context.Context, network, address string, config *tls.Config) (net.Conn, error) {
-		connection, err := (&tls.Dialer{Config: config}).DialContext(ctx, network, address)
+	transport.DialTLSContext = func(ctx context.Context, network, address string, tlsOptions *tls.Config) (net.Conn, error) {
+		if config.DialAddress != "" {
+			address = config.DialAddress
+		}
+		connection, err := (&tls.Dialer{Config: tlsOptions}).DialContext(ctx, network, address)
 		if err == nil {
 			remoteAddr = connection.RemoteAddr()
 		}
@@ -148,7 +208,7 @@ func dialMasqueHTTP2(
 		cancel()
 		_ = writer.CloseWithError(err)
 		transport.CloseIdleConnections()
-		return nil, fmt.Errorf("open HTTP/2 CONNECT-IP tunnel: %w", err)
+		return nil, preSessionFailure(fmt.Errorf("open HTTP/2 CONNECT-IP tunnel: %w", err))
 	}
 	if err := validateMasqueResponse(response); err != nil {
 		cancel()
@@ -165,6 +225,10 @@ func dialMasqueHTTP2(
 		_ = response.Body.Close()
 		transport.CloseIdleConnections()
 		return nil
+	}
+	if err := client.configureMTU(response.Header); err != nil {
+		_ = client.close()
+		return nil, err
 	}
 	return client, nil
 }
@@ -188,7 +252,7 @@ func dialMasqueHTTP3(
 	}
 	if (config.PacketConn == nil) != (config.RemoteAddr == nil) {
 		cancel()
-		return nil, errors.New("packet connection and remote address must be provided together")
+		return nil, PermanentError{Err: errors.New("packet connection and remote address must be provided together")}
 	}
 	handshakeCtx, stopHandshake := context.WithTimeout(ctx, config.Timeout)
 	var (
@@ -198,13 +262,24 @@ func dialMasqueHTTP3(
 	if config.PacketConn != nil {
 		connection, err = quic.Dial(handshakeCtx, config.PacketConn, config.RemoteAddr, tlsConfig, quicConfig)
 	} else {
-		connection, err = quic.DialAddr(handshakeCtx, endpoint.Host, tlsConfig, quicConfig)
+		var address string
+		target := endpoint.Host
+		if config.DialAddress != "" {
+			target = config.DialAddress
+		}
+		address, err = resolveQUICAddress(handshakeCtx, target)
+		if err == nil {
+			connection, err = quic.DialAddr(handshakeCtx, address, tlsConfig, quicConfig)
+		}
 	}
 	stopHandshake()
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("dial QUIC: %w", err)
+		return nil, preSessionFailure(fmt.Errorf("dial QUIC: %w", err))
 	}
+	context.AfterFunc(ctx, func() {
+		_ = connection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "context canceled")
+	})
 	transport := &http3.Transport{
 		EnableDatagrams:        true,
 		MaxResponseHeaderBytes: 16 << 10,
@@ -215,23 +290,23 @@ func dialMasqueHTTP3(
 	case <-time.After(config.Timeout):
 		cancel()
 		_ = clientConnection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "settings timeout")
-		return nil, context.DeadlineExceeded
+		return nil, TransportUnavailableError{Err: context.DeadlineExceeded}
 	case <-ctx.Done():
 		cancel()
 		_ = clientConnection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "context canceled")
-		return nil, ctx.Err()
+		return nil, TransportUnavailableError{Err: ctx.Err()}
 	}
 	settings := clientConnection.Settings()
 	if !settings.EnableExtendedConnect {
 		cancel()
 		_ = clientConnection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeSettingsError), "extended CONNECT unavailable")
-		return nil, errors.New("gateway did not enable HTTP/3 Extended CONNECT")
+		return nil, TransportUnavailableError{Err: errors.New("gateway did not enable HTTP/3 Extended CONNECT")}
 	}
 	stream, err := clientConnection.OpenRequestStream(ctx)
 	if err != nil {
 		cancel()
 		_ = clientConnection.CloseWithError(0, "")
-		return nil, err
+		return nil, preSessionFailure(err)
 	}
 	request := &http.Request{
 		Method: http.MethodConnect,
@@ -241,12 +316,13 @@ func dialMasqueHTTP3(
 		Header: make(http.Header),
 	}
 	setMasqueHeaders(request, config)
+	request.Header.Set(masque.MTUDiscoveryHeader, "1")
 	if err := stream.SendRequestHeader(request); err != nil {
 		cancel()
 		stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 		stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 		_ = clientConnection.CloseWithError(0, "")
-		return nil, err
+		return nil, preSessionFailure(err)
 	}
 	type responseResult struct {
 		response *http.Response
@@ -263,17 +339,17 @@ func dialMasqueHTTP3(
 		if got.err != nil {
 			cancel()
 			_ = clientConnection.CloseWithError(0, "")
-			return nil, got.err
+			return nil, preSessionFailure(got.err)
 		}
 		response = got.response
 	case <-time.After(config.Timeout):
 		cancel()
 		_ = clientConnection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "response timeout")
-		return nil, context.DeadlineExceeded
+		return nil, TransportUnavailableError{Err: context.DeadlineExceeded}
 	case <-ctx.Done():
 		cancel()
 		_ = clientConnection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "context canceled")
-		return nil, ctx.Err()
+		return nil, TransportUnavailableError{Err: ctx.Err()}
 	}
 	if err := validateMasqueResponse(response); err != nil {
 		cancel()
@@ -292,7 +368,47 @@ func dialMasqueHTTP3(
 		stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
 		return clientConnection.CloseWithError(0, "")
 	}
+	if err := client.configureMTU(response.Header); err != nil {
+		_ = client.close()
+		return nil, err
+	}
 	return client, nil
+}
+
+func resolveQUICAddress(ctx context.Context, address string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", err
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return address, nil
+	}
+	// quic.DialAddr's own DNS lookup has no context, so pass it a numeric address.
+	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return "", err
+	}
+	if len(addresses) == 0 {
+		return "", &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
+	}
+	return net.JoinHostPort(addresses[0].String(), port), nil
+}
+
+func preSessionFailure(err error) error {
+	if IsRetryable(err) || errors.Is(err, context.Canceled) {
+		return TransportUnavailableError{Err: err}
+	}
+	return PermanentError{Err: err}
+}
+
+func sessionFailure(err error) error {
+	if IsRetryable(err) || errors.Is(err, context.Canceled) {
+		return err
+	}
+	return PermanentError{Err: err}
 }
 
 func newMasqueClient(
@@ -336,23 +452,42 @@ func (m *masqueClient) readCapsules() {
 			return
 		}
 		switch capsule.Type {
+		case masque.CapsuleMTUSelected:
+			if m.mtuDiscovery == nil {
+				m.report(PermanentError{Err: masque.ErrMTUMessage})
+				return
+			}
+			mtu, err := masque.DecodeMTUSelection(capsule.Value, m.mtuDiscovery.token)
+			if err != nil || mtu < masque.SafeMTU || mtu > m.mtuDiscovery.maximum {
+				m.report(PermanentError{Err: masque.ErrMTUMessage})
+				return
+			}
+			select {
+			case m.mtuDiscovery.selected <- mtu:
+			default:
+			}
 		case masque.CapsuleAddressAssign:
 			addresses, err := masque.DecodeAddressAssign(capsule.Value)
 			if err != nil {
-				m.report(err)
+				m.report(PermanentError{Err: err})
 				return
 			}
 			for _, address := range addresses {
-				if address.RequestID == masqueRequestID && address.Prefix.Addr().Is4() && address.Prefix.Bits() == 32 && !address.Prefix.Addr().IsUnspecified() {
-					select {
-					case m.leaseReady <- address.Prefix:
-					default:
-					}
+				if address.RequestID != masqueRequestID {
+					continue
+				}
+				if !address.Prefix.Addr().Is4() || address.Prefix.Bits() != 32 || !address.Prefix.Addr().IsGlobalUnicast() {
+					m.report(PermanentError{Err: fmt.Errorf("gateway returned an invalid IPv4 /32 lease: %s", address.Prefix)})
+					return
+				}
+				select {
+				case m.leaseReady <- address.Prefix:
+				default:
 				}
 			}
 		case masque.CapsuleRouteAdvertisement:
 			if _, err := masque.DecodeRouteAdvertisement(capsule.Value); err != nil {
-				m.report(err)
+				m.report(PermanentError{Err: err})
 				return
 			}
 		case masque.CapsuleDatagram:
@@ -377,6 +512,15 @@ func (m *masqueClient) readDatagrams() {
 		if err != nil {
 			m.report(err)
 			return
+		}
+		if m.mtuDiscovery != nil && masque.IsMTUProbe(value) {
+			if probe, err := masque.DecodeMTUProbe(value); err == nil && probe.Token == m.mtuDiscovery.token {
+				select {
+				case m.mtuDiscovery.echoes <- probe:
+				default:
+				}
+			}
+			continue
 		}
 		packet, err := masque.DecodeIPPacket(value)
 		if err != nil {
@@ -410,7 +554,7 @@ func (m *masqueClient) send(packet []byte) error {
 		return fmt.Errorf("packet source %s does not match lease %s", info.Source, m.lease.Address)
 	}
 	if m.sendDatagram != nil {
-		return m.sendDatagram(masque.EncodeIPPacket(packet))
+		return masque.SendIPPacket(packet, m.sendDatagram, m.encoder)
 	}
 	return m.encoder.WriteIPPacket(packet)
 }
@@ -463,7 +607,7 @@ func setMasqueHeaders(request *http.Request, config Config) {
 func validateMasqueResponse(response *http.Response) error {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_ = response.Body.Close()
-		return &GatewayResponseError{
+		failure := &GatewayResponseError{
 			StatusCode:       response.StatusCode,
 			Status:           response.Status,
 			ServerVersion:    response.Header.Get(protocol.HeaderVersion),
@@ -471,16 +615,37 @@ func validateMasqueResponse(response *http.Response) error {
 			ServerMaxVersion: response.Header.Get(protocol.HeaderMaxVersion),
 			ClientVersion:    protocol.Version,
 		}
+		switch response.StatusCode {
+		case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusMisdirectedRequest, http.StatusNotImplemented, http.StatusHTTPVersionNotSupported:
+			return TransportUnavailableError{Err: failure}
+		case http.StatusUpgradeRequired:
+			if failure.ServerMinVersion == "" && failure.ServerMaxVersion == "" {
+				return TransportUnavailableError{Err: failure}
+			}
+			return PermanentError{Err: failure}
+		default:
+			return failure
+		}
 	}
 	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
-		return errors.New("gateway response did not enable the Capsule Protocol")
+		return PermanentError{Err: errors.New("gateway response did not enable the Capsule Protocol")}
 	}
 	if response.Header.Get(protocol.HeaderVersion) != protocol.Version {
-		return fmt.Errorf(
+		return PermanentError{Err: fmt.Errorf(
 			"gateway selected Porta protocol %q, client requires %q",
 			response.Header.Get(protocol.HeaderVersion),
 			protocol.Version,
-		)
+		)}
+	}
+	if value := response.Header.Get("X-Porta-MTU"); value != "" {
+		if mtu, err := strconv.Atoi(value); err != nil || mtu < 576 || mtu > 9000 {
+			return PermanentError{Err: errors.New("gateway returned an invalid tunnel MTU")}
+		}
+	}
+	if value := response.Header.Get("X-Porta-DNS"); value != "" {
+		if address, err := netip.ParseAddr(value); err != nil || !address.Is4() || !address.IsGlobalUnicast() {
+			return PermanentError{Err: errors.New("gateway returned an invalid IPv4 DNS address")}
+		}
 	}
 	return nil
 }

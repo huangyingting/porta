@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run shell regressions without invoking host service or networking commands."""
 
+import base64
 import hashlib
 import fcntl
 import json
@@ -162,6 +163,23 @@ class AutomationTests(unittest.TestCase):
                         "eth0", success=False)
         self.assertEqual(self.state()["nft_table"], "old")
         self.assertFalse(any(call[0] == "iptables" for call in self.commands()))
+
+    def test_automatic_mtu_scopes_icmp_acceptance_to_owned_tun(self):
+        self.run_script("server-up.sh", "porta.0", "10.66.0.1/24",
+                        "10.66.0.0/24", "eth0")
+        calls = self.commands()
+        self.assertIn(["sysctl", "-w", "net/ipv4/conf/porta.0/accept_local=1"], calls)
+        self.assertIn(["sysctl", "-w", "net/ipv4/conf/porta.0/rp_filter=2"], calls)
+        ipv4_changes = [call[2] for call in calls
+                        if call[:2] == ["sysctl", "-w"] and "/ipv4/conf/" in call[2]]
+        self.assertEqual(len(ipv4_changes), 2)
+        self.assertTrue(all("/porta.0/" in value for value in ipv4_changes))
+
+    def test_fixed_mtu_does_not_change_source_validation(self):
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "--auto-mtu=false")
+        self.assertFalse(any("accept_local" in " ".join(call) or "rp_filter" in " ".join(call)
+                             for call in self.commands()))
 
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
@@ -369,9 +387,38 @@ class AutomationTests(unittest.TestCase):
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--listen :8443", unit)
         self.assertIn("--admin-listen 127.0.0.1:81", unit)
+        self.assertIn("--egress-interface eth0", unit)
+        self.assertIn("--mtu 1400", unit)
+        self.assertIn("--auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=true", unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", unit)
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_deploy_automatic_mtu_preserves_custom_ceiling(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.run_deploy(deploy, "--build-local", "--auto-mtu", "--mtu", "1280")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--auto-mtu=true", unit)
+        self.assertIn("--mtu 1280", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=true", unit)
+
+    def test_deploy_fixed_mtu_disables_discovery_and_helper_settings(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.run_deploy(deploy, "--build-local", "--auto-mtu=false", "--mtu", "1100")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--auto-mtu=false", unit)
+        self.assertNotIn("--auto-mtu=true", unit)
+        self.assertIn("--mtu 1100", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=false", unit)
+
+    def test_bundled_service_uses_automatic_mtu_defaults(self):
+        unit = (ROOT / "deploy/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        setup = next(line for line in unit.splitlines() if line.startswith("ExecStartPost="))
+        self.assertIn("--auto-mtu=true", start)
+        self.assertIn("--mtu 1400", unit)
+        self.assertIn("--auto-mtu=true", setup)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
         deploy = self.prepare_deploy()
@@ -431,13 +478,98 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
         self.assertFalse(list((self.root / "system/var/lib/porta").glob("downloads.new.*")))
 
-    def publish_release(self, success=True):
+    def release_script(self, name):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        step = workflow.split("      - name: Publish GitHub release\n", 1)[1]
-        script = step.split("        run: |\n", 1)[1]
-        script = "\n".join(line[10:] for line in script.splitlines())
+        step = workflow.split(f"      - name: {name}\n", 1)[1]
+        step = step.split("\n      - ", 1)[0]
+        script = step.split("        run: ", 1)[1]
+        if script.startswith("|\n"):
+            return "\n".join(line[10:] for line in script[2:].splitlines())
+        return script.strip()
+
+    def signing_environment(self):
+        return self.env | {
+            "RUNNER_TEMP": str(self.root / "scratch"),
+            "GITHUB_ENV": str(self.root / "github.env"),
+            "KEYSTORE_BASE64": base64.b64encode(b"signing-fixture").decode(),
+            "KEYSTORE_PASSWORD": "test-only",
+            "KEY_ALIAS": "porta",
+            "KEY_PASSWORD": "test-only",
+        }
+
+    def test_release_requires_complete_signing_secrets(self):
+        for name in ("KEYSTORE_BASE64", "KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD"):
+            with self.subTest(missing=name):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c",
+                     self.release_script("Prepare persistent Android signing key")],
+                    cwd=self.root, env=self.signing_environment() | {name: ""},
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("All four PORTA_ANDROID signing secrets are required", result.stderr)
+                self.assertFalse((self.root / "scratch/porta-release.p12").exists())
+
+    def test_release_prepares_private_signing_store_and_removes_it(self):
+        environment = self.signing_environment()
         result = subprocess.run(
-            ["bash", "-euo", "pipefail", "-c", script], cwd=self.root,
+            ["bash", "-euo", "pipefail", "-c",
+             self.release_script("Prepare persistent Android signing key")],
+            cwd=self.root, env=environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        store = self.root / "scratch/porta-release.p12"
+        self.assertEqual(store.read_bytes(), b"signing-fixture")
+        self.assertEqual(store.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / "github.env").read_text(),
+                         f"PORTA_ANDROID_KEYSTORE={store}\n")
+        subprocess.run(
+            ["bash", "-euo", "pipefail", "-c",
+             self.release_script("Remove temporary Android signing key")],
+            cwd=self.root, env=environment, check=True, capture_output=True, timeout=10,
+        )
+        self.assertFalse(store.exists())
+
+    def test_release_verifies_apk_signature_and_exact_signer(self):
+        fingerprint = "a" * 64
+        (self.root / "signing-certificate.sha256").write_text(fingerprint + "\n")
+        gradle = self.root / "gradlew"
+        gradle.write_text("#!/bin/sh\nexit 0\n")
+        gradle.chmod(0o755)
+        apksigner = self.root / "sdk/build-tools/35.0.0/apksigner"
+        apksigner.parent.mkdir(parents=True)
+        apksigner.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$APK_SIGNER_OUTPUT"\nexit "$APK_VERIFY_STATUS"\n'
+        )
+        apksigner.chmod(0o755)
+        apk = self.root / "app/build/outputs/apk/release/app-arm64-v8a-release.apk"
+        apk.parent.mkdir(parents=True)
+        apk.touch()
+        good = f"Signer #1 certificate SHA-256 digest: {fingerprint}"
+        cases = (
+            ("valid", good, "0", True),
+            ("wrong key", good.replace(fingerprint, "b" * 64), "0", False),
+            ("additional signer", good + "\nSigner #2 certificate SHA-256 digest: "
+             + "b" * 64, "0", False),
+            ("invalid signature", good, "1", False),
+        )
+        for name, output, status, success in cases:
+            with self.subTest(case=name):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c",
+                     self.release_script("Build Android release")],
+                    cwd=self.root, env=self.env | {
+                        "ANDROID_HOME": str(self.root / "sdk"),
+                        "APK_SIGNER_OUTPUT": output,
+                        "APK_VERIFY_STATUS": status,
+                    }, text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+
+    def publish_release(self, success=True):
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", self.release_script("Publish GitHub release")],
+            cwd=self.root,
             env=self.env | {"GITHUB_REF_NAME": "v0.1.4"},
             text=True, capture_output=True, timeout=10,
         )

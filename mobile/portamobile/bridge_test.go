@@ -108,6 +108,9 @@ func TestDialErrorClassification(t *testing.T) {
 	}{
 		{"missing endpoint", &tunnel.GatewayResponseError{StatusCode: 404, Status: "404 Not Found"}, true, false},
 		{"authentication", &tunnel.GatewayResponseError{StatusCode: 401, Status: "401 Unauthorized"}, false, false},
+		{"wire protocol mismatch", &tunnel.GatewayResponseError{StatusCode: 426, ServerMinVersion: "3", ServerMaxVersion: "3"}, false, false},
+		{"permanent protocol error", tunnel.PermanentError{Err: errors.New("gateway response did not enable the Capsule Protocol")}, false, false},
+		{"transport upgrade", &tunnel.GatewayResponseError{StatusCode: 426, Status: "426 Upgrade Required"}, true, false},
 		{"server failure", &tunnel.GatewayResponseError{StatusCode: 500, Status: "500 Internal Server Error"}, false, true},
 		{"extended connect", errors.New("gateway did not enable HTTP/3 Extended CONNECT"), true, false},
 		{"lease failure", errors.New("invalid ADDRESS_ASSIGN"), false, false},

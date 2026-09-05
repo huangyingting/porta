@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -90,10 +91,16 @@ func run() error {
 	poolCIDR := flag.String("pool", "10.66.0.0/24", "IPv4 client address pool")
 	leaseState := flag.String("lease-state", "", "optional persistent client lease state file")
 	dns := flag.String("dns", "1.1.1.1", "DNS address advertised to clients")
-	mtu := flag.Int("mtu", 1100, "tunnel MTU")
+	mtu := flag.Int("mtu", 1400, "tunnel MTU ceiling (fixed MTU with --auto-mtu=false)")
+	autoMTU := flag.Bool("auto-mtu", true, "select a stable per-connection HTTP/3 MTU using bounded datagram probes")
 	tokenFlag := flag.String("token", "", "bearer token (prefer PORTA_TOKEN environment variable)")
 	metricsTokenFlag := flag.String("metrics-token", "", "metrics bearer token (prefer PORTA_METRICS_TOKEN environment variable; empty disables /metrics)")
 	jsonLogs := flag.Bool("json-logs", false, "write structured JSON logs")
+	egressInterface := flag.String("egress-interface", "", "expected forwarding egress interface (empty discovers a usable default route)")
+	readinessTimeout := flag.Duration("readiness-timeout", 3*time.Second, "maximum duration of a readiness check")
+	readinessNAT := flag.Bool("readiness-require-nat", true, "require the deployed Porta nftables masquerade rule (disable only for routed deployments)")
+	readinessEgressURL := flag.String("readiness-egress-url", "", "optional HTTP(S) egress probe URL; failures do not gate local readiness")
+	readinessDNSName := flag.String("readiness-dns-name", "", "optional name to resolve through --dns; failures do not gate local readiness")
 	flag.Parse()
 
 	token := os.Getenv("PORTA_TOKEN")
@@ -188,6 +195,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	readiness, err := newForwardingReadiness(forwardingReadinessConfig{
+		Interface: *interfaceName, Gateway: pool.Gateway(), Pool: netip.MustParsePrefix(*poolCIDR).Masked(),
+		EgressInterface: *egressInterface, RequireNAT: *readinessNAT, Timeout: *readinessTimeout,
+		AutoMTU:   *autoMTU,
+		EgressURL: *readinessEgressURL, DNSName: *readinessDNSName, DNSAddress: *dns,
+	}, localReadinessDependencies())
+	if err != nil {
+		return err
+	}
 	tunDevice, err := device.OpenNative(*interfaceName, *mtu)
 	if err != nil {
 		return err
@@ -197,7 +213,7 @@ func run() error {
 	router := gateway.NewRouter(tunDevice, logger)
 	metrics := &gateway.Metrics{}
 	handler, err := gateway.NewHandler(gateway.HandlerConfig{
-		AuthorizeClient:   registry.Authenticate,
+		AuthorizeSession:  registry.AuthenticateSession,
 		MetricsToken:      metricsToken,
 		Metrics:           metrics,
 		Usage:             usageStore,
@@ -205,9 +221,11 @@ func run() error {
 		Router:            router,
 		DNS:               *dns,
 		MTU:               *mtu,
+		AutoMTU:           *autoMTU,
 		EnableH3Datagrams: true,
 		TrustProxyHeaders: *behindProxy,
 		Logger:            logger,
+		Readiness:         readiness,
 	})
 	if err != nil {
 		return err
@@ -228,12 +246,12 @@ func run() error {
 	if !*disableForwardProxy {
 		proxyHandler, err := forwardproxy.New(forwardproxy.Config{
 			Next: publicHandler,
-			Authorize: func(token, deviceID string) (forwardproxy.Identity, error) {
-				identity, authorizeErr := registry.Authenticate(token, deviceID)
+			AuthorizeSession: func(ctx context.Context, token, deviceID string) (forwardproxy.Identity, context.Context, func(), error) {
+				identity, sessionCtx, release, authorizeErr := registry.AuthenticateSession(ctx, token, deviceID)
 				return forwardproxy.Identity{
 					AccountID: identity.AccountID,
 					DeviceID:  deviceID,
-				}, authorizeErr
+				}, sessionCtx, release, authorizeErr
 			},
 			Logger:     logger,
 			Camouflage: true,
@@ -337,7 +355,7 @@ func run() error {
 		}
 	}
 	attributes = append(attributes, "version", buildinfo.Version)
-	logger.Info("gateway ready", attributes...)
+	logger.Info("gateway listeners starting; forwarding readiness is reported by /readyz", attributes...)
 
 	var runErr error
 	select {

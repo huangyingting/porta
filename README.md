@@ -97,6 +97,12 @@ sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
   --client-id my-linux-pc
 ```
 
+Linux configures routes, DNS, and an owned fail-closed firewall automatically;
+root, iproute2, nftables, and systemd-resolved's local stub are required.
+Desktop clients default to HTTP/3 with safe HTTP/2 fallback. See the
+[client guide](docs/clients.md) for protection boundaries, manual networking,
+and `--cleanup-network` recovery after a crash.
+
 ### Windows client
 
 Extract `porta-client-windows-amd64.zip` and launch `porta.exe` as
@@ -132,6 +138,12 @@ curl http://127.0.0.1:9090/readyz
 
 Re-run `scripts/deploy.sh` to upgrade while preserving credentials, client
 records, usage, and leases.
+
+Automatic HTTP/3 tunnel MTU selection is enabled by default, with a 1400
+ceiling and a conservative 1100 baseline. Clients require no extra setting.
+Use `--auto-mtu=false --mtu 1100` for a fixed MTU. See
+[MTU selection](docs/architecture.md#stable-per-connection-mtu-selection)
+for fallback, IPv4 handling, and nested-VPN limits.
 
 ## Documentation
 

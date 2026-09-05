@@ -10,4 +10,8 @@
 /android/app/build/
 /android/build/
 *.log
-
+*.jks
+*.keystore
+*.p12
+signing.properties
+android-signing.properties

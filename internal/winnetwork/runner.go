@@ -2,12 +2,13 @@ package winnetwork
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/binary"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,132 +16,302 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf16"
 
 	"github.com/huangyingting/porta/internal/tunnel"
 )
+
+var ErrStateInUse = errors.New("another Porta process owns this network state; disconnect or close that process first")
 
 type Runner struct {
 	mu         sync.Mutex
 	statePath  string
 	state      networkState
+	protected  bool
+	lock       *os.File
+	guard      guardEngine
 	runCommand func(context.Context, ...string) (string, error)
 }
 
+type routeState struct {
+	Kind      string `json:"kind,omitempty"`
+	Prefix    string `json:"prefix"`
+	Interface int    `json:"interface_index"`
+	GUID      string `json:"interface_guid"`
+	NextHop   string `json:"next_hop"`
+	Metric    int    `json:"metric"`
+}
+
+type dnsState struct {
+	Interface int      `json:"interface_index"`
+	Automatic bool     `json:"automatic"`
+	Original  []string `json:"original"`
+	Applied   string   `json:"applied"`
+	Pending   string   `json:"pending"`
+}
+
+type mtuState struct {
+	Original uint32 `json:"original"`
+	Applied  int    `json:"applied"`
+	Pending  int    `json:"pending"`
+}
+
 type networkState struct {
-	Interface            string `json:"interface"`
-	ServerIP             string `json:"server_ip"`
-	CreatedEscapeRoute   bool   `json:"created_escape_route"`
-	EscapeInterfaceIndex int    `json:"escape_interface_index,omitempty"`
-	EscapeNextHop        string `json:"escape_next_hop,omitempty"`
+	Version        int          `json:"version"`
+	Interface      string       `json:"interface"`
+	ServerIP       string       `json:"server_ip"`
+	GuardKey       string       `json:"guard_key,omitempty"`
+	Endpoint       endpoint     `json:"endpoint"`
+	Application    string       `json:"application,omitempty"`
+	InterfaceLUID  uint64       `json:"interface_luid,omitempty"`
+	InterfaceIndex int          `json:"interface_index,omitempty"`
+	InterfaceGUID  string       `json:"interface_guid,omitempty"`
+	OriginalDHCP   string       `json:"original_dhcp,omitempty"`
+	Addresses      []string     `json:"addresses,omitempty"`
+	Routes         []routeState `json:"routes,omitempty"`
+	DNS            *dnsState    `json:"dns,omitempty"`
+	MTU            *mtuState    `json:"mtu,omitempty"`
 }
 
 func NewRunner(statePath string) (*Runner, error) {
 	if strings.TrimSpace(statePath) == "" {
 		return nil, errors.New("network state path is required")
 	}
-	runner := &Runner{
-		statePath: statePath,
+	path, err := filepath.Abs(statePath)
+	if err != nil {
+		return nil, err
 	}
-	data, err := os.ReadFile(statePath)
-	if err == nil {
-		if err := json.Unmarshal(data, &runner.state); err != nil {
-			return nil, fmt.Errorf("decode network state: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read network state: %w", err)
+	runner := &Runner{statePath: filepath.Clean(path), guard: nativeGuard{}}
+	if err := runner.reloadLocked(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 	return runner, nil
+}
+
+// Protected reports only activation confirmed by this Runner, never merely the
+// existence of a journal left by another process. External administrator/WFP
+// changes and the boot interval before BFE starts are outside this guarantee.
+func (r *Runner) Protected() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.protected
+}
+
+// NeedsCleanup reports owned recovery state, not proof of active filtering.
+func (r *Runner) NeedsCleanup() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state.Interface != "" || r.state.GuardKey != ""
+}
+
+// RecoveryEndpoints exposes the journaled literal address without doing DNS or
+// claiming that persisted state alone proves activation in this process.
+func (r *Runner) RecoveryEndpoints() []net.Addr {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state.GuardKey == "" {
+		return nil
+	}
+	address := net.TCPAddrFromAddrPort(netip.AddrPortFrom(r.state.Endpoint.IP, r.state.Endpoint.Port))
+	if _, err := parseEndpoint(address); err != nil {
+		// A non-empty invalid result makes clientapp reject recovery instead of
+		// treating a damaged guarded journal as permission to bootstrap DNS.
+		return []net.Addr{nil}
+	}
+	return []net.Addr{address}
+}
+
+// Prepare activates after the first authenticated bootstrap, before VPN route
+// setup. On guarded reconnection it pins a literal endpoint BEFORE dialing.
+// It may run before the TUN exists; no payload interface is then exempt.
+// No physical DNS exemption is created. Errors retain the guard until Down.
+func (r *Runner) Prepare(ctx context.Context, interfaceName string, remoteAddr net.Addr) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.prepareLocked(ctx, interfaceName, remoteAddr, false)
+}
+
+func (r *Runner) prepareLocked(ctx context.Context, interfaceName string, remoteAddr net.Addr, requireInterface bool) error {
+	if strings.TrimSpace(interfaceName) == "" {
+		return errors.New("tunnel interface name is required")
+	}
+	remote, err := parseEndpoint(remoteAddr)
+	if err != nil {
+		return err
+	}
+	if err := r.acquireLocked(); err != nil {
+		return err
+	}
+	if r.state.Interface != "" && r.state.Interface != interfaceName {
+		return errors.New("saved network state belongs to a different interface; explicitly disconnect it first")
+	}
+	if r.state.Interface != "" && r.state.Version != 2 {
+		return errors.New("legacy network journal lacks exact ownership; restore it with the client version that created it before upgrading")
+	}
+	if r.guard == nil {
+		r.guard = nativeGuard{}
+	}
+	var luid uint64
+	var interfaceGUID string
+	if requireInterface {
+		luid, err = r.guard.InterfaceLUID(interfaceName)
+		if err != nil {
+			return err
+		}
+		interfaceGUID, err = r.guard.InterfaceGUID(luid)
+		if err != nil {
+			return err
+		}
+		if previousLUID := r.state.InterfaceLUID; previousLUID != 0 && (previousLUID != luid || !strings.EqualFold(r.state.InterfaceGUID, interfaceGUID)) {
+			_, retireErr := r.invoke(ctx, "retire-interface", r.statePath)
+			if err := errors.Join(retireErr, r.reloadLocked()); err != nil {
+				return fmt.Errorf("retire replaced tunnel interface while retaining protection: %w", err)
+			}
+			if r.state.InterfaceLUID != 0 {
+				return errors.New("previous tunnel interface still exists; explicitly disconnect it first")
+			}
+		}
+	}
+	next := r.state
+	next.Version = 2
+	next.Interface = interfaceName
+	next.ServerIP = remote.IP.String()
+	next.Endpoint = remote
+	if next.GuardKey == "" {
+		next.GuardKey = objectKey(strings.ToLower(r.statePath), -2)
+	}
+	application, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("determine transport executable: %w", err)
+	}
+	next.Application = application
+	if requireInterface {
+		next.InterfaceLUID = luid
+		next.InterfaceGUID = interfaceGUID
+	}
+	previous := r.state
+	r.state = next
+	if err := r.persistLocked(); err != nil {
+		r.state = previous
+		return err
+	}
+	if err := r.guard.Replace(ctx, guardSpec{
+		Key: next.GuardKey, InterfaceLUID: luid,
+		Endpoint: remote, Application: next.Application,
+	}); err != nil {
+		return fmt.Errorf("activate persistent Windows leak protection (explicit Disconnect restores owned state): %w", err)
+	}
+	r.protected = true
+	if _, err := r.invoke(ctx, "prepare", r.statePath); err != nil {
+		return errors.Join(err, r.reloadLocked())
+	}
+	return r.reloadLocked()
 }
 
 func (r *Runner) Up(ctx context.Context, interfaceName string, remoteAddr net.Addr, lease tunnel.Lease) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.state.Interface != "" {
-		if err := r.downLocked(ctx); err != nil {
-			return fmt.Errorf("clean stale network state: %w", err)
-		}
+	if !lease.Address.IsValid() || !lease.Address.Addr().Is4() || !lease.Address.Addr().IsGlobalUnicast() {
+		return errors.New("full tunnel requires a valid IPv4 lease")
 	}
-	if remoteAddr == nil {
-		return errors.New("tunnel did not report its remote address")
+	if !lease.DNS.IsValid() || !lease.DNS.Is4() || !lease.DNS.IsGlobalUnicast() {
+		return errors.New("full tunnel requires an IPv4 DNS resolver reachable through the tunnel")
 	}
-	serverIP, _, err := net.SplitHostPort(remoteAddr.String())
+	if lease.MTU < 576 || lease.MTU > 9000 {
+		return fmt.Errorf("tunnel MTU %d is outside 576..9000", lease.MTU)
+	}
+	remote, err := parseEndpoint(remoteAddr)
 	if err != nil {
-		return errors.New("tunnel remote address is invalid")
-	}
-	parsedServerIP := net.ParseIP(serverIP)
-	if parsedServerIP == nil {
-		return errors.New("tunnel remote address is invalid")
-	}
-	if parsedServerIP.To4() == nil {
-		serverIP = ""
-	}
-	dns := ""
-	if lease.DNS.IsValid() {
-		dns = lease.DNS.String()
-	}
-	r.state = networkState{Interface: interfaceName, ServerIP: serverIP}
-	if err := r.persistLocked(); err != nil {
-		r.state = networkState{}
 		return err
 	}
-	_, upErr := r.invoke(ctx, "up", interfaceName, lease.Address.String(), serverIP, dns, r.statePath)
-	// The helper journals route ownership before changing the network, including
-	// when CommandContext terminates PowerShell before its catch block can run.
-	data, readErr := os.ReadFile(r.statePath)
-	if readErr == nil {
-		var saved networkState
-		readErr = json.Unmarshal(data, &saved)
-		if readErr == nil {
-			r.state = saved
-		}
+	if lease.DNS == remote.IP {
+		return errors.New("tunnel DNS cannot be the transport endpoint (its host route bypasses the tunnel)")
 	}
-	if readErr != nil {
-		return errors.Join(upErr, fmt.Errorf("read network helper state: %w", readErr))
+	if err := r.prepareLocked(ctx, interfaceName, remoteAddr, true); err != nil {
+		return err
 	}
-	if upErr != nil {
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		return errors.Join(upErr, r.downLocked(rollbackCtx))
-	}
-	return nil
+	_, upErr := r.invoke(ctx, "up", r.statePath, lease.Address.String(), lease.DNS.String(), fmt.Sprint(lease.MTU))
+	// PowerShell journals ownership BEFORE each mutation. Never automatically
+	// call Down here: a lease/configuration failure must not release protection.
+	return errors.Join(upErr, r.reloadLocked())
 }
 
+func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAddr net.Addr, lease tunnel.Lease) error {
+	return r.Up(ctx, interfaceName, remoteAddr, lease)
+}
+
+// Down is intentional Disconnect, not transport-failure cleanup. Network state
+// is restored first; only successful restoration permits guard removal.
 func (r *Runner) Down(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.downLocked(ctx)
-}
-
-func (r *Runner) downLocked(ctx context.Context) error {
-	if r.state.Interface == "" {
-		return nil
-	}
-	if _, err := r.invoke(ctx, downArguments(r.state)...); err != nil {
+	if err := r.acquireLocked(); err != nil {
 		return err
+	}
+	if r.state.Interface == "" && r.state.GuardKey == "" {
+		if err := os.Remove(r.statePath + ".pending"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.Join(fmt.Errorf("remove pending network state: %w", err), r.releaseLocked())
+		}
+		return r.releaseLocked()
+	}
+	_, downErr := r.invoke(ctx, "down", r.statePath)
+	if err := errors.Join(downErr, r.reloadLocked()); err != nil {
+		return err
+	}
+	if r.state.GuardKey != "" {
+		if r.guard == nil {
+			r.guard = nativeGuard{}
+		}
+		if err := r.guard.Remove(ctx, r.state.GuardKey); err != nil {
+			return fmt.Errorf("remove persistent leak protection: %w", err)
+		}
+		r.protected = false
+	}
+	if err := os.Remove(r.statePath + ".pending"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove pending network state: %w", err)
 	}
 	if err := os.Remove(r.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove network state: %w", err)
 	}
 	r.state = networkState{}
+	return r.releaseLocked()
+}
+
+func (r *Runner) acquireLocked() error {
+	if r.lock != nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o700); err != nil {
+		return fmt.Errorf("create network ownership directory: %w", err)
+	}
+	lock, err := lockJournal(r.statePath + ".lock")
+	if err != nil {
+		return err
+	}
+	r.lock = lock
+	if err := r.reloadLocked(); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			r.state = networkState{}
+		} else {
+			return errors.Join(err, r.releaseLocked())
+		}
+	}
 	return nil
 }
 
-func (r *Runner) invoke(ctx context.Context, arguments ...string) (string, error) {
+func (r *Runner) releaseLocked() error {
+	if r.lock == nil {
+		return nil
+	}
+	err := r.lock.Close()
+	r.lock = nil
+	// Never delete the sidecar: unlink/recreate would allow locks on different
+	// files for the same journal. Process death closes this handle, not WFP.
+	return err
+}
+
+func (r *Runner) invoke(ctx context.Context, arguments ...string) (result string, runErr error) {
 	if r.runCommand != nil {
 		return r.runCommand(ctx, arguments...)
-	}
-	if len(arguments) == 0 {
-		return "", errors.New("network operation is required")
-	}
-	var script string
-	switch arguments[0] {
-	case "up":
-		script = upScript
-	case "down":
-		script = downScript
-	default:
-		return "", errors.New("unsupported network operation")
 	}
 	if runtime.GOOS != "windows" {
 		return "", errors.New("Windows network configuration is unavailable on this platform")
@@ -150,112 +321,69 @@ func (r *Runner) invoke(ctx context.Context, arguments ...string) (string, error
 		return "", errors.New("SystemRoot is unavailable")
 	}
 	powerShell := filepath.Join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-	commandArgs := []string{"-NoProfile", "-NonInteractive", "-EncodedCommand", encodeCommand(script, arguments[1:])}
-	output, err := exec.CommandContext(ctx, powerShell, commandArgs...).CombinedOutput()
+	scriptPath, err := writeNetworkScript(filepath.Dir(r.statePath))
 	if err != nil {
-		message := string(output)
-		if message == "" {
-			message = err.Error()
+		return "", err
+	}
+	defer func() {
+		if err := os.Remove(scriptPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			runErr = errors.Join(runErr, fmt.Errorf("remove network helper: %w", err))
 		}
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("network helper: %w", ctx.Err())
+	}()
+	commandCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	args := append([]string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath}, arguments...)
+	command := exec.CommandContext(commandCtx, powerShell, args...)
+	hideNetworkCommand(command)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		if commandCtx.Err() != nil {
+			return "", fmt.Errorf("network helper: %w", commandCtx.Err())
 		}
-		return "", fmt.Errorf("network helper failed: %s", message)
+		return "", fmt.Errorf("network helper failed: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return string(output), nil
 }
 
-func encodeCommand(script string, arguments []string) string {
-	for _, argument := range arguments {
-		script += " '" + strings.ReplaceAll(argument, "'", "''") + "'"
+func writeNetworkScript(directory string) (path string, err error) {
+	file, err := os.CreateTemp(directory, ".porta-network-*.ps1")
+	if err != nil {
+		return "", fmt.Errorf("create network helper: %w", err)
 	}
-	words := utf16.Encode([]rune(script))
-	encoded := make([]byte, len(words)*2)
-	for index, word := range words {
-		binary.LittleEndian.PutUint16(encoded[index*2:], word)
+	path = file.Name()
+	_, writeErr := file.WriteString("\xef\xbb\xbf" + networkScript)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write network helper: %w", err)
 	}
-	return base64.StdEncoding.EncodeToString(encoded)
+	return path, nil
 }
 
-const upScript = `& {
-param($interfaceName, $addressCidr, $serverIP, $dnsServer, $statePath)
-$ErrorActionPreference = "Stop"
-$parts = $addressCidr.Split("/")
-if ($parts.Count -ne 2) { throw "Invalid tunnel address" }
-$existingHostRoute = $null
-if ($serverIP) {
-  $existingHostRoute = Get-NetRoute -DestinationPrefix "$serverIP/32" -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
-}
-$createdEscape = $false
-$escapeInterface = 0
-$escapeNextHop = ""
-try {
-  if ($serverIP -and -not $existingHostRoute) {
-    $existingRoute = Find-NetRoute -RemoteIPAddress $serverIP |
-      Where-Object { $_.DestinationPrefix } | Select-Object -First 1
-    if (-not $existingRoute) { throw "Could not determine the gateway escape route" }
-    $escapeInterface = $existingRoute.InterfaceIndex
-    $escapeNextHop = [string]$existingRoute.NextHop
-    $state = [ordered]@{interface=$interfaceName;server_ip=$serverIP;created_escape_route=$true;escape_interface_index=$escapeInterface;escape_next_hop=$escapeNextHop}
-    $json = $state | ConvertTo-Json -Compress
-    [IO.File]::WriteAllText("$statePath.pending", $json, (New-Object Text.UTF8Encoding($false)))
-    Move-Item -LiteralPath "$statePath.pending" -Destination $statePath -Force -ErrorAction Stop
-    New-NetRoute -DestinationPrefix "$serverIP/32" -InterfaceIndex $existingRoute.InterfaceIndex -NextHop $existingRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-    $createdEscape = $true
-  }
-  Get-NetRoute -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object { $_.DestinationPrefix -in @("0.0.0.0/1", "128.0.0.0/1") } |
-    Remove-NetRoute -Confirm:$false -ErrorAction Stop
-  Get-NetIPAddress -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
-  New-NetIPAddress -InterfaceAlias $interfaceName -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) -ErrorAction Stop | Out-Null
-  if ($dnsServer) { Set-DnsClientServerAddress -InterfaceAlias $interfaceName -ServerAddresses $dnsServer -ErrorAction Stop }
-  New-NetRoute -DestinationPrefix "0.0.0.0/1" -InterfaceAlias $interfaceName -NextHop "0.0.0.0" -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-  New-NetRoute -DestinationPrefix "128.0.0.0/1" -InterfaceAlias $interfaceName -NextHop "0.0.0.0" -RouteMetric 5 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-} catch {
-  Get-NetRoute -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object { $_.DestinationPrefix -in @("0.0.0.0/1", "128.0.0.0/1") } |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-  Set-DnsClientServerAddress -InterfaceAlias $interfaceName -ResetServerAddresses -ErrorAction SilentlyContinue
-  Get-NetIPAddress -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-  if ($createdEscape) {
-    Get-NetRoute -DestinationPrefix "$serverIP/32" -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-      Where-Object { $_.InterfaceIndex -eq $escapeInterface -and [string]$_.NextHop -eq $escapeNextHop } |
-      Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-  }
-  throw
-}
-}`
+//go:embed network.ps1
+var networkScript string
 
-const downScript = `& {
-param($interfaceName, $serverIP, $createdEscape, $escapeInterface, $escapeNextHop)
-$ErrorActionPreference = "Stop"
-Get-NetRoute -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Where-Object { $_.DestinationPrefix -in @("0.0.0.0/1", "128.0.0.0/1") } |
-  Remove-NetRoute -Confirm:$false -ErrorAction Stop
-if ($createdEscape -eq "true" -and $serverIP) {
-  Get-NetRoute -DestinationPrefix "$serverIP/32" -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceIndex -eq [int]$escapeInterface -and [string]$_.NextHop -eq $escapeNextHop } |
-    Remove-NetRoute -Confirm:$false -ErrorAction Stop
-}
-if (Get-NetIPInterface -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue) {
-  Set-DnsClientServerAddress -InterfaceAlias $interfaceName -ResetServerAddresses -ErrorAction Stop
-  Get-NetIPAddress -InterfaceAlias $interfaceName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
-}
-}`
-
-func downArguments(state networkState) []string {
-	return []string{
-		"down",
-		state.Interface,
-		state.ServerIP,
-		fmt.Sprintf("%t", state.CreatedEscapeRoute),
-		fmt.Sprintf("%d", state.EscapeInterfaceIndex),
-		state.EscapeNextHop,
+func (r *Runner) reloadLocked() error {
+	file, err := os.Open(r.statePath)
+	if err != nil {
+		return fmt.Errorf("read network helper state: %w", err)
 	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+	if err != nil {
+		return fmt.Errorf("read network helper state: %w", err)
+	}
+	if len(data) > 1<<20 {
+		return errors.New("network recovery journal exceeds 1 MiB")
+	}
+	var saved networkState
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return fmt.Errorf("decode network helper state: %w", err)
+	}
+	if err := saved.validate(); err != nil {
+		return fmt.Errorf("invalid network recovery journal: %w", err)
+	}
+	r.state = saved
+	return nil
 }
 
 func (r *Runner) persistLocked() error {
@@ -266,12 +394,19 @@ func (r *Runner) persistLocked() error {
 	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o700); err != nil {
 		return fmt.Errorf("create network state directory: %w", err)
 	}
-	temp := r.statePath + ".tmp"
-	defer os.Remove(temp)
-	if err := os.WriteFile(temp, data, 0o600); err != nil {
+	pending := r.statePath + ".pending"
+	defer os.Remove(pending)
+	file, err := os.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return fmt.Errorf("write network state: %w", err)
 	}
-	if err := os.Rename(temp, r.statePath); err != nil {
+	_, writeErr := file.Write(data)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return fmt.Errorf("flush network state: %w", err)
+	}
+	if err := replaceJournal(pending, r.statePath); err != nil {
 		return fmt.Errorf("replace network state: %w", err)
 	}
 	return nil

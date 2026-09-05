@@ -85,6 +85,10 @@ func TestAdminPageIsProfessionalAndDoesNotEmbedSecrets(t *testing.T) {
 		strings.Contains(body, `class="card"`) {
 		t.Fatal("admin page does not provide the compact operational table")
 	}
+	if !strings.Contains(body, `id="disconnect-client"`) || !strings.Contains(body, "Disconnect now") ||
+		!strings.Contains(body, "/disconnect") {
+		t.Fatal("admin page does not offer explicit non-revoking disconnect")
+	}
 }
 
 func TestAdminAPIIncludesLiveClientAndDeviceUsage(t *testing.T) {

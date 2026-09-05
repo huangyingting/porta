@@ -88,6 +88,29 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 	}
 }
 
+func TestAdvertisedDNSValidation(t *testing.T) {
+	pool, err := NewPool("10.66.0.0/29")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		dns   string
+		valid bool
+	}{
+		{"", true}, {"1.1.1.1", true}, {"10.66.0.1", true},
+		{"invalid", false}, {"::1", false}, {"127.0.0.53", false},
+		{"169.254.1.1", false}, {"0.0.0.0", false}, {"224.0.0.1", false},
+	} {
+		_, err := NewHandler(HandlerConfig{
+			AuthorizeClient: func(string, string) (ClientIdentity, error) { return ClientIdentity{}, nil },
+			Pool:            pool, Router: NewRouter(testPacketDevice{}, nil), MTU: 1100, DNS: test.dns,
+		})
+		if (err == nil) != test.valid {
+			t.Fatalf("DNS %q validity=%t, error=%v", test.dns, test.valid, err)
+		}
+	}
+}
+
 func TestParseLaneConfig(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, TunnelPath, nil)
 	if _, err := parseLaneConfig(request); err == nil {

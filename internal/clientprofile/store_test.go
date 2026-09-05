@@ -98,6 +98,7 @@ func TestStoreRollsBackFailedMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	original, err := store.Save(Profile{Name: "Original", ServerURL: "https://gateway", ClientID: "laptop"}, "secret")
 	if err != nil {
 		t.Fatal(err)
@@ -118,5 +119,34 @@ func TestStoreRollsBackFailedMutations(t *testing.T) {
 	token, err := store.Token(original.ID)
 	if err != nil || token != "secret" {
 		t.Fatalf("failed mutation changed token: %q, %v", token, err)
+	}
+}
+
+func TestStoreAutomaticDefaultPreservesExplicitTransport(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "profiles.json"), testProtector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transport := range []tunnel.Transport{"", tunnel.TransportAuto, tunnel.TransportHTTP3, tunnel.TransportHTTP2} {
+		profile, err := store.Save(Profile{
+			Name: "Profile", ServerURL: "https://gateway", ClientID: "laptop", Transport: transport,
+		}, "secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := transport
+		if want == "" {
+			want = tunnel.TransportAuto
+		}
+		if profile.Transport != want {
+			t.Fatalf("transport %q became %q, want %q", transport, profile.Transport, want)
+		}
+	}
+	reopened, err := Open(store.path, testProtector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened.List()) != 4 {
+		t.Fatal("profiles missing after reopen")
 	}
 }

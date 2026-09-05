@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/masque"
+	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/usage"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -20,7 +21,17 @@ import (
 
 const connectIPProtocol = "connect-ip"
 
-func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
+var errInvalidClientPacket = errors.New("invalid client packet")
+
+type masqueSession struct {
+	HandlerConfig
+	mtuDiscovery *masque.MTUResponder
+	addressReady chan struct{}
+	icmpAfter    time.Time
+}
+
+func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
+	c := masqueSession{HandlerConfig: config, addressReady: make(chan struct{}, 1)}
 	if r.ProtoMajor < 2 || !isConnectIP(r) {
 		http.Error(w, "CONNECT-IP requires HTTP Extended CONNECT", http.StatusBadRequest)
 		return
@@ -34,13 +45,15 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
 		return
 	}
-	identity, err := c.authorizeClient(r.Header.Get("Authorization"), clientID)
+	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), clientID)
 	if err != nil {
 		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	defer release()
+	r = r.WithContext(sessionParent)
 	if !requireProtocolVersion(w, r) {
 		return
 	}
@@ -53,7 +66,30 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	defer c.Pool.Release(lease)
 	session, sessionCtx := c.Router.Register(r.Context(), lease.Address)
 	defer session.Close()
+	stopResponseIO := stopStreamOnCancel(sessionCtx, w, r.Body)
+	defer stopResponseIO()
 
+	useDatagrams := false
+	if r.ProtoMajor == 3 {
+		if settings, ok := w.(http3.Settingser); ok {
+			select {
+			case <-settings.ReceivedSettings():
+				peerSettings := settings.Settings()
+				useDatagrams = c.EnableH3Datagrams && peerSettings != nil && peerSettings.EnableDatagrams
+			case <-sessionCtx.Done():
+				return
+			}
+		}
+	}
+	if c.AutoMTU && c.MTU > masque.SafeMTU && useDatagrams && r.Header.Get(masque.MTUDiscoveryHeader) == "1" {
+		c.mtuDiscovery, err = masque.NewMTUResponder(c.MTU)
+		if err != nil {
+			c.Logger.Error("initialize MTU discovery", "error", err)
+			http.Error(w, "MTU discovery unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set(masque.MTUDiscoveryHeader, c.mtuDiscovery.Offer())
+	}
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 	w.Header().Set("Cache-Control", "no-store")
 	setProtocolVersionHeaders(w.Header())
@@ -66,7 +102,6 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	remoteHost := clientAddress(r, c.TrustProxyHeaders)
 	transportName := "masque-h2-capsule"
 	var stream *http3.Stream
-	useDatagrams := false
 	reader := io.Reader(r.Body)
 	writer := io.Writer(w)
 	if r.ProtoMajor == 3 {
@@ -78,15 +113,11 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		defer stream.Close()
 		defer stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 		reader, writer = stream, stream
-		if settings, ok := w.(http3.Settingser); ok {
-			select {
-			case <-settings.ReceivedSettings():
-				peerSettings := settings.Settings()
-				useDatagrams = c.EnableH3Datagrams && peerSettings != nil && peerSettings.EnableDatagrams
-			case <-r.Context().Done():
-				return
-			}
-		}
+		stopIO := onSessionCancel(sessionCtx, func() {
+			stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+		})
+		defer stopIO()
 		if useDatagrams {
 			transportName = "masque-h3-datagram"
 		} else {
@@ -134,25 +165,26 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	var outgoing <-chan []byte
+	ready := c.addressReady
 	for {
 		select {
-		case packet := <-session.Outgoing:
+		case <-ready:
+			outgoing, ready = session.Outgoing, nil
+		case packet := <-outgoing:
 			if useDatagrams {
-				if err := stream.SendDatagram(masque.EncodeIPPacket(packet)); err != nil {
+				send := func(packet []byte) error { return c.sendMasqueIPPacket(packet, stream.SendDatagram, encoder) }
+				if err := c.sendDownlink(sessionCtx, lease, packet, send, usageSession); err != nil {
 					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 					return
 				}
-				c.Metrics.sentToClient()
-				usageSession.AddDownloaded(uint64(len(packet)), 1)
 			} else {
 			drain:
 				for count := 0; ; count++ {
-					if err := encoder.WriteIPPacket(packet); err != nil {
+					if err := c.sendDownlink(sessionCtx, lease, packet, encoder.WriteIPPacket, usageSession); err != nil {
 						c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
 						return
 					}
-					c.Metrics.sentToClient()
-					usageSession.AddDownloaded(uint64(len(packet)), 1)
 					if count+1 >= streamPacketBatch {
 						break
 					}
@@ -175,7 +207,18 @@ func (c HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (c HandlerConfig) readMasqueCapsules(
+func (c HandlerConfig) sendMasqueIPPacket(packet []byte, sendDatagram func([]byte) error, encoder *masque.Encoder) error {
+	return masque.SendIPPacket(packet, func(value []byte) error {
+		err := sendDatagram(value)
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			c.Metrics.DatagramOversize()
+		}
+		return err
+	}, encoder)
+}
+
+func (c *masqueSession) readMasqueCapsules(
 	ctx context.Context,
 	reader io.Reader,
 	encoder *masque.Encoder,
@@ -189,10 +232,32 @@ func (c HandlerConfig) readMasqueCapsules(
 	for {
 		capsule, err := decoder.ReadInto(valueBuffer)
 		if err != nil {
+			if errors.Is(err, masque.ErrCapsuleTooLarge) {
+				c.Metrics.droppedFromClient()
+			}
 			done <- err
 			return
 		}
 		switch capsule.Type {
+		case masque.CapsuleMTUSelect:
+			if c.mtuDiscovery == nil {
+				done <- masque.ErrMTUMessage
+				return
+			}
+			wasCommitted := c.mtuDiscovery.Committed()
+			selected, err := c.mtuDiscovery.Commit(capsule.Value)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := encoder.Write(masque.CapsuleMTUSelected, selected); err != nil {
+				done <- err
+				return
+			}
+			encoder.Flush()
+			if !wasCommitted {
+				c.Logger.Info("tunnel MTU selected", "address", lease.Address, "mtu", c.packetMTU(), "ceiling", c.MTU)
+			}
 		case masque.CapsuleAddressRequest:
 			if err := c.answerAddressRequest(encoder, lease, assigned, capsule.Value); err != nil {
 				done <- err
@@ -200,17 +265,18 @@ func (c HandlerConfig) readMasqueCapsules(
 			}
 		case masque.CapsuleDatagram:
 			if !assigned.Load() {
+				c.Metrics.droppedFromClient()
 				continue
 			}
 			packet, err := masque.DecodeIPPacket(capsule.Value)
 			if err != nil {
-				if errors.Is(err, masque.ErrUnknownContext) {
-					continue
-				}
-				done <- err
-				return
+				c.Metrics.droppedFromClient()
+				continue
 			}
 			if err := c.injectMasquePacket(ctx, lease.Address, packet); err != nil {
+				if errors.Is(err, errInvalidClientPacket) {
+					continue
+				}
 				done <- err
 				return
 			}
@@ -231,7 +297,7 @@ func (c HandlerConfig) readMasqueCapsules(
 	}
 }
 
-func (c HandlerConfig) readMasqueDatagrams(
+func (c *masqueSession) readMasqueDatagrams(
 	ctx context.Context,
 	stream *http3.Stream,
 	lease Lease,
@@ -245,18 +311,30 @@ func (c HandlerConfig) readMasqueDatagrams(
 			done <- err
 			return
 		}
+		if c.mtuDiscovery != nil && masque.IsMTUProbe(value) {
+			if err := c.mtuDiscovery.Echo(value, stream.SendDatagram); err != nil {
+				if errors.Is(err, masque.ErrMTUMessage) {
+					c.Metrics.droppedFromClient()
+					continue
+				}
+				done <- err
+				return
+			}
+			continue
+		}
 		if !assigned.Load() {
+			c.Metrics.droppedFromClient()
 			continue
 		}
 		packet, err := masque.DecodeIPPacket(value)
 		if err != nil {
-			if errors.Is(err, masque.ErrUnknownContext) {
-				continue
-			}
-			done <- err
-			return
+			c.Metrics.droppedFromClient()
+			continue
 		}
 		if err := c.injectMasquePacket(ctx, lease.Address, packet); err != nil {
+			if errors.Is(err, errInvalidClientPacket) {
+				continue
+			}
 			done <- err
 			return
 		}
@@ -264,12 +342,15 @@ func (c HandlerConfig) readMasqueDatagrams(
 	}
 }
 
-func (c HandlerConfig) answerAddressRequest(
+func (c *masqueSession) answerAddressRequest(
 	encoder *masque.Encoder,
 	lease Lease,
 	assigned *atomic.Bool,
 	value []byte,
 ) error {
+	if c.mtuDiscovery != nil && !c.mtuDiscovery.Committed() {
+		return fmt.Errorf("%w: MTU selection must precede address assignment", masque.ErrMTUMessage)
+	}
 	requests, err := masque.DecodeAddressRequest(value)
 	if err != nil {
 		return err
@@ -317,14 +398,33 @@ func (c HandlerConfig) answerAddressRequest(
 		assigned.Store(true)
 	}
 	encoder.Flush()
+	if assignedIPv4 {
+		select {
+		case c.addressReady <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
-func (c HandlerConfig) injectMasquePacket(ctx context.Context, address netip.Addr, packet []byte) error {
-	if len(packet) > c.MTU {
-		return fmt.Errorf("packet length %d exceeds tunnel MTU %d", len(packet), c.MTU)
+func (c *masqueSession) packetMTU() int {
+	if c.mtuDiscovery != nil {
+		return c.mtuDiscovery.MTU()
 	}
-	if err := c.Router.Inject(ctx, address, packet); err != nil {
+	return c.MTU
+}
+
+func (c *masqueSession) injectMasquePacket(ctx context.Context, address netip.Addr, packet []byte) error {
+	if mtu := c.packetMTU(); len(packet) > mtu {
+		c.Metrics.droppedFromClient()
+		return fmt.Errorf("%w: packet length %d exceeds tunnel MTU %d", errInvalidClientPacket, len(packet), mtu)
+	}
+	info, err := protocol.ParseIPv4(packet)
+	if err != nil || info.Source != address {
+		c.Metrics.droppedFromClient()
+		return errInvalidClientPacket
+	}
+	if err := c.Router.injectValidated(ctx, packet); err != nil {
 		return err
 	}
 	c.Metrics.receivedFromClient()

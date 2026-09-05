@@ -36,6 +36,21 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - name: Prepare persistent Android signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.PORTA_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+            echo "All four PORTA_ANDROID signing secrets are required; debug-key fallback is forbidden" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.p12"
+          test -s "$RUNNER_TEMP/porta-release.p12"
+          echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.p12" >> "$GITHUB_ENV"
       - uses: android-actions/setup-android@v3
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
       - name: Install Go mobile tools
@@ -64,25 +79,24 @@ jobs:
           cp scripts/deploy.sh scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh dist/deploy-bundle/porta/scripts/
           cp deploy/99-porta-quic.conf deploy/porta-cert-sync.timer dist/deploy-bundle/porta/deploy/
           tar -C dist/deploy-bundle -czf dist/porta-deploy.tar.gz porta
-      - name: Prepare Android signing key
-        env:
-          KEYSTORE_BASE64: ${{ secrets.PORTA_ANDROID_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
-        run: |
-          if [[ -n "$KEYSTORE_BASE64" || -n "$KEYSTORE_PASSWORD" || -n "$KEY_ALIAS" || -n "$KEY_PASSWORD" ]]; then
-            test -n "$KEYSTORE_BASE64" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
-            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.jks"
-            echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.jks" >> "$GITHUB_ENV"
-          fi
       - name: Build Android release
         working-directory: android
         env:
           PORTA_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
           PORTA_ANDROID_KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
           PORTA_ANDROID_KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
-        run: ./gradlew testDebugUnitTest assembleRelease --no-daemon
+        run: |
+          set -euo pipefail
+          ./gradlew testDebugUnitTest assembleRelease --no-daemon
+          expected=$(tr -d '\r\n' < signing-certificate.sha256)
+          for apk in app/build/outputs/apk/release/*.apk; do
+            actual=$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk" |
+              sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p')
+            [[ "$actual" == "$expected" ]] || {
+              echo "APK signing identity does not match the Porta certificate pin: $apk" >&2
+              exit 1
+            }
+          done
       - name: Collect artifacts
         run: |
           cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk dist/porta-android-arm64-v8a.apk
@@ -110,3 +124,6 @@ jobs:
             dist/porta-deploy.tar.gz \
             dist/SHA256SUMS
           gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Remove temporary Android signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/porta-release.p12"

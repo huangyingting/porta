@@ -216,6 +216,17 @@ func TestRunTrafficEventsFinishBeforeReturn(t *testing.T) {
 	}
 }
 
+func TestDeviceReaderOwnsCancellationAndJoinsWithoutClosingDevice(t *testing.T) {
+	tunDevice := &testDevice{readStarted: make(chan struct{})}
+	reader := startDeviceReader(context.Background(), tunDevice, make(chan []byte, 1), make(chan error, 1))
+	<-tunDevice.readStarted
+	reader.stop()
+	reader.stop()
+	if !tunDevice.readExited.Load() || tunDevice.closed.Load() {
+		t.Fatalf("reader exited=%t device closed=%t", tunDevice.readExited.Load(), tunDevice.closed.Load())
+	}
+}
+
 func TestReconnectDelayBounds(t *testing.T) {
 	for _, test := range []struct {
 		failures      int

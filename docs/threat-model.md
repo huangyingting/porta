@@ -45,6 +45,16 @@ transport fingerprints from network inspection.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.
+- Default automatic MTU selection is bounded and authenticated, not continuous
+  path-MTU discovery or a guarantee that a path will never change. Lost probes
+  cannot raise the MTU. A later QUIC payload-limit reduction uses reliable
+  capsules; this cannot repair a path unable to carry QUIC's minimum UDP packet
+  size. IPv4 DF feedback still depends on remote hosts accepting ICMP, and
+  fragmented packets can be lost like other unreliable IP traffic.
+- Automatic-MTU ICMP feedback permits locally sourced ingress only on the
+  owned server TUN, using `accept_local=1` and loose `rp_filter=2`. Incoming
+  client packet sources must still match their authenticated lease. Physical
+  interfaces and global reverse-path filtering are not weakened.
 - Android mitigates fallback head-of-line blocking with four independent
   HTTP/2 connections, including a dedicated DNS lane. Loss can still stall all
   flows assigned to the affected lane.
@@ -53,5 +63,22 @@ transport fingerprints from network inspection.
   UDP or HTTP/3 is unavailable.
 - Android relies on the system trust store and does not offer an insecure TLS
   switch.
-- The Windows route setup is explicit rather than automatic. Kill-switch and
-  DNS leak protection must be applied by deployment policy.
+- Linux automatic networking uses an owned nftables OUTPUT guard. Windows
+  desktop and opt-in automatic CLI networking use persistent native WFP filters;
+  the explicit Windows helpers use the same implementation. Protection starts
+  after the initial DNS/authenticated handshake, before route installation.
+- Guards remain active on reconnect, process crash, and terminal failure.
+  Intentional disconnect/cleanup restores owned networking and removes the
+  guard last. A recovery journal is essential; deleting it is not cleanup.
+- Linux protection covers the host's network namespace, not forwarded/container
+  traffic. Its exact endpoint TCP/UDP exceptions are not process-specific.
+  Windows endpoint exceptions are application scoped and forwarding is blocked.
+  Neither implementation overrides unrelated firewall blocks.
+- IPv6 payload is blocked, not tunneled. Loopback and narrowly required
+  transport/control exceptions remain. Protected retries use cached literal
+  endpoints and retain TLS hostname verification; arbitrary DNS changes,
+  physical DHCP renewal, and unrestricted network handover are not guaranteed.
+- Process-crash persistence is not a blanket boot-time protection guarantee.
+  Linux reboot/external nftables removal and Windows early boot/BFE shutdown
+  are outside the guarantee, as is administrator tampering. Mocked policy and
+  cross-platform builds are not native packet-level leak certification.

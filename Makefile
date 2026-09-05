@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: check-version test test-automation test-race vet build build-windows android clean
+.PHONY: check-version test test-automation test-race test-native-mtu vet build build-windows android clean
 
 check-version:
 	./scripts/check-version.sh
@@ -14,6 +14,14 @@ test-automation:
 
 test-race:
 	GODEBUG=http2xconnect=1 $(GO) test -race ./...
+
+test-native-mtu:
+	@set -eu; directory=$$(mktemp -d); \
+	trap 'rm -f "$$directory/gateway.test"; rmdir "$$directory"' EXIT; \
+	$(GO) test -c -o "$$directory/gateway.test" ./internal/gateway; \
+	cd internal/gateway; \
+	sudo -n unshare --net -- env PORTA_MTU_NATIVE_TEST=1 "$$directory/gateway.test" \
+		-test.run '^TestNativeMTU' -test.count=1 -test.v -test.timeout=30s
 
 vet:
 	$(GO) vet ./...

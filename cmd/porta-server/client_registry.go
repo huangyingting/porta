@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -26,12 +27,25 @@ var (
 	errClientUnauthorized = errors.New("client token is invalid")
 	errClientDisabled     = errors.New("client is disabled")
 	errDeviceLimit        = errors.New("client device limit reached")
+	errDeviceDraining     = errors.New("device sessions are being disconnected")
 )
 
 type clientRegistry struct {
-	mu      sync.Mutex
-	path    string
-	clients []clientRecord
+	mu       sync.Mutex
+	path     string
+	clients  []clientRecord
+	sessions map[registryDeviceKey]map[*activeClientSession]struct{}
+	retiring map[registryDeviceKey]bool
+}
+
+type registryDeviceKey struct {
+	accountID string
+	deviceID  string
+}
+
+type activeClientSession struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type clientRecord struct {
@@ -143,12 +157,53 @@ func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 }
 
 func (r *clientRegistry) Authenticate(token, deviceID string) (gateway.ClientIdentity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.authenticateLocked(token, deviceID)
+}
+
+// AuthenticateSession registers cancellation under the same lock as authentication.
+// release must run after all packet/copy workers and usage accounting have drained.
+func (r *clientRegistry) AuthenticateSession(parent context.Context, token, deviceID string) (gateway.ClientIdentity, context.Context, func(), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := parent.Err(); err != nil {
+		return gateway.ClientIdentity{}, nil, nil, err
+	}
+	identity, err := r.authenticateLocked(token, deviceID)
+	if err != nil {
+		return gateway.ClientIdentity{}, nil, nil, err
+	}
+	ctx, cancel := context.WithCancel(parent)
+	key := registryDeviceKey{identity.AccountID, deviceID}
+	session := &activeClientSession{cancel: cancel, done: make(chan struct{})}
+	if r.sessions == nil {
+		r.sessions = make(map[registryDeviceKey]map[*activeClientSession]struct{})
+	}
+	if r.sessions[key] == nil {
+		r.sessions[key] = make(map[*activeClientSession]struct{})
+	}
+	r.sessions[key][session] = struct{}{}
+	var once sync.Once
+	return identity, ctx, func() {
+		once.Do(func() {
+			cancel()
+			r.mu.Lock()
+			delete(r.sessions[key], session)
+			if len(r.sessions[key]) == 0 {
+				delete(r.sessions, key)
+			}
+			r.mu.Unlock()
+			close(session.done)
+		})
+	}, nil
+}
+
+func (r *clientRegistry) authenticateLocked(token, deviceID string) (gateway.ClientIdentity, error) {
 	if !gateway.ValidClientID(deviceID) {
 		return gateway.ClientIdentity{}, errClientUnauthorized
 	}
 	tokenHash := hashToken(token)
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	for clientIndex := range r.clients {
 		client := &r.clients[clientIndex]
 		if subtle.ConstantTimeCompare([]byte(client.TokenHash), []byte(tokenHash)) != 1 {
@@ -156,6 +211,9 @@ func (r *clientRegistry) Authenticate(token, deviceID string) (gateway.ClientIde
 		}
 		if !client.Enabled {
 			return gateway.ClientIdentity{}, errClientDisabled
+		}
+		if r.retiring[registryDeviceKey{client.ID, deviceID}] {
+			return gateway.ClientIdentity{}, errDeviceDraining
 		}
 		now := time.Now().UTC()
 		for deviceIndex := range client.Devices {
@@ -274,7 +332,11 @@ func (r *clientRegistry) Update(id, name string, maxDevices int, enabled bool) (
 		return clientSummary{}, err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var stopped []*activeClientSession
+	defer func() {
+		r.mu.Unlock()
+		drainClientSessions(stopped)
+	}()
 	client := r.findLocked(id)
 	if client == nil {
 		return clientSummary{}, os.ErrNotExist
@@ -290,6 +352,9 @@ func (r *clientRegistry) Update(id, name string, maxDevices int, enabled bool) (
 		*client = previous
 		return clientSummary{}, err
 	}
+	if !enabled {
+		stopped = r.sessionsLocked(id, "")
+	}
 	return summarizeClient(*client, append([]deviceRecord(nil), client.Devices...), usage.Snapshot{}), nil
 }
 
@@ -299,7 +364,11 @@ func (r *clientRegistry) RotateToken(id string) (string, error) {
 		return "", err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var stopped []*activeClientSession
+	defer func() {
+		r.mu.Unlock()
+		drainClientSessions(stopped)
+	}()
 	client := r.findLocked(id)
 	if client == nil {
 		return "", os.ErrNotExist
@@ -310,12 +379,17 @@ func (r *clientRegistry) RotateToken(id string) (string, error) {
 		client.TokenHash = previous
 		return "", err
 	}
+	stopped = r.sessionsLocked(id, "")
 	return token, nil
 }
 
 func (r *clientRegistry) Delete(id string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var stopped []*activeClientSession
+	defer func() {
+		r.mu.Unlock()
+		drainClientSessions(stopped)
+	}()
 	for index := range r.clients {
 		if r.clients[index].ID != id {
 			continue
@@ -326,14 +400,33 @@ func (r *clientRegistry) Delete(id string) error {
 			r.clients = previous
 			return err
 		}
+		stopped = r.sessionsLocked(id, "")
 		return nil
 	}
 	return os.ErrNotExist
 }
 
 func (r *clientRegistry) DeleteDevice(clientID, deviceID string) error {
+	return r.forgetDevice(clientID, deviceID, nil)
+}
+
+func (r *clientRegistry) forgetDevice(clientID, deviceID string, store *usage.Store) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var stopped []*activeClientSession
+	retired := false
+	key := registryDeviceKey{clientID, deviceID}
+	defer func() {
+		r.mu.Unlock()
+		drainClientSessions(stopped)
+		if retired {
+			if store != nil {
+				store.DeleteDevice(clientID, deviceID)
+			}
+			r.mu.Lock()
+			delete(r.retiring, key)
+			r.mu.Unlock()
+		}
+	}()
 	client := r.findLocked(clientID)
 	if client == nil {
 		return os.ErrNotExist
@@ -348,9 +441,60 @@ func (r *clientRegistry) DeleteDevice(clientID, deviceID string) error {
 			client.Devices = previous
 			return err
 		}
+		stopped = r.sessionsLocked(clientID, deviceID)
+		if r.retiring == nil {
+			r.retiring = make(map[registryDeviceKey]bool)
+		}
+		r.retiring[key] = true
+		retired = true
 		return nil
 	}
 	return os.ErrNotExist
+}
+
+func (r *clientRegistry) Disconnect(clientID, deviceID string) (int, error) {
+	r.mu.Lock()
+	client := r.findLocked(clientID)
+	if client == nil {
+		r.mu.Unlock()
+		return 0, os.ErrNotExist
+	}
+	if deviceID != "" {
+		found := false
+		for _, device := range client.Devices {
+			found = found || device.ID == deviceID
+		}
+		if !found {
+			r.mu.Unlock()
+			return 0, os.ErrNotExist
+		}
+	}
+	stopped := r.sessionsLocked(clientID, deviceID)
+	r.mu.Unlock()
+	drainClientSessions(stopped)
+	return len(stopped), nil
+}
+
+func (r *clientRegistry) sessionsLocked(accountID, deviceID string) []*activeClientSession {
+	var sessions []*activeClientSession
+	for key, active := range r.sessions {
+		if key.accountID == accountID && (deviceID == "" || key.deviceID == deviceID) {
+			for session := range active {
+				sessions = append(sessions, session)
+			}
+		}
+	}
+	return sessions
+}
+
+func drainClientSessions(sessions []*activeClientSession) {
+	// Signal every lane before waiting for any of them. Never wait under r.mu.
+	for _, session := range sessions {
+		session.cancel()
+	}
+	for _, session := range sessions {
+		<-session.done
+	}
 }
 
 func (r *clientRegistry) findLocked(id string) *clientRecord {

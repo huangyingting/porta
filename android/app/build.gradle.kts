@@ -1,3 +1,9 @@
+import java.io.File
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.PrivateKey
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -22,10 +28,33 @@ val buildNativeMasqueAar by tasks.registering(Exec::class) {
     outputs.file(nativeMasqueAar)
 }
 
-val releaseKeystorePath = providers.environmentVariable("PORTA_ANDROID_KEYSTORE").orNull
-val releaseKeystorePassword = providers.environmentVariable("PORTA_ANDROID_KEYSTORE_PASSWORD").orNull
-val releaseKeyAlias = providers.environmentVariable("PORTA_ANDROID_KEY_ALIAS").orNull
-val releaseKeyPassword = providers.environmentVariable("PORTA_ANDROID_KEY_PASSWORD").orNull
+val signingEnvironment = mapOf(
+    "storeFile" to providers.environmentVariable("PORTA_ANDROID_KEYSTORE").orNull,
+    "storePassword" to providers.environmentVariable("PORTA_ANDROID_KEYSTORE_PASSWORD").orNull,
+    "keyAlias" to providers.environmentVariable("PORTA_ANDROID_KEY_ALIAS").orNull,
+    "keyPassword" to providers.environmentVariable("PORTA_ANDROID_KEY_PASSWORD").orNull,
+)
+val hasEnvironmentSigning = signingEnvironment.values.any { !it.isNullOrBlank() }
+val signingConfigRoot = providers.environmentVariable("XDG_CONFIG_HOME").orNull
+    ?.takeIf { it.isNotBlank() }?.let(::File) ?: File(System.getProperty("user.home"), ".config")
+val signingPropertiesFile = providers.environmentVariable("PORTA_ANDROID_SIGNING_PROPERTIES").orNull
+    ?.takeIf { it.isNotBlank() }?.let { rootProject.file(it) }
+    ?: rootProject.file(signingConfigRoot.resolve("porta/android-signing/signing.properties"))
+val signingProperties = Properties().apply {
+    // Partial environment credentials must not silently borrow a local key.
+    if (!hasEnvironmentSigning && signingPropertiesFile.isFile) {
+        signingPropertiesFile.inputStream().use { load(it) }
+    }
+}
+val releaseSigning = signingEnvironment.mapValues { (name, value) ->
+    if (hasEnvironmentSigning) value else signingProperties.getProperty(name)
+}
+val releaseKeystoreFile = releaseSigning["storeFile"]?.let {
+    if (hasEnvironmentSigning) file(it) else signingPropertiesFile.parentFile.resolve(it)
+}
+val releaseKeystorePassword = releaseSigning["storePassword"]
+val releaseKeyAlias = releaseSigning["keyAlias"]
+val releaseKeyPassword = releaseSigning["keyPassword"]
 val sourceVersion = rootProject.projectDir.parentFile
     .resolve("internal/buildinfo/VERSION")
     .readText()
@@ -42,12 +71,37 @@ val applicationVersionCode = configuredVersionCode?.toIntOrNull() ?: if (configu
 require(applicationVersionCode in 1..2_100_000_000) {
     "PORTA_ANDROID_VERSION_CODE must be between 1 and 2100000000"
 }
-val hasReleaseSigning = listOf(
-    releaseKeystorePath,
-    releaseKeystorePassword,
-    releaseKeyAlias,
-    releaseKeyPassword,
-).all { !it.isNullOrBlank() }
+val hasReleaseSigning = releaseSigning.values.all { !it.isNullOrBlank() }
+val signingCertificatePin = rootProject.file("signing-certificate.sha256")
+val validatePortaReleaseSigning by tasks.registering {
+    group = "verification"
+    description = "Requires the persistent Porta signing key and checks its certificate identity"
+    inputs.file(signingCertificatePin)
+    doLast {
+        require(hasReleaseSigning) {
+            "Release signing is not configured. Restore the persistent Porta key and " +
+                "$signingPropertiesFile, or provide all four PORTA_ANDROID signing variables. " +
+                "Debug-key fallback is forbidden."
+        }
+        val storeFile = checkNotNull(releaseKeystoreFile)
+        require(storeFile.isFile) { "Porta signing keystore is missing: $storeFile" }
+        val store = KeyStore.getInstance(storeFile, checkNotNull(releaseKeystorePassword).toCharArray())
+        val alias = checkNotNull(releaseKeyAlias)
+        require(store.isKeyEntry(alias)) { "Porta signing alias is missing: $alias" }
+        require(store.getKey(alias, checkNotNull(releaseKeyPassword).toCharArray()) is PrivateKey) {
+            "Porta signing alias does not contain a private key"
+        }
+        val certificate = checkNotNull(store.getCertificate(alias)) { "Porta signing certificate is missing" }
+        val actual = MessageDigest.getInstance("SHA-256").digest(certificate.encoded)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val expected = signingCertificatePin.readText().trim().lowercase()
+        require(expected.matches(Regex("[0-9a-f]{64}"))) { "Invalid Porta signing certificate pin" }
+        require(actual == expected) {
+            "Wrong Android signing identity: expected $expected, got $actual. " +
+                "Restore the existing key; do not generate a replacement."
+        }
+    }
+}
 
 android {
     namespace = "dev.porta.android"
@@ -64,9 +118,9 @@ android {
     }
 
     signingConfigs {
-        if (hasReleaseSigning) {
-            create("release") {
-                storeFile = file(releaseKeystorePath!!)
+        create("release") {
+            if (hasReleaseSigning) {
+                storeFile = releaseKeystoreFile
                 storePassword = releaseKeystorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword
@@ -79,11 +133,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -117,4 +167,10 @@ dependencies {
 
 tasks.named("preBuild").configure {
     dependsOn(buildNativeMasqueAar)
+}
+
+tasks.configureEach {
+    if (name.contains("Release") && name != "validatePortaReleaseSigning") {
+        dependsOn(validatePortaReleaseSigning)
+    }
 }

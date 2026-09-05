@@ -39,6 +39,13 @@ jobs:
       - run: make test-automation
       - run: make test
       - run: make test-race
+      - name: Test native MTU feedback in an isolated network namespace
+        run: |
+          if ! command -v nft >/dev/null || ! command -v ip >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y nftables iproute2
+          fi
+          make test-native-mtu
       - run: make vet
       - run: make build
       - run: make build-windows
@@ -52,7 +59,9 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Test Windows packages
-        run: go test ./internal/clientapp ./internal/clientprofile ./cmd/porta-client
+        env:
+          PORTA_WFP_NATIVE_TEST: "1"
+        run: go test -count=1 ./internal/clientapp ./internal/clientprofile ./internal/winnetwork ./cmd/porta-client ./cmd/porta-windows
       - name: Build Windows applications
         shell: pwsh
         run: |
@@ -84,9 +93,19 @@ jobs:
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
           go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
       - uses: gradle/actions/setup-gradle@v4
+      - name: Verify release signing cannot fall back to a debug key
+        working-directory: android
+        env:
+          PORTA_ANDROID_SIGNING_PROPERTIES: ${{ runner.temp }}/missing-porta-signing.properties
+        run: |
+          if ./gradlew :app:assembleRelease --no-daemon > "$RUNNER_TEMP/porta-signing-check.log" 2>&1; then
+            echo "Release signing unexpectedly succeeded without the persistent key" >&2
+            exit 1
+          fi
+          grep -q "Release signing is not configured" "$RUNNER_TEMP/porta-signing-check.log"
       - working-directory: android
-        run: ./gradlew testDebugUnitTest assembleDebug assembleRelease --no-daemon
+        run: ./gradlew testDebugUnitTest assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: android-apks
-          path: android/app/build/outputs/apk/**/*.apk
+          name: android-debug-apks
+          path: android/app/build/outputs/apk/debug/*.apk

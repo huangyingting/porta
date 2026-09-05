@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
@@ -13,6 +14,21 @@ func EncodeIPPacket(packet []byte) []byte {
 	value := make([]byte, 1+len(packet))
 	copy(value[1:], packet)
 	return value
+}
+
+// SendIPPacket uses a reliable DATAGRAM capsule only when a packet exceeds the
+// current QUIC path limit. Both forms can coexist on the same CONNECT-IP tunnel.
+func SendIPPacket(packet []byte, sendDatagram func([]byte) error, encoder *Encoder) error {
+	err := sendDatagram(EncodeIPPacket(packet))
+	var tooLarge *quic.DatagramTooLargeError
+	if !errors.As(err, &tooLarge) {
+		return err
+	}
+	if err := encoder.WriteIPPacket(packet); err != nil {
+		return err
+	}
+	encoder.Flush()
+	return nil
 }
 
 func DecodeIPPacket(value []byte) ([]byte, error) {

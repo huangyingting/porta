@@ -35,3 +35,14 @@ func TestNewProfileDefaults(t *testing.T) {
 		t.Fatalf("new profile defaults: %+v", got)
 	}
 }
+
+func TestTransportSelectionPreservesExplicitProfiles(t *testing.T) {
+	for _, transport := range []tunnel.Transport{tunnel.TransportAuto, tunnel.TransportHTTP3, tunnel.TransportHTTP2} {
+		if got := selectedTransport(transportIndex(transport)); got != transport {
+			t.Errorf("transport %q became %q", transport, got)
+		}
+	}
+	if got := selectedTransport(0); got != tunnel.TransportAuto {
+		t.Fatalf("new profile transport = %q", got)
+	}
+}

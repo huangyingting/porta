@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -61,9 +63,17 @@ func TestHTTP3MasqueCallerOwnsPacketConn(t *testing.T) {
 	testHTTP3MasqueRoundTrip(t, true, true)
 }
 
-func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bool) {
+func TestHTTP3OversizedPacketsKeepTunnelUsable(t *testing.T) {
+	testHTTP3MasqueRoundTrip(t, true, false, 20, 8000, 20)
+}
+
+func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bool, packetSizes ...int) {
 	t.Helper()
-	handler, router, dev := testGateway(t, enableDatagrams)
+	mtu := 1300
+	for _, size := range packetSizes {
+		mtu = max(mtu, size)
+	}
+	handler, router, dev := testGateway(t, enableDatagrams, mtu)
 	tempDir := t.TempDir()
 	certPath := filepath.Join(tempDir, "server.crt")
 	keyPath := filepath.Join(tempDir, "server.key")
@@ -101,6 +111,20 @@ func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bo
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
 		Timeout:   3 * time.Second,
 	}
+	if !supplyPacketConn {
+		_, port, err := net.SplitHostPort(packetConn.LocalAddr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		config.URL = "https://vpn.example.invalid:" + port
+		config.DialAddress = packetConn.LocalAddr().String()
+		config.TLSConfig.VerifyConnection = func(state tls.ConnectionState) error {
+			if state.ServerName != "vpn.example.invalid" {
+				return fmt.Errorf("pinned QUIC connection lost TLS hostname: %q", state.ServerName)
+			}
+			return nil
+		}
+	}
 	if supplyPacketConn {
 		udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
@@ -116,10 +140,19 @@ func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bo
 		config.PacketConn = tracked
 		config.RemoteAddr = packetConn.LocalAddr()
 	}
-	testPacketRoundTrip(t, router, dev, config)
+	testPacketRoundTrip(t, router, dev, config, packetSizes...)
 }
 
-func testGateway(t *testing.T, enableH3Datagrams bool) (http.Handler, *gateway.Router, *fakeDevice) {
+func testGateway(t *testing.T, enableH3Datagrams bool, configuredMTU ...int) (http.Handler, *gateway.Router, *fakeDevice) {
+	t.Helper()
+	mtu := 1300
+	if len(configuredMTU) > 0 {
+		mtu = configuredMTU[0]
+	}
+	return testMTUGateway(t, enableH3Datagrams, mtu, false)
+}
+
+func testMTUGateway(t *testing.T, enableH3Datagrams bool, mtu int, autoMTU bool) (http.Handler, *gateway.Router, *fakeDevice) {
 	t.Helper()
 	pool, err := gateway.NewPool("10.66.0.0/29")
 	if err != nil {
@@ -138,7 +171,8 @@ func testGateway(t *testing.T, enableH3Datagrams bool) (http.Handler, *gateway.R
 		Pool:              pool,
 		Router:            router,
 		DNS:               "1.1.1.1",
-		MTU:               1300,
+		MTU:               mtu,
+		AutoMTU:           autoMTU,
 		EnableH3Datagrams: enableH3Datagrams,
 		KeepaliveInterval: time.Hour,
 		Logger:            logger,
@@ -151,7 +185,7 @@ func testGateway(t *testing.T, enableH3Datagrams bool) (http.Handler, *gateway.R
 
 // testPacketRoundTrip owns the real context and starts the router only after
 // the transport-specific server is listening.
-func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, config tunnel.Config) {
+func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, config tunnel.Config, packetSizes ...int) tunnel.Transport {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -170,41 +204,53 @@ func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, 
 		t.Fatal("tunnel did not expose its remote address")
 	}
 
-	clientPacket := ipv4Packet(connection.Lease.Address.Addr().As4(), [4]byte{1, 1, 1, 1})
-	if err := connection.Send(clientPacket); err != nil {
-		t.Fatal(err)
+	if len(packetSizes) == 0 {
+		packetSizes = []int{20}
 	}
-	select {
-	case got := <-dev.writes:
-		if !bytes.Equal(got, clientPacket) {
-			t.Fatalf("gateway TUN got %x, want %x", got, clientPacket)
+	for _, size := range packetSizes {
+		clientPacket := sizedIPv4Packet(connection.Lease.Address.Addr().As4(), [4]byte{1, 1, 1, 1}, size)
+		if err := connection.Send(clientPacket); err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(packetRoundTripTimeout):
-		t.Fatal("timed out waiting for client-to-gateway packet")
-	}
+		select {
+		case got := <-dev.writes:
+			if !bytes.Equal(got, clientPacket) {
+				t.Fatalf("gateway TUN got %x, want %x", got, clientPacket)
+			}
+		case <-time.After(packetRoundTripTimeout):
+			t.Fatal("timed out waiting for client-to-gateway packet")
+		}
 
-	serverPacket := ipv4Packet([4]byte{8, 8, 8, 8}, connection.Lease.Address.Addr().As4())
-	dev.reads <- serverPacket
-	received := make(chan []byte, 1)
-	errs := make(chan error, 1)
-	go func() {
-		packet, receiveErr := connection.Receive()
-		if receiveErr != nil {
-			errs <- receiveErr
-			return
+		serverPacket := sizedIPv4Packet([4]byte{8, 8, 8, 8}, connection.Lease.Address.Addr().As4(), size)
+		dev.reads <- serverPacket
+		received := make(chan []byte, 1)
+		errs := make(chan error, 1)
+		go func() {
+			packet, receiveErr := connection.Receive()
+			if receiveErr != nil {
+				errs <- receiveErr
+				return
+			}
+			received <- packet
+		}()
+		select {
+		case got := <-received:
+			if !bytes.Equal(got, serverPacket) {
+				t.Fatalf("client got %x, want %x", got, serverPacket)
+			}
+		case receiveErr := <-errs:
+			t.Fatal(receiveErr)
+		case <-time.After(packetRoundTripTimeout):
+			t.Fatal("timed out waiting for gateway-to-client packet")
 		}
-		received <- packet
-	}()
-	select {
-	case got := <-received:
-		if !bytes.Equal(got, serverPacket) {
-			t.Fatalf("client got %x, want %x", got, serverPacket)
-		}
-	case receiveErr := <-errs:
-		t.Fatal(receiveErr)
-	case <-time.After(packetRoundTripTimeout):
-		t.Fatal("timed out waiting for gateway-to-client packet")
 	}
+	return connection.Transport
+}
+
+func sizedIPv4Packet(source, destination [4]byte, size int) []byte {
+	packet := append(ipv4Packet(source, destination), make([]byte, size-20)...)
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	return packet
 }
 
 type fakeDevice struct {

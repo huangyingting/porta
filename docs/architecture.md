@@ -9,17 +9,18 @@ its protocol fingerprint.
 ## Data path
 
 ```text
-Windows Wintun                 Android VpnService
-       |                               |
-MASQUE CONNECT-IP              four-lane Porta stream
-       |                               |
-  +----+-------------------------------+
-  |                                    |
-HTTP/2 capsules             HTTP/3 QUIC Datagrams
-  |                         (capsule fallback)
-  +--------------------+---------------+
+Linux TUN / Windows Wintun / Android VpnService
                        |
-                  Porta gateway
+                MASQUE CONNECT-IP
+                       |
+          +------------+------------+
+          |                         |
+   HTTP/3 QUIC Datagrams       HTTP/2 capsules
+   (capsules when needed)     (desktop fallback)
+          |                         |
+          +------------+------------+
+                       |
+                 Porta gateway <---- Android four-lane HTTP/2 fallback
                        |
                    Linux TUN
                        |
@@ -43,6 +44,76 @@ optional `X-Porta-DNS` and `X-Porta-MTU` response extensions. Authentication use
 selection and reconnect replacement. The token identifies a client account,
 while the client ID identifies one enrolled device. Their combined identity
 prevents device-name collisions between accounts.
+
+### Stable per-connection MTU selection
+
+Automatic MTU selection is enabled by default for HTTP/3 Datagram connections,
+using an optional Porta protocol extension. The default ceiling is 1400;
+`--mtu` bounds the selected value, and 1100 is the conservative discovery
+baseline. Clients require no extra setting. The shared gateway TUN keeps the
+configured ceiling. Use `--auto-mtu=false --mtu 1100` to select a fixed MTU
+instead; the daemon, deployment script, and network helper support the same
+boolean MTU-mode override.
+
+An eligible client sends `X-Porta-MTU-Discovery: 1`. When enabled, the server
+responds with the same header containing a random, session-specific
+16-byte nonce encoded as 32 hexadecimal characters. Discovery is offered only
+when both peers support HTTP Datagrams and the configured ceiling exceeds
+1100. Without an offer, `X-Porta-MTU` remains the fixed MTU. With an offer, it
+is the ceiling until reliable selection completes.
+
+Discovery happens before ADDRESS_REQUEST and before client TUN creation:
+
+1. Start at 1100. Send a warm-up probe, then try increasing candidates of 1152,
+   1200, 1280, 1360, and 1400, including the exact configured ceiling if lower.
+2. Each probe is an HTTP Datagram with Context ID 1, the 16-byte nonce, a
+   big-endian 16-bit sequence, a big-endian 16-bit candidate MTU, and zero
+   padding. Its total length is exactly the candidate MTU plus one byte, just
+   like a Context ID 0 IP datagram of that size.
+3. The server echoes valid probes unchanged, only as unreliable datagrams.
+   A matching echo demonstrates current delivery in both directions. Capsule
+   delivery and successfully queueing a send are never sufficient proof.
+4. Probing has a 750 ms budget, at most two 150 ms attempts per candidate,
+   and stops increasing on loss or a local QUIC payload-limit error. Keep the
+   last confirmed value, or 1100 if discovery is inconclusive. The server
+   accepts at most 16 valid probes within three seconds of its offer.
+5. The client sends Porta-specific `MTU_SELECT` capsule type `0xff7000`;
+   the server validates and acknowledges with `MTU_SELECTED` type
+   `0xff7001`. Both contain the nonce followed by a big-endian 16-bit MTU.
+   Values above 1100 must match an echoed candidate. A committed selection
+   cannot change during that connection.
+
+The entire exchange remains inside the normal startup timeout. Lost probes
+do not fail the tunnel, but a missing/malformed reliable agreement does not
+permit returning a partially configured connection or downgrading transports.
+IP downlink delivery is withheld until address assignment completes. The final
+lease MTU reaches Linux, Windows, and the Android native bridge before network
+configuration.
+
+Each MASQUE session enforces its own MTU. Oversized packets from the shared
+TUN are fragmented when IPv4 DF is clear, including correct copied options,
+fragment offsets and checksums. With DF set, the gateway sends ICMP
+Destination Unreachable / Fragmentation Needed back through TUN toward the
+original sender, quoting the original header and advertising the selected
+MTU. Forbidden ICMP replies are suppressed; permitted replies are limited to
+one per 100 ms per session. The `porta_mtu_packets_total` metric reports
+`fragmented`, `icmp_sent`, `icmp_suppressed`, and `icmp_rate_limited` actions;
+selected MTUs appear in server logs.
+
+Linux ordinarily rejects TUN ingress sourced from its own gateway address.
+Automatic deployment therefore enables `accept_local=1` and loose
+`rp_filter=2` on the owned TUN only. The `mtu_feedback` readiness component
+requires local-source acceptance and rejects effective strict reverse-path
+filtering. Global and physical-interface source-validation settings remain
+unchanged; no production raw-socket capability is added.
+
+This is conservative setup-time selection, not a measurement of the absolute
+maximum path MTU or continuous tunnel resizing. QUIC manages its own outer
+path MTU independently. If its datagram limit later shrinks, ordinary packets
+still use the reliable capsule fallback described below. Selection runs again
+on reconnect; a changed lease MTU can recreate the client TUN. HTTP/2,
+Android's private HTTP/2 lanes, and HTTP/3 without Datagrams keep the configured
+MTU because their streams can segment data without UDP-sized inner packets.
 
 ## Protocol compatibility
 
@@ -94,6 +165,13 @@ IP packets are therefore unreliable, independently delivered Datagrams, as
 required for the efficient RFC 9484 mode. Control capsules remain on the
 reliable Extended CONNECT request stream.
 
+If an IP packet exceeds the current QUIC datagram payload limit, Porta sends
+that packet in a DATAGRAM capsule on the same connection instead of
+disconnecting the tunnel. Smaller packets continue using datagrams. This
+preserves the selected inner MTU without inventing an MTU from outer-packet
+overhead; oversized packets temporarily inherit reliable-stream head-of-line
+blocking.
+
 HTTP/2 has no unreliable Datagram frame. It carries the Context ID 0 payload in
 DATAGRAM capsules on the reliable CONNECT stream. This is interoperable but
 inherits TCP head-of-line blocking.
@@ -102,13 +180,28 @@ The current `golang.org/x/net/http2` server gates Extended CONNECT behind the
 official `GODEBUG=http2xconnect=1` switch. The gateway re-executes itself once
 with this setting if it is absent. Tests set it before process startup.
 
+Client establishment has one timeout covering transport setup, request headers,
+optional MTU discovery/agreement, ADDRESS_REQUEST writes and ADDRESS_ASSIGN
+receipt. Completing establishment
+removes that startup deadline; it does not limit the lifetime of a working
+tunnel.
+
 ## Platform clients
 
+- Linux configures the TUN, endpoint escape and full-tunnel routes, and
+  systemd-resolved per-link DNS through an exclusively locked recovery journal.
+  An owned nftables OUTPUT guard remains installed during reconnect and cleanup
+  removes it last. This covers host traffic, not containers or forwarded traffic.
 - Windows uses the WireGuard project's Wintun bindings. The desktop client
-  configures addresses, DNS and routes through a journaled PowerShell helper;
-  the CLI leaves this to the operator's separate up/down scripts. Gateway
-  escape routes are established before default tunnel routes, and cleanup
-  removes only escape routes created by Porta. MASQUE is the default protocol.
+  configures addresses, DNS and routes through a journaled PowerShell helper.
+  Persistent native WFP filters provide atomic fail-closed protection in an
+  owned sublayer without overriding unrelated firewall blocks. The CLI retains
+  manual networking by default; `--manual-network=false` enables the same
+  automatic lifecycle. Separate up/down scripts invoke the same executable's
+  native helper rather than duplicating protection logic. The helper explicitly
+  sets the Windows IP-interface MTU: Wintun's buffer MTU does not configure the
+  OS network stack. MTU/DNS/routes are journaled for retryable recovery, and
+  guarded reconnects revalidate the adapter before restoring its exemption.
 - Android uses `VpnService` with a native Go HTTP/3 MASQUE bridge. The UDP
   socket is protected from the VPN routing loop and bound to Android's selected
   underlying network. Four-lane HTTP/2 remains an automatic fallback.
@@ -116,6 +209,15 @@ with this setting if it is absent. Tests set it before process startup.
   runtime while retaining the complete HTTP/3 implementation.
   Named server profiles and their tokens are stored locally, with tokens
   encrypted by Android Keystore.
+
+Desktop clients default to automatic HTTP/3 selection with HTTP/2 fallback only
+for transport unavailability, never authentication, certificate, or protocol
+rejection. Protected reconnects prepare a cached numeric endpoint before dialing
+while preserving URL authority and TLS identity. Lease/address/MTU changes
+reconfigure networking under the guard; native TUN replacement joins workers
+and discards stale queued packets. Initial DNS and authenticated bootstrap are
+outside the guard. Recovery journals allow crash restart without physical DNS,
+but cannot discover previously unknown hostname addresses while protected.
 
 ## Android HTTP/2 fallback
 

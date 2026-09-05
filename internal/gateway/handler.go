@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -46,12 +47,15 @@ type ClientIdentity struct {
 
 type AuthorizeClientFunc func(token, deviceID string) (ClientIdentity, error)
 
+type AuthorizeSessionFunc func(context.Context, string, string) (ClientIdentity, context.Context, func(), error)
+
 func ValidClientID(value string) bool {
 	return validClientID.MatchString(value)
 }
 
 type HandlerConfig struct {
 	AuthorizeClient   AuthorizeClientFunc
+	AuthorizeSession  AuthorizeSessionFunc
 	MetricsToken      string
 	Metrics           *Metrics
 	Usage             *usage.Store
@@ -59,14 +63,16 @@ type HandlerConfig struct {
 	Router            *Router
 	DNS               string
 	MTU               int
+	AutoMTU           bool
 	EnableH3Datagrams bool
 	TrustProxyHeaders bool
 	KeepaliveInterval time.Duration
 	Logger            *slog.Logger
+	Readiness         *Readiness
 }
 
 func NewHandler(config HandlerConfig) (http.Handler, error) {
-	if config.AuthorizeClient == nil {
+	if config.AuthorizeClient == nil && config.AuthorizeSession == nil {
 		return nil, errors.New("gateway client authorizer is required")
 	}
 	if config.MetricsToken != "" && len(config.MetricsToken) < 16 {
@@ -81,8 +87,15 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 	if config.Pool == nil || config.Router == nil {
 		return nil, errors.New("gateway pool and router are required")
 	}
+	config.Router.metrics.Store(config.Metrics)
 	if config.MTU < 576 || config.MTU > 9000 {
 		return nil, fmt.Errorf("MTU %d is outside 576..9000", config.MTU)
+	}
+	if config.DNS != "" {
+		address, err := netip.ParseAddr(config.DNS)
+		if err != nil || !address.Is4() || !address.IsGlobalUnicast() {
+			return nil, errors.New("advertised DNS must be a unicast IPv4 address, not loopback or link-local")
+		}
 	}
 	if config.KeepaliveInterval <= 0 {
 		config.KeepaliveInterval = 20 * time.Second
@@ -97,11 +110,7 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
 	})
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"status":"ready"}`+"\n")
-	})
+	mux.Handle("GET /readyz", config.Readiness)
 	if config.MetricsToken != "" {
 		mux.Handle("GET /metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !authorized(r.Header.Get("Authorization"), config.MetricsToken) {
@@ -127,13 +136,15 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid client ID", http.StatusBadRequest)
 		return
 	}
-	identity, err := c.authorizeClient(r.Header.Get("Authorization"), clientID)
+	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), clientID)
 	if err != nil {
 		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	defer release()
+	r = r.WithContext(sessionParent)
 	if !requireProtocolVersion(w, r) {
 		return
 	}
@@ -167,6 +178,8 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer session.Close()
+	stopIO := stopStreamOnCancel(sessionCtx, w, r.Body)
+	defer stopIO()
 	usageSession := c.Usage.Begin(
 		"vpn:"+identity.AccountID+":"+clientID+":"+lanes.sessionID,
 		identity.AccountID,
@@ -324,15 +337,55 @@ func parseLaneConfig(r *http.Request) (laneConfig, error) {
 }
 
 func (c HandlerConfig) authorizeClient(header, deviceID string) (ClientIdentity, error) {
+	token, err := bearerToken(header)
+	if err != nil {
+		return ClientIdentity{}, err
+	}
+	return c.AuthorizeClient(token, deviceID)
+}
+
+func (c HandlerConfig) authorizeSession(parent context.Context, header, deviceID string) (ClientIdentity, context.Context, func(), error) {
+	token, err := bearerToken(header)
+	if err != nil {
+		return ClientIdentity{}, nil, nil, err
+	}
+	if c.AuthorizeSession != nil {
+		return c.AuthorizeSession(parent, token, deviceID)
+	}
+	identity, err := c.AuthorizeClient(token, deviceID)
+	return identity, parent, func() {}, err
+}
+
+func bearerToken(header string) (string, error) {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
-		return ClientIdentity{}, errors.New("missing bearer token")
+		return "", errors.New("missing bearer token")
 	}
 	token := strings.TrimPrefix(header, prefix)
 	if len(token) < 16 {
-		return ClientIdentity{}, errors.New("invalid bearer token")
+		return "", errors.New("invalid bearer token")
 	}
-	return c.AuthorizeClient(token, deviceID)
+	return token, nil
+}
+
+func stopStreamOnCancel(ctx context.Context, w http.ResponseWriter, body io.Closer) func() {
+	return onSessionCancel(ctx, func() {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+		_ = body.Close()
+	})
+}
+
+func onSessionCancel(ctx context.Context, interrupt func()) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		interrupt()
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
 }
 
 func clientAddress(r *http.Request, trustProxyHeaders bool) string {

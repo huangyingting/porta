@@ -242,8 +242,16 @@ func classifyDialError(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return err
 	}
+	var permanent tunnel.PermanentError
+	var permanentPointer *tunnel.PermanentError
+	if errors.As(err, &permanent) || errors.As(err, &permanentPointer) {
+		return err
+	}
 	var responseError *tunnel.GatewayResponseError
 	if errors.As(err, &responseError) {
+		if responseError.StatusCode == 426 && (responseError.ServerMinVersion != "" || responseError.ServerMaxVersion != "") {
+			return err
+		}
 		switch responseError.StatusCode {
 		case 404, 405, 421, 426, 501, 505:
 			return fmt.Errorf("%s%w", transportUnavailablePrefix, err)

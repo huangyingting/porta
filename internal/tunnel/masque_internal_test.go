@@ -1,15 +1,18 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -90,6 +93,50 @@ func TestValidateMasqueResponseProtocolVersion(t *testing.T) {
 	response.Header.Del(protocol.HeaderVersion)
 	if err := validateMasqueResponse(response); err == nil {
 		t.Fatal("response without a protocol version was accepted")
+	}
+}
+
+func TestInvalidLeaseIsPermanent(t *testing.T) {
+	for _, value := range []string{"0.0.0.0/32", "127.0.0.1/32", "224.0.0.1/32", "10.66.0.0/24", "2001:db8::1/128"} {
+		t.Run(value, func(t *testing.T) {
+			payload, err := masque.EncodeAddressAssign([]masque.Address{{RequestID: masqueRequestID, Prefix: netip.MustParsePrefix(value)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stream bytes.Buffer
+			if err := masque.NewEncoder(&stream).Write(masque.CapsuleAddressAssign, payload); err != nil {
+				t.Fatal(err)
+			}
+			client := &masqueClient{
+				ctx: context.Background(), decoder: masque.NewDecoder(&stream),
+				errors: make(chan error, 1), leaseReady: make(chan netip.Prefix, 1),
+			}
+			client.readCapsules()
+			select {
+			case err := <-client.errors:
+				if IsRetryable(err) || IsTransportUnavailable(err) || !isPermanent(err) {
+					t.Fatalf("invalid lease not classified permanently: %v", err)
+				}
+			default:
+				t.Fatal("invalid lease was silently ignored")
+			}
+		})
+	}
+}
+
+func TestInvalidLeaseHeadersArePermanent(t *testing.T) {
+	for _, test := range []struct{ header, value string }{
+		{"X-Porta-MTU", "invalid"}, {"X-Porta-MTU", "575"}, {"X-Porta-MTU", "9001"},
+		{"X-Porta-DNS", "not-an-address"}, {"X-Porta-DNS", "0.0.0.0"}, {"X-Porta-DNS", "ff02::1"},
+		{"X-Porta-DNS", "127.0.0.53"}, {"X-Porta-DNS", "169.254.1.1"},
+	} {
+		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}
+		response.Header.Set(http3.CapsuleProtocolHeader, "?1")
+		response.Header.Set(protocol.HeaderVersion, protocol.Version)
+		response.Header.Set(test.header, test.value)
+		if err := validateMasqueResponse(response); err == nil || !isPermanent(err) {
+			t.Fatalf("%s=%s did not produce permanent rejection: %v", test.header, test.value, err)
+		}
 	}
 }
 

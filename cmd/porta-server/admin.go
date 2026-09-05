@@ -126,21 +126,38 @@ func (a *adminAPI) serveClientAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"token": token})
+	case len(parts) == 2 && parts[1] == "disconnect" && r.Method == http.MethodPost:
+		a.disconnect(w, clientID, "")
+	case len(parts) == 4 && parts[1] == "devices" && parts[3] == "disconnect" && r.Method == http.MethodPost:
+		deviceID, err := url.PathUnescape(parts[2])
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		a.disconnect(w, clientID, deviceID)
 	case len(parts) == 3 && parts[1] == "devices" && r.Method == http.MethodDelete:
 		deviceID, err := url.PathUnescape(parts[2])
 		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
-		if err := a.registry.DeleteDevice(clientID, deviceID); err != nil {
+		if err := a.registry.forgetDevice(clientID, deviceID, a.usage); err != nil {
 			a.writeError(w, err)
 			return
 		}
-		a.usage.DeleteDevice(clientID, deviceID)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (a *adminAPI) disconnect(w http.ResponseWriter, clientID, deviceID string) {
+	count, err := a.registry.Disconnect(clientID, deviceID)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"disconnected_sessions": count})
 }
 
 func (a *adminAPI) writeMutation(w http.ResponseWriter, client clientSummary, err error) {

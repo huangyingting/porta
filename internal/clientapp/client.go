@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +57,29 @@ type NetworkConfigurator interface {
 	Down(context.Context) error
 }
 
+// NetworkPreparer installs a fail-closed guard and a narrowly scoped physical
+// escape route before dialing a literal endpoint. Repeated calls retain the guard.
+type NetworkPreparer interface {
+	Prepare(context.Context, net.Addr) error
+}
+
+// NetworkInterfacePreparer is the preparation variant for platforms that must
+// journal the requested interface identity before the device exists.
+type NetworkInterfacePreparer interface {
+	Prepare(context.Context, string, net.Addr) error
+}
+
+// NetworkReconfigurer replaces a live configuration without dropping its guard.
+type NetworkReconfigurer interface {
+	Reconfigure(context.Context, string, net.Addr, tunnel.Lease) error
+}
+
+// NetworkRecoveryEndpoints exposes journaled literal endpoints so a process can
+// resume protection after a crash without using the physical DNS resolver.
+type NetworkRecoveryEndpoints interface {
+	RecoveryEndpoints() []net.Addr
+}
+
 type Event struct {
 	State             State
 	Message           string
@@ -82,7 +107,7 @@ func Run(ctx context.Context, config Config, observer Observer) error {
 		if err != nil {
 			return nil, err
 		}
-		return &clientConnection{packetConnection: connection, lease: connection.Lease, remoteAddr: connection.RemoteAddr}, nil
+		return &clientConnection{packetConnection: connection, lease: connection.Lease, remoteAddr: connection.RemoteAddr, transport: connection.Transport}, nil
 	}, func(name string, mtu int) (device.PacketDevice, error) {
 		return device.OpenNative(name, mtu)
 	})
@@ -92,6 +117,7 @@ type clientConnection struct {
 	packetConnection
 	lease      tunnel.Lease
 	remoteAddr net.Addr
+	transport  tunnel.Transport
 }
 
 func run(ctx context.Context, config Config, observer Observer, dial func(context.Context, tunnel.Config) (*clientConnection, error), openDevice func(string, int) (device.PacketDevice, error)) (runErr error) {
@@ -99,7 +125,10 @@ func run(ctx context.Context, config Config, observer Observer, dial func(contex
 		return errors.New("server URL and token are required")
 	}
 	if config.Transport == "" {
-		config.Transport = tunnel.TransportHTTP3
+		config.Transport = tunnel.TransportAuto
+	}
+	if config.Transport != tunnel.TransportAuto && config.Transport != tunnel.TransportHTTP3 && config.Transport != tunnel.TransportHTTP2 {
+		return fmt.Errorf("unsupported transport %q", config.Transport)
 	}
 	if config.InterfaceName == "" {
 		config.InterfaceName = "Porta"
@@ -129,35 +158,44 @@ func run(ctx context.Context, config Config, observer Observer, dial func(contex
 		TLSConfig: tlsConfig,
 		Timeout:   15 * time.Second,
 	}
-	emit(observer, Event{State: StateConnecting, Message: "Connecting", Transport: config.Transport})
-	connection, err := dial(ctx, tunnelConfig)
-	if err != nil {
-		if ctx.Err() != nil {
-			emit(observer, Event{State: StateDisconnected, Message: "Disconnected", Transport: config.Transport})
-			return ctx.Err()
+	var (
+		tunDevice      device.PacketDevice
+		connection     *clientConnection
+		reader         *deviceReader
+		networkStarted bool
+		networkUp      bool
+		lease          tunnel.Lease
+		remote         string
+		transport      = config.Transport
+		connectedAt    time.Time
+		totals         counters
+	)
+	outbound := make(chan []byte, 256)
+	deviceErrors := make(chan error, 1)
+	var prepareNetwork func(context.Context, net.Addr) error
+	if preparer, ok := config.Network.(NetworkPreparer); ok {
+		prepareNetwork = preparer.Prepare
+	} else if preparer, ok := config.Network.(NetworkInterfacePreparer); ok {
+		prepareNetwork = func(ctx context.Context, endpoint net.Addr) error {
+			return preparer.Prepare(ctx, config.InterfaceName, endpoint)
 		}
-		emit(observer, Event{State: StateError, Message: err.Error(), Transport: config.Transport})
-		return err
 	}
-	if ctx.Err() != nil {
-		_ = connection.Close()
-		emit(observer, Event{State: StateDisconnected, Message: "Disconnected", Transport: config.Transport})
-		return ctx.Err()
+	stopReader := func() {
+		reader.stop()
+		reader = nil
 	}
-	tunDevice, err := openDevice(config.InterfaceName, connection.lease.MTU)
-	if err != nil {
-		_ = connection.Close()
-		emit(observer, Event{State: StateError, Message: err.Error(), Transport: config.Transport})
-		return err
-	}
-	defer tunDevice.Close()
-
-	if config.Network != nil {
-		defer func() {
+	defer func() {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		stopReader()
+		if networkStarted && prepareNetwork != nil && ctx.Err() == nil && runErr != nil {
+			runErr = fmt.Errorf("%w; automatic cleanup was not attempted: use --cleanup-network for network recovery", runErr)
+		} else if networkStarted {
 			downCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			if err := config.Network.Down(downCtx); err != nil {
-				config.Logger.Error("restore Windows network", "error", err)
+				config.Logger.Error("restore network", "error", err)
 				cleanupErr := fmt.Errorf("restore network: %w", err)
 				if errors.Is(runErr, context.Canceled) {
 					runErr = cleanupErr
@@ -165,116 +203,298 @@ func run(ctx context.Context, config Config, observer Observer, dial func(contex
 					runErr = errors.Join(runErr, cleanupErr)
 				}
 			}
-		}()
-		emit(observer, Event{State: StateConfiguring, Message: "Configuring Windows network", Lease: connection.lease, Transport: config.Transport})
-		if err := config.Network.Up(ctx, tunDevice.Name(), connection.remoteAddr, connection.lease); err != nil {
-			_ = connection.Close()
-			if ctx.Err() != nil {
-				emit(observer, Event{State: StateDisconnected, Message: "Disconnected", Transport: config.Transport})
-				return ctx.Err()
-			}
-			emit(observer, Event{State: StateError, Message: err.Error(), Lease: connection.lease, Transport: config.Transport})
-			return fmt.Errorf("configure network: %w", err)
 		}
-	}
-
-	var totals counters
-	connectedAt := time.Now()
-	emitSnapshot(observer, StateConnected, "Connected", connection.lease, config.Transport, connectedAt, &totals)
-
-	outbound := make(chan []byte, 256)
-	deviceErrors := make(chan error, 1)
-	readCtx, stopReading := context.WithCancel(ctx)
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		readDevice(readCtx, tunDevice, outbound, deviceErrors)
-	}()
-	defer func() {
-		stopReading()
-		<-readDone
+		if tunDevice != nil {
+			_ = tunDevice.Close()
+		}
 	}()
 
-	initialLease := connection.lease
-	initialRemote := remoteHost(connection.remoteAddr)
-	failures := 0
-	connectionStarted := time.Now()
-	waitForReconnect := func(delay time.Duration) error {
-		err := wait(ctx, delay, deviceErrors)
-		if err != nil {
-			if ctx.Err() != nil {
-				err = ctx.Err()
-				emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
-			} else {
-				emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
-			}
+	finish := func(err error) error {
+		state := StateError
+		message := err.Error()
+		if ctx.Err() != nil {
+			err, state, message = ctx.Err(), StateDisconnected, "Disconnected"
 		}
+		emitSnapshot(observer, state, message, lease, transport, connectedAt, &totals)
 		return err
 	}
+	emit(observer, Event{State: StateConnecting, Message: "Connecting", Transport: transport})
+	var endpoints []net.Addr
+	if recovery, ok := config.Network.(NetworkRecoveryEndpoints); ok && prepareNetwork != nil {
+		if saved := recovery.RecoveryEndpoints(); len(saved) > 0 {
+			networkStarted = true
+			endpoints, err = restoredEndpoints(parsedURL, saved)
+			if err != nil {
+				return finish(err)
+			}
+		}
+	}
+	failures := 0
+	var retryErr error
 	for {
-		err := runConnection(ctx, tunDevice, connection, outbound, deviceErrors, &totals, func() {
-			emitSnapshot(observer, StateConnected, "Connected", initialLease, config.Transport, connectedAt, &totals)
-		})
 		if ctx.Err() != nil {
-			emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
-			return ctx.Err()
+			return finish(ctx.Err())
 		}
-		var deviceErr clientDeviceError
-		if errors.As(err, &deviceErr) || !config.Reconnect {
-			emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
-			return err
+		if retryErr != nil {
+			var deviceErr clientDeviceError
+			if errors.As(retryErr, &deviceErr) || !config.Reconnect || !tunnel.IsRetryable(retryErr) {
+				return finish(retryErr)
+			}
+			delay := ReconnectDelay(failures, config.ReconnectMaxDelay)
+			failures++
+			emitSnapshot(observer, StateReconnecting, fmt.Sprintf("Reconnecting in %s", delay), lease, transport, connectedAt, &totals)
+			if err := wait(ctx, delay, deviceErrors); err != nil {
+				return finish(err)
+			}
 		}
+		var endpoint net.Addr
+		if prepareNetwork != nil {
+			if len(endpoints) == 0 {
+				resolveCtx, cancel := context.WithTimeout(ctx, tunnelConfig.Timeout)
+				endpoints, err = resolveEndpoints(resolveCtx, parsedURL)
+				cancel()
+				if err != nil {
+					retryErr = err
+					continue
+				}
+			}
+			// Never use the system resolver while the guard is active. Rotate
+			// only the addresses obtained before installing it.
+			endpoint = endpoints[failures%len(endpoints)]
+			tunnelConfig.DialAddress = endpoint.String()
+		}
+		sessionDial := dial
+		if prepareNetwork != nil && networkStarted {
+			sessionDial = func(ctx context.Context, candidate tunnel.Config) (*clientConnection, error) {
+				if err := prepareNetwork(ctx, transportEndpoint(endpoint, candidate.Transport)); err != nil {
+					return nil, tunnel.PermanentError{Err: fmt.Errorf("prepare network: %w", err)}
+				}
+				return dial(ctx, candidate)
+			}
+		}
+		connection, err = dialAutomatic(ctx, tunnelConfig, sessionDial)
+		if err != nil {
+			retryErr = err
+			continue
+		}
+		if ctx.Err() != nil {
+			return finish(ctx.Err())
+		}
+		if prepareNetwork != nil && !networkStarted {
+			// Initial DNS and handshake are ordinary bootstrap traffic. Begin
+			// protection only after authentication, before configuring routes.
+			networkStarted = true
+			if err := prepareNetwork(ctx, transportEndpoint(endpoint, connection.transport)); err != nil {
+				return finish(fmt.Errorf("prepare network: %w", err))
+			}
+		}
+		transport = connection.transport
+		changedLease := tunDevice != nil && connection.lease != lease
+		nextRemote := ""
+		if connection.remoteAddr != nil {
+			nextRemote = connection.remoteAddr.String()
+		}
+		changedRemote := networkUp && remote != nextRemote
+		// Address/MTU changes invalidate source queues or native buffers.
+		// Resolver and route-only changes can retain the adapter identity.
+		if tunDevice == nil || connection.lease.Address != lease.Address || connection.lease.MTU != lease.MTU {
+			stopReader()
+			if tunDevice != nil {
+				if err := tunDevice.Close(); err != nil {
+					return finish(fmt.Errorf("close previous TUN: %w", err))
+				}
+				tunDevice = nil
+			}
+			drainPackets(outbound)
+			select {
+			case err := <-deviceErrors:
+				return finish(clientDeviceError{err})
+			default:
+			}
+			tunDevice, err = openDevice(config.InterfaceName, connection.lease.MTU)
+			if err != nil {
+				return finish(err)
+			}
+		}
+		if config.Network != nil && (!networkUp || changedLease || changedRemote || prepareNetwork != nil) {
+			networkStarted = true
+			emitSnapshot(observer, StateConfiguring, "Configuring network", connection.lease, transport, connectedAt, &totals)
+			if !networkUp {
+				err = config.Network.Up(ctx, tunDevice.Name(), connection.remoteAddr, connection.lease)
+			} else if reconfigurer, ok := config.Network.(NetworkReconfigurer); ok {
+				err = reconfigurer.Reconfigure(ctx, tunDevice.Name(), connection.remoteAddr, connection.lease)
+			} else {
+				err = errors.New("network configurator cannot safely reconfigure a changed session")
+			}
+			if err != nil {
+				return finish(fmt.Errorf("configure network: %w", err))
+			}
+			networkUp = true
+		}
+		lease = connection.lease
+		remote = nextRemote
+		if reader == nil {
+			reader = startDeviceReader(ctx, tunDevice, outbound, deviceErrors)
+		}
+		if connectedAt.IsZero() {
+			connectedAt = time.Now()
+		}
+		progress := func() { emitSnapshot(observer, StateConnected, "Connected", lease, transport, connectedAt, &totals) }
+		progress()
+		connectionStarted := time.Now()
+		retryErr = runConnection(ctx, tunDevice, connection, outbound, deviceErrors, &totals, progress)
+		connection = nil
 		if time.Since(connectionStarted) >= 30*time.Second {
 			failures = 0
 		}
-		delay := ReconnectDelay(failures, config.ReconnectMaxDelay)
-		failures++
-		emitSnapshot(observer, StateReconnecting, fmt.Sprintf("Reconnecting in %s", delay), initialLease, config.Transport, connectedAt, &totals)
-		if err := waitForReconnect(delay); err != nil {
-			return err
-		}
-		for {
-			connection, err = dial(ctx, tunnelConfig)
-			if err == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
-				return ctx.Err()
-			}
-			delay = ReconnectDelay(failures, config.ReconnectMaxDelay)
-			failures++
-			emitSnapshot(observer, StateReconnecting, fmt.Sprintf("Reconnect failed; retrying in %s", delay), initialLease, config.Transport, connectedAt, &totals)
-			if err := waitForReconnect(delay); err != nil {
-				return err
-			}
-		}
-		if ctx.Err() != nil {
-			_ = connection.Close()
-			emitSnapshot(observer, StateDisconnected, "Disconnected", initialLease, config.Transport, connectedAt, &totals)
-			return ctx.Err()
-		}
-		if connection.lease != initialLease {
-			_ = connection.Close()
-			err := fmt.Errorf("gateway lease changed from %+v to %+v", initialLease, connection.lease)
-			emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
-			return err
-		}
-		if remoteHost(connection.remoteAddr) != initialRemote {
-			_ = connection.Close()
-			err := fmt.Errorf("gateway address changed from %s to %s; reconnect to refresh the escape route", initialRemote, remoteHost(connection.remoteAddr))
-			emitSnapshot(observer, StateError, err.Error(), initialLease, config.Transport, connectedAt, &totals)
-			return err
-		}
-		connectionStarted = time.Now()
-		emitSnapshot(observer, StateConnected, "Connected", connection.lease, config.Transport, connectedAt, &totals)
 	}
+}
+
+func dialAutomatic(ctx context.Context, config tunnel.Config, dial func(context.Context, tunnel.Config) (*clientConnection, error)) (*clientConnection, error) {
+	automatic := config.Transport == "" || config.Transport == tunnel.TransportAuto
+	if automatic {
+		config.Transport = tunnel.TransportHTTP3
+	}
+	connection, err := dial(ctx, config)
+	if automatic && err != nil && ctx.Err() == nil && tunnel.IsTransportUnavailable(err) {
+		config.Transport = tunnel.TransportHTTP2
+		connection, err = dial(ctx, config)
+	}
+	if err == nil && connection.transport == "" {
+		connection.transport = config.Transport
+	}
+	return connection, err
+}
+
+func resolveEndpoints(ctx context.Context, endpoint *url.URL) ([]net.Addr, error) {
+	port, err := gatewayPort(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	var addresses []netip.Addr
+	if address, parseErr := netip.ParseAddr(endpoint.Hostname()); parseErr == nil {
+		if !usableProtectedEndpoint(address) {
+			return nil, errors.New("automatic networking requires an unscoped unicast gateway endpoint, not a link-local or loopback address")
+		}
+		addresses = []netip.Addr{address}
+	} else {
+		addresses, err = net.DefaultResolver.LookupNetIP(ctx, "ip", endpoint.Hostname())
+		if err != nil {
+			return nil, fmt.Errorf("resolve gateway before network protection: %w", err)
+		}
+	}
+	var endpoints []net.Addr
+	for _, ipv4 := range []bool{true, false} {
+		for _, address := range addresses {
+			address = address.Unmap()
+			if address.Is4() == ipv4 && usableProtectedEndpoint(address) {
+				endpoints = append(endpoints, &net.TCPAddr{IP: net.IP(address.AsSlice()), Port: port, Zone: address.Zone()})
+			}
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil, errors.New("gateway has no supported unscoped unicast IP endpoint")
+	}
+	return endpoints, nil
+}
+
+func gatewayPort(endpoint *url.URL) (int, error) {
+	if endpoint.Port() == "" {
+		return 443, nil
+	}
+	port, err := strconv.Atoi(endpoint.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return 0, errors.New("gateway port must be in 1..65535")
+	}
+	return port, nil
+}
+
+func usableProtectedEndpoint(address netip.Addr) bool {
+	return address.IsGlobalUnicast() && address.Zone() == ""
+}
+
+func restoredEndpoints(endpoint *url.URL, saved []net.Addr) ([]net.Addr, error) {
+	port, err := gatewayPort(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if address, err := netip.ParseAddr(endpoint.Hostname()); err == nil {
+		if !usableProtectedEndpoint(address) {
+			return nil, errors.New("automatic networking requires an unscoped unicast gateway endpoint, not a link-local or loopback address")
+		}
+		return []net.Addr{&net.TCPAddr{IP: net.IP(address.AsSlice()), Zone: address.Zone(), Port: port}}, nil
+	}
+	var endpoints []net.Addr
+	seen := make(map[netip.AddrPort]bool)
+	for _, endpoint := range saved {
+		if endpoint == nil {
+			return nil, errors.New("network recovery journal has an invalid endpoint")
+		}
+		address, err := netip.ParseAddrPort(endpoint.String())
+		if err != nil || !usableProtectedEndpoint(address.Addr()) {
+			return nil, errors.New("network recovery journal has an invalid numeric endpoint")
+		}
+		if int(address.Port()) == port && !seen[address] {
+			seen[address] = true
+			endpoints = append(endpoints, net.TCPAddrFromAddrPort(address))
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil, errors.New("network protection is active but no cached endpoint matches this gateway port")
+	}
+	return endpoints, nil
+}
+
+func drainPackets(packets <-chan []byte) {
+	for {
+		select {
+		case <-packets:
+		default:
+			return
+		}
+	}
+}
+
+func transportEndpoint(endpoint net.Addr, transport tunnel.Transport) net.Addr {
+	if address, ok := endpoint.(*net.TCPAddr); ok && transport == tunnel.TransportHTTP3 {
+		return &net.UDPAddr{IP: address.IP, Port: address.Port, Zone: address.Zone}
+	}
+	if address, ok := endpoint.(*net.UDPAddr); ok && transport == tunnel.TransportHTTP2 {
+		return &net.TCPAddr{IP: address.IP, Port: address.Port, Zone: address.Zone}
+	}
+	return endpoint
+}
+
+type deviceReader struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func startDeviceReader(ctx context.Context, tunDevice device.PacketDevice, outbound chan<- []byte, deviceErrors chan<- error) *deviceReader {
+	readCtx, cancel := context.WithCancel(ctx)
+	reader := &deviceReader{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(reader.done)
+		readDevice(readCtx, tunDevice, outbound, deviceErrors)
+	}()
+	return reader
+}
+
+func (r *deviceReader) stop() {
+	if r == nil {
+		return
+	}
+	r.cancel()
+	<-r.done
 }
 
 func readDevice(ctx context.Context, tunDevice device.PacketDevice, outbound chan<- []byte, deviceErrors chan<- error) {
 	for {
 		packet, err := tunDevice.ReadPacket(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			select {
 			case deviceErrors <- err:
 			case <-ctx.Done():
@@ -450,11 +670,11 @@ func TLSConfig(caPath, thumbprint string, insecure bool) (*tls.Config, error) {
 		}
 		config.VerifyConnection = func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) == 0 {
-				return errors.New("gateway did not provide a certificate")
+				return tunnel.PermanentError{Err: errors.New("gateway did not provide a certificate")}
 			}
 			actual := sha256.Sum256(state.PeerCertificates[0].Raw)
 			if subtle.ConstantTimeCompare(actual[:], pinnedThumbprint) != 1 {
-				return fmt.Errorf("gateway certificate SHA-256 thumbprint mismatch: got %s", hex.EncodeToString(actual[:]))
+				return tunnel.PermanentError{Err: fmt.Errorf("gateway certificate SHA-256 thumbprint mismatch: got %s", hex.EncodeToString(actual[:]))}
 			}
 			return nil
 		}

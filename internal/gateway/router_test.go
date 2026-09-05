@@ -8,7 +8,8 @@ import (
 
 func TestSessionQueueDropsOldestPacketWithoutClosing(t *testing.T) {
 	queue := make(chan []byte, 2)
-	session := &Session{Outgoing: queue, outgoing: queue}
+	metrics := &Metrics{}
+	session := &Session{Outgoing: queue, outgoing: queue, metrics: metrics}
 	session.enqueue([]byte{1})
 	session.enqueue([]byte{2})
 	session.enqueue([]byte{3})
@@ -18,7 +19,20 @@ func TestSessionQueueDropsOldestPacketWithoutClosing(t *testing.T) {
 	if first[0] != 2 || second[0] != 3 {
 		t.Fatalf("queued packets = %v, %v; want newest packets 2 and 3", first, second)
 	}
+	if got := metrics.queueOldestDrops.Load(); got != 1 {
+		t.Fatalf("oldest packet drop count = %d", got)
+	}
+}
 
+func TestCanceledSessionDoesNotQueuePackets(t *testing.T) {
+	session, ctx := newSession(context.Background(), netip.MustParseAddr("10.66.0.2"))
+	session.metrics = &Metrics{}
+	session.Close()
+	<-ctx.Done()
+	session.enqueue([]byte{1})
+	if len(session.outgoing) != 0 || session.metrics.closedSessionDrops.Load() != 1 {
+		t.Fatal("canceled session queued traffic or did not count the drop")
+	}
 }
 
 func TestRouterGroupedLanesDoNotReplaceSiblings(t *testing.T) {

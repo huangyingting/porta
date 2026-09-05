@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface>" >&2
+if [[ $# -lt 4 || $# -gt 5 ]]; then
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> [--auto-mtu=BOOL]" >&2
   echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0" >&2
   exit 2
 fi
@@ -11,6 +11,12 @@ tun_interface=$1
 gateway_cidr=$2
 pool_cidr=$3
 external_interface=$4
+auto_mtu=true
+case "${5:---auto-mtu=true}" in
+  --auto-mtu|--auto-mtu=true) ;;
+  --auto-mtu=false) auto_mtu=false ;;
+  *) echo "invalid MTU mode; use --auto-mtu=true or --auto-mtu=false" >&2; exit 2 ;;
+esac
 
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
@@ -26,6 +32,12 @@ ip link show dev "$external_interface" >/dev/null
 ip address replace "$gateway_cidr" dev "$tun_interface"
 ip link set dev "$tun_interface" up
 sysctl -w net.ipv4.ip_forward=1
+if $auto_mtu; then
+  # Gateway-sourced ICMP enters through TUN; allow it without weakening
+  # source validation on physical interfaces.
+  sysctl -w "net/ipv4/conf/$tun_interface/accept_local=1"
+  sysctl -w "net/ipv4/conf/$tun_interface/rp_filter=2"
+fi
 if [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
   sysctl -w "net/ipv6/conf/$tun_interface/disable_ipv6=1"
 fi

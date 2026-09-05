@@ -41,30 +41,34 @@ type Identity struct {
 
 type AuthorizeFunc func(token, deviceID string) (Identity, error)
 
+type AuthorizeSessionFunc func(context.Context, string, string) (Identity, context.Context, func(), error)
+
 type Config struct {
-	Next           http.Handler
-	Authorize      AuthorizeFunc
-	Logger         *slog.Logger
-	Camouflage     bool
-	MaxConnections int
-	Usage          *usage.Store
+	Next             http.Handler
+	Authorize        AuthorizeFunc
+	AuthorizeSession AuthorizeSessionFunc
+	Logger           *slog.Logger
+	Camouflage       bool
+	MaxConnections   int
+	Usage            *usage.Store
 }
 
 type Handler struct {
-	next       http.Handler
-	authorize  AuthorizeFunc
-	logger     *slog.Logger
-	camouflage bool
-	slots      chan struct{}
-	usage      *usage.Store
-	dial       func(context.Context, string, string) (net.Conn, error)
+	next             http.Handler
+	authorize        AuthorizeFunc
+	authorizeSession AuthorizeSessionFunc
+	logger           *slog.Logger
+	camouflage       bool
+	slots            chan struct{}
+	usage            *usage.Store
+	dial             func(context.Context, string, string) (net.Conn, error)
 }
 
 func New(config Config) (*Handler, error) {
 	if config.Next == nil {
 		return nil, errors.New("forward proxy fallback handler is required")
 	}
-	if config.Authorize == nil {
+	if config.Authorize == nil && config.AuthorizeSession == nil {
 		return nil, errors.New("forward proxy authorizer is required")
 	}
 	if config.Logger == nil {
@@ -77,12 +81,13 @@ func New(config Config) (*Handler, error) {
 		config.Usage, _ = usage.Open("", config.Logger)
 	}
 	handler := &Handler{
-		next:       config.Next,
-		authorize:  config.Authorize,
-		logger:     config.Logger,
-		camouflage: config.Camouflage,
-		slots:      make(chan struct{}, config.MaxConnections),
-		usage:      config.Usage,
+		next:             config.Next,
+		authorize:        config.Authorize,
+		authorizeSession: config.AuthorizeSession,
+		logger:           config.Logger,
+		camouflage:       config.Camouflage,
+		slots:            make(chan struct{}, config.MaxConnections),
+		usage:            config.Usage,
 	}
 	handler.dial = handler.dialPublic
 	return handler, nil
@@ -97,7 +102,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.next.ServeHTTP(w, r)
 		return
 	}
-	identity, ok := h.authenticate(r.Header.Get("Proxy-Authorization"))
+	identity, sessionCtx, release, ok := h.authenticateSession(r.Context(), r.Header.Get("Proxy-Authorization"))
 	if !ok {
 		if h.camouflage && r.Method != http.MethodConnect {
 			h.next.ServeHTTP(w, r)
@@ -107,6 +112,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
+	defer release()
+	r = r.WithContext(sessionCtx)
 	if r.Method != http.MethodConnect {
 		http.Error(w, "HTTPS CONNECT is required", http.StatusForbidden)
 		return
@@ -139,20 +146,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authenticate(header string) (Identity, bool) {
-	const prefix = "Basic "
-	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return Identity{}, false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
-	if err != nil {
-		return Identity{}, false
-	}
-	deviceID, token, ok := strings.Cut(string(decoded), ":")
-	if !ok || deviceID == "" || token == "" {
+	deviceID, token, ok := proxyCredentials(header)
+	if !ok {
 		return Identity{}, false
 	}
 	identity, err := h.authorize(token, deviceID)
 	return identity, err == nil
+}
+
+func (h *Handler) authenticateSession(parent context.Context, header string) (Identity, context.Context, func(), bool) {
+	deviceID, token, ok := proxyCredentials(header)
+	if !ok {
+		return Identity{}, nil, nil, false
+	}
+	if h.authorizeSession != nil {
+		identity, ctx, release, err := h.authorizeSession(parent, token, deviceID)
+		return identity, ctx, release, err == nil
+	}
+	identity, err := h.authorize(token, deviceID)
+	return identity, parent, func() {}, err == nil
+}
+
+func proxyCredentials(header string) (string, string, bool) {
+	const prefix = "Basic "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
+	if err != nil {
+		return "", "", false
+	}
+	deviceID, token, ok := strings.Cut(string(decoded), ":")
+	if !ok || deviceID == "" || token == "" {
+		return "", "", false
+	}
+	return deviceID, token, true
 }
 
 func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target string, identity Identity) {
@@ -177,6 +205,10 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target st
 	}
 	w.WriteHeader(http.StatusOK)
 	clientWriter := &flushWriter{writer: w, controller: http.NewResponseController(w)}
+	stop := onSessionCancel(r.Context(), func() {
+		closeTunnelEndpoints(upstream, r.Body, clientWriter)
+	})
+	defer stop()
 	if _, err := clientWriter.Write(nil); err != nil {
 		return
 	}
@@ -194,6 +226,11 @@ func (h *Handler) serveHijackedConnect(ctx context.Context, w http.ResponseWrite
 		return
 	}
 	defer client.Close()
+	stop := onSessionCancel(ctx, func() {
+		_ = client.Close()
+		_ = upstream.Close()
+	})
+	defer stop()
 	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
@@ -201,6 +238,19 @@ func (h *Handler) serveHijackedConnect(ctx context.Context, w http.ResponseWrite
 		return
 	}
 	copyStreamTunnel(ctx, upstream, buffered.Reader, &writeTimeoutConn{Conn: client})
+}
+
+func onSessionCancel(ctx context.Context, interrupt func()) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		interrupt()
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
 }
 
 func (h *Handler) dialPublic(ctx context.Context, network, address string) (net.Conn, error) {

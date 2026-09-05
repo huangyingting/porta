@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"github.com/huangyingting/porta/internal/device"
 	"github.com/huangyingting/porta/internal/protocol"
@@ -24,6 +25,8 @@ type Session struct {
 	outgoing chan []byte
 	cancel   context.CancelFunc
 	once     sync.Once
+	ctx      context.Context
+	metrics  *Metrics
 }
 
 func (s *Session) Close() {
@@ -31,6 +34,12 @@ func (s *Session) Close() {
 }
 
 func (s *Session) enqueue(packet []byte) {
+	if s.ctx != nil && s.ctx.Err() != nil {
+		if s.metrics != nil {
+			s.metrics.closedSessionDrops.Add(1)
+		}
+		return
+	}
 	select {
 	case s.outgoing <- packet:
 		return
@@ -41,11 +50,17 @@ func (s *Session) enqueue(packet []byte) {
 	// disconnecting the whole tunnel when a client briefly falls behind.
 	select {
 	case <-s.outgoing:
+		if s.metrics != nil {
+			s.metrics.queueOldestDrops.Add(1)
+		}
 	default:
 	}
 	select {
 	case s.outgoing <- packet:
 	default:
+		if s.metrics != nil {
+			s.metrics.queueFullDrops.Add(1)
+		}
 	}
 }
 
@@ -54,6 +69,7 @@ type Router struct {
 	logger   *slog.Logger
 	mu       sync.RWMutex
 	sessions map[netip.Addr]*sessionGroup
+	metrics  atomic.Pointer[Metrics]
 }
 
 type sessionGroup struct {
@@ -66,15 +82,18 @@ func NewRouter(dev device.PacketDevice, logger *slog.Logger) *Router {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Router{
+	router := &Router{
 		device:   dev,
 		logger:   logger,
 		sessions: make(map[netip.Addr]*sessionGroup),
 	}
+	router.metrics.Store(&Metrics{})
+	return router
 }
 
 func (r *Router) Register(parent context.Context, address netip.Addr) (*Session, context.Context) {
 	session, ctx := newSession(parent, address)
+	session.metrics = r.metrics.Load()
 	r.mu.Lock()
 	previous := r.sessions[address]
 	r.sessions[address] = &sessionGroup{
@@ -101,6 +120,7 @@ func (r *Router) RegisterGroup(
 		return nil, nil, errors.New("invalid router lane configuration")
 	}
 	session, ctx := newSession(parent, address)
+	session.metrics = r.metrics.Load()
 	var replacedGroup *sessionGroup
 	var replacedLane *Session
 	r.mu.Lock()
@@ -132,7 +152,7 @@ func (r *Router) RegisterGroup(
 func newSession(parent context.Context, address netip.Addr) (*Session, context.Context) {
 	ctx, cancel := context.WithCancel(parent)
 	queue := make(chan []byte, 256)
-	session := &Session{Address: address, Outgoing: queue, outgoing: queue, cancel: cancel}
+	session := &Session{Address: address, Outgoing: queue, outgoing: queue, cancel: cancel, ctx: ctx}
 	return session, ctx
 }
 
@@ -192,6 +212,7 @@ func (r *Router) Run(ctx context.Context) error {
 		}
 		info, err := protocol.ParseIPv4(packet)
 		if err != nil {
+			r.metrics.Load().invalidTUNDrops.Add(1)
 			r.logger.Warn("dropping invalid packet from gateway TUN", "error", err)
 			continue
 		}
@@ -201,6 +222,7 @@ func (r *Router) Run(ctx context.Context) error {
 		session := selectLane(group, packet)
 		r.mu.RUnlock()
 		if session == nil {
+			r.metrics.Load().noSessionDrops.Add(1)
 			continue
 		}
 		if ctx.Err() != nil {

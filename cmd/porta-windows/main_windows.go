@@ -17,7 +17,6 @@ import (
 	"github.com/huangyingting/porta/internal/clientapp"
 	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/clientprofile"
-	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/huangyingting/porta/internal/winnetwork"
 	"github.com/rodrigocfd/windigo/co"
 	"github.com/rodrigocfd/windigo/ui"
@@ -41,6 +40,7 @@ type application struct {
 	download      *ui.Static
 	logs          *ui.Edit
 	connect       *ui.Button
+	restore       *ui.Button
 	save          *ui.Button
 	remove        *ui.Button
 	store         *clientprofile.Store
@@ -50,6 +50,7 @@ type application struct {
 	cancel        context.CancelFunc
 	running       bool
 	disconnecting bool
+	restoring     bool
 	closing       bool
 	connectedAt   time.Time
 	logLines      []string
@@ -63,21 +64,40 @@ func main() {
 	runtime.LockOSThread()
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "porta:", err)
+		if len(os.Args) == 1 {
+			_, _ = win.HWND(0).MessageBox(err.Error(), "Porta", co.MB_ICONERROR)
+		}
 		os.Exit(1)
 	}
 }
 
 func run() error {
+	if buildinfo.IsVersionRequest(os.Args[1:]) {
+		fmt.Println(buildinfo.Version)
+		return nil
+	}
+	if handled, err := winnetwork.RunHelper(context.Background(), os.Args[1:]); handled {
+		return err
+	}
+	cleanup := len(os.Args) == 2 && os.Args[1] == "--cleanup-network"
+	if len(os.Args) > 1 && !cleanup {
+		return errors.New("unsupported arguments; use --version or --cleanup-network")
+	}
 	dataDir, err := os.UserConfigDir()
 	if err != nil {
 		return fmt.Errorf("locate profile directory: %w", err)
 	}
 	dataDir = filepath.Join(dataDir, "Porta")
-	store, err := clientprofile.Open(filepath.Join(dataDir, "profiles.json"), clientprofile.DPAPIProtector{})
+	network, err := winnetwork.NewRunner(filepath.Join(dataDir, "network-state.json"))
 	if err != nil {
 		return err
 	}
-	network, err := winnetwork.NewRunner(filepath.Join(dataDir, "network-state.json"))
+	if cleanup {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		return network.Down(ctx)
+	}
+	store, err := clientprofile.Open(filepath.Join(dataDir, "profiles.json"), clientprofile.DPAPIProtector{})
 	if err != nil {
 		return err
 	}
@@ -108,7 +128,7 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 	app.name = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 140)).Width(ui.DpiX(270)).Height(ui.DpiY(25)))
 	ui.NewStatic(window, ui.OptsStatic().Text("Transport").Position(ui.Dpi(310, 120)))
 	app.transport = ui.NewComboBox(window, ui.OptsComboBox().
-		Position(ui.Dpi(310, 140)).Width(ui.DpiX(274)).Texts("Automatic (HTTP/3)", "HTTP/2").Select(0))
+		Position(ui.Dpi(310, 140)).Width(ui.DpiX(274)).Texts("Automatic", "HTTP/3 only", "HTTP/2 only").Select(0))
 
 	ui.NewStatic(window, ui.OptsStatic().Text("Gateway URL").Position(ui.Dpi(24, 178)))
 	app.server = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 198)).Width(ui.DpiX(560)).Height(ui.DpiY(25)))
@@ -120,6 +140,7 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 		CtrlStyle(co.ES_LEFT|co.ES_AUTOHSCROLL|co.ES_PASSWORD))
 
 	app.save = ui.NewButton(window, ui.OptsButton().Text("Save profile").Position(ui.Dpi(24, 296)).Width(ui.DpiX(126)))
+	app.restore = ui.NewButton(window, ui.OptsButton().Text("Restore network").Position(ui.Dpi(170, 296)).Width(ui.DpiX(170)))
 	app.connect = ui.NewButton(window, ui.OptsButton().Text("Connect").Position(ui.Dpi(458, 296)).Width(ui.DpiX(126)))
 
 	ui.NewStatic(window, ui.OptsStatic().Text("CONNECTION").Position(ui.Dpi(24, 348)).Size(ui.Dpi(120, 18)))
@@ -140,6 +161,15 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 	app.save.On().BnClicked(func() { app.saveProfile() })
 	app.remove.On().BnClicked(app.deleteProfile)
 	app.connect.On().BnClicked(app.toggleConnection)
+	app.restore.On().BnClicked(func() {
+		answer, _ := app.window.Hwnd().MessageBox(
+			"Restore normal connectivity and remove Porta's retained network protection?",
+			"Porta", co.MB_YESNO|co.MB_ICONQUESTION,
+		)
+		if answer == co.ID_YES {
+			app.restoreNetwork()
+		}
+	})
 	window.On().WmCreate(func(ui.WmCreate) int {
 		app.addTray()
 		profiles := app.store.List()
@@ -148,6 +178,11 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 			app.newProfile()
 		} else {
 			app.reloadProfiles(profiles[0].ID)
+		}
+		app.restore.Hwnd().EnableWindow(network.NeedsCleanup())
+		if network.NeedsCleanup() {
+			setText(app.status, "Network recovery available")
+			app.appendLog("Reconnect to resume, or Restore network to remove retained settings.")
 		}
 		return 0
 	})
@@ -189,16 +224,12 @@ func (a *application) loadProfile(profile clientprofile.Profile) {
 	a.server.SetText(profile.ServerURL)
 	a.clientID.SetText(profile.ClientID)
 	a.token.SetText("")
-	if profile.Transport == tunnel.TransportHTTP2 {
-		a.transport.SelectIndex(1)
-	} else {
-		a.transport.SelectIndex(0)
-	}
+	a.transport.SelectIndex(transportIndex(profile.Transport))
 	a.appendLog("Selected profile " + profile.Name)
 }
 
 func (a *application) newProfile() {
-	if a.running {
+	if a.running || a.restoring {
 		return
 	}
 	a.selectedID = ""
@@ -212,10 +243,7 @@ func (a *application) newProfile() {
 }
 
 func (a *application) profileFromFields() clientprofile.Profile {
-	transport := tunnel.TransportHTTP3
-	if a.transport.SelectedIndex() == 1 {
-		transport = tunnel.TransportHTTP2
-	}
+	transport := selectedTransport(a.transport.SelectedIndex())
 	var original clientprofile.Profile
 	for _, profile := range a.items {
 		if profile.ID == a.selectedID {
@@ -233,7 +261,7 @@ func (a *application) profileFromFields() clientprofile.Profile {
 }
 
 func (a *application) saveProfile() bool {
-	if a.running {
+	if a.running || a.restoring {
 		return false
 	}
 	profile, err := a.store.Save(a.profileFromFields(), strings.TrimSpace(a.token.Text()))
@@ -249,7 +277,7 @@ func (a *application) saveProfile() bool {
 }
 
 func (a *application) deleteProfile() {
-	if a.running || a.selectedID == "" {
+	if a.running || a.restoring || a.selectedID == "" {
 		return
 	}
 	answer, _ := a.window.Hwnd().MessageBox(
@@ -271,6 +299,10 @@ func (a *application) deleteProfile() {
 
 func (a *application) toggleConnection() {
 	a.mu.Lock()
+	if a.restoring {
+		a.mu.Unlock()
+		return
+	}
 	if a.running {
 		cancel := a.cancel
 		a.disconnecting = true
@@ -330,7 +362,7 @@ func (a *application) toggleConnection() {
 			a.setEditing(true)
 			a.connect.SetText("Connect")
 			a.connect.Hwnd().EnableWindow(true)
-			if err != nil && !errors.Is(err, context.Canceled) {
+			if err != nil && err != context.Canceled {
 				a.appendLog("Error: " + err.Error())
 				setText(a.status, "Error")
 				a.updateTray("Error")
@@ -339,8 +371,11 @@ func (a *application) toggleConnection() {
 				a.updateTray("Disconnected")
 			}
 			setText(a.address, "Address  —")
-			if closing {
+			if closing && canExitAfterDisconnect(err, a.network.NeedsCleanup()) {
 				a.window.Hwnd().DestroyWindow()
+			} else if closing {
+				a.closing = false
+				a.window.Hwnd().ShowWindow(co.SW_RESTORE)
 			}
 		})
 	}()
@@ -351,8 +386,12 @@ func (a *application) handleEvent(event clientapp.Event) {
 		if a.disconnecting && event.State != clientapp.StateError && event.State != clientapp.StateDisconnected {
 			return
 		}
-		setText(a.status, event.Message)
-		a.updateTray(event.Message)
+		status := event.Message
+		if event.State == clientapp.StateConnected {
+			status += " (" + strings.ToUpper(string(event.Transport)) + ")"
+		}
+		setText(a.status, status)
+		a.updateTray(status)
 		if event.State == clientapp.StateConnected {
 			a.connectedAt = event.ConnectedAt
 			a.connect.SetText("Disconnect")
@@ -380,6 +419,54 @@ func (a *application) setEditing(enabled bool) {
 	a.token.Hwnd().EnableWindow(enabled)
 	a.save.Hwnd().EnableWindow(enabled)
 	a.remove.Hwnd().EnableWindow(enabled)
+	a.restore.Hwnd().EnableWindow(enabled && a.network.NeedsCleanup())
+}
+
+func (a *application) restoreNetwork() {
+	a.mu.Lock()
+	if a.running || a.restoring {
+		a.mu.Unlock()
+		return
+	}
+	a.restoring = true
+	a.mu.Unlock()
+	a.setEditing(false)
+	a.connect.Hwnd().EnableWindow(false)
+	setText(a.status, "Restoring network")
+	a.updateTray("Restoring network")
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := a.network.Down(ctx)
+		cancel()
+		a.window.UiThread(func() {
+			a.mu.Lock()
+			a.restoring = false
+			closing := a.closing
+			if err != nil {
+				a.closing = false
+			}
+			a.mu.Unlock()
+			a.setEditing(true)
+			a.connect.Hwnd().EnableWindow(true)
+			if closing && errors.Is(err, winnetwork.ErrStateInUse) {
+				a.window.Hwnd().DestroyWindow()
+				return
+			}
+			if err != nil {
+				setText(a.status, "Network recovery failed")
+				a.updateTray("Network recovery failed")
+				a.window.Hwnd().ShowWindow(co.SW_RESTORE)
+				a.showError(err)
+				return
+			}
+			setText(a.status, "Disconnected")
+			a.updateTray("Disconnected")
+			a.appendLog("Restored network and removed retained protection.")
+			if closing {
+				a.window.Hwnd().DestroyWindow()
+			}
+		})
+	}()
 }
 
 func (a *application) appendLog(message string) {
@@ -426,9 +513,19 @@ func (a *application) close() {
 		a.window.Hwnd().ShowWindow(co.SW_HIDE)
 		return
 	}
-	if !a.running {
+	if a.restoring {
+		a.closing = true
 		a.mu.Unlock()
-		a.window.Hwnd().DestroyWindow()
+		return
+	}
+	if !a.running {
+		a.closing = true
+		a.mu.Unlock()
+		if a.network.NeedsCleanup() {
+			a.restoreNetwork()
+		} else {
+			a.window.Hwnd().DestroyWindow()
+		}
 		return
 	}
 	a.closing = true

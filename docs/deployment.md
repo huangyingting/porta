@@ -92,7 +92,9 @@ The default deployment:
 - uses HTTP/3 MASQUE with HTTP/2 fallback;
 - enables authenticated HTTPS CONNECT proxying;
 - creates `porta0` and the `10.66.0.0/24` client network;
-- advertises `1.1.1.1` and an MTU of 1100;
+- advertises `1.1.1.1` and selects HTTP/3 MTU automatically between 1100 and
+  the default 1400 ceiling; custom advertised DNS must be a
+  numeric unicast IPv4 address, not loopback or link-local;
 - installs narrowly scoped nftables NAT and forwarding rules;
 - installs hardened systemd services;
 - either renews its own Let's Encrypt certificate or synchronizes externally
@@ -114,6 +116,45 @@ sudo ./scripts/deploy.sh \
   --pool 10.77.0.0/24 \
   --gateway-cidr 10.77.0.1/24
 ```
+
+### Automatic tunnel MTU
+
+Conservative per-connection HTTP/3 selection is enabled by default, with a
+1400 ceiling and 1100 discovery baseline. `--mtu` sets the gateway TUN MTU
+and automatic upper bound. Use `--auto-mtu=false --mtu 1100` to disable
+discovery and use a fixed 1100 MTU; another fixed MTU can be specified with
+the same override. The daemon accepts the same options when started directly.
+The deployment script accepts MTUs from 576 through 1400.
+
+Automatic MTU also requires Linux to accept gateway-sourced ICMP injected
+through TUN. Deployment passes the chosen `--auto-mtu=true` or
+`--auto-mtu=false` mode to both the daemon and
+`server-up.sh`; the helper sets `accept_local=1` and loose `rp_filter=2` only
+on the owned TUN. It does not change global or physical-interface reverse-path
+filtering. These interface-local settings disappear with the TUN.
+
+The network helper also defaults to automatic mode:
+
+```sh
+sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0
+```
+
+Use the actual interface/address/pool values. When selecting fixed mode in a
+manually edited service unit, pass `--auto-mtu=false` to both the daemon and
+network helper. Upgrade the daemon and helper together.
+The required `mtu_feedback` readiness component detects missing local-source
+acceptance or effective strict reverse-path filtering instead of reporting
+automatic MTU ready with unusable DF feedback.
+
+Clients need no additional setting. They increase above 1100 only after
+bidirectional datagram confirmation, agree with the server before configuring
+the interface, and keep that MTU until reconnect. Inconclusive discovery keeps
+the conservative value; HTTP/2 and capsule-only HTTP/3 retain the configured
+MTU. QUIC size reductions still trigger per-packet capsule fallback instead of
+live interface resizing. See [MTU selection](architecture.md#stable-per-connection-mtu-selection)
+for protocol details and oversized IPv4 handling.
+
+### Upgrade behavior
 
 The script serializes deployments with a lock and is idempotent. Re-running it
 downloads and upgrades the server while preserving `/etc/porta/porta.env`,
@@ -266,8 +307,12 @@ sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 Use the admin UI for additional clients. Each client receives one random token
 that can enroll multiple unique device IDs up to its configured limit. The
 registry stores only token hashes in `/var/lib/porta/clients.json`. Disabling a
-client or rotating its token blocks future connections immediately; existing
-tunnel connections end normally or when the service is restarted.
+client, deleting it, or rotating its token cancels its existing VPN lanes and
+forward-proxy connections as well as blocking the old credentials. The action
+waits for session workers and accounting to finish. Forgetting a device also
+disconnects it, but a device with a still-valid shared token can enroll again.
+Use **Disconnect now** to end current sessions without changing credentials;
+clients with automatic reconnect enabled may reconnect immediately.
 
 ## Validation and operations
 
@@ -299,6 +344,25 @@ the reload failure and subsequent recovery.
 In automatic Let's Encrypt mode, Porta additionally listens on TCP 80 for
 HTTP-01 challenges and stores its ACME account and certificates under
 `/var/lib/porta/acme`.
+
+`/readyz` returns a component report, not an unconditional success. Required
+checks cover the TUN link and gateway address, pool/default routes, IPv4
+forwarding, and the deployed Porta nftables forwarding/NAT rules. Missing or
+failed required checks return HTTP 503. Deployment passes the expected egress
+interface; manual runs can set `--egress-interface`. A routed deployment without
+NAT can use `--readiness-require-nat=false`.
+
+Checks share the `--readiness-timeout` budget (default three seconds). Optional
+`--readiness-egress-url` and `--readiness-dns-name` probes report outbound HTTP
+and resolution through the configured DNS server; their failures are visible
+but do not change local readiness. These host-originated probes do not prove
+end-to-end client forwarding or validate cloud firewall policy. Arbitrary
+third-party firewall rules are not interpreted by the Porta rule checker.
+
+Metrics include `porta_router_dropped_packets_total{reason="..."}` for queue
+overflow, closed/missing sessions and invalid TUN packets, plus
+`porta_datagram_oversize_total` for datagrams carried by capsule fallback. The
+latter is not a dropped-packet counter.
 
 ## Android
 

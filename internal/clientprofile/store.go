@@ -113,7 +113,7 @@ func (s *Store) Save(profile Profile, token string) (Profile, error) {
 	}
 	profile.UpdatedAt = now
 	if profile.Transport == "" {
-		profile.Transport = tunnel.TransportHTTP3
+		profile.Transport = tunnel.TransportAuto
 	}
 	if profile.ReconnectMaxDelay <= 0 {
 		profile.ReconnectMaxDelay = 30 * time.Second
@@ -249,8 +249,8 @@ func validate(profile Profile) error {
 	if profile.ClientID == "" || len(profile.ClientID) > 64 {
 		return errors.New("client ID must contain 1 to 64 characters")
 	}
-	if profile.Transport != tunnel.TransportHTTP2 && profile.Transport != tunnel.TransportHTTP3 {
-		return errors.New("transport must be h2 or h3")
+	if profile.Transport != tunnel.TransportAuto && profile.Transport != tunnel.TransportHTTP2 && profile.Transport != tunnel.TransportHTTP3 {
+		return errors.New("transport must be auto, h2, or h3")
 	}
 	return nil
 }

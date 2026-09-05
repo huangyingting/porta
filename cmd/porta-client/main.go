@@ -30,24 +30,43 @@ func main() {
 }
 
 func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if handled, err := runNetworkHelper(ctx, os.Args[1:]); handled {
+		return err
+	}
 	serverURL := flag.String("server", "", "gateway origin, for example https://vpn.example.com:8443")
-	transportName := flag.String("transport", "h3", "tunnel transport: h3 or h2")
+	transportName := flag.String("transport", "auto", "tunnel transport: auto (HTTP/3 with safe HTTP/2 fallback), h3, or h2")
 	interfaceName := flag.String("interface", defaultInterfaceName(), "TUN interface name")
 	clientID := flag.String("client-id", defaultClientID(), "stable client identifier")
 	caPath := flag.String("ca", "", "optional PEM CA certificate")
 	thumbprint := flag.String("thumbprint", "", "optional SHA-256 gateway certificate thumbprint")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (development only)")
 	tokenFlag := flag.String("token", "", "bearer token (prefer PORTA_TOKEN environment variable)")
-	reconnect := flag.Bool("reconnect", true, "reconnect automatically after an established tunnel is interrupted")
+	reconnect := flag.Bool("reconnect", true, "retry transient startup failures and interrupted tunnels")
 	reconnectMaxDelay := flag.Duration("reconnect-max-delay", 30*time.Second, "maximum reconnect delay")
+	manualNetwork := flag.Bool("manual-network", runtime.GOOS != "linux", "manage routes, DNS, and leak protection yourself (Linux defaults to automatic)")
+	cleanupNetwork := flag.Bool("cleanup-network", false, "restore network and remove Porta's crash-surviving guard, then exit")
+	networkState := flag.String("network-state", "", "network recovery state file (default: platform-specific Porta state)")
 	flag.Parse()
 
 	token := os.Getenv("PORTA_TOKEN")
 	if token == "" {
 		token = *tokenFlag
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	var network clientapp.NetworkConfigurator
+	if *cleanupNetwork || !*manualNetwork {
+		var err error
+		network, err = newNetworkConfigurator(*networkState)
+		if err != nil {
+			return err
+		}
+	}
+	if *cleanupNetwork {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		return network.Down(cleanupCtx)
+	}
 	return clientapp.Run(ctx, clientapp.Config{
 		ServerURL:         *serverURL,
 		Token:             token,
@@ -59,10 +78,13 @@ func run() error {
 		Insecure:          *insecure,
 		Reconnect:         *reconnect,
 		ReconnectMaxDelay: *reconnectMaxDelay,
+		Network:           network,
 	}, func(event clientapp.Event) {
 		if event.State == clientapp.StateConnected {
-			fmt.Fprintf(os.Stderr, "porta-client: connected address=%s transport=%s uploaded=%d downloaded=%d\n",
-				event.Lease.Address, event.Transport, event.BytesUploaded, event.BytesDownloaded)
+			fmt.Fprintf(os.Stderr, "porta-client: connected address=%s dns=%s mtu=%d transport=%s uploaded=%d downloaded=%d\n",
+				event.Lease.Address, event.Lease.DNS, event.Lease.MTU, event.Transport, event.BytesUploaded, event.BytesDownloaded)
+		} else {
+			fmt.Fprintf(os.Stderr, "porta-client: %s\n", event.Message)
 		}
 	})
 }
