@@ -64,7 +64,7 @@
     <string name="no_profiles">No VPN profiles</string>
     <string name="no_profiles_detail">Add a server profile to start a secure connection.</string>
     <string name="edit">Edit</string>
-    <string name="profile_swipe_hint">Swipe across the full card: right to edit, left to delete.</string>
+    <string name="profile_swipe_hint">Swipe a profile right to edit or left to delete.</string>
     <string name="edit_named_profile">Edit %1$s</string>
     <string name="delete_named_profile">Delete %1$s</string>
     <string name="delete_profile">Delete profile?</string>

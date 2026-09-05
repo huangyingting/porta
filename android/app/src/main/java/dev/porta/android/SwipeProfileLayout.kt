@@ -99,8 +99,12 @@ internal class SwipeProfileLayout(
             MotionEvent.ACTION_UP -> {
                 val tap = gesture.isTap
                 val action = gesture.finish(event.x, event.y)
-                resetCard()
-                if (action != null) onAction(action) else if (tap) performClick()
+                if (action != null) {
+                    completeAction(action)
+                } else {
+                    resetCard()
+                    if (tap) performClick()
+                }
             }
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> cancelGesture()
         }
@@ -128,7 +132,10 @@ internal class SwipeProfileLayout(
             control.isShown && bounds.contains(event.x.toInt(), event.y.toInt())
         }
         armed = false
-        gesture = ProfileSwipeGesture(touchSlop, maxOf(width.toFloat(), touchSlop + 1f))
+        gesture = ProfileSwipeGesture(
+            touchSlop,
+            profileSwipeActionDistance(width.toFloat(), touchSlop),
+        )
         if (!blocked) gesture.begin(event.x, event.y)
     }
 
@@ -148,6 +155,18 @@ internal class SwipeProfileLayout(
     private fun cancelGesture() {
         gesture.cancel()
         resetCard()
+    }
+
+    private fun completeAction(action: ProfileSwipeAction) {
+        parent?.requestDisallowInterceptTouchEvent(false)
+        val target = if (action == ProfileSwipeAction.EDIT) width.toFloat() else -width.toFloat()
+        card.animate().translationX(target).setDuration(140).withEndAction {
+            card.translationX = 0f
+            editLabel.visibility = INVISIBLE
+            deleteLabel.visibility = INVISIBLE
+            armed = false
+            if (isAttachedToWindow && canSwipe()) onAction(action)
+        }.start()
     }
 
     private fun resetCard() {

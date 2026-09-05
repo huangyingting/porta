@@ -74,16 +74,37 @@ class ProfileSwipeGestureTest {
     }
 
     @Test
-    fun fullCardWidthIsRequiredInBothDirections() {
+    fun halfCardDistanceTriggersAcrossPhoneAndTabletWidths() {
         for (width in listOf(296f, 342f, 744f)) {
+            val distance = profileSwipeActionDistance(width, 8f)
+            assertEquals(width / 2f, distance, 0f)
             for ((direction, expected) in listOf(1f to ProfileSwipeAction.EDIT, -1f to ProfileSwipeAction.DELETE)) {
-                val partial = ProfileSwipeGesture(8f, width).apply { begin(400f, 100f) }
-                partial.move(400f + direction * width * 0.95f, 102f)
+                val partial = ProfileSwipeGesture(8f, distance).apply { begin(400f, 100f) }
+                partial.move(400f + direction * (distance - 1f), 102f)
                 assertFalse(partial.isArmed)
-                assertNull(partial.finish(400f + direction * (width - 1f), 102f))
-                val full = ProfileSwipeGesture(8f, width).apply { begin(400f, 100f) }
-                assertEquals(expected, full.finish(400f + direction * width, 102f))
+                assertNull(partial.finish(400f + direction * (distance - 1f), 102f))
+                val committed = ProfileSwipeGesture(8f, distance).apply { begin(400f, 100f) }
+                assertEquals(expected, committed.finish(400f + direction * distance, 102f))
             }
         }
+    }
+
+    @Test
+    fun armedGestureIsStickyAcrossASmallRetreat() {
+        val swipe = ProfileSwipeGesture(8f, 100f).apply { begin(200f, 100f) }
+        swipe.move(300f, 102f)
+        assertTrue(swipe.isArmed)
+        swipe.move(290f, 102f)
+        assertTrue(swipe.isArmed)
+        assertEquals(ProfileSwipeAction.EDIT, swipe.finish(290f, 102f))
+    }
+
+    @Test
+    fun retreatingWellBelowTheHalfCardThresholdDisarmsTheGesture() {
+        val swipe = ProfileSwipeGesture(8f, 100f).apply { begin(200f, 100f) }
+        swipe.move(300f, 102f)
+        swipe.move(275f, 102f)
+        assertFalse(swipe.isArmed)
+        assertNull(swipe.finish(275f, 102f))
     }
 }

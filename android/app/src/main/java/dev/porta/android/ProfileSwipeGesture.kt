@@ -4,6 +4,9 @@ import kotlin.math.abs
 
 internal enum class ProfileSwipeAction { EDIT, DELETE }
 
+internal fun profileSwipeActionDistance(cardWidth: Float, touchSlop: Float): Float =
+    maxOf(cardWidth * 0.5f, touchSlop + 1f)
+
 internal class ProfileSwipeGesture(
     private val touchSlop: Float,
     private val actionDistance: Float,
@@ -14,11 +17,12 @@ internal class ProfileSwipeGesture(
     private var startX = 0f
     private var startY = 0f
     private var moved = false
+    private var armedDirection = 0
     var displacement = 0f
         private set
     val isHorizontal: Boolean get() = axis == Axis.HORIZONTAL
     val isTap: Boolean get() = axis == Axis.PENDING && !moved
-    val isArmed: Boolean get() = isHorizontal && abs(displacement) >= actionDistance
+    val isArmed: Boolean get() = isHorizontal && armedDirection != 0
 
     init {
         require(touchSlop > 0 && actionDistance > touchSlop)
@@ -29,6 +33,7 @@ internal class ProfileSwipeGesture(
         startY = y
         displacement = 0f
         moved = false
+        armedDirection = 0
         axis = Axis.PENDING
     }
 
@@ -45,6 +50,16 @@ internal class ProfileSwipeGesture(
             }
         }
         displacement = if (isHorizontal) dx else 0f
+        if (isHorizontal) {
+            val direction = if (displacement > 0) 1 else -1
+            if (armedDirection == 0 && abs(displacement) >= actionDistance) {
+                armedDirection = direction
+            } else if (armedDirection != 0 && direction != armedDirection) {
+                armedDirection = if (abs(displacement) >= actionDistance) direction else 0
+            } else if (armedDirection != 0 && abs(displacement) < actionDistance * 0.8f) {
+                armedDirection = 0
+            }
+        }
     }
 
     fun finish(x: Float, y: Float): ProfileSwipeAction? {
@@ -61,5 +76,6 @@ internal class ProfileSwipeGesture(
     fun cancel() {
         axis = Axis.CANCELLED
         displacement = 0f
+        armedDirection = 0
     }
 }
