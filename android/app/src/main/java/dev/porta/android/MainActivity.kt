@@ -21,6 +21,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowInsets
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -119,6 +120,23 @@ class MainActivity : Activity() {
     @Deprecated("VpnService preparation still uses the activity-result contract")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_QR) {
+            if (resultCode == QrScannerActivity.RESULT_ENTER_MANUALLY) {
+                showProfileDialog(null)
+            } else if (resultCode == RESULT_OK) {
+                val draft = qrProfileDraft(true, data?.getStringExtra(QrScannerActivity.EXTRA_PAYLOAD))
+                if (draft != null) {
+                    showProfileDialog(null, draft)
+                } else {
+                    AlertDialog.Builder(this)
+                        .setMessage(R.string.qr_invalid_profile)
+                        .setPositiveButton(R.string.qr_retry) { _, _ -> scanProfileQr() }
+                        .setNegativeButton(R.string.cancel, null)
+                        .show()
+                }
+            }
+            return
+        }
         if (requestCode == REQUEST_VPN) {
             if (resultCode == RESULT_OK) {
                 val profileId = pendingProfileId
@@ -187,7 +205,7 @@ class MainActivity : Activity() {
             minHeight = 0
             setPadding(0, 0, 0, dp(2))
             layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
-            setOnClickListener { showProfileDialog(null) }
+            setOnClickListener { showAddProfileChooser() }
         })
         page.addView(header)
         page.addView(connectionSummary().apply {
@@ -513,29 +531,45 @@ class MainActivity : Activity() {
             setTextColor(COLOR_BUTTON_TEXT)
             setTypeface(typeface, Typeface.BOLD)
             background = rounded(COLOR_ACCENT, 14f)
-            setOnClickListener { showProfileDialog(null) }
+            setOnClickListener { showAddProfileChooser() }
         })
     }
 
-    private fun showProfileDialog(existing: VpnProfile?) {
+    private fun showAddProfileChooser() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.add_profile)
+            .setItems(arrayOf(getString(R.string.scan_qr_code), getString(R.string.enter_manually))) { _, which ->
+                if (which == 0) scanProfileQr() else showProfileDialog(null)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun scanProfileQr() {
+        @Suppress("DEPRECATION")
+        startActivityForResult(Intent(this, QrScannerActivity::class.java), REQUEST_QR)
+    }
+
+    private fun showProfileDialog(existing: VpnProfile?, imported: VpnProfile? = null) {
         if (existing?.id == TunnelService.currentProfileId() && isActiveStatus(TunnelService.currentStatus())) {
             Toast.makeText(this, R.string.disconnect_before_editing, Toast.LENGTH_SHORT).show()
             return
         }
-        val name = dialogField(R.string.profile_name_hint, existing?.name.orEmpty())
+        val initial = existing ?: imported
+        val name = dialogField(R.string.profile_name_hint, initial?.name.orEmpty())
         val server = dialogField(
             R.string.gateway_hint,
-            existing?.server.orEmpty(),
+            initial?.server.orEmpty(),
         )
         val token = dialogField(
             if (existing == null) R.string.token_hint else R.string.token_unchanged_hint,
-            "",
+            imported?.token.orEmpty(),
         ).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         val clientId = dialogField(
             R.string.client_id_hint,
-            existing?.clientId ?: Build.MODEL.safeClientId(),
+            initial?.clientId ?: Build.MODEL.safeClientId(),
         )
         val autoConnect = CheckBox(this).apply {
             setText(R.string.auto_connect)
@@ -558,7 +592,7 @@ class MainActivity : Activity() {
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (existing == null) R.string.add_profile else R.string.edit_profile)
-            .setView(form)
+            .setView(ScrollView(this).apply { addView(form) })
             .setPositiveButton(R.string.save, null)
             .setNeutralButton(R.string.cancel, null)
             .apply {
@@ -568,7 +602,7 @@ class MainActivity : Activity() {
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val profile = VpnProfile(
-                    id = existing?.id ?: UUID.randomUUID().toString(),
+                    id = initial?.id ?: UUID.randomUUID().toString(),
                     name = name.text.toString().trim(),
                     server = server.text.toString().trim().trimEnd('/'),
                     clientId = clientId.text.toString().trim(),
@@ -589,6 +623,7 @@ class MainActivity : Activity() {
                 render(TunnelService.currentStatus())
             }
         }
+        dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         dialog.show()
     }
 
@@ -763,6 +798,7 @@ class MainActivity : Activity() {
     companion object {
         private const val REQUEST_VPN = 100
         private const val REQUEST_NOTIFICATIONS = 101
+        private const val REQUEST_QR = 102
         private const val STATE_PENDING_PROFILE = "pending_profile"
         private const val STATUS_PERMISSION = "dev.porta.android.permission.STATUS"
         private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

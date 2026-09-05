@@ -15,6 +15,14 @@
     <string name="upload">↑ %1$s</string>
     <string name="traffic_total">Downloaded %1$s  •  Uploaded %2$s</string>
     <string name="add_profile">Add profile</string>
+    <string name="scan_qr_code">Scan QR code</string>
+    <string name="enter_manually">Enter manually</string>
+    <string name="qr_scan_help">Scan a Porta profile QR code from your administrator. Review the details and tap Save before connecting.</string>
+    <string name="qr_scanning">Point the camera at a Porta profile QR code.</string>
+    <string name="qr_retry">Try again</string>
+    <string name="qr_invalid_profile">This QR code is not a valid Porta profile. Try another code or enter the details manually.</string>
+    <string name="qr_camera_permission_denied">Camera access is needed to scan a QR code. Try again to allow access, or enter the details manually. You can also allow camera access in Android Settings.</string>
+    <string name="qr_camera_unavailable">The camera is unavailable. Try again or enter the details manually.</string>
     <string name="edit_profile">Edit profile</string>
     <string name="profile_name">Profile name</string>
     <string name="profile_name_hint">Home, Work, Lab…</string>

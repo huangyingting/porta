@@ -69,6 +69,8 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/api/profile/qr" && r.Method == http.MethodPost:
+		a.serveProfileQR(w, r)
 	case r.URL.Path == "/api/clients" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"clients": a.registry.List(a.usage.Snapshot())})
 	case r.URL.Path == "/api/clients" && r.Method == http.MethodPost:

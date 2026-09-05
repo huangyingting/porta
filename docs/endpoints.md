@@ -48,6 +48,37 @@ The operations listener defaults to `127.0.0.1:9090`:
 Keep this listener private. Public browser sessions are handled separately on
 the main Porta listener.
 
+## Android profile QR codes
+
+`POST /api/profile/qr` requires an administrator browser session (with the
+existing same-origin checks) or a loopback API administrator bearer token.
+Send a JSON body with `server`, `token`, and optional `name`. It returns
+`{"image":"data:image/png;base64,..."}` with `Cache-Control: no-store`.
+Credentials stay in the POST body and response, never URL query parameters,
+external QR services, or persistent QR storage. The endpoint encodes the
+supplied configuration; it does not redeem or authenticate the client token.
+
+The QR text format is:
+
+```text
+porta://profile?v=1&server=https%3A%2F%2Fporta.example.com%3A8443&token=example-not-a-secret&name=Phone
+```
+
+Values use UTF-8 form-percent encoding (`+` represents a space); parameter
+order is irrelevant. Version `1`, `server`, and `token` are required; `name`
+is optional. Android rejects unknown or duplicate fields, other versions,
+malformed encoding, and non-HTTPS server origins. The server cannot contain
+credentials, a query, a fragment, or a path other than `/`. Explicit ports
+must be between 1 and 65535. Limits are 2048 bytes for the whole QR URI,
+512 bytes for the server, 512 printable ASCII characters for the token, and
+80 UTF-8 bytes for the name. Leading/trailing whitespace and control
+characters are rejected.
+
+This URI is consumed only by Porta's in-app scanner; it is not an HTTP
+endpoint or an exported Android deep link. Import always requires reviewing
+and saving a new profile, and does not import a device ID or auto-connect/TLS
+override settings.
+
 ## Session administration
 
 Authorized administrators can end current sessions without changing tokens:

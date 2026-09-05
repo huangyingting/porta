@@ -179,6 +179,7 @@ internal fun profileName(server: String): String = try {
 internal fun isHttpsOrigin(server: String): Boolean = try {
     val uri = java.net.URI(server)
     uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.userInfo == null &&
+        uri.rawAuthority?.endsWith(":") != true &&
         (uri.port == -1 || uri.port in 1..65_535) &&
         (uri.path.isNullOrEmpty() || uri.path == "/") && uri.query == null && uri.fragment == null
 } catch (_: java.net.URISyntaxException) {

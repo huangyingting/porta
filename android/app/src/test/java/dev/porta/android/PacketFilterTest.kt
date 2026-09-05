@@ -135,6 +135,7 @@ class PacketFilterTest {
         }
         for (server in listOf(
             "https://vpn.example.com:0", "https://vpn.example.com:65536",
+            "https://vpn.example.com:", "https://[::1]:",
             "https://vpn.example.com/path", "http://vpn.example.com", "https://user@vpn.example.com",
         )) {
             assertFalse(server, isHttpsOrigin(server))

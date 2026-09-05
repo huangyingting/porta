@@ -236,7 +236,29 @@ routing and firewall/kill-switch rules.
 Use `porta-android-arm64-v8a.apk` for most current physical devices,
 `armeabi-v7a` for older 32-bit ARM devices, or `x86_64` for an emulator.
 
-Open Porta, tap **Add profile**, and enter:
+For QR setup, create a client or rotate its token in **Porta Control**. The
+one-time token dialog displays a QR code containing the server address, token,
+and profile name. The server address defaults to the public HTTPS origin of the
+control panel, including its port. If you administer Porta through another
+address, edit **VPN server** and select **Update QR** before scanning.
+
+On Android, tap **Add profile** (the **+** button), then **Scan QR code**. Allow
+camera access, scan the code, review the HTTPS server address and profile name,
+and tap **Save**. Scanning runs entirely on-device without Google Play Services
+or a network lookup. It creates a new profile with a fresh device ID; it does
+not overwrite existing profiles, change TLS verification, enable auto-connect,
+or start a tunnel without your approval. Manual entry remains available if
+the camera is unavailable or permission is denied.
+
+**Treat the QR code like the token itself.** Anyone who obtains it can use the
+account, subject to its device limit. Share it privately and scan only codes
+from an administrator you trust. Porta does not retain the QR image or
+recoverable token; once the token dialog closes, it cannot display that code
+again. Rotating a token invalidates previous codes and disconnects existing
+sessions, so do not rotate merely to redisplay a code if you already have the
+original token.
+
+For manual setup, tap **Add profile**, then **Enter manually**, and enter:
 
 - a recognizable profile name;
 - the direct gateway URL, including the port when it is not 443;

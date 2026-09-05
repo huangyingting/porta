@@ -14,6 +14,8 @@ github.com/quic-go/quic-go v0.61.0 h1:ui88A53s8MSVYLC56en0KQ17HARk+9986Dn0SBfKNv
 github.com/quic-go/quic-go v0.61.0/go.mod h1:9So2anK4Tp22URSQq00k+Vo2PNkle96ycDPDHL4s9vs=
 github.com/rodrigocfd/windigo v0.2.6 h1:/rTNYsBqllPKr4qfiPB5iHbtNp4KwZWelBCgYf80mag=
 github.com/rodrigocfd/windigo v0.2.6/go.mod h1:3zHhLYU08CkrMx5cdPlmC1HObT8fSldWtfS8cnSRzYo=
+github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e h1:MRM5ITcdelLK2j1vwZ3Je0FKVCfqOLp5zO6trqMLYs0=
+github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e/go.mod h1:XV66xRDqSt+GTGFMVlhk3ULuV0y9ZmzeVGR4mloJI3M=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=

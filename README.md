@@ -112,8 +112,11 @@ device ID.
 ### Android client
 
 Install the APK matching the device architecture. In Porta, tap **Add profile**
-and enter the gateway URL, client token, and a stable device ID. Android uses
-HTTP/3 when available and falls back to HTTP/2 automatically.
+then **Scan QR code** to import the code shown when an administrator creates or
+rotates a client token. Review the server and save; a fresh device ID is generated
+locally. Keep the QR code private because it contains the access token.
+**Enter manually** remains available. Android uses HTTP/3 when available and
+falls back to HTTP/2 automatically.
 
 ### Forward proxy
 
