@@ -2,6 +2,40 @@ package winnetwork
 
 import "testing"
 
+func nativeGuardFilterFlagsMatch(flags uint32) bool {
+	// BFE may add INDEXED (0x40), a lookup optimization, to PERSISTENT (0x01).
+	// All other flags, including DISABLED and CLEAR_ACTION_RIGHT, remain forbidden.
+	// https://learn.microsoft.com/windows/win32/api/fwpmtypes/ns-fwpmtypes-fwpm_filter0
+	return flags&^0x40 == 0x01
+}
+
+func TestNativeGuardFilterFlags(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		flags uint32
+		want  bool
+	}{
+		{"persistent", 0x01, true},
+		{"persistent indexed", 0x41, true},
+		{"not persistent", 0, false},
+		{"indexed but not persistent", 0x40, false},
+		{"boot time", 0x03, false},
+		{"provider context", 0x05, false},
+		{"hard permit", 0x09, false},
+		{"indexed hard permit", 0x49, false},
+		{"unregistered callout permit", 0x11, false},
+		{"disabled", 0x21, false},
+		{"indexed disabled", 0x61, false},
+		{"unknown flag", 0x80000041, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := nativeGuardFilterFlagsMatch(test.flags); got != test.want {
+				t.Fatalf("nativeGuardFilterFlagsMatch(%#x) = %t, want %t", test.flags, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeStatusUsesDWORDWidth(t *testing.T) {
 	for _, test := range []struct {
 		name   string

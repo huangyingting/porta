@@ -227,9 +227,22 @@ func nativeAssertStagedFilter(t *testing.T, engine uintptr, owner string, index 
 		action, weight = 0x1002, 100
 	}
 	if actual.key != key || actual.layer != guid(layerKeys[rule.layer]) || actual.sublayer != guid(objectKey(owner, -1)) ||
-		actual.flags != 1 || actual.action.kind != action || actual.weight.kind != 4 ||
-		*nativeValuePointer[uint64](actual.weight) != weight || actual.count != uint32(len(rule.conditions)) {
+		!nativeGuardFilterFlagsMatch(actual.flags) || actual.action.kind != action || actual.count != uint32(len(rule.conditions)) {
 		t.Fatalf("%s filter %d has incorrect identity/persistence/arbitration: %+v", rule.layer, index, actual)
+	}
+	// Production supplies explicit UINT64 weights, not UINT8 range indexes.
+	// BFE must use them unchanged, including the effective classification weight.
+	// https://learn.microsoft.com/windows/win32/fwp/filter-weight-assignment
+	for _, field := range []struct {
+		name  string
+		value wfpValue
+	}{{"weight", actual.weight}, {"effectiveWeight", actual.effectiveWeight}} {
+		if field.value.kind != 4 || nativeValuePointer[uint64](field.value) == nil {
+			t.Fatalf("%s filter %d %s is not a nonnil UINT64: %+v", rule.layer, index, field.name, field.value)
+		}
+		if got := *nativeValuePointer[uint64](field.value); got != weight {
+			t.Fatalf("%s filter %d %s = %d, want %d", rule.layer, index, field.name, got, weight)
+		}
 	}
 	// In particular, permits must NOT set CLEAR_ACTION_RIGHT (hard permit).
 	// This checks the staged native policy, not actual packet classification.
