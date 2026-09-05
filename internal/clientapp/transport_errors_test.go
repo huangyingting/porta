@@ -88,7 +88,7 @@ func TestEstablishedTransportNormalClosuresReconnect(t *testing.T) {
 			}
 			second := &testConnection{closed: make(chan struct{})}
 			attempts, connected := 0, 0
-			err := run(ctx, Config{
+			err := run(ctx, testIdentity, Config{
 				ServerURL: "https://gateway.invalid", Token: "token", Transport: test.transport, Reconnect: true,
 			}, func(event Event) {
 				if event.State == StateConnected {
@@ -193,7 +193,7 @@ func TestStartupGatewaySlownessAndLeaseWaitRetryWithoutDowngrade(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			attempts := 0
-			err := run(ctx, Config{ServerURL: "https://gateway.invalid", Token: "token", Reconnect: true}, func(event Event) {
+			err := run(ctx, testIdentity, Config{ServerURL: "https://gateway.invalid", Token: "token", Reconnect: true}, func(event Event) {
 				if event.State == StateConnected {
 					cancel()
 				}

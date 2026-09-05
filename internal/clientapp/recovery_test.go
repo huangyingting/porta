@@ -66,8 +66,13 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	calls := 0
+	identityCalls := 0
+	resolveIdentity := func() (string, error) {
+		identityCalls++
+		return testIdentity()
+	}
 	connected := false
-	err := run(ctx, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true}, func(event Event) {
+	err := run(ctx, resolveIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true}, func(event Event) {
 		if event.State == StateConnected {
 			connected = true
 			if event.Transport != tunnel.TransportHTTP2 {
@@ -77,6 +82,9 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 		}
 	}, func(_ context.Context, config tunnel.Config) (*clientConnection, error) {
 		calls++
+		if want, _ := testIdentity(); config.ClientID != want {
+			t.Fatal("retry or fallback lost OS-derived identity")
+		}
 		if calls <= 2 || config.Transport == tunnel.TransportHTTP3 {
 			return nil, tunnel.TransportUnavailableError{Err: context.DeadlineExceeded}
 		}
@@ -84,8 +92,25 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 	}, func(string, int) (device.PacketDevice, error) {
 		return &testDevice{readStarted: make(chan struct{})}, nil
 	})
-	if !connected || calls != 4 || !errors.Is(err, context.Canceled) {
-		t.Fatalf("connected=%t attempts=%d error=%v", connected, calls, err)
+	if !connected || calls != 4 || identityCalls != 1 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("connected=%t attempts=%d identity lookups=%d error=%v", connected, calls, identityCalls, err)
+	}
+}
+
+func TestUnavailableIdentityDoesNotDialOrChangeNetworking(t *testing.T) {
+	missing := errors.New("OS identifier unavailable")
+	network := &recoveryNetwork{}
+	err := run(context.Background(), func() (string, error) { return "", missing },
+		Config{ServerURL: "https://192.0.2.1", Token: "token", Network: network}, nil,
+		func(context.Context, tunnel.Config) (*clientConnection, error) {
+			t.Fatal("dialed without an OS identity")
+			return nil, nil
+		}, func(string, int) (device.PacketDevice, error) {
+			t.Fatal("opened a device without an OS identity")
+			return nil, nil
+		})
+	if !errors.Is(err, missing) || network.guard || network.prepared != 0 || network.up != 0 || network.down != 0 {
+		t.Fatalf("identity failure was swallowed or changed networking: %v, %+v", err, network)
 	}
 }
 
@@ -96,7 +121,7 @@ func TestPermanentStartupFailsWithoutRetry(t *testing.T) {
 		x509.UnknownAuthorityError{},
 	} {
 		calls := 0
-		err := run(context.Background(), Config{ServerURL: "https://gateway.example", Token: "token", Reconnect: true}, nil,
+		err := run(context.Background(), testIdentity, Config{ServerURL: "https://gateway.example", Token: "token", Reconnect: true}, nil,
 			func(context.Context, tunnel.Config) (*clientConnection, error) {
 				calls++
 				return nil, failure
@@ -198,7 +223,7 @@ func TestReconnectReplacesLeaseMTUDNSAndDrainsOldPackets(t *testing.T) {
 		}
 		return nil
 	}
-	err := run(ctx, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true, Network: network}, func(event Event) {
+	err := run(ctx, testIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true, Network: network}, func(event Event) {
 		if event.State == StateReconnecting {
 			if !network.guard || network.down != 0 {
 				t.Error("guard removed during reconnect")
@@ -262,7 +287,7 @@ func TestTerminalFailureRetainsPreparedGuardUntilExplicitCleanup(t *testing.T) {
 		<-tunDevice.readStarted
 		return nil, failure
 	}
-	err := run(context.Background(), Config{ServerURL: "https://192.0.2.1", Token: "token", Network: network, Reconnect: true}, nil,
+	err := run(context.Background(), testIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", Network: network, Reconnect: true}, nil,
 		func(context.Context, tunnel.Config) (*clientConnection, error) {
 			return &clientConnection{packetConnection: connection, lease: tunnel.Lease{MTU: 1280}}, nil
 		}, func(string, int) (device.PacketDevice, error) { return tunDevice, nil })
@@ -288,7 +313,7 @@ func TestNamedPrepareAfterBootstrapAndCanceledSessionCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	network := &namedRecoveryNetwork{recoveryNetwork: &recoveryNetwork{}}
-	err := run(ctx, Config{ServerURL: "https://192.0.2.1", Token: "token", InterfaceName: "Porta-owned", Network: network}, func(event Event) {
+	err := run(ctx, testIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", InterfaceName: "Porta-owned", Network: network}, func(event Event) {
 		if event.State == StateConnected {
 			if !network.guard || network.interfaceName != "Porta-owned" {
 				t.Error("named guard not prepared before connection became usable")
@@ -320,7 +345,7 @@ func TestReconnectPermanentFailureStopsPromptly(t *testing.T) {
 		return nil, io.EOF
 	}
 	attempts := 0
-	err := run(ctx, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true}, nil,
+	err := run(ctx, testIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true}, nil,
 		func(context.Context, tunnel.Config) (*clientConnection, error) {
 			attempts++
 			if attempts > 1 {
@@ -373,7 +398,7 @@ func TestProtectedFallbackPreparesEachTransportBeforeDial(t *testing.T) {
 	}
 	second := &testConnection{closed: make(chan struct{})}
 	attempts, connected := 0, 0
-	err := run(ctx, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true, Network: network}, func(event Event) {
+	err := run(ctx, testIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", Reconnect: true, Network: network}, func(event Event) {
 		if event.State == StateConnected {
 			connected++
 			if connected == 2 {
@@ -439,7 +464,7 @@ func TestCrashRecoveryUsesJournalWithoutPhysicalDNS(t *testing.T) {
 		endpoints:       []net.Addr{&net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}},
 	}
 	dialed := false
-	err := run(ctx, Config{ServerURL: "https://never-resolve.invalid", Token: "token", Network: network}, func(event Event) {
+	err := run(ctx, testIdentity, Config{ServerURL: "https://never-resolve.invalid", Token: "token", Network: network}, func(event Event) {
 		if event.State == StateConnected {
 			cancel()
 		}
@@ -465,7 +490,7 @@ func TestCrashRecoveryPortMismatchRetainsProtection(t *testing.T) {
 		recoveryNetwork: &recoveryNetwork{guard: true},
 		endpoints:       []net.Addr{&net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 8443}},
 	}
-	err := run(context.Background(), Config{ServerURL: "https://never-resolve.invalid", Token: "token", Network: network}, nil,
+	err := run(context.Background(), testIdentity, Config{ServerURL: "https://never-resolve.invalid", Token: "token", Network: network}, nil,
 		func(context.Context, tunnel.Config) (*clientConnection, error) {
 			t.Fatal("dialed gateway without a matching cached endpoint")
 			return nil, nil
@@ -509,7 +534,7 @@ func testReconnectionPreservesDeviceIdentity(t *testing.T, changedDNS bool) {
 		return nil
 	}
 	attempts, opens, connected := 0, 0, 0
-	err := run(ctx, Config{ServerURL: "https://192.0.2.1", Token: "token", Network: network, Reconnect: true}, func(event Event) {
+	err := run(ctx, testIdentity, Config{ServerURL: "https://192.0.2.1", Token: "token", Network: network, Reconnect: true}, func(event Event) {
 		if event.State == StateConnected {
 			connected++
 			if connected == 2 {
@@ -540,7 +565,7 @@ func TestAutomaticNetworkRejectsUnsupportedEndpointsBeforeBootstrap(t *testing.T
 	} {
 		t.Run(origin, func(t *testing.T) {
 			network := &recoveryNetwork{}
-			err := run(context.Background(), Config{ServerURL: origin, Token: "token", Network: network}, nil,
+			err := run(context.Background(), testIdentity, Config{ServerURL: origin, Token: "token", Network: network}, nil,
 				func(context.Context, tunnel.Config) (*clientConnection, error) {
 					t.Fatal("dialed unsupported automatic-network endpoint")
 					return nil, nil

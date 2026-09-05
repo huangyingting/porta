@@ -17,13 +17,12 @@ import (
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
-const stateVersion = 1
+const stateVersion = 2
 
 type Profile struct {
 	ID                string           `json:"id"`
 	Name              string           `json:"name"`
 	ServerURL         string           `json:"server_url"`
-	ClientID          string           `json:"client_id"`
 	Transport         tunnel.Transport `json:"transport"`
 	CAPath            string           `json:"ca_path,omitempty"`
 	Thumbprint        string           `json:"thumbprint,omitempty"`
@@ -77,12 +76,18 @@ func Open(path string, protector Protector) (*Store, error) {
 	if err := json.Unmarshal(data, &store.state); err != nil {
 		return nil, fmt.Errorf("decode profile store: %w", err)
 	}
-	if store.state.Version != stateVersion {
+	if store.state.Version != 1 && store.state.Version != stateVersion {
 		return nil, fmt.Errorf("unsupported profile store version %d", store.state.Version)
 	}
 	for index := range store.state.Profiles {
 		if err := validate(store.state.Profiles[index].Profile); err != nil {
 			return nil, fmt.Errorf("profile %d: %w", index+1, err)
+		}
+	}
+	if store.state.Version != stateVersion {
+		store.state.Version = stateVersion
+		if err := store.persistLocked(); err != nil {
+			return nil, fmt.Errorf("upgrade profile store: %w", err)
 		}
 	}
 	return store, nil
@@ -120,7 +125,6 @@ func (s *Store) Save(profile Profile, token string) (Profile, error) {
 	}
 	profile.Name = strings.TrimSpace(profile.Name)
 	profile.ServerURL = strings.TrimSpace(profile.ServerURL)
-	profile.ClientID = strings.TrimSpace(profile.ClientID)
 	if err := validate(profile); err != nil {
 		return Profile{}, err
 	}
@@ -245,9 +249,6 @@ func validate(profile Profile) error {
 	}
 	if profile.ServerURL == "" {
 		return errors.New("server URL is required")
-	}
-	if profile.ClientID == "" || len(profile.ClientID) > 64 {
-		return errors.New("client ID must contain 1 to 64 characters")
 	}
 	if profile.Transport != tunnel.TransportAuto && profile.Transport != tunnel.TransportHTTP2 && profile.Transport != tunnel.TransportHTTP3 {
 		return errors.New("transport must be auto, h2, or h3")

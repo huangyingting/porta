@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/device"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
@@ -40,7 +41,6 @@ const (
 type Config struct {
 	ServerURL         string
 	Token             string
-	ClientID          string
 	Transport         tunnel.Transport
 	InterfaceName     string
 	CAPath            string
@@ -102,7 +102,7 @@ type counters struct {
 }
 
 func Run(ctx context.Context, config Config, observer Observer) error {
-	return run(ctx, config, observer, func(ctx context.Context, config tunnel.Config) (*clientConnection, error) {
+	return run(ctx, clientid.Current, config, observer, func(ctx context.Context, config tunnel.Config) (*clientConnection, error) {
 		connection, err := tunnel.Dial(ctx, config)
 		if err != nil {
 			return nil, err
@@ -120,7 +120,7 @@ type clientConnection struct {
 	transport  tunnel.Transport
 }
 
-func run(ctx context.Context, config Config, observer Observer, dial func(context.Context, tunnel.Config) (*clientConnection, error), openDevice func(string, int) (device.PacketDevice, error)) (runErr error) {
+func run(ctx context.Context, resolveIdentity func() (string, error), config Config, observer Observer, dial func(context.Context, tunnel.Config) (*clientConnection, error), openDevice func(string, int) (device.PacketDevice, error)) (runErr error) {
 	if strings.TrimSpace(config.ServerURL) == "" || config.Token == "" {
 		return errors.New("server URL and token are required")
 	}
@@ -150,10 +150,14 @@ func run(ctx context.Context, config Config, observer Observer, dial func(contex
 	if err != nil {
 		return err
 	}
+	deviceID, err := resolveIdentity()
+	if err != nil {
+		return fmt.Errorf("resolve OS device identity: %w", err)
+	}
 	tunnelConfig := tunnel.Config{
 		URL:       config.ServerURL,
 		Token:     config.Token,
-		ClientID:  config.ClientID,
+		ClientID:  deviceID,
 		Transport: config.Transport,
 		TLSConfig: tlsConfig,
 		Timeout:   15 * time.Second,
@@ -218,6 +222,7 @@ func run(ctx context.Context, config Config, observer Observer, dial func(contex
 		emitSnapshot(observer, state, message, lease, transport, connectedAt, &totals)
 		return err
 	}
+	emit(observer, Event{State: StateConnecting, Message: "Device ID: " + deviceID + " (OS derived)", Transport: transport})
 	emit(observer, Event{State: StateConnecting, Message: "Connecting", Transport: transport})
 	var endpoints []net.Addr
 	if recovery, ok := config.Network.(NetworkRecoveryEndpoints); ok && prepareNetwork != nil {

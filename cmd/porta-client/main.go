@@ -14,7 +14,6 @@ import (
 
 	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/clientapp"
-	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
@@ -38,7 +37,6 @@ func run() error {
 	serverURL := flag.String("server", "", "gateway origin, for example https://vpn.example.com:8443")
 	transportName := flag.String("transport", "auto", "tunnel transport: auto (HTTP/3 with safe HTTP/2 fallback), h3, or h2")
 	interfaceName := flag.String("interface", defaultInterfaceName(), "TUN interface name")
-	clientID := flag.String("client-id", defaultClientID(), "stable client identifier")
 	caPath := flag.String("ca", "", "optional PEM CA certificate")
 	thumbprint := flag.String("thumbprint", "", "optional SHA-256 gateway certificate thumbprint")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (development only)")
@@ -70,7 +68,6 @@ func run() error {
 	return clientapp.Run(ctx, clientapp.Config{
 		ServerURL:         *serverURL,
 		Token:             token,
-		ClientID:          *clientID,
 		Transport:         tunnel.Transport(*transportName),
 		InterfaceName:     *interfaceName,
 		CAPath:            *caPath,
@@ -106,8 +103,4 @@ func defaultInterfaceName() string {
 		return "Porta"
 	}
 	return "porta0"
-}
-
-func defaultClientID() string {
-	return clientid.Default("porta-client")
 }

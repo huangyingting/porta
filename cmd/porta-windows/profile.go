@@ -39,7 +39,6 @@ func profileWithFields(original, fields clientprofile.Profile) clientprofile.Pro
 	original.ID = fields.ID
 	original.Name = fields.Name
 	original.ServerURL = fields.ServerURL
-	original.ClientID = fields.ClientID
 	original.Transport = fields.Transport
 	return original
 }

@@ -15,7 +15,6 @@ import (
 
 	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/clientapp"
-	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/clientprofile"
 	"github.com/huangyingting/porta/internal/winnetwork"
 	"github.com/rodrigocfd/windigo/co"
@@ -30,7 +29,6 @@ type application struct {
 	profiles      *ui.ComboBox
 	name          *ui.Edit
 	server        *ui.Edit
-	clientID      *ui.Edit
 	transport     *ui.ComboBox
 	token         *ui.Edit
 	status        *ui.Static
@@ -132,8 +130,9 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 
 	ui.NewStatic(window, ui.OptsStatic().Text("Gateway URL").Position(ui.Dpi(24, 178)))
 	app.server = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 198)).Width(ui.DpiX(560)).Height(ui.DpiY(25)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Device ID").Position(ui.Dpi(24, 236)))
-	app.clientID = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 256)).Width(ui.DpiX(270)).Height(ui.DpiY(25)))
+	ui.NewStatic(window, ui.OptsStatic().Text("Device identity").Position(ui.Dpi(24, 236)))
+	ui.NewStatic(window, ui.OptsStatic().Text("Supplied automatically by Windows").
+		Position(ui.Dpi(24, 256)).Size(ui.Dpi(270, 25)))
 	ui.NewStatic(window, ui.OptsStatic().Text("Client token").Position(ui.Dpi(310, 236)))
 	app.token = ui.NewEdit(window, ui.OptsEdit().
 		Position(ui.Dpi(310, 256)).Width(ui.DpiX(274)).Height(ui.DpiY(25)).
@@ -222,7 +221,6 @@ func (a *application) loadProfile(profile clientprofile.Profile) {
 	a.selectedID = profile.ID
 	a.name.SetText(profile.Name)
 	a.server.SetText(profile.ServerURL)
-	a.clientID.SetText(profile.ClientID)
 	a.token.SetText("")
 	a.transport.SelectIndex(transportIndex(profile.Transport))
 	a.appendLog("Selected profile " + profile.Name)
@@ -236,7 +234,6 @@ func (a *application) newProfile() {
 	a.profiles.SelectIndex(0)
 	a.name.SetText("")
 	a.server.SetText("https://")
-	a.clientID.SetText(defaultClientID())
 	a.transport.SelectIndex(0)
 	a.token.SetText("")
 	a.name.Hwnd().SetFocus()
@@ -255,7 +252,6 @@ func (a *application) profileFromFields() clientprofile.Profile {
 		ID:        a.selectedID,
 		Name:      strings.TrimSpace(a.name.Text()),
 		ServerURL: strings.TrimSpace(a.server.Text()),
-		ClientID:  strings.TrimSpace(a.clientID.Text()),
 		Transport: transport,
 	})
 }
@@ -343,7 +339,6 @@ func (a *application) toggleConnection() {
 		err := clientapp.Run(ctx, clientapp.Config{
 			ServerURL:         profile.ServerURL,
 			Token:             token,
-			ClientID:          profile.ClientID,
 			Transport:         profile.Transport,
 			InterfaceName:     "Porta",
 			CAPath:            profile.CAPath,
@@ -414,7 +409,6 @@ func (a *application) setEditing(enabled bool) {
 	a.profiles.Hwnd().EnableWindow(enabled)
 	a.name.Hwnd().EnableWindow(enabled)
 	a.server.Hwnd().EnableWindow(enabled)
-	a.clientID.Hwnd().EnableWindow(enabled)
 	a.transport.Hwnd().EnableWindow(enabled)
 	a.token.Hwnd().EnableWindow(enabled)
 	a.save.Hwnd().EnableWindow(enabled)
@@ -612,8 +606,4 @@ func formatDuration(value time.Duration) string {
 	minutes := int(value.Minutes()) % 60
 	seconds := int(value.Seconds()) % 60
 	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
-}
-
-func defaultClientID() string {
-	return clientid.Default("porta-windows")
 }

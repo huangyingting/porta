@@ -66,10 +66,14 @@ func (n testNetwork) Up(ctx context.Context, name string, _ net.Addr, _ tunnel.L
 }
 func (n testNetwork) Down(ctx context.Context) error { return n.down(ctx) }
 
+func testIdentity() (string, error) {
+	return "os-derived-test-device", nil
+}
+
 func runTestClient(ctx context.Context, config Config, observer Observer, connection *testConnection, tunDevice *testDevice) error {
 	config.ServerURL = "https://gateway.example"
 	config.Token = "token"
-	return run(ctx, config, observer,
+	return run(ctx, testIdentity, config, observer,
 		func(context.Context, tunnel.Config) (*clientConnection, error) {
 			return &clientConnection{packetConnection: connection, lease: tunnel.Lease{MTU: 1280}}, nil
 		},
