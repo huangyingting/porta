@@ -64,9 +64,34 @@ func TestHTTP3AutomaticMTUEndToEnd(t *testing.T) {
 				if mtu < masque.SafeMTU || mtu > masque.MaxDiscoveredMTU {
 					t.Fatalf("automatic MTU outside safe range: %d", mtu)
 				}
+				if !connection.MTUAutomatic {
+					t.Fatal("automatic MTU selection was not recorded")
+				}
+				if connection.MTUCeiling != min(test.ceiling, masque.MaxDiscoveredMTU) {
+					t.Fatalf(
+						"MTU ceiling = %d, want %d",
+						connection.MTUCeiling,
+						min(test.ceiling, masque.MaxDiscoveredMTU),
+					)
+				}
 				t.Logf("real HTTP/3 selected MTU %d under ceiling %d", mtu, test.ceiling)
-			} else if mtu != test.ceiling {
-				t.Fatalf("fixed transport MTU changed: got %d, want %d", mtu, test.ceiling)
+			} else {
+				if connection.MTUAutomatic {
+					t.Fatal("fixed transport incorrectly reported automatic MTU")
+				}
+				if connection.MTUCeiling != 0 {
+					t.Fatalf("fixed transport reported unexpected MTU ceiling %d", connection.MTUCeiling)
+				}
+				if mtu != test.ceiling {
+					t.Fatalf("fixed transport MTU changed: got %d, want %d", mtu, test.ceiling)
+				}
+			}
+			wantMode := tunnel.DeliveryModeCapsule
+			if test.datagrams {
+				wantMode = tunnel.DeliveryModeDatagram
+			}
+			if connection.DeliveryMode != wantMode {
+				t.Fatalf("delivery mode = %q, want %q", connection.DeliveryMode, wantMode)
 			}
 			clientPacket := sizedIPv4Packet(connection.Lease.Address.Addr().As4(), [4]byte{1, 1, 1, 1}, mtu)
 			if err := connection.Send(clientPacket); err != nil {
@@ -145,10 +170,53 @@ func TestHTTP2AutomaticMTURetainsConfiguredMTU(t *testing.T) {
 	}
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	testPacketRoundTrip(t, router, dev, tunnel.Config{
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	routerDone := make(chan error, 1)
+	go func() { routerDone <- router.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-routerDone; err != nil {
+			t.Error(err)
+		}
+	})
+	connection, err := tunnel.Dial(ctx, tunnel.Config{
 		URL: server.URL, Token: testToken, ClientID: "mtu-h2", Transport: tunnel.TransportHTTP2,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, Timeout: 3 * time.Second, // test-only certificate
-	}, 1300)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	if connection.Lease.MTU != 1300 {
+		t.Fatalf("HTTP/2 MTU = %d, want 1300", connection.Lease.MTU)
+	}
+	if connection.MTUAutomatic {
+		t.Fatal("HTTP/2 incorrectly reported automatic MTU discovery")
+	}
+	if connection.MTUCeiling != 0 {
+		t.Fatalf("HTTP/2 reported unexpected MTU ceiling %d", connection.MTUCeiling)
+	}
+	if connection.DeliveryMode != tunnel.DeliveryModeCapsule {
+		t.Fatalf("HTTP/2 delivery mode = %q, want capsule", connection.DeliveryMode)
+	}
+	clientPacket := sizedIPv4Packet(connection.Lease.Address.Addr().As4(), [4]byte{1, 1, 1, 1}, connection.Lease.MTU)
+	if err := connection.Send(clientPacket); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-dev.writes:
+		if !bytes.Equal(got, clientPacket) {
+			t.Fatal("HTTP/2 upload changed")
+		}
+	case <-time.After(packetRoundTripTimeout):
+		t.Fatal("HTTP/2 upload did not reach TUN")
+	}
+	serverPacket := sizedIPv4Packet([4]byte{8, 8, 8, 8}, connection.Lease.Address.Addr().As4(), connection.Lease.MTU)
+	dev.reads <- serverPacket
+	if got := receiveMTUPacket(t, connection); !bytes.Equal(got, serverPacket) {
+		t.Fatal("HTTP/2 downlink changed")
+	}
 }
 
 func startMTUTestHTTP3(t *testing.T, handler http.Handler, datagrams bool) tunnel.Config {

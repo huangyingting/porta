@@ -135,6 +135,27 @@ func (s *Session) MTU() int32 {
 	return int32(s.conn.Lease.MTU)
 }
 
+func (s *Session) AutomaticMTU() bool {
+	if s == nil || s.conn == nil {
+		return false
+	}
+	return s.conn.MTUAutomatic
+}
+
+func (s *Session) MaximumMTU() int32 {
+	if s == nil || s.conn == nil {
+		return 0
+	}
+	return int32(s.conn.MTUCeiling)
+}
+
+func (s *Session) PacketDeliveryMode() string {
+	if s == nil || s.conn == nil {
+		return ""
+	}
+	return string(s.conn.DeliveryMode)
+}
+
 func (s *Session) Send(packet []byte) error {
 	if s == nil || s.conn == nil {
 		return errors.New("tunnel is closed")

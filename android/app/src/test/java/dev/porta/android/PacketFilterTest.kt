@@ -8,11 +8,9 @@ import org.junit.Test
 
 class PacketFilterTest {
     @Test
-    fun derivesReadableProfileNamesAndSafeClientIds() {
+    fun derivesReadableProfileNames() {
         assertTrue(profileName("https://vpn.example.com:8443") == "vpn.example.com")
         assertTrue(profileName("invalid") == "VPN server")
-        assertTrue("Pixel 10 Pro".safeClientId() == "Pixel-10-Pro")
-        assertTrue("***".safeClientId() == "android")
     }
 
     @Test

@@ -52,10 +52,21 @@ type Lease struct {
 	MTU     int
 }
 
+type DeliveryMode string
+
+const (
+	DeliveryModeUnknown  DeliveryMode = ""
+	DeliveryModeCapsule  DeliveryMode = "capsule"
+	DeliveryModeDatagram DeliveryMode = "datagram"
+)
+
 type Conn struct {
-	Lease      Lease
-	RemoteAddr net.Addr
-	Transport  Transport
+	Lease        Lease
+	RemoteAddr   net.Addr
+	Transport    Transport
+	DeliveryMode DeliveryMode
+	MTUAutomatic bool
+	MTUCeiling   int
 
 	sendPacket    func([]byte) error
 	receivePacket func() ([]byte, error)

@@ -16,7 +16,6 @@ internal class ProfileQr private constructor(
         id = UUID.randomUUID().toString(),
         name = name,
         server = server,
-        clientId = "android-${UUID.randomUUID()}",
         token = token,
         autoConnect = false,
     )

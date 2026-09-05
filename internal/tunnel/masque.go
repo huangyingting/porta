@@ -35,6 +35,9 @@ type masqueClient struct {
 	packets      chan []byte
 	errors       chan error
 	mtuDiscovery *clientMTUDiscovery
+	deliveryMode DeliveryMode
+	mtuAutomatic bool
+	mtuCeiling   int
 
 	sendDatagram    func([]byte) error
 	receiveDatagram func(context.Context) ([]byte, error)
@@ -164,6 +167,9 @@ func establishMasque(ctx context.Context, config Config) (*Conn, error) {
 	return &Conn{
 		Lease:         client.lease,
 		RemoteAddr:    client.remoteAddr,
+		DeliveryMode:  client.deliveryMode,
+		MTUAutomatic:  client.mtuAutomatic,
+		MTUCeiling:    client.mtuCeiling,
 		sendPacket:    client.send,
 		receivePacket: client.receive,
 		closePacket:   client.close,
@@ -220,6 +226,7 @@ func dialMasqueHTTP2(
 
 	client := newMasqueClient(ctx, cancel, masque.NewEncoder(writer), masque.NewDecoder(response.Body), response.Header)
 	client.remoteAddr = remoteAddr
+	client.deliveryMode = DeliveryModeCapsule
 	client.closeTransport = func() error {
 		_ = writer.Close()
 		_ = response.Body.Close()
@@ -362,6 +369,9 @@ func dialMasqueHTTP3(
 	if settings.EnableDatagrams {
 		client.sendDatagram = stream.SendDatagram
 		client.receiveDatagram = stream.ReceiveDatagram
+		client.deliveryMode = DeliveryModeDatagram
+	} else {
+		client.deliveryMode = DeliveryModeCapsule
 	}
 	client.closeTransport = func() error {
 		stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))

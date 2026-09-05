@@ -53,6 +53,8 @@ func (m *masqueClient) selectMTU(ctx context.Context) error {
 			return PermanentError{Err: fmt.Errorf("%w: gateway selected %d instead of %d", masque.ErrMTUMessage, selected, mtu)}
 		}
 		m.lease.MTU = selected
+		m.mtuAutomatic = true
+		m.mtuCeiling = p.maximum
 		return nil
 	case err := <-m.errors:
 		return err

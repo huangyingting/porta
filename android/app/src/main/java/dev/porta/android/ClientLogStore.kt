@@ -65,7 +65,7 @@ internal class ClientLogStore(context: Context) {
         private const val KEY_ENTRIES = "entries"
         private const val KEY_TIMESTAMP = "timestamp"
         private const val KEY_MESSAGE = "message"
-        private const val MAX_ENTRIES = 100
+        private const val MAX_ENTRIES = 200
         private const val MAX_MESSAGE_LENGTH = 240
         private val LOCK = Any()
     }

@@ -81,12 +81,17 @@ class TunnelService : VpnService() {
 
         val server = intent.getStringExtra(EXTRA_SERVER).orEmpty()
         val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
-        val clientId = intent.getStringExtra(EXTRA_CLIENT_ID).orEmpty()
         val profileId = intent.getStringExtra(EXTRA_PROFILE_ID).orEmpty()
         val profileLabel = intent.getStringExtra(EXTRA_PROFILE_NAME).orEmpty()
-        if (!validConfiguration(server, token, clientId)) {
+        if (!isHttpsOrigin(server) || !isValidToken(token)) {
             logEvent("Connection rejected: invalid profile configuration")
             stopTunnel("Invalid tunnel configuration")
+            return START_NOT_STICKY
+        }
+        val clientId = try {
+            androidDeviceIdentity(this)
+        } catch (_: DeviceIdentityUnavailableException) {
+            stopTunnel(getString(R.string.device_identity_unavailable))
             return START_NOT_STICKY
         }
         currentProfileId = profileId.ifBlank { server }
@@ -95,7 +100,10 @@ class TunnelService : VpnService() {
         uploadedBytes.set(0)
         downloadedBytes.set(0)
         currentSnapshot = TrafficSnapshot()
-        logEvent("Connecting ${currentProfileName} to ${gatewayHost(server) ?: server}")
+        resetConnectionDetailsState()
+        logEvent("Porta ${Portamobile.version()}; protocol ${PacketFraming.VERSION}")
+        logEvent("Device ID: ${redactDiagnosticMessage(clientId, token)} (Android supplied)")
+        logEvent("Connecting ${currentProfileName} to ${redactDiagnosticMessage(server, token)}")
 
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -158,11 +166,13 @@ class TunnelService : VpnService() {
                     if (!waitForRetry("Waiting for a network", backoff.nextDelayMillis(), runGeneration)) break
                     continue
                 }
-                synchronized(this) {
+                val attemptToken = synchronized(this) {
                     if (!isRunActive(runGeneration)) return
                     selectedNetwork.set(network)
                     setUnderlyingNetworks(arrayOf(network))
+                    beginConnectionAttempt(runGeneration)
                 }
+                val selectedNetworkType = networkType(network)
                 val attemptActive = AtomicBoolean(true)
                 val vpnReady = CountDownLatch(1)
                 var attemptConnectedAt = 0L
@@ -170,13 +180,15 @@ class TunnelService : VpnService() {
                     val reconnecting = descriptor.get() != null
                     updateConnectionStatus(if (reconnecting) "Reconnecting" else "Connecting", runGeneration)
                     try {
-                        logEvent("Trying HTTP/3 MASQUE")
+                        logEvent(formatAttemptEvent("HTTP/3 MASQUE", selectedNetworkType))
                         connectNativeOnce(
                             server,
                             token,
                             clientId,
                             network,
                             attemptActive,
+                            attemptToken,
+                            selectedNetworkType,
                             runGeneration,
                         ) {
                             attemptConnectedAt = System.currentTimeMillis()
@@ -184,7 +196,10 @@ class TunnelService : VpnService() {
                     } catch (error: NativeTransportUnavailableException) {
                         if (!isRunActive(runGeneration)) break
                         Log.i(TAG, "HTTP/3 MASQUE unavailable; falling back to HTTP/2")
-                        logEvent("HTTP/3 unavailable; trying encrypted HTTP/2 fallback")
+                        logEvent(
+                            "HTTP/3 unavailable: ${safeErrorMessage(error, token)}; " +
+                                "trying encrypted HTTP/2 fallback",
+                        )
                         connectHttp2Once(
                             client,
                             server,
@@ -192,6 +207,8 @@ class TunnelService : VpnService() {
                             clientId,
                             attemptActive,
                             vpnReady,
+                            attemptToken,
+                            selectedNetworkType,
                             runGeneration,
                         ) {
                             attemptConnectedAt = System.currentTimeMillis()
@@ -199,14 +216,14 @@ class TunnelService : VpnService() {
                     }
                 } catch (error: PermanentTunnelException) {
                     if (!isRunActive(runGeneration)) break
-                    finalStatus = error.message ?: "Connection rejected"
-                    Log.w(TAG, "Tunnel rejected: ${error.message}")
-                    logEvent("Connection rejected: ${safeErrorMessage(error, token)}")
+                    finalStatus = "Connection rejected: ${safeErrorMessage(error, token)}"
+                    clearConnectionDetails(attemptToken)
+                    logEvent(finalStatus)
                     break
                 } catch (error: Exception) {
                     if (!isRunActive(runGeneration)) break
-                    Log.w(TAG, "Tunnel interrupted", error)
                     logEvent("Connection interrupted: ${safeErrorMessage(error, token)}")
+                    clearConnectionDetails(attemptToken)
                     if (attemptConnectedAt != 0L &&
                         System.currentTimeMillis() - attemptConnectedAt >= STABLE_CONNECTION_MILLIS
                     ) {
@@ -235,9 +252,12 @@ class TunnelService : VpnService() {
         clientId: String,
         network: Network,
         attemptActive: AtomicBoolean,
+        attemptToken: ConnectionAttemptToken,
+        selectedNetworkType: String?,
         runGeneration: Long,
         onConnected: () -> Unit,
     ) {
+        val attemptStartedAt = System.nanoTime()
         val host = gatewayHost(server)
             ?: throw PermanentTunnelException("Gateway URL has no hostname")
         val remoteAddresses = try {
@@ -347,9 +367,29 @@ class TunnelService : VpnService() {
                 activeSession.mtu().toString(),
                 runGeneration,
             )
+            val details = ConnectionTelemetry(
+                transport = "HTTP/3 MASQUE",
+                mtu = activeSession.mtu().toInt(),
+                automaticMtu = activeSession.automaticMTU(),
+                mtuCeiling = activeSession.maximumMTU().toInt().takeIf { it > 0 },
+                address = activeSession.address(),
+                dns = activeSession.dns(),
+                deliveryMode = when (activeSession.packetDeliveryMode()) {
+                    "datagram" -> "datagrams"
+                    "capsule" -> "capsules"
+                    else -> null
+                },
+                networkType = selectedNetworkType,
+                setupDurationMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - attemptStartedAt),
+                appVersion = Portamobile.version(),
+                protocolVersion = PacketFraming.VERSION,
+            )
+            if (!publishConnectionDetails(attemptToken, details.toConnectionDetails())) {
+                throw InterruptedException("Native tunnel was replaced")
+            }
             val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
             onConnected()
-            logEvent("Connected using HTTP/3 MASQUE")
+            formatConnectedEvents(details).forEach(::logEvent)
             updateConnectionStatus("Connected over HTTP/3 MASQUE", runGeneration)
             sender.start()
             while (isRunActive(runGeneration) && attemptActive.get()) {
@@ -392,9 +432,12 @@ class TunnelService : VpnService() {
         clientId: String,
         attemptActive: AtomicBoolean,
         vpnReady: CountDownLatch,
+        attemptToken: ConnectionAttemptToken,
+        selectedNetworkType: String?,
         runGeneration: Long,
         onConnected: () -> Unit,
     ) {
+        val attemptStartedAt = System.nanoTime()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         val laneQueues = List(HTTP2_LANE_COUNT) { ArrayBlockingQueue<ByteArray>(128) }
         val laneClients = List(HTTP2_LANE_COUNT) {
@@ -456,8 +499,25 @@ class TunnelService : VpnService() {
             }
             vpnReady.countDown()
             uploadReady.countDown()
+            val configuration = expectedConfiguration.get()
+                ?: throw IOException("HTTP/2 fallback did not return a VPN lease")
+            val details = ConnectionTelemetry(
+                transport = "multi-lane HTTP/2",
+                mtu = configuration.mtu,
+                automaticMtu = false,
+                address = "${configuration.address}/${configuration.prefix}",
+                dns = configuration.dns,
+                deliveryMode = "$HTTP2_LANE_COUNT lanes",
+                networkType = selectedNetworkType,
+                setupDurationMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - attemptStartedAt),
+                appVersion = Portamobile.version(),
+                protocolVersion = PacketFraming.VERSION,
+            )
+            if (!publishConnectionDetails(attemptToken, details.toConnectionDetails())) {
+                throw InterruptedException("HTTP/2 fallback was replaced")
+            }
             onConnected()
-            logEvent("Connected using $HTTP2_LANE_COUNT encrypted HTTP/2 lanes")
+            formatConnectedEvents(details).forEach(::logEvent)
             updateConnectionStatus("Connected over multi-lane HTTP/2", runGeneration)
             downstreamWriter = Thread({
                 try {
@@ -852,6 +912,7 @@ class TunnelService : VpnService() {
             totalDownloadedBytes = downloadedBytes.get(),
             totalUploadedBytes = uploadedBytes.get(),
         )
+        resetConnectionDetailsState()
         logEvent(message)
         sendStatus(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -876,6 +937,7 @@ class TunnelService : VpnService() {
             totalDownloadedBytes = downloadedBytes.get(),
             totalUploadedBytes = uploadedBytes.get(),
         )
+        resetConnectionDetailsState()
         logEvent(message)
         sendStatus(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -912,14 +974,6 @@ class TunnelService : VpnService() {
 
     private fun closeNativeDialer() {
         nativeDialer.getAndSet(null)?.close()
-    }
-
-    private fun validConfiguration(server: String, token: String, clientId: String): Boolean = try {
-        isHttpsOrigin(server) &&
-            isValidToken(token) &&
-            CLIENT_ID.matches(clientId)
-    } catch (_: Exception) {
-        false
     }
 
     private fun sendStatus(value: String) {
@@ -997,12 +1051,19 @@ class TunnelService : VpnService() {
     }
 
     private fun safeErrorMessage(error: Exception, token: String): String =
-        error.message.orEmpty()
-            .replace(token, "[redacted]")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-            .take(180)
-            .ifBlank { error.javaClass.simpleName }
+        diagnosticFailureDetail(error, token)
+
+    private fun networkType(network: Network): String? {
+        val connectivity = getSystemService(ConnectivityManager::class.java)
+        val capabilities = connectivity.getNetworkCapabilities(network) ?: return null
+        return when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_USB) -> "USB"
+            else -> null
+        }
+    }
 
     private fun notification(text: String): Notification {
         val openApp = PendingIntent.getActivity(
@@ -1050,7 +1111,6 @@ class TunnelService : VpnService() {
         const val ACTION_STATS = "dev.porta.android.STATS"
         const val EXTRA_SERVER = "server"
         const val EXTRA_TOKEN = "token"
-        const val EXTRA_CLIENT_ID = "client_id"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
         const val EXTRA_SESSION_ID = "session_id"
@@ -1086,7 +1146,6 @@ class TunnelService : VpnService() {
         private const val HEADER_LANE_COUNT = "X-Porta-Lanes"
         private const val STATUS_PERMISSION = "dev.porta.android.permission.STATUS"
         private val RETRYABLE_HTTP_CODES = setOf(408, 425, 429)
-        private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
         fun currentStatus(): String = currentStatus
         fun currentProfileId(): String? = currentProfileId

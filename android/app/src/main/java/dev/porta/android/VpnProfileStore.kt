@@ -21,7 +21,6 @@ internal data class VpnProfile(
     val id: String,
     val name: String,
     val server: String,
-    val clientId: String,
     val token: String,
     val autoConnect: Boolean,
 )
@@ -30,22 +29,37 @@ internal class VpnProfileStore(private val context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
     fun profiles(): List<VpnProfile> {
-        val encoded = preferences.getString(KEY_PROFILES, null) ?: return emptyList()
+        val stored = readProfiles() ?: return emptyList()
+        if (stored.needsUpgrade && !write(stored.profiles)) {
+            Log.e(TAG, "Could not upgrade profile storage; existing encrypted records were retained")
+        }
+        return stored.profiles
+    }
+
+    private data class StoredProfiles(val profiles: List<VpnProfile>, val needsUpgrade: Boolean)
+
+    private fun readProfiles(): StoredProfiles? {
+        val encoded = preferences.getString(KEY_PROFILES, null) ?: return StoredProfiles(emptyList(), false)
         return try {
             val entries = JSONArray(encoded)
-            buildList {
-                for (index in 0 until entries.length()) {
-                    decode(entries.getJSONObject(index))?.let(::add)
-                }
+            val profiles = mutableListOf<VpnProfile>()
+            var needsUpgrade = false
+            for (index in 0 until entries.length()) {
+                val entry = entries.getJSONObject(index)
+                val profile = decode(entry) ?: return null
+                profiles += profile
+                if (entry.optInt(KEY_VERSION, 1) != ProfileTokenFormat.VERSION) needsUpgrade = true
             }
+            StoredProfiles(profiles, needsUpgrade)
         } catch (error: JSONException) {
             Log.e(TAG, "Could not read VPN profiles", error)
-            emptyList()
+            null
         }
     }
 
     fun save(profile: VpnProfile): Boolean {
-        val updated = profiles().filterNot { it.id == profile.id }.toMutableList()
+        val stored = readProfiles() ?: return false
+        val updated = stored.profiles.filterNot { it.id == profile.id }.toMutableList()
         if (profile.autoConnect) {
             for (index in updated.indices) {
                 updated[index] = updated[index].copy(autoConnect = false)
@@ -55,8 +69,10 @@ internal class VpnProfileStore(private val context: Context) {
         return write(updated.sortedBy { it.name.lowercase() })
     }
 
-    fun delete(profileId: String): Boolean =
-        write(profiles().filterNot { it.id == profileId })
+    fun delete(profileId: String): Boolean {
+        val stored = readProfiles() ?: return false
+        return write(stored.profiles.filterNot { it.id == profileId })
+    }
 
     fun selectedProfileId(): String? = preferences.getString(KEY_SELECTED_PROFILE, null)
 
@@ -84,13 +100,13 @@ internal class VpnProfileStore(private val context: Context) {
     private fun encode(profile: VpnProfile): JSONObject {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, encryptionKey())
-        cipher.updateAAD(associatedData(profile))
+        cipher.updateAAD(ProfileTokenFormat.associatedData(profile.id, profile.server))
         val encrypted = cipher.doFinal(profile.token.toByteArray(Charsets.UTF_8))
         return JSONObject()
+            .put(KEY_VERSION, ProfileTokenFormat.VERSION)
             .put(KEY_ID, profile.id)
             .put(KEY_NAME, profile.name)
             .put(KEY_SERVER, profile.server)
-            .put(KEY_CLIENT_ID, profile.clientId)
             .put(KEY_AUTO_CONNECT, profile.autoConnect)
             .put(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .put(KEY_TOKEN, Base64.encodeToString(encrypted, Base64.NO_WRAP))
@@ -98,11 +114,11 @@ internal class VpnProfileStore(private val context: Context) {
 
     private fun decode(entry: JSONObject): VpnProfile? {
         return try {
+            val version = entry.optInt(KEY_VERSION, 1)
             val profile = VpnProfile(
                 id = entry.getString(KEY_ID),
                 name = entry.getString(KEY_NAME),
                 server = entry.getString(KEY_SERVER),
-                clientId = entry.getString(KEY_CLIENT_ID),
                 token = "",
                 autoConnect = entry.optBoolean(KEY_AUTO_CONNECT),
             )
@@ -112,7 +128,14 @@ internal class VpnProfileStore(private val context: Context) {
                 encryptionKey(),
                 GCMParameterSpec(128, Base64.decode(entry.getString(KEY_IV), Base64.NO_WRAP)),
             )
-            cipher.updateAAD(associatedData(profile))
+            cipher.updateAAD(
+                ProfileTokenFormat.associatedData(
+                    profile.id,
+                    profile.server,
+                    version,
+                    if (version == 1) entry.getString(KEY_PREVIOUS_CLIENT_ID) else null,
+                ),
+            )
             profile.copy(
                 token = cipher.doFinal(Base64.decode(entry.getString(KEY_TOKEN), Base64.NO_WRAP))
                     .toString(Charsets.UTF_8),
@@ -149,9 +172,6 @@ internal class VpnProfileStore(private val context: Context) {
         }
     }
 
-    private fun associatedData(profile: VpnProfile): ByteArray =
-        "${profile.id}\n${profile.server}\n${profile.clientId}".toByteArray(Charsets.UTF_8)
-
     companion object {
         private const val TAG = "VpnProfileStore"
         private const val PREFERENCES = "vpn_profiles"
@@ -163,7 +183,8 @@ internal class VpnProfileStore(private val context: Context) {
         private const val KEY_ID = "id"
         private const val KEY_NAME = "name"
         private const val KEY_SERVER = "server"
-        private const val KEY_CLIENT_ID = "client_id"
+        private const val KEY_VERSION = "version"
+        private const val KEY_PREVIOUS_CLIENT_ID = "client_id"
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_IV = "iv"
         private const val KEY_TOKEN = "token"

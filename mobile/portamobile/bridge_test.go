@@ -132,3 +132,27 @@ func TestDialErrorClassification(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionExposesReadOnlyConnectionMetadata(t *testing.T) {
+	session := &Session{conn: &tunnel.Conn{
+		Lease: tunnel.Lease{
+			Address: netip.MustParsePrefix("10.66.0.2/32"),
+			DNS:     netip.MustParseAddr("1.1.1.1"),
+			MTU:     1360,
+		},
+		MTUAutomatic: true,
+		MTUCeiling:   1400,
+		Transport:    tunnel.TransportHTTP3,
+		DeliveryMode: tunnel.DeliveryModeDatagram,
+	}}
+
+	if !session.AutomaticMTU() {
+		t.Fatal("automatic MTU metadata not exposed")
+	}
+	if got := session.MaximumMTU(); got != 1400 {
+		t.Fatalf("maximum MTU = %d", got)
+	}
+	if got := session.PacketDeliveryMode(); got != "datagram" {
+		t.Fatalf("delivery mode = %q", got)
+	}
+}

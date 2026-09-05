@@ -78,7 +78,7 @@ class ProfileQrTest {
             assertNull(ProfileQr.parse("porta://profile?$query"))
         }
         for (suffix in listOf("&v=1", "&token=def", "&server=https%3A%2F%2Fother.com", "&name=other",
-            "&%74oken=def", "&clientId=remote", "&device_id=remote", "&autoConnect=true",
+            "&%74oken=def", "&clientId=remote", "&client_id=remote", "&device_id=remote", "&android_id=remote", "&autoConnect=true",
             "&insecure=true", "&x=1", "&", "&&", "&=x", "&broken")) {
             assertNull(suffix, ProfileQr.parse(uri(name = "Test") + suffix))
         }
@@ -150,14 +150,14 @@ class ProfileQrTest {
     }
 
     @Test
-    fun eachAcceptedScanCreatesFreshLocalIdsAndNeverEnablesAutoConnect() {
+    fun eachAcceptedScanCreatesOnlyALocalProfileIdAndNeverEnablesAutoConnect() {
         val first = qrProfileDraft(true, uri(name = "Test"))!!
         val second = qrProfileDraft(true, uri(name = "Test"))!!
         assertNotEquals(first.id, second.id)
-        assertNotEquals(first.clientId, second.clientId)
         assertNotNull(UUID.fromString(first.id))
-        assertNotNull(UUID.fromString(first.clientId.removePrefix("android-")))
-        assertTrue(first.clientId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")))
+        assertTrue(VpnProfile::class.java.declaredFields.none { it.name == "clientId" })
+        assertEquals(first.server, second.server)
+        assertEquals(first.token, second.token)
         assertFalse(first.autoConnect)
         assertFalse(second.autoConnect)
         assertEquals("Test", first.name)

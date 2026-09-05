@@ -5,6 +5,9 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -15,6 +18,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PersistableBundle
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -48,6 +52,17 @@ class MainActivity : Activity() {
     private lateinit var trafficTotal: TextView
     private lateinit var trafficState: TextView
     private var pendingProfileId: String? = null
+    private var clientLogDialog: AlertDialog? = null
+    private var clientLogView: TextView? = null
+    private var clientLogScroll: ScrollView? = null
+    private var displayedLogEntries: List<ClientLogEntry>? = null
+    private val refreshLog = object : Runnable {
+        override fun run() {
+            if (clientLogDialog?.isShowing != true) return
+            refreshClientLog()
+            clientLogView?.postDelayed(this, 1_000)
+        }
+    }
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -105,11 +120,18 @@ class MainActivity : Activity() {
             )
         }
         render(TunnelService.currentStatus())
+        clientLogView?.post(refreshLog)
     }
 
     override fun onStop() {
+        clientLogView?.removeCallbacks(refreshLog)
         unregisterReceiver(statusReceiver)
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        clientLogDialog?.dismiss()
+        super.onDestroy()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -124,16 +146,7 @@ class MainActivity : Activity() {
             if (resultCode == QrScannerActivity.RESULT_ENTER_MANUALLY) {
                 showProfileDialog(null)
             } else if (resultCode == RESULT_OK) {
-                val draft = qrProfileDraft(true, data?.getStringExtra(QrScannerActivity.EXTRA_PAYLOAD))
-                if (draft != null) {
-                    showProfileDialog(null, draft)
-                } else {
-                    AlertDialog.Builder(this)
-                        .setMessage(R.string.qr_invalid_profile)
-                        .setPositiveButton(R.string.qr_retry) { _, _ -> scanProfileQr() }
-                        .setNegativeButton(R.string.cancel, null)
-                        .show()
-                }
+                importProfileSetup(data?.getStringExtra(QrScannerActivity.EXTRA_PAYLOAD), ::scanProfileQr)
             }
             return
         }
@@ -220,6 +233,12 @@ class MainActivity : Activity() {
             setTextColor(COLOR_MUTED)
             setTypeface(typeface, Typeface.BOLD)
             setPadding(dp(2), dp(25), 0, dp(10))
+        })
+        page.addView(TextView(this).apply {
+            setText(R.string.profile_swipe_hint)
+            textSize = 12f
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(2), 0, dp(2), dp(12))
         })
         profilesContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -381,6 +400,16 @@ class MainActivity : Activity() {
             active -> getString(R.string.establishing_secure_tunnel)
             else -> getString(R.string.choose_profile)
         }
+        if (connected) {
+            TunnelService.currentConnectionDetails()?.let { details ->
+                statusDetail.append(
+                    "\n" + getString(
+                        if (details.automaticMtu) R.string.connection_auto_mtu else R.string.connection_mtu,
+                        details.mtu,
+                    ),
+                )
+            }
+        }
         statusDot.background = circle(
             if (connected) COLOR_CONNECTED else if (active) COLOR_CONNECTING else COLOR_OFFLINE,
         )
@@ -430,7 +459,8 @@ class MainActivity : Activity() {
         val active = profile.id == activeProfileId && isActiveStatus(TunnelService.currentStatus())
         val anotherProfileActive = activeProfileId != null && activeProfileId != profile.id &&
             isActiveStatus(TunnelService.currentStatus())
-        return LinearLayout(this).apply {
+        val controls = mutableListOf<View>()
+        val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(17), dp(16), dp(13), dp(14))
             background = rounded(COLOR_CARD, 18f, if (selected) COLOR_ACCENT_DARK else COLOR_BORDER)
@@ -469,6 +499,7 @@ class MainActivity : Activity() {
             })
             @Suppress("DEPRECATION")
             top.addView(Switch(this@MainActivity).apply {
+                controls += this
                 isChecked = active
                 isEnabled = !anotherProfileActive
                 thumbTintList = switchThumbColors()
@@ -482,7 +513,7 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(56), dp(11), 0, 0)
+                setPadding(0, dp(11), 0, 0)
                 addView(TextView(this@MainActivity).apply {
                     text = when {
                         active -> profileStatus(TunnelService.currentStatus())
@@ -494,18 +525,55 @@ class MainActivity : Activity() {
                     setTextColor(if (active) COLOR_ACCENT else COLOR_MUTED)
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 })
-                addView(TextView(this@MainActivity).apply {
-                    setText(R.string.edit)
-                    textSize = 13f
-                    setTextColor(if (active) COLOR_MUTED else COLOR_ACCENT)
-                    setTypeface(typeface, Typeface.BOLD)
-                    setPadding(dp(14), dp(5), dp(5), dp(5))
-                    isEnabled = !active
-                    setOnClickListener { showProfileDialog(profile) }
-                })
+                for ((label, action) in listOf(
+                    R.string.edit to ProfileSwipeAction.EDIT,
+                    R.string.delete to ProfileSwipeAction.DELETE,
+                )) {
+                    addView(Button(this@MainActivity).apply {
+                        controls += this
+                        setText(label)
+                        contentDescription = getString(
+                            if (action == ProfileSwipeAction.EDIT) R.string.edit_named_profile else R.string.delete_named_profile,
+                            profile.name,
+                        )
+                        textSize = 12f
+                        isAllCaps = false
+                        setTextColor(if (active) COLOR_MUTED else if (action == ProfileSwipeAction.EDIT) COLOR_ACCENT else COLOR_DELETE)
+                        setTypeface(typeface, Typeface.BOLD)
+                        background = rounded(COLOR_CARD, 8f)
+                        setPadding(dp(10), 0, dp(10), 0)
+                        minWidth = 0
+                        minimumWidth = dp(54)
+                        minHeight = 0
+                        minimumHeight = dp(44)
+                        isEnabled = !active
+                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44))
+                        setOnClickListener { profileAction(profile, action) }
+                    })
+                }
             })
         }
+        return SwipeProfileLayout(
+            this,
+            card,
+            controls,
+            canSwipe = { !profileIsActive(profile.id) },
+            onAction = { profileAction(profile, it) },
+            editColor = COLOR_ACCENT_DARK,
+            deleteColor = COLOR_DELETE_DARK,
+            textColor = COLOR_TEXT,
+        )
     }
+
+    private fun profileAction(profile: VpnProfile, action: ProfileSwipeAction) {
+        when (action) {
+            ProfileSwipeAction.EDIT -> showProfileDialog(profile)
+            ProfileSwipeAction.DELETE -> confirmDeleteProfile(profile)
+        }
+    }
+
+    private fun profileIsActive(profileId: String): Boolean =
+        profileId == TunnelService.currentProfileId() && isActiveStatus(TunnelService.currentStatus())
 
     private fun emptyProfiles(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
@@ -538,8 +606,12 @@ class MainActivity : Activity() {
     private fun showAddProfileChooser() {
         AlertDialog.Builder(this)
             .setTitle(R.string.add_profile)
-            .setItems(arrayOf(getString(R.string.scan_qr_code), getString(R.string.enter_manually))) { _, which ->
-                if (which == 0) scanProfileQr() else showProfileDialog(null)
+            .setItems(arrayOf(getString(R.string.scan_qr_code), getString(R.string.paste_setup), getString(R.string.enter_manually))) { _, which ->
+                when (which) {
+                    0 -> scanProfileQr()
+                    1 -> pasteProfileSetup()
+                    else -> showProfileDialog(null)
+                }
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
@@ -550,8 +622,28 @@ class MainActivity : Activity() {
         startActivityForResult(Intent(this, QrScannerActivity::class.java), REQUEST_QR)
     }
 
+    private fun pasteProfileSetup() {
+        val clipboard = getSystemService(ClipboardManager::class.java)?.primaryClip
+        val text = clipboard?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text
+            ?.takeIf { it.length <= 2048 }?.toString()
+        importProfileSetup(text, ::pasteProfileSetup)
+    }
+
+    private fun importProfileSetup(payload: String?, retry: () -> Unit) {
+        val draft = qrProfileDraft(true, payload)
+        if (draft != null) {
+            showProfileDialog(null, draft)
+        } else {
+            AlertDialog.Builder(this)
+                .setMessage(R.string.qr_invalid_profile)
+                .setPositiveButton(R.string.qr_retry) { _, _ -> retry() }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+        }
+    }
+
     private fun showProfileDialog(existing: VpnProfile?, imported: VpnProfile? = null) {
-        if (existing?.id == TunnelService.currentProfileId() && isActiveStatus(TunnelService.currentStatus())) {
+        if (existing != null && profileIsActive(existing.id)) {
             Toast.makeText(this, R.string.disconnect_before_editing, Toast.LENGTH_SHORT).show()
             return
         }
@@ -567,10 +659,6 @@ class MainActivity : Activity() {
         ).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
-        val clientId = dialogField(
-            R.string.client_id_hint,
-            initial?.clientId ?: Build.MODEL.safeClientId(),
-        )
         val autoConnect = CheckBox(this).apply {
             setText(R.string.auto_connect)
             isChecked = existing?.autoConnect ?: false
@@ -586,26 +674,30 @@ class MainActivity : Activity() {
             addView(server)
             addView(dialogLabel(R.string.token_label))
             addView(token)
-            addView(dialogLabel(R.string.device_id_label))
-            addView(clientId)
+            addView(TextView(this@MainActivity).apply {
+                setText(R.string.device_identity_automatic)
+                textSize = 12f
+                setTextColor(COLOR_MUTED)
+                setPadding(dp(2), dp(14), dp(2), dp(4))
+            })
             addView(autoConnect)
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (existing == null) R.string.add_profile else R.string.edit_profile)
             .setView(ScrollView(this).apply { addView(form) })
             .setPositiveButton(R.string.save, null)
-            .setNeutralButton(R.string.cancel, null)
-            .apply {
-                if (existing != null) setNegativeButton(R.string.delete) { _, _ -> deleteProfile(existing) }
-            }
+            .setNegativeButton(R.string.cancel, null)
             .create()
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (existing != null && profileIsActive(existing.id)) {
+                    Toast.makeText(this, R.string.disconnect_before_editing, Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
                 val profile = VpnProfile(
                     id = initial?.id ?: UUID.randomUUID().toString(),
                     name = name.text.toString().trim(),
                     server = server.text.toString().trim().trimEnd('/'),
-                    clientId = clientId.text.toString().trim(),
                     token = token.text.toString().ifBlank { existing?.token.orEmpty() },
                     autoConnect = autoConnect.isChecked,
                 )
@@ -628,34 +720,105 @@ class MainActivity : Activity() {
     }
 
     private fun showClientLog() {
-        val entries = ClientLogStore(this).entries()
-        val content = if (entries.isEmpty()) {
-            getString(R.string.log_empty)
-        } else {
-            val formatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-            entries.joinToString("\n") {
-                "${formatter.format(Date(it.timestampMillis))}  ${it.message}"
-            }
-        }
+        if (clientLogDialog?.isShowing == true) return
         val logView = TextView(this).apply {
-            text = content
             textSize = 12f
             setTextColor(COLOR_TEXT)
             typeface = Typeface.MONOSPACE
             setPadding(dp(18), dp(12), dp(18), dp(18))
             setTextIsSelectable(true)
         }
-        AlertDialog.Builder(this)
+        val scroll = ScrollView(this).apply { addView(logView) }
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.connection_log)
-            .setView(ScrollView(this).apply { addView(logView) })
-            .setPositiveButton(R.string.close, null)
-            .setNeutralButton(R.string.clear_log) { _, _ ->
-                ClientLogStore(this).clear()
+            .setView(scroll)
+            .setPositiveButton(R.string.copy_log, null)
+            .setNegativeButton(R.string.close, null)
+            .setNeutralButton(R.string.clear_log, null)
+            .create()
+        clientLogDialog = dialog
+        clientLogView = logView
+        clientLogScroll = scroll
+        displayedLogEntries = null
+        dialog.setOnDismissListener {
+            logView.removeCallbacks(refreshLog)
+            if (clientLogDialog === dialog) {
+                clientLogDialog = null
+                clientLogView = null
+                clientLogScroll = null
+                displayedLogEntries = null
             }
-            .show()
+        }
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { copyClientLog() }
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                ClientLogStore(this).clear()
+                logView.text = ""
+                displayedLogEntries = null
+                refreshClientLog()
+            }
+            logView.post(refreshLog)
+        }
+        dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        dialog.show()
+    }
+
+    private fun refreshClientLog() {
+        val view = clientLogView ?: return
+        val scroll = clientLogScroll ?: return
+        val entries = ClientLogStore(this).entries()
+        if (entries == displayedLogEntries || view.hasSelection()) return
+        val followLatest = !scroll.canScrollVertically(1)
+        displayedLogEntries = entries
+        val formatter = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.getDefault())
+        view.text = if (entries.isEmpty()) getString(R.string.log_empty) else entries.joinToString("\n\n") {
+            "${formatter.format(Date(it.timestampMillis))}\n${it.message}"
+        }
+        clientLogDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = entries.isNotEmpty()
+        if (followLatest) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun copyClientLog() {
+        val view = clientLogView ?: return
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        if (clipboard == null) {
+            Toast.makeText(this, R.string.log_copy_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clip = ClipData.newPlainText(getString(R.string.connection_log), view.text)
+        if (Build.VERSION.SDK_INT >= 33) {
+            clip.description.extras = PersistableBundle().apply {
+                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
+        try {
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(this, R.string.log_copied, Toast.LENGTH_SHORT).show()
+        } catch (_: SecurityException) {
+            Toast.makeText(this, R.string.log_copy_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun confirmDeleteProfile(profile: VpnProfile) {
+        if (profileIsActive(profile.id)) {
+            Toast.makeText(this, R.string.disconnect_before_deleting, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.delete_profile)
+            .setMessage(getString(R.string.delete_profile_confirmation, profile.name))
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.delete) { _, _ -> deleteProfile(profile) }
+            .create()
+        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_NEGATIVE).requestFocus() }
+        dialog.show()
     }
 
     private fun deleteProfile(profile: VpnProfile) {
+        if (profileIsActive(profile.id)) {
+            Toast.makeText(this, R.string.disconnect_before_deleting, Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!profileStore.delete(profile.id)) {
             Toast.makeText(this, R.string.profile_delete_failed, Toast.LENGTH_LONG).show()
             return
@@ -672,6 +835,13 @@ class MainActivity : Activity() {
             isActiveStatus(TunnelService.currentStatus())
         ) {
             Toast.makeText(this, R.string.disconnect_active_profile, Toast.LENGTH_SHORT).show()
+            renderProfiles()
+            return
+        }
+        try {
+            androidDeviceIdentity(this)
+        } catch (_: DeviceIdentityUnavailableException) {
+            Toast.makeText(this, R.string.device_identity_unavailable, Toast.LENGTH_LONG).show()
             renderProfiles()
             return
         }
@@ -696,8 +866,7 @@ class MainActivity : Activity() {
                 .putExtra(TunnelService.EXTRA_PROFILE_ID, profile.id)
                 .putExtra(TunnelService.EXTRA_PROFILE_NAME, profile.name)
                 .putExtra(TunnelService.EXTRA_SERVER, profile.server)
-                .putExtra(TunnelService.EXTRA_TOKEN, profile.token)
-                .putExtra(TunnelService.EXTRA_CLIENT_ID, profile.clientId),
+                .putExtra(TunnelService.EXTRA_TOKEN, profile.token),
         )
         render("Connecting")
     }
@@ -713,7 +882,7 @@ class MainActivity : Activity() {
     private fun profileValidationError(profile: VpnProfile): Int? {
         if (profile.name.isBlank()) return R.string.profile_name_required
         if (!isHttpsOrigin(profile.server)) return R.string.https_required
-        if (!isValidToken(profile.token) || !CLIENT_ID.matches(profile.clientId)) {
+        if (!isValidToken(profile.token)) {
             return R.string.credentials_required
         }
         return null
@@ -801,7 +970,6 @@ class MainActivity : Activity() {
         private const val REQUEST_QR = 102
         private const val STATE_PENDING_PROFILE = "pending_profile"
         private const val STATUS_PERMISSION = "dev.porta.android.permission.STATUS"
-        private val CLIENT_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
         private val COLOR_BACKGROUND = Color.rgb(8, 17, 31)
         private val COLOR_CARD = Color.rgb(17, 29, 48)
@@ -812,6 +980,8 @@ class MainActivity : Activity() {
         private val COLOR_MUTED = Color.rgb(148, 163, 184)
         private val COLOR_ACCENT = Color.rgb(110, 231, 183)
         private val COLOR_ACCENT_DARK = Color.rgb(31, 107, 88)
+        private val COLOR_DELETE = Color.rgb(252, 165, 165)
+        private val COLOR_DELETE_DARK = Color.rgb(127, 45, 57)
         private val COLOR_UPLOAD = Color.rgb(96, 165, 250)
         private val COLOR_BUTTON_TEXT = Color.rgb(5, 35, 29)
         private val COLOR_CONNECTED = Color.rgb(74, 222, 128)
@@ -819,6 +989,3 @@ class MainActivity : Activity() {
         private val COLOR_OFFLINE = Color.rgb(100, 116, 139)
     }
 }
-
-internal fun String.safeClientId(): String = replace(Regex("[^A-Za-z0-9._-]+"), "-")
-    .trim('-', '.', '_').take(64).ifBlank { "android" }
