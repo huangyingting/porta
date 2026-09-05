@@ -163,7 +163,8 @@ func nativeAssertGuardAbsent(t *testing.T, engine uintptr, owner string) {
 	t.Helper()
 	key := guid(objectKey(owner, -1))
 	var sublayer *wfpSubLayer
-	code, _, _ := nativeSubLayerGet.Call(engine, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&sublayer)))
+	result, _, _ := nativeSubLayerGet.Call(engine, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&sublayer)))
+	code := nativeStatus(result)
 	if sublayer != nil {
 		freeMemory.Call(uintptr(unsafe.Pointer(&sublayer)))
 	}
@@ -179,7 +180,8 @@ func nativeAssertFilterAbsent(t *testing.T, engine uintptr, owner string, index 
 	t.Helper()
 	key := guid(objectKey(owner, index))
 	var filter *wfpFilter
-	code, _, _ := nativeFilterGet.Call(engine, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&filter)))
+	result, _, _ := nativeFilterGet.Call(engine, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&filter)))
+	code := nativeStatus(result)
 	if filter != nil {
 		freeMemory.Call(uintptr(unsafe.Pointer(&filter)))
 	}

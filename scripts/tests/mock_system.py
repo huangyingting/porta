@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Command doubles used only inside test_automation.py's isolated checkout."""
 
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -14,12 +16,10 @@ import uuid
 
 root = Path(os.environ["AUTOMATION_FIXTURE"]).resolve()
 state_path = root / "state.json"
-state = json.loads(state_path.read_text())
+state_lock = (root / "state.lock").open("a")
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 code = 0
-with (root / "commands.jsonl").open("a") as log:
-    log.write(json.dumps([name, *args]) + "\n")
 
 
 def safe(path):
@@ -29,8 +29,32 @@ def safe(path):
     return result
 
 
+def load():
+    fcntl.flock(state_lock, fcntl.LOCK_EX)
+    return json.loads(state_path.read_text())
+
+
 def save():
-    state_path.write_text(json.dumps(state))
+    replacement = state_path.with_suffix(".json.new")
+    replacement.write_text(json.dumps(state))
+    os.replace(replacement, state_path)
+
+
+@contextmanager
+def unlocked_state():
+    global state
+    # Pipeline producers and nested mocks need this same lock to make progress.
+    save()
+    fcntl.flock(state_lock, fcntl.LOCK_UN)
+    try:
+        yield
+    finally:
+        state = load()
+
+
+state = load()
+with (root / "commands.jsonl").open("a") as log:
+    log.write(json.dumps([name, *args]) + "\n")
 
 
 if name == "mktemp":
@@ -97,10 +121,10 @@ elif name == "systemctl":
                     for line in unit_path.read_text().splitlines()
                     if line.startswith("ExecStart=")
                 )
-                save()
-                code = subprocess.run(shlex.split(command), check=False).returncode
-                state = json.loads(state_path.read_text())
+                with unlocked_state():
+                    code = subprocess.run(shlex.split(command), check=False).returncode
                 active = state["active"]
+                enabled = state["enabled"]
                 active[unit] = False
     elif operation != "daemon-reload":
         raise RuntimeError(f"unexpected systemctl call: {args}")
@@ -123,7 +147,8 @@ elif name == "nft":
     if args[:2] == ["list", "table"]:
         code = 0 if state.get("nft_table") else 1
     elif args == ["-f", "-"]:
-        transaction = sys.stdin.read()
+        with unlocked_state():
+            transaction = sys.stdin.read()
         state["nft_transaction"] = transaction
         if state.get("fail_nft"):
             code = 1
@@ -239,4 +264,5 @@ else:
     raise RuntimeError(f"unexpected mocked command: {name}")
 
 save()
+state_lock.close()
 sys.exit(code)

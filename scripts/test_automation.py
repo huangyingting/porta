@@ -157,6 +157,60 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(mutations), 1)
         self.assertEqual(len(self.state()["iptables_rules"]), 2)
 
+    def test_mock_pipeline_preserves_concurrent_state_and_atomic_snapshots(self):
+        self.update_state(nft_table="old")
+        transaction = "delete table ip porta\ntable ip porta {}\n"
+        with subprocess.Popen(
+            [str(self.bin / "nft"), "-f", "-"], cwd=self.root, env=self.env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        ) as consumer:
+            try:
+                deadline = time.monotonic() + 5
+                while not (self.root / "commands.jsonl").exists():
+                    self.assertIsNone(consumer.poll())
+                    if time.monotonic() >= deadline:
+                        self.fail("nft mock did not start")
+                    time.sleep(0.01)
+                # The consumer has read state, but cannot finish until we close
+                # stdin. Its producer must be able to run other mock commands.
+                before = self.state()
+                with (self.root / "state.json").open() as snapshot:
+                    producer = subprocess.run(
+                        [str(self.bin / "sysctl"), "-w", "net.ipv4.ip_forward=1"],
+                        cwd=self.root, env=self.env, capture_output=True, text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(producer.returncode, 0,
+                                     producer.stdout + producer.stderr)
+                    self.assertEqual(json.load(snapshot), before,
+                                     "saving state truncated an existing reader's snapshot")
+                stdout, stderr = consumer.communicate(transaction, timeout=5)
+                self.assertEqual(consumer.returncode, 0, stdout + stderr)
+            finally:
+                if consumer.poll() is None:
+                    consumer.kill()
+                consumer.communicate()
+        self.assertEqual(self.state()["sysctl"]["net.ipv4.ip_forward"], "1")
+        self.assertEqual(self.state()["nft_table"], transaction)
+        self.assertCountEqual(self.commands(), [
+            ["nft", "-f", "-"], ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+        ])
+
+    def test_mock_nested_command_reloads_state_without_deadlock(self):
+        self.prepare_deploy()
+        unit = self.root / "system/etc/systemd/system/porta-cert-sync.service"
+        unit.write_text(f"ExecStart={self.bin / 'systemctl'} enable nested.service\n")
+        result = subprocess.run(
+            [str(self.bin / "systemctl"), "start",
+             "porta-cert-sync.service", "other.service"],
+            cwd=self.root, env=self.env, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state()["enabled"]["nested.service"], "enabled")
+        self.assertFalse(self.state()["active"]["porta-cert-sync.service"])
+        self.assertTrue(self.state()["active"]["other.service"])
+
     def test_nft_failure_preserves_previous_table(self):
         self.update_state(nft_table="old", fail_nft=True, docker=True)
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",

@@ -133,7 +133,8 @@ func (nativeGuard) InterfaceLUID(name string) (uint64, error) {
 		return 0, err
 	}
 	var luid uint64
-	code, _, _ := convertInterfaceAlias.Call(uintptr(unsafe.Pointer(alias)), uintptr(unsafe.Pointer(&luid)))
+	result, _, _ := convertInterfaceAlias.Call(uintptr(unsafe.Pointer(alias)), uintptr(unsafe.Pointer(&luid)))
+	code := nativeStatus(result)
 	if code != 0 {
 		return 0, fmt.Errorf("resolve tunnel interface LUID: %w", windows.Errno(code))
 	}
@@ -145,7 +146,8 @@ func (nativeGuard) InterfaceLUID(name string) (uint64, error) {
 
 func (nativeGuard) InterfaceGUID(luid uint64) (string, error) {
 	var id windows.GUID
-	code, _, _ := convertInterfaceGUID.Call(uintptr(unsafe.Pointer(&luid)), uintptr(unsafe.Pointer(&id)))
+	result, _, _ := convertInterfaceGUID.Call(uintptr(unsafe.Pointer(&luid)), uintptr(unsafe.Pointer(&id)))
+	code := nativeStatus(result)
 	if code != 0 {
 		return "", fmt.Errorf("resolve tunnel interface GUID: %w", windows.Errno(code))
 	}
@@ -168,7 +170,8 @@ func guid(text string) windows.GUID {
 //
 //go:uintptrescapes
 func wfpCall(proc *windows.LazyProc, args ...uintptr) error {
-	code, _, _ := proc.Call(args...)
+	result, _, _ := proc.Call(args...)
+	code := nativeStatus(result)
 	if code != 0 {
 		return fmt.Errorf("%s: WFP error %#x", proc.Name, code)
 	}
@@ -211,7 +214,8 @@ func withTransaction(ctx context.Context, change func(uintptr) error) (err error
 func deleteFilters(engine uintptr, owner string) error {
 	for index := 0; index < maxGuardFilters; index++ {
 		key := guid(objectKey(owner, index))
-		code, _, _ := filterDelete.Call(engine, uintptr(unsafe.Pointer(&key)))
+		result, _, _ := filterDelete.Call(engine, uintptr(unsafe.Pointer(&key)))
+		code := nativeStatus(result)
 		if code != 0 && code != 0x80320003 { // FWP_E_FILTER_NOT_FOUND
 			return fmt.Errorf("remove owned WFP filter: %#x", code)
 		}
@@ -225,7 +229,8 @@ func (nativeGuard) Remove(ctx context.Context, owner string) error {
 			return err
 		}
 		key := guid(objectKey(owner, -1))
-		code, _, _ := subLayerDelete.Call(engine, uintptr(unsafe.Pointer(&key)))
+		result, _, _ := subLayerDelete.Call(engine, uintptr(unsafe.Pointer(&key)))
+		code := nativeStatus(result)
 		if code != 0 && code != 0x80320007 { // FWP_E_SUBLAYER_NOT_FOUND
 			return fmt.Errorf("remove owned WFP sublayer: %#x", code)
 		}
@@ -264,7 +269,8 @@ func installGuard(engine uintptr, spec guardSpec) error {
 		key: guid(objectKey(spec.Key, -1)), display: wfpDisplay{name: name},
 		flags: 1, weight: 0xffff, // FWPM_SUBLAYER_FLAG_PERSISTENT
 	}
-	code, _, _ := subLayerAdd.Call(engine, uintptr(unsafe.Pointer(&sublayer)), 0)
+	result, _, _ := subLayerAdd.Call(engine, uintptr(unsafe.Pointer(&sublayer)), 0)
+	code := nativeStatus(result)
 	if code != 0 && code != 0x80320009 { // FWP_E_ALREADY_EXISTS
 		return fmt.Errorf("add persistent WFP sublayer: %#x", code)
 	}
