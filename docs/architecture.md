@@ -38,6 +38,12 @@ IP packets use HTTP Datagrams whose first field is Context ID 0. HTTP/2, and
 HTTP/3 peers that do not negotiate Datagrams, carry the same Context-ID-plus-IP
 payload in RFC 9297 DATAGRAM capsules.
 
+The gateway enables assigned-source uplink processing before writing
+ADDRESS_ASSIGN: a QUIC peer can receive the lease and send its first datagram
+before the control write returns. Failed control writes restore the prior
+assignment state. Downlink delivery remains gated until the assignment and
+route response have been written and flushed.
+
 RFC 9484 does not define DNS or link-MTU negotiation, so the gateway provides
 optional `X-Porta-DNS` and `X-Porta-MTU` response extensions. Authentication uses
 `Authorization: Bearer <token>`, and `X-Porta-Client-ID` provides stable lease

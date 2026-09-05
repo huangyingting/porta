@@ -347,7 +347,7 @@ func (c *masqueSession) answerAddressRequest(
 	lease Lease,
 	assigned *atomic.Bool,
 	value []byte,
-) error {
+) (err error) {
 	if c.mtuDiscovery != nil && !c.mtuDiscovery.Committed() {
 		return fmt.Errorf("%w: MTU selection must precede address assignment", masque.ErrMTUMessage)
 	}
@@ -381,6 +381,17 @@ func (c *masqueSession) answerAddressRequest(
 	if err != nil {
 		return err
 	}
+	if assignedIPv4 {
+		previous := assigned.Load()
+		// QUIC can deliver ADDRESS_ASSIGN before Write returns. Accept the
+		// peer's first datagram as soon as it can observe its assigned address.
+		assigned.Store(true)
+		defer func() {
+			if err != nil {
+				assigned.Store(previous)
+			}
+		}()
+	}
 	if err := encoder.Write(masque.CapsuleAddressAssign, assignment); err != nil {
 		return err
 	}
@@ -395,7 +406,6 @@ func (c *masqueSession) answerAddressRequest(
 		if err := encoder.Write(masque.CapsuleRouteAdvertisement, routes); err != nil {
 			return err
 		}
-		assigned.Store(true)
 	}
 	encoder.Flush()
 	if assignedIPv4 {

@@ -53,6 +53,7 @@ func TestMasqueDropsInvalidPacketsWithoutEndingSessionOrCountingUsage(t *testing
 			t.Fatal(err)
 		}
 	}
+
 	valid := testIPv4UDP()
 	// testIPv4UDP has the assigned source; also send a source-spoofed packet.
 	valid[12] = 192
@@ -79,3 +80,92 @@ func TestMasqueDropsInvalidPacketsWithoutEndingSessionOrCountingUsage(t *testing
 			metrics.droppedPacketsFromClient.Load(), metrics.packetsFromClient.Load(), device)
 	}
 }
+
+func TestAddressAssignmentEnablesUplinkBeforePublishingControlBytes(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		previous  bool
+		ipv4      bool
+		wantReady bool
+	}{
+		{"initial IPv4", false, true, true},
+		{"initial IPv6 only", false, false, false},
+		{"existing IPv4", true, true, true},
+		{"preserve existing IPv4", true, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := &masqueSession{addressReady: make(chan struct{}, 1)}
+			var assigned atomic.Bool
+			assigned.Store(test.previous)
+			prefix := netip.MustParsePrefix("::/128")
+			if test.ipv4 {
+				prefix = netip.MustParsePrefix("0.0.0.0/32")
+			}
+			request, err := masque.EncodeAddressRequest([]masque.Address{{RequestID: 1, Prefix: prefix}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer := &assignmentObserverWriter{
+				write: func(value []byte) (int, error) {
+					if assigned.Load() != test.wantReady {
+						t.Error("ADDRESS_ASSIGN can reach the peer before uplink readiness is published")
+					}
+					select {
+					case <-session.addressReady:
+						t.Error("downlink enabled before control response was flushed")
+					default:
+					}
+					return len(value), nil
+				},
+			}
+			err = session.answerAddressRequest(masque.NewEncoder(writer),
+				Lease{Address: netip.MustParseAddr("10.66.0.2")}, &assigned, request)
+			if err != nil || !writer.flushed || assigned.Load() != test.wantReady {
+				t.Fatalf("assignment readiness/flush failed: %v", err)
+			}
+			if got := len(session.addressReady) != 0; got != test.wantReady {
+				t.Fatalf("downlink ready = %t, want %t", got, test.wantReady)
+			}
+		})
+	}
+}
+
+func TestAddressAssignmentWriteFailureRestoresUplinkState(t *testing.T) {
+	request, err := masque.EncodeAddressRequest([]masque.Address{{
+		RequestID: 1, Prefix: netip.MustParsePrefix("0.0.0.0/32"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, previous := range []bool{false, true} {
+		for failAt := 1; failAt <= 4; failAt++ {
+			session := &masqueSession{addressReady: make(chan struct{}, 1)}
+			var assigned atomic.Bool
+			assigned.Store(previous)
+			writes := 0
+			writer := &assignmentObserverWriter{
+				write: func(value []byte) (int, error) {
+					writes++
+					if writes == failAt {
+						return 0, io.ErrClosedPipe
+					}
+					return len(value), nil
+				},
+			}
+			err := session.answerAddressRequest(masque.NewEncoder(writer),
+				Lease{Address: netip.MustParseAddr("10.66.0.2")}, &assigned, request)
+			if !errors.Is(err, io.ErrClosedPipe) || assigned.Load() != previous ||
+				len(session.addressReady) != 0 || writer.flushed {
+				t.Fatalf("write %d failure with previous=%t changed readiness: %v", failAt, previous, err)
+			}
+		}
+	}
+}
+
+type assignmentObserverWriter struct {
+	write   func([]byte) (int, error)
+	flushed bool
+}
+
+func (w *assignmentObserverWriter) Write(value []byte) (int, error) { return w.write(value) }
+func (w *assignmentObserverWriter) Flush()                          { w.flushed = true }
