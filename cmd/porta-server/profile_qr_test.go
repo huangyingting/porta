@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -55,27 +54,15 @@ func TestProfileQRInteroperability(t *testing.T) {
 		values.Get("token") != input.Token || values.Get("name") != input.Name || len(values) != 4 {
 		t.Fatal("profile fields did not round-trip")
 	}
-	body, err := json.Marshal(input)
+	image, err := profileQRCode(input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := adminHandler(http.NotFoundHandler(), nil, testAdminToken)
-	response := adminRequest(t, handler, http.MethodPost, "/api/profile/qr", string(body))
-	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
-		response.Header().Get("Referrer-Policy") != "no-referrer" {
-		t.Fatalf("QR response status/headers = %d %v", response.Code, response.Header())
-	}
-	var result struct {
-		Image string `json:"image"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
-		t.Fatal(err)
-	}
 	const prefix = "data:image/png;base64,"
-	if !strings.HasPrefix(result.Image, prefix) {
+	if !strings.HasPrefix(image, prefix) {
 		t.Fatal("QR response is not an inline PNG")
 	}
-	generated, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(result.Image, prefix))
+	generated, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(image, prefix))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,20 +163,20 @@ func TestProfileQRValidation(t *testing.T) {
 func TestProfileQRAPIRequiresAdminAndStrictBody(t *testing.T) {
 	handler := adminHandler(http.NotFoundHandler(), nil, testAdminToken)
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/profile/qr", strings.NewReader("{}")))
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/client-access", strings.NewReader("{}")))
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated QR request = %d", response.Code)
 	}
-	if response := adminRequest(t, handler, http.MethodGet, "/api/profile/qr", ""); response.Code != http.StatusNotFound {
+	if response := adminRequest(t, handler, http.MethodGet, "/api/client-access", ""); response.Code != http.StatusNotFound {
 		t.Fatalf("GET QR request = %d", response.Code)
 	}
 	for _, body := range []string{
-		`{`, `{}`, `{"server":"https://porta.example.com","token":"private","insecure":true}`,
-		`{"server":"https://porta.example.com","token":"private"}{}`,
-		`{"server":"https://porta.example.com","token":"private` + strings.Repeat("a", 16<<10) + `"}`,
-		`{"server":"http://porta.example.com","token":"private"}`,
+		`{`, `{}`, `{"origin":"https://porta.example.com","token":"private","insecure":true}`,
+		`{"origin":"https://porta.example.com","token":"private"}{}`,
+		`{"origin":"https://porta.example.com","token":"private` + strings.Repeat("a", 16<<10) + `"}`,
+		`{"origin":"http://porta.example.com","token":"private"}`,
 	} {
-		response := adminRequest(t, handler, http.MethodPost, "/api/profile/qr", body)
+		response := adminRequest(t, handler, http.MethodPost, "/api/client-access", body)
 		if response.Code != http.StatusBadRequest || strings.Contains(response.Body.String(), "private") {
 			t.Fatalf("invalid QR body status/error = %d %q", response.Code, response.Body.String())
 		}
@@ -222,8 +209,8 @@ func TestProfileQRPortalAuthorizationAndOrigin(t *testing.T) {
 		{"same origin admin", admin, "https://porta.example.com", http.StatusOK},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, "https://porta.example.com/api/profile/qr",
-				strings.NewReader(`{"name":"Phone","server":"https://porta.example.com","token":"example-not-a-secret"}`))
+			request := httptest.NewRequest(http.MethodPost, "https://porta.example.com/api/client-access",
+				strings.NewReader(`{"origin":"https://porta.example.com","token":"client-token-0123456789"}`))
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Origin", test.origin)
 			if test.cookie != nil {

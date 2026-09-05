@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,25 +19,16 @@ type profileQRInput struct {
 	Token  string `json:"token"`
 }
 
-func (a *adminAPI) serveProfileQR(w http.ResponseWriter, r *http.Request) {
-	var input profileQRInput
-	if err := decodeJSON(r, &input); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
+func profileQRCode(input profileQRInput) (string, error) {
 	payload, err := profileQRPayload(input)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
+		return "", err
 	}
 	image, err := qrcode.Encode(payload, qrcode.Medium, 512)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to generate profile QR code"})
-		return
+		return "", errors.New("Unable to generate profile QR code")
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"image": "data:image/png;base64," + base64.StdEncoding.EncodeToString(image),
-	})
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(image), nil
 }
 
 func profileQRPayload(input profileQRInput) (string, error) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -35,11 +36,12 @@ const (
 )
 
 type portalSession struct {
-	Role       portalRole
-	ClientID   string
-	ClientName string
-	TokenHash  string
-	ExpiresAt  time.Time
+	Role           portalRole
+	ClientID       string
+	ClientName     string
+	TokenHash      string
+	EncryptedToken string
+	ExpiresAt      time.Time
 }
 
 type portalConfig struct {
@@ -62,6 +64,7 @@ type portalHandler struct {
 	logger             *slog.Logger
 	trustProxyHeaders  bool
 	downloadTicketKey  [32]byte
+	tokenCipher        cipher.AEAD
 	mu                 sync.Mutex
 	sessions           map[string]portalSession
 }
@@ -79,6 +82,10 @@ func newPortalHandler(config portalConfig) (http.Handler, error) {
 	if _, err := rand.Read(downloadTicketKey[:]); err != nil {
 		return nil, fmt.Errorf("generate download ticket key: %w", err)
 	}
+	tokenCipher, err := portalCredentialCipher(downloadTicketKey[:], "session-token-v1")
+	if err != nil {
+		return nil, fmt.Errorf("initialize portal credential protection: %w", err)
+	}
 	return &portalHandler{
 		next:               config.Next,
 		registry:           config.Registry,
@@ -89,12 +96,29 @@ func newPortalHandler(config portalConfig) (http.Handler, error) {
 		logger:             config.Logger,
 		trustProxyHeaders:  config.TrustProxyHeaders,
 		downloadTicketKey:  downloadTicketKey,
+		tokenCipher:        tokenCipher,
 		sessions:           make(map[string]portalSession),
 	}, nil
 }
 
 func (p *portalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/assets/portal-join.js":
+		servePortalScript(w, r, portalJoinScript)
+	case r.URL.Path == "/assets/portal-client.js":
+		servePortalScript(w, r, portalClientScript)
+	case r.URL.Path == "/join":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+		p.serveJoin(w, r, "", http.StatusOK)
+	case r.URL.Path == "/join/redeem":
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		p.redeemClientAccess(w, r)
 	case r.URL.Path == "/access" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		p.serveAccessPage(w, r, false)
 	case r.URL.Path == "/access" && r.Method == http.MethodPost:
@@ -131,17 +155,39 @@ func (p *portalHandler) signIn(w http.ResponseWriter, r *http.Request) {
 		session.Role = portalRoleAdmin
 		destination = "/portal/admin"
 	} else {
-		identity, err := p.registry.AuthenticatePortal(token)
+		var err error
+		session, err = p.clientSession(token)
 		if err != nil {
+			if !errors.Is(err, errClientUnauthorized) && !errors.Is(err, errClientDisabled) {
+				p.logger.Error("portal session creation failed", "error", err)
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			p.logger.Warn("portal sign-in rejected", "remote", r.RemoteAddr)
 			serveLandingError(w, r)
 			return
 		}
-		session.Role = portalRoleClient
-		session.ClientID = identity.ID
-		session.ClientName = identity.Name
-		session.TokenHash = hashToken(token)
 	}
+	p.startSession(w, r, session, destination)
+}
+
+func (p *portalHandler) clientSession(token string) (portalSession, error) {
+	identity, err := p.registry.AuthenticatePortal(token)
+	if err != nil {
+		return portalSession{}, err
+	}
+	session := portalSession{
+		Role: portalRoleClient, ClientID: identity.ID, ClientName: identity.Name,
+		TokenHash: hashToken(token), ExpiresAt: time.Now().Add(portalSessionTTL),
+	}
+	session.EncryptedToken, err = sealPortalCredential(p.tokenCipher, []byte(token), session.ClientID+"\n"+session.TokenHash)
+	if err != nil {
+		return portalSession{}, err
+	}
+	return session, nil
+}
+
+func (p *portalHandler) startSession(w http.ResponseWriter, r *http.Request, session portalSession, destination string) {
 	id, err := randomPortalSessionID()
 	if err != nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
@@ -152,6 +198,7 @@ func (p *portalHandler) signIn(w http.ResponseWriter, r *http.Request) {
 	p.limitSessionsLocked(session)
 	p.sessions[id] = session
 	p.mu.Unlock()
+	w.Header().Set("Cache-Control", "no-store")
 	http.SetCookie(w, &http.Cookie{
 		Name:     portalCookieName,
 		Value:    id,
@@ -198,6 +245,11 @@ func (p *portalHandler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
 func (p *portalHandler) serveAdminAPI(w http.ResponseWriter, r *http.Request) {
 	session, ok := p.session(r)
 	if !ok || session.Role != portalRoleAdmin {
+		// Never forward credential-bearing API bodies to camouflage handlers.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
 		p.next.ServeHTTP(w, r)
 		return
 	}
@@ -226,6 +278,28 @@ func (p *portalHandler) serveDownloadsPage(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodGet {
+		var profile *downloadProfile
+		if session.Role == portalRoleClient {
+			token, err := openPortalCredential(p.tokenCipher, session.EncryptedToken, session.ClientID+"\n"+session.TokenHash)
+			if err != nil || hashToken(string(token)) != session.TokenHash {
+				http.Error(w, "profile configuration unavailable; sign in again", http.StatusServiceUnavailable)
+				return
+			}
+			origin, err := clientAccessOrigin("https://" + portalRequestHost(r, p.trustProxyHeaders))
+			if err != nil {
+				http.Error(w, "public server address is invalid", http.StatusServiceUnavailable)
+				return
+			}
+			profile = &downloadProfile{Server: origin, Token: string(token)}
+			input := profileQRInput{Name: session.ClientName, Server: origin, Token: string(token)}
+			profile.SetupURI, err = profileQRPayload(input)
+			if err == nil {
+				profile.QRCode, err = profileQRCode(input)
+			}
+			if err != nil {
+				profile.Notice = "QR setup is unavailable for this credential. Use the server and token for manual setup."
+			}
+		}
 		artifacts := availableDownloads(p.downloadsDirectory)
 		tickets := make(map[string]string, len(artifacts))
 		for _, artifact := range artifacts {
@@ -238,6 +312,7 @@ func (p *portalHandler) serveDownloadsPage(w http.ResponseWriter, r *http.Reques
 			readDownloadVersion(p.downloadsDirectory),
 			artifacts,
 			tickets,
+			profile,
 		))
 	}
 }
@@ -365,7 +440,7 @@ func serveLandingError(w http.ResponseWriter, r *http.Request) {
 }
 
 func setPortalSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
@@ -483,7 +558,7 @@ func formatDownloadSize(size int64) string {
 	return fmt.Sprintf("%d B", size)
 }
 
-func downloadsPageHTML(clientName, host, version string, artifacts []downloadArtifact, tickets map[string]string) string {
+func downloadsPageHTML(clientName, host, version string, artifacts []downloadArtifact, tickets map[string]string, profile *downloadProfile) string {
 	var rows strings.Builder
 	for _, artifact := range artifacts {
 		recommended := ""
@@ -497,6 +572,7 @@ func downloadsPageHTML(clientName, host, version string, artifacts []downloadArt
 	if len(artifacts) == 0 {
 		rows.WriteString(`<div class="empty"><strong>Downloads are being prepared.</strong><span>Check back shortly.</span></div>`)
 	}
+	rows.WriteString(clientSetupHTML(profile))
 	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml"><title>Porta downloads</title><style>
 	@font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-weight:200 900;font-display:swap}:root{font-family:"Mona Sans",sans-serif;color:#171923;background:#f5f6fa;--violet:#6558ed;--line:#e2e4ea}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 85% 0,rgba(115,217,208,.3),transparent 25rem),#f5f6fa}.page{width:min(900px,calc(100% - 28px));margin:auto;padding:24px 0 44px}.top{display:flex;justify-content:space-between;align-items:center}.brand{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:800}.brand img{width:29px}.logout{border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.8);padding:8px 11px;font-size:11px;cursor:pointer}.hero{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:end;margin:38px 0 22px}.eyebrow{color:var(--violet);font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.version{display:inline-flex;margin-left:7px;padding:3px 7px;border-radius:999px;background:#ece9ff;color:#594ed6;letter-spacing:0;text-transform:none}h1{margin:8px 0 8px;font-size:clamp(36px,5vw,48px);line-height:1;letter-spacing:-.05em}.lead{max-width:560px;margin:0;color:#747987;font-size:13px;line-height:1.6}.endpoint{min-width:240px;padding:12px 14px;border:1px solid rgba(255,255,255,.95);border-radius:11px;background:rgba(255,255,255,.78)}.endpoint small{display:block;margin-bottom:4px;color:#969aa5;font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.endpoint code{font-size:12px}.files{display:grid;gap:8px}.download-row{display:grid;grid-template-columns:40px minmax(0,1fr) auto 118px;gap:13px;align-items:center;padding:13px 14px;border:1px solid rgba(255,255,255,.96);border-radius:13px;background:rgba(255,255,255,.88);box-shadow:0 5px 18px rgba(35,40,68,.035)}.platform-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:11px;background:linear-gradient(145deg,#ece9ff,#e5f8f5);color:#584bd7;font-size:13px;font-weight:850}.platform-line{display:flex;align-items:center;gap:7px}.platform-line h2{margin:0;font-size:15px;letter-spacing:-.02em}.package p{margin:3px 0 0;color:#7d828f;font-size:11px;line-height:1.4}.recommended{padding:3px 6px;border-radius:5px;background:#e6f7f2;color:#218568;font-size:9px;font-weight:800}.meta{display:flex;gap:5px}.meta span{padding:5px 7px;border-radius:6px;background:#f1f2f6;color:#686e7b;font-size:10px;white-space:nowrap}.download-button{display:flex;align-items:center;justify-content:space-between;border-radius:8px;background:#171923;color:white;padding:9px 10px;text-decoration:none;font-size:11px;font-weight:750}.download-button span{font-size:13px}.support{display:flex;justify-content:space-between;gap:18px;margin-top:15px;padding-top:15px;border-top:1px solid rgba(25,29,45,.1);color:#7d828f;font-size:11px}.support a{color:#665cf6;text-decoration:none}.empty{padding:34px;border:1px dashed #ccd0da;border-radius:13px;text-align:center}.empty strong,.empty span{display:block}.empty span{margin-top:5px;color:#888d99}@media(max-width:680px){.hero{grid-template-columns:1fr;margin-top:32px}.endpoint{min-width:0}.download-row{grid-template-columns:40px minmax(0,1fr) 104px}.meta{display:none}}@media(max-width:430px){.page{width:min(100% - 20px,900px)}.download-row{grid-template-columns:36px minmax(0,1fr)}.platform-icon{width:36px;height:36px}.download-button{grid-column:1/-1}.support{align-items:flex-start;flex-direction:column}}</style></head><body><main class="page"><div class="top"><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><form method="post" action="/portal/logout"><button class="logout">Sign out</button></form></div><section class="hero"><div><div class="eyebrow">Client version <span class="version">` + html.EscapeString(version) + `</span></div><h1>Downloads</h1><p class="lead">Welcome, ` + html.EscapeString(clientName) + `. Choose the package for your device and use your existing Porta token to connect.</p></div><div class="endpoint"><small>Server address</small><code>https://` + html.EscapeString(host) + `</code></div></section><section class="files">` + rows.String() + `</section><div class="support"><span>Verify package integrity before installation.</span><a href="/download/SHA256SUMS?ticket=` + html.EscapeString(tickets["SHA256SUMS"]) + `" download>SHA256 checksums</a></div></main></body></html>`
 }
