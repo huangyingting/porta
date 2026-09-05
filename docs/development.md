@@ -26,6 +26,20 @@ deployment, certificate sync, firewall cleanup and packaging with isolated
 fixtures and mocked system commands. It does not change host services or
 network settings.
 
+For two-step QR onboarding, the focused server suite also invokes Node.js
+regressions for invitation generation, dialog cleanup, fragment redemption,
+and profile-copy controls:
+
+```sh
+GODEBUG=http2xconnect=1 go test ./cmd/porta-server -run 'Test(ClientAccess|ProfileQR|Portal|Admin)' -count=1
+```
+
+Run `make android` for the in-app scanner/paste parser and signed APK build.
+Before shipping browser changes, exercise actual HTTPS onboarding and compact
+admin dialogs at 390x844, 320x568, and 844x390. A valid first QR must open downloads
+without a token prompt; only that authenticated client page shows the profile QR.
+The Android camera and clipboard UI still require device acceptance.
+
 `make test-native-mtu` separately exercises MTU feedback through a real Linux
 TUN, veth pair, forwarding and NAT. It requires `ip`, `nft`, `sysctl`, and
 passwordless `sudo` permission for `unshare --net`. The target compiles the

@@ -1,0 +1,123 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+const {spawn} = require('node:child_process');
+const {once} = require('node:events');
+
+async function main() {
+  const root = path.resolve(__dirname, '../..');
+  const chromePath = process.env.CHROME_BIN || '/usr/bin/google-chrome';
+  const profile = path.join(root, '.cache', 'onboarding-layout-' + process.pid);
+  fs.mkdirSync(profile, {recursive: true});
+  const html = fs.readFileSync(path.join(root, 'cmd/porta-server/admin_page.go'), 'utf8')
+    .match(/var adminHTML = `([\s\S]*)`/)[1];
+  const font = fs.readFileSync(path.join(root, 'cmd/porta-server/assets/MonaSans.woff2'));
+  const server = http.createServer((request, response) => {
+    if (request.url === '/api/clients') {
+      response.setHeader('Content-Type', 'application/json');
+      response.end('{"clients":[]}');
+    } else if (request.url === '/assets/mona-sans.woff2') {
+      response.setHeader('Content-Type', 'font/woff2');
+      response.end(font);
+    } else if (request.url === '/') {
+      response.setHeader('Content-Type', 'text/html');
+      response.end(html);
+    } else {
+      response.statusCode = 404;
+      response.end();
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const chrome = spawn(chromePath, [
+    '--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
+    '--disable-component-update', '--no-first-run', '--no-default-browser-check',
+    '--remote-debugging-pipe', '--user-data-dir=' + profile, 'about:blank',
+  ], {env: {...process.env, TMPDIR: profile}, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']});
+  const pending = new Map(), events = new Map();
+  let sequence = 0, buffer = '';
+  chrome.stdio[4].on('data', data => {
+    buffer += data.toString();
+    let end;
+    while ((end = buffer.indexOf('\0')) !== -1) {
+      const message = JSON.parse(buffer.slice(0, end));
+      buffer = buffer.slice(end + 1);
+      if (message.id) {
+        const callback = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) callback?.reject(new Error(JSON.stringify(message.error)));
+        else callback?.resolve(message.result);
+      } else {
+        events.get(message.sessionId + ':' + message.method)?.(message.params);
+      }
+    }
+  });
+  const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    const id = ++sequence;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error('Chrome protocol timeout: ' + method)); }, 10000);
+    pending.set(id, {
+      resolve(value) { clearTimeout(timer); resolve(value); },
+      reject(error) { clearTimeout(timer); reject(error); },
+    });
+    chrome.stdio[3].write(JSON.stringify({id, method, params, sessionId}) + '\0');
+  });
+  try {
+    const {targetId} = await send('Target.createTarget', {url: 'about:blank'});
+    const {sessionId} = await send('Target.attachToTarget', {targetId, flatten: true});
+    const evaluate = async expression => {
+      const result = await send('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true}, sessionId);
+      assert.equal(result.exceptionDetails, undefined, JSON.stringify(result.exceptionDetails));
+      return result.result.value;
+    };
+    await send('Page.enable', {}, sessionId);
+    const loaded = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Browser page load timeout')), 10000);
+      events.set(sessionId + ':Page.loadEventFired', () => { clearTimeout(timer); resolve(); });
+    });
+    await send('Page.navigate', {url: 'http://127.0.0.1:' + server.address().port + '/'}, sessionId);
+    await loaded;
+    await evaluate('document.fonts.ready.then(()=>true)');
+    await evaluate(`clients=[{id:'existing',name:'Product team',max_devices:5}];
+      Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:()=>Promise.reject(new Error('Clipboard unavailable'))}});
+      true`);
+    for (const [width, height] of [[390, 844], [320, 568], [844, 390]]) {
+      await send('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: true}, sessionId);
+      const states = [
+        ['create', "openCreate()"],
+        ['edit', "openEdit('existing')"],
+        ['access-ready', "showToken('private-token','Product team');document.getElementById('access-status').textContent='Ready to share. Save now: the token cannot be shown again.'"],
+        ['access-error', "showToken('private-token','Product team');document.getElementById('access-status').textContent='Access link unavailable. Copy the token now; it cannot be shown again.';document.getElementById('retry-access').hidden=false"],
+        ['access-fallback', "showToken('private-token','Product team');document.getElementById('retry-access').hidden=false;await copyToken()"],
+      ];
+      for (const [name, setup] of states) {
+        const result = await evaluate(`(async()=>{
+          closeTokenDialog();closeDialog();${setup};
+          const dialog=document.querySelector('dialog[open]'),bounds=dialog.getBoundingClientRect();
+          return {width:innerWidth,height:innerHeight,top:bounds.top,bottom:bounds.bottom,
+            clientHeight:dialog.clientHeight,scrollHeight:dialog.scrollHeight,
+            clientWidth:dialog.clientWidth,scrollWidth:dialog.scrollWidth,
+            locked:document.body.classList.contains('modal-open'),focus:document.activeElement.tagName};
+        })()`);
+        const label = `${width}x${height} ${name}: ${JSON.stringify(result)}`;
+        assert.equal(result.width, width, label);
+        assert.equal(result.height, height, label);
+        assert.equal(result.locked, true, label);
+        assert.ok(result.top >= 0 && result.bottom <= height, label);
+        assert.ok(result.scrollHeight <= result.clientHeight, label);
+        assert.ok(result.scrollWidth <= result.clientWidth, label);
+        if (name !== 'access-fallback') assert.equal(result.focus, 'BUTTON', label);
+        console.log(`${width}x${height} ${name}: ${result.clientHeight}px, no overflow`);
+      }
+    }
+    await evaluate('closeTokenDialog();closeDialog();true');
+    assert.equal(await evaluate("document.body.classList.contains('modal-open')"), false);
+  } finally {
+    chrome.kill();
+    await once(chrome, 'close');
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(profile, {recursive: true, force: true});
+  }
+}
+
+main().catch(error => { console.error(error); process.exitCode = 1; });
