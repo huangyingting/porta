@@ -4,18 +4,23 @@ import (
 	"context"
 	"net/netip"
 	"testing"
+	"time"
+
+	"github.com/huangyingting/porta/internal/protocol"
 )
 
 func TestSessionQueueDropsOldestPacketWithoutClosing(t *testing.T) {
-	queue := make(chan []byte, 2)
 	metrics := &Metrics{}
-	session := &Session{Outgoing: queue, outgoing: queue, metrics: metrics}
+	config := defaultPacketQueueConfig
+	config.maxPackets = 2
+	config.maxBytes = 100
+	session := &Session{metrics: metrics, queue: newPacketQueue(config, metrics, 0)}
 	session.enqueue([]byte{1})
 	session.enqueue([]byte{2})
 	session.enqueue([]byte{3})
 
-	first := <-queue
-	second := <-queue
+	first, _ := session.dequeue()
+	second, _ := session.dequeue()
 	if first[0] != 2 || second[0] != 3 {
 		t.Fatalf("queued packets = %v, %v; want newest packets 2 and 3", first, second)
 	}
@@ -25,12 +30,18 @@ func TestSessionQueueDropsOldestPacketWithoutClosing(t *testing.T) {
 }
 
 func TestCanceledSessionDoesNotQueuePackets(t *testing.T) {
-	session, ctx := newSession(context.Background(), netip.MustParseAddr("10.66.0.2"))
-	session.metrics = &Metrics{}
+	metrics := &Metrics{}
+	session, ctx := newSession(
+		context.Background(),
+		netip.MustParseAddr("10.66.0.2"),
+		metrics,
+		0,
+		defaultPacketQueueConfig,
+	)
 	session.Close()
 	<-ctx.Done()
 	session.enqueue([]byte{1})
-	if len(session.outgoing) != 0 || session.metrics.closedSessionDrops.Load() != 1 {
+	if session.queue.queuedPackets() != 0 || metrics.closedSessionDrops.Load() != 1 {
 		t.Fatal("canceled session queued traffic or did not count the drop")
 	}
 }
@@ -38,11 +49,11 @@ func TestCanceledSessionDoesNotQueuePackets(t *testing.T) {
 func TestRouterGroupedLanesDoNotReplaceSiblings(t *testing.T) {
 	router := NewRouter(testPacketDevice{}, nil)
 	address := netip.MustParseAddr("10.66.0.2")
-	first, firstContext, err := router.RegisterGroup(context.Background(), address, "session-12345678", 0, 4)
+	first, firstContext, _, err := router.RegisterGroup(context.Background(), address, "session-12345678", 0, 4, "peer:1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, secondContext, err := router.RegisterGroup(context.Background(), address, "session-12345678", 1, 4)
+	second, secondContext, _, err := router.RegisterGroup(context.Background(), address, "session-12345678", 1, 4, "peer:2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +63,7 @@ func TestRouterGroupedLanesDoNotReplaceSiblings(t *testing.T) {
 	default:
 	}
 
-	replacement, _, err := router.RegisterGroup(context.Background(), address, "session-12345678", 0, 4)
+	replacement, _, _, err := router.RegisterGroup(context.Background(), address, "session-12345678", 0, 4, "peer:3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +82,52 @@ func TestRouterGroupedLanesDoNotReplaceSiblings(t *testing.T) {
 	first.Close()
 }
 
+func TestRouterDetectsCollapsedBackendConnections(t *testing.T) {
+	router := NewRouter(testPacketDevice{}, nil)
+	address := netip.MustParseAddr("10.66.0.2")
+	first, _, collapsed, err := router.RegisterGroup(
+		context.Background(), address, "session-12345678", 0, 4, "proxy:443",
+	)
+	if err != nil || collapsed {
+		t.Fatalf("first lane = collapsed %t, error %v", collapsed, err)
+	}
+	second, _, collapsed, err := router.RegisterGroup(
+		context.Background(), address, "session-12345678", 1, 4, "proxy:443",
+	)
+	if err != nil || !collapsed {
+		t.Fatalf("second lane = collapsed %t, error %v", collapsed, err)
+	}
+	if router.metrics.Load().laneCollapsedGroups.Load() != 1 {
+		t.Fatal("collapsed lane group was not counted")
+	}
+	first.Close()
+	second.Close()
+}
+
+func TestRouterPinsNewFlowsToLeastLoadedDataLane(t *testing.T) {
+	group := &sessionGroup{
+		laneCount: 4,
+		lanes:     make(map[int]*Session),
+		flows:     make(map[protocol.FlowKey]flowLane),
+	}
+	for lane := 1; lane < 4; lane++ {
+		group.lanes[lane] = &Session{queue: newPacketQueue(defaultPacketQueueConfig, nil, lane)}
+	}
+	group.lanes[1].queue.enqueue(make([]byte, 100), time.Now())
+	group.lanes[2].queue.enqueue(make([]byte, 50), time.Now())
+	packet := testIPv4UDP()
+	packet = append(packet, make([]byte, 300-len(packet))...)
+	packet[2], packet[3] = byte(len(packet)>>8), byte(len(packet))
+	metadata := protocol.ClassifyIPv4(packet)
+	if lane := selectDataLane(group, metadata); lane != 3 {
+		t.Fatalf("selected lane = %d, want least-loaded lane 3", lane)
+	}
+	group.lanes[3].queue.enqueue(make([]byte, 200), time.Now())
+	if lane := selectDataLane(group, metadata); lane != 3 {
+		t.Fatalf("pinned flow moved to lane %d", lane)
+	}
+}
+
 func TestPacketLaneReservesLaneZeroForDNS(t *testing.T) {
 	packet := testIPv4UDP()
 	packet[22] = 0
@@ -78,6 +135,9 @@ func TestPacketLaneReservesLaneZeroForDNS(t *testing.T) {
 	if lane := packetLane(packet, 4); lane != 0 {
 		t.Fatalf("DNS lane = %d, want 0", lane)
 	}
+	packet = append(packet, make([]byte, 300-len(packet))...)
+	packet[2] = byte(len(packet) >> 8)
+	packet[3] = byte(len(packet))
 	packet[22] = 1
 	packet[23] = 187
 	first := packetLane(packet, 4)
@@ -94,6 +154,7 @@ func TestPacketLaneReservesLaneZeroForDNS(t *testing.T) {
 func testIPv4UDP() []byte {
 	packet := make([]byte, 28)
 	packet[0] = 0x45
+	packet[2] = byte(len(packet) >> 8)
 	packet[3] = byte(len(packet))
 	packet[9] = 17
 	copy(packet[12:16], []byte{10, 66, 0, 2})

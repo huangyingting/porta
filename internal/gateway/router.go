@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/huangyingting/porta/internal/device"
 	"github.com/huangyingting/porta/internal/protocol"
@@ -19,18 +20,20 @@ var (
 )
 
 type Session struct {
-	Address  netip.Addr
-	Outgoing <-chan []byte
+	Address netip.Addr
 
-	outgoing chan []byte
-	cancel   context.CancelFunc
-	once     sync.Once
-	ctx      context.Context
-	metrics  *Metrics
+	cancel  context.CancelFunc
+	once    sync.Once
+	ctx     context.Context
+	metrics *Metrics
+	queue   *packetQueue
 }
 
 func (s *Session) Close() {
-	s.once.Do(func() { s.cancel() })
+	s.once.Do(func() {
+		s.cancel()
+		s.queue.close()
+	})
 }
 
 func (s *Session) enqueue(packet []byte) {
@@ -40,28 +43,19 @@ func (s *Session) enqueue(packet []byte) {
 		}
 		return
 	}
-	select {
-	case s.outgoing <- packet:
-		return
-	default:
-	}
+	s.queue.enqueue(packet, time.Now())
+}
 
-	// VPN traffic is packet-oriented. Drop stale congestion rather than
-	// disconnecting the whole tunnel when a client briefly falls behind.
-	select {
-	case <-s.outgoing:
-		if s.metrics != nil {
-			s.metrics.queueOldestDrops.Add(1)
-		}
-	default:
-	}
-	select {
-	case s.outgoing <- packet:
-	default:
-		if s.metrics != nil {
-			s.metrics.queueFullDrops.Add(1)
-		}
-	}
+func (s *Session) ready() <-chan struct{} {
+	return s.queue.readySignal()
+}
+
+func (s *Session) dequeue() ([]byte, bool) {
+	return s.queue.dequeue(time.Now())
+}
+
+func (s *Session) queueBytes() int {
+	return s.queue.queuedBytes()
 }
 
 type Router struct {
@@ -73,9 +67,18 @@ type Router struct {
 }
 
 type sessionGroup struct {
-	id        string
-	laneCount int
-	lanes     map[int]*Session
+	id              string
+	laneCount       int
+	lanes           map[int]*Session
+	laneConnections map[int]string
+	flowMu          sync.Mutex
+	flows           map[protocol.FlowKey]flowLane
+	collapseWarned  bool
+}
+
+type flowLane struct {
+	lane     int
+	lastSeen time.Time
 }
 
 func NewRouter(dev device.PacketDevice, logger *slog.Logger) *Router {
@@ -92,8 +95,7 @@ func NewRouter(dev device.PacketDevice, logger *slog.Logger) *Router {
 }
 
 func (r *Router) Register(parent context.Context, address netip.Addr) (*Session, context.Context) {
-	session, ctx := newSession(parent, address)
-	session.metrics = r.metrics.Load()
+	session, ctx := newSession(parent, address, r.metrics.Load(), -1, masquePacketQueueConfig)
 	r.mu.Lock()
 	previous := r.sessions[address]
 	r.sessions[address] = &sessionGroup{
@@ -112,15 +114,15 @@ func (r *Router) RegisterGroup(
 	groupID string,
 	laneIndex int,
 	laneCount int,
-) (*Session, context.Context, error) {
+	outerConnection string,
+) (*Session, context.Context, bool, error) {
 	if groupID == "" {
-		return nil, nil, errors.New("router session group ID is required")
+		return nil, nil, false, errors.New("router session group ID is required")
 	}
-	if laneCount < 2 || laneCount > 8 || laneIndex < 0 || laneIndex >= laneCount {
-		return nil, nil, errors.New("invalid router lane configuration")
+	if laneCount < minTunnelLanes || laneCount > maxTunnelLanes || laneIndex < 0 || laneIndex >= laneCount {
+		return nil, nil, false, errors.New("invalid router lane configuration")
 	}
-	session, ctx := newSession(parent, address)
-	session.metrics = r.metrics.Load()
+	session, ctx := newSession(parent, address, r.metrics.Load(), laneIndex, defaultPacketQueueConfig)
 	var replacedGroup *sessionGroup
 	var replacedLane *Session
 	r.mu.Lock()
@@ -128,31 +130,47 @@ func (r *Router) RegisterGroup(
 	if group == nil || group.id != groupID {
 		replacedGroup = group
 		group = &sessionGroup{
-			id:        groupID,
-			laneCount: laneCount,
-			lanes:     make(map[int]*Session, laneCount),
+			id:              groupID,
+			laneCount:       laneCount,
+			lanes:           make(map[int]*Session, laneCount),
+			laneConnections: make(map[int]string, laneCount),
+			flows:           make(map[protocol.FlowKey]flowLane),
 		}
 		r.sessions[address] = group
 	} else if group.laneCount != laneCount {
 		r.mu.Unlock()
 		session.Close()
-		return nil, nil, errors.New("router lane count does not match existing group")
+		return nil, nil, false, errors.New("router lane count does not match existing group")
 	}
 	replacedLane = group.lanes[laneIndex]
 	group.lanes[laneIndex] = session
+	group.laneConnections[laneIndex] = outerConnection
+	collapsed := collapsedLaneGroup(group)
+	if collapsed && !group.collapseWarned {
+		group.collapseWarned = true
+		if metrics := r.metrics.Load(); metrics != nil {
+			metrics.laneCollapsedGroups.Add(1)
+		}
+	}
 	r.mu.Unlock()
 	closeSessionGroup(replacedGroup)
 	if replacedLane != nil {
 		replacedLane.Close()
 	}
 	r.removeSessionWhenDone(ctx, address, groupID, laneIndex, session)
-	return session, ctx, nil
+	return session, ctx, collapsed, nil
 }
 
-func newSession(parent context.Context, address netip.Addr) (*Session, context.Context) {
+func newSession(
+	parent context.Context,
+	address netip.Addr,
+	metrics *Metrics,
+	lane int,
+	queueConfig packetQueueConfig,
+) (*Session, context.Context) {
 	ctx, cancel := context.WithCancel(parent)
-	queue := make(chan []byte, 256)
-	session := &Session{Address: address, Outgoing: queue, outgoing: queue, cancel: cancel, ctx: ctx}
+	session := &Session{Address: address, cancel: cancel, ctx: ctx, metrics: metrics}
+	session.queue = newPacketQueue(queueConfig, metrics, lane)
 	return session, ctx
 }
 
@@ -178,6 +196,7 @@ func (r *Router) removeSessionWhenDone(
 		group := r.sessions[address]
 		if group != nil && group.id == groupID && group.lanes[laneIndex] == session {
 			delete(group.lanes, laneIndex)
+			delete(group.laneConnections, laneIndex)
 		}
 		if group != nil && len(group.lanes) == 0 {
 			delete(r.sessions, address)
@@ -236,7 +255,11 @@ func selectLane(group *sessionGroup, packet []byte) *Session {
 	if group == nil || len(group.lanes) == 0 {
 		return nil
 	}
-	preferred := packetLane(packet, group.laneCount)
+	metadata := protocol.ClassifyIPv4(packet)
+	preferred := 0
+	if metadata.Class != protocol.PacketClassControl {
+		preferred = selectDataLane(group, metadata)
+	}
 	if session := group.lanes[preferred]; session != nil {
 		return session
 	}
@@ -248,37 +271,82 @@ func selectLane(group *sessionGroup, packet []byte) *Session {
 	return nil
 }
 
+func selectDataLane(group *sessionGroup, metadata protocol.PacketMetadata) int {
+	group.flowMu.Lock()
+	defer group.flowMu.Unlock()
+	now := time.Now()
+	if assignment, ok := group.flows[metadata.Flow]; ok {
+		if group.lanes[assignment.lane] != nil {
+			assignment.lastSeen = now
+			group.flows[metadata.Flow] = assignment
+			return assignment.lane
+		}
+		delete(group.flows, metadata.Flow)
+	}
+	if len(group.flows) >= 4096 {
+		var (
+			oldestFlow protocol.FlowKey
+			oldest     time.Time
+		)
+		for flow, assignment := range group.flows {
+			if now.Sub(assignment.lastSeen) >= 2*time.Minute {
+				delete(group.flows, flow)
+				continue
+			}
+			if oldest.IsZero() || assignment.lastSeen.Before(oldest) {
+				oldestFlow = flow
+				oldest = assignment.lastSeen
+			}
+		}
+		if len(group.flows) >= 4096 {
+			delete(group.flows, oldestFlow)
+		}
+	}
+	candidates := make([]int, 0, group.laneCount-1)
+	for lane := 1; lane < group.laneCount; lane++ {
+		if group.lanes[lane] != nil {
+			candidates = append(candidates, lane)
+		}
+	}
+	if len(candidates) == 0 {
+		return 0
+	}
+	start := int(metadata.Hash % uint32(len(candidates)))
+	selected := candidates[start]
+	selectedBytes := group.lanes[selected].queueBytes()
+	for offset := 1; offset < len(candidates); offset++ {
+		lane := candidates[(start+offset)%len(candidates)]
+		queued := group.lanes[lane].queueBytes()
+		if queued < selectedBytes {
+			selected = lane
+			selectedBytes = queued
+		}
+	}
+	group.flows[metadata.Flow] = flowLane{lane: selected, lastSeen: now}
+	return selected
+}
+
+func collapsedLaneGroup(group *sessionGroup) bool {
+	if len(group.lanes) < 2 {
+		return false
+	}
+	connections := make(map[string]struct{}, len(group.laneConnections))
+	for lane := range group.lanes {
+		connection := group.laneConnections[lane]
+		if connection != "" {
+			connections[connection] = struct{}{}
+		}
+	}
+	return len(connections) > 0 && len(connections) < len(group.lanes)
+}
+
 func packetLane(packet []byte, laneCount int) int {
-	if laneCount <= 1 || len(packet) < 20 {
+	if laneCount <= 1 {
 		return 0
 	}
-	headerLength := int(packet[0]&0x0f) * 4
-	if headerLength < 20 || headerLength > len(packet) {
+	metadata := protocol.ClassifyIPv4(packet)
+	if metadata.Class == protocol.PacketClassControl {
 		return 0
 	}
-	protocolNumber := packet[9]
-	// Every fragment must hash alike; only the first contains transport ports.
-	fragmented := (uint16(packet[6])<<8|uint16(packet[7]))&0x3fff != 0
-	hasPorts := !fragmented && (protocolNumber == 6 || protocolNumber == 17) && len(packet) >= headerLength+4
-	if hasPorts {
-		sourcePort := int(packet[headerLength])<<8 | int(packet[headerLength+1])
-		destinationPort := int(packet[headerLength+2])<<8 | int(packet[headerLength+3])
-		if sourcePort == 53 || destinationPort == 53 {
-			return 0
-		}
-	}
-	hash := uint32(2166136261)
-	hash ^= uint32(protocolNumber)
-	hash *= 16777619
-	for _, value := range packet[12:20] {
-		hash ^= uint32(value)
-		hash *= 16777619
-	}
-	if hasPorts {
-		for _, value := range packet[headerLength : headerLength+4] {
-			hash ^= uint32(value)
-			hash *= 16777619
-		}
-	}
-	return 1 + int(hash%uint32(laneCount-1))
+	return 1 + int(metadata.Hash%uint32(laneCount-1))
 }

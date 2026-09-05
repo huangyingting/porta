@@ -89,6 +89,25 @@ is not a prediction of end-to-end VPN speed. Network tests should compare
 HTTP/3, HTTP/2 fallback and CONNECT separately under the same latency, loss,
 client count and server load.
 
+The transport round-trip benchmark exercises the complete local HTTP/2 framed
+or HTTP/3 Datagram path, including the gateway router and a fake TUN:
+
+```sh
+go test ./internal/tunnel -run '^$' \
+  -bench '^BenchmarkTransportPacketRoundTrip$' -benchmem -count=3
+```
+
+For controlled impairment, `scripts/benchmark-transports.sh` builds the
+loss-tolerant transport probe once and runs it in disposable network
+namespaces. It reports bidirectional delivery and control-packet latency rather
+than blocking when an HTTP/3 Datagram is intentionally lost. It does not alter
+the host qdisc. The defaults cover 20/80/150 ms RTT, 0/0.5/1/2 percent loss,
+and 20/100 Mbit/s. Override the matrix with `PORTA_BENCH_RTT_MS`,
+`PORTA_BENCH_LOSS_PERCENT`, `PORTA_BENCH_RATES`, `PORTA_BENCH_PACKETS`,
+`PORTA_BENCH_TIMEOUT_SECONDS`, `PORTA_BENCH_PACING_MICROS`, and
+`PORTA_BENCH_COUNT`. The script requires `ip`, `tc`, `unshare`, and passwordless
+`sudo`.
+
 ## Android signing
 
 All distributed Android release APKs use one persistent signing identity,

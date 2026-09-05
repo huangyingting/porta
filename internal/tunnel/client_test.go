@@ -14,7 +14,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,11 +30,35 @@ import (
 const testToken = "0123456789abcdef0123456789abcdef"
 const packetRoundTripTimeout = 10 * time.Second
 
-func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
-	if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
-		t.Skip("set GODEBUG=http2xconnect=1 to exercise HTTP/2 Extended CONNECT")
-	}
+func TestHTTP2FramedPacketRoundTripUsesIndependentConnections(t *testing.T) {
 	handler, router, dev := testGateway(t, false)
+	baseHandler := handler
+	const laneCount = 4
+	var (
+		requestMu sync.Mutex
+		requests  = make(map[int]string)
+	)
+	allLanes := make(chan struct{})
+	var allLanesOnce sync.Once
+	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == gateway.TunnelPath {
+			lane, err := strconv.Atoi(r.Header.Get("X-Porta-Lane"))
+			if err != nil {
+				t.Errorf("invalid lane header: %v", err)
+			} else {
+				requestMu.Lock()
+				requests[lane] = r.RemoteAddr
+				if len(requests) == laneCount {
+					allLanesOnce.Do(func() { close(allLanes) })
+				}
+				requestMu.Unlock()
+			}
+			if r.Method != http.MethodPost || r.Header.Get("X-Porta-Lanes") != strconv.Itoa(laneCount) {
+				t.Errorf("invalid framed lane request: %s lanes=%q", r.Method, r.Header.Get("X-Porta-Lanes"))
+			}
+		}
+		baseHandler.ServeHTTP(w, r)
+	})
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true
 	if err := http2.ConfigureServer(server.Config, &http2.Server{}); err != nil {
@@ -49,6 +74,20 @@ func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
 		Timeout:   3 * time.Second,
 	})
+	select {
+	case <-allLanes:
+	case <-time.After(packetRoundTripTimeout):
+		t.Fatal("not all HTTP/2 lanes joined")
+	}
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	outerConnections := make(map[string]struct{}, len(requests))
+	for _, remote := range requests {
+		outerConnections[remote] = struct{}{}
+	}
+	if len(outerConnections) != laneCount {
+		t.Fatalf("%d lanes used %d TCP connections: %v", len(requests), len(outerConnections), requests)
+	}
 }
 
 func TestHTTP3MasqueDatagramPacketRoundTrip(t *testing.T) {
@@ -142,7 +181,7 @@ func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bo
 	testPacketRoundTrip(t, router, dev, config, packetSizes...)
 }
 
-func testGateway(t *testing.T, enableH3Datagrams bool, configuredMTU ...int) (http.Handler, *gateway.Router, *fakeDevice) {
+func testGateway(t testing.TB, enableH3Datagrams bool, configuredMTU ...int) (http.Handler, *gateway.Router, *fakeDevice) {
 	t.Helper()
 	mtu := 1300
 	if len(configuredMTU) > 0 {
@@ -151,7 +190,7 @@ func testGateway(t *testing.T, enableH3Datagrams bool, configuredMTU ...int) (ht
 	return testMTUGateway(t, enableH3Datagrams, mtu, false)
 }
 
-func testMTUGateway(t *testing.T, enableH3Datagrams bool, mtu int, autoMTU bool) (http.Handler, *gateway.Router, *fakeDevice) {
+func testMTUGateway(t testing.TB, enableH3Datagrams bool, mtu int, autoMTU bool) (http.Handler, *gateway.Router, *fakeDevice) {
 	t.Helper()
 	pool, err := gateway.NewPool("10.66.0.0/29")
 	if err != nil {

@@ -46,6 +46,15 @@ internal fun formatAttemptEvent(transport: String, networkType: String?): String
         }
     }
 
+internal fun formatHttp2LaneDiagnostic(
+    lane: Int,
+    queue: PacketQueueSnapshot,
+    reconnects: Int,
+): String =
+    "HTTP/2 lane $lane: drops ${queue.totalDrops}; high-water " +
+        "${queue.highWaterBytes}B/${queue.highWaterPackets}p; " +
+        "oldest ${queue.oldestAgeMillis}ms; reconnects $reconnects"
+
 internal fun formatConnectedEvents(telemetry: ConnectionTelemetry): List<String> = listOf(
     buildString {
         append("Connected over ")

@@ -132,7 +132,12 @@ func TestHTTP2ConnectForwardsBidirectionalTraffic(t *testing.T) {
 	if string(echo) != "porta-h2" {
 		t.Fatalf("echo = %q", echo)
 	}
-	_ = requestWriter.Close()
+	if err := requestWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatalf("read clean CONNECT response EOF: %v", err)
+	}
 }
 
 func TestCamouflagePassesInvalidProxyRequestsToWebsite(t *testing.T) {
@@ -322,7 +327,8 @@ func TestStreamCancellationUnblocksResponseWrite(t *testing.T) {
 	defer body.Close()
 	defer bodyWriter.Close()
 	response := &blockedResponseWriter{started: make(chan struct{}), unblocked: make(chan struct{})}
-	writer := &flushWriter{writer: response, controller: http.NewResponseController(response)}
+	writer := newFlushWriter(response, 128, time.Millisecond)
+	defer writer.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -338,7 +344,7 @@ func TestStreamCancellationUnblocksResponseWrite(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		_ = writer.Close()
+		_ = writer.Abort()
 		t.Fatal("stream cancellation left the response writer blocked")
 	}
 	if _, err := writer.Write([]byte("late")); !errors.Is(err, net.ErrClosed) {

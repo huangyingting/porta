@@ -58,6 +58,9 @@ func TestDrainWaitsForHijackedHandlerAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-clientDone
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	reopened, err := usage.Open(path, nil)
 	if err != nil {
 		t.Fatal(err)

@@ -20,7 +20,8 @@
   MASQUE endpoint. It requires Extended CONNECT with `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, a signed native-device proof, and a
   supported Porta protocol version.
-- `POST /v1/tunnel` is Android's authenticated four-lane HTTP/2 fallback.
+- `POST /v1/tunnel` is the authenticated multi-lane HTTP/2 fallback used by
+  native clients. A group declares two through four lanes.
   Every lane carries an independent signed native-device proof; requests
   without valid lane metadata or a supported protocol version are rejected.
 - Standard HTTP `CONNECT` requests form the authenticated HTTPS forward proxy.

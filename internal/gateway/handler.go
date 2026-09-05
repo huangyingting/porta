@@ -31,8 +31,10 @@ const (
 	laneSessionHeader = "X-Porta-Lane-Session"
 	laneIndexHeader   = "X-Porta-Lane"
 	laneCountHeader   = "X-Porta-Lanes"
-	tunnelLaneCount   = 4
-	streamPacketBatch = 32
+	minTunnelLanes    = 2
+	maxTunnelLanes    = 4
+	streamPacketBatch = 16
+	streamBatchBytes  = 16 << 10
 )
 
 type laneConfig struct {
@@ -160,16 +162,24 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 
 	defer c.Pool.Release(lease)
 
-	session, sessionCtx, err := c.Router.RegisterGroup(
+	session, sessionCtx, collapsed, err := c.Router.RegisterGroup(
 		r.Context(),
 		lease.Address,
 		lanes.sessionID,
 		lanes.index,
 		lanes.count,
+		r.RemoteAddr,
 	)
 	if err != nil {
 		http.Error(w, "invalid tunnel lane group", http.StatusConflict)
 		return
+	}
+	if collapsed {
+		c.Logger.Warn(
+			"HTTP/2 fallback lanes share a backend TCP connection; reverse-proxy multiplexing restores head-of-line blocking",
+			"address", lease.Address,
+			"session", lanes.sessionID,
+		)
 	}
 	defer session.Close()
 	stopIO := stopStreamOnCancel(sessionCtx, w, r.Body)
@@ -264,20 +274,26 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	defer keepalive.Stop()
 	for {
 		select {
-		case packet := <-session.Outgoing:
+		case <-session.ready():
+			packet, ok := session.dequeue()
+			if !ok {
+				continue
+			}
+			batchBytes := 0
 		drain:
 			for count := 0; ; count++ {
 				if err := encoder.WritePacket(packet); err != nil {
 					return
 				}
+				batchBytes += len(packet)
 				c.Metrics.sentToClient()
 				usageSession.AddDownloaded(uint64(len(packet)), 1)
-				if count+1 >= streamPacketBatch {
+				if count+1 >= streamPacketBatch || batchBytes >= streamBatchBytes {
 					break
 				}
-				select {
-				case packet = <-session.Outgoing:
-				default:
+				var available bool
+				packet, available = session.dequeue()
+				if !available {
 					break drain
 				}
 			}
@@ -325,7 +341,7 @@ func parseLaneConfig(r *http.Request) (laneConfig, error) {
 		return laneConfig{}, errors.New("invalid tunnel lane index")
 	}
 	count, err := strconv.Atoi(countValue)
-	if err != nil || count != tunnelLaneCount || index < 0 || index >= count {
+	if err != nil || count < minTunnelLanes || count > maxTunnelLanes || index < 0 || index >= count {
 		return laneConfig{}, errors.New("invalid tunnel lane count")
 	}
 	return laneConfig{sessionID: sessionID, index: index, count: count}, nil

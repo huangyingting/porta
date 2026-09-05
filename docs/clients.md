@@ -261,7 +261,7 @@ No client-facing MTU toggle is necessary.
 The value stays fixed for the connection. Reconnects can choose another MTU;
 a change can recreate the desktop TUN and interrupt existing flows. A later
 QUIC size-limit reduction uses reliable capsules for affected packets rather
-than resizing the live interface. HTTP/2, Android's four-lane fallback, and
+than resizing the live interface. HTTP/2, the native multi-lane fallback, and
 HTTP/3 without Datagrams retain the configured server MTU. This setting does
 not apply to the HTTPS forward proxy, which has no VPN TUN interface.
 
@@ -342,17 +342,18 @@ is local diagnostic information rather than proof to the server.
 
 Approve Android's VPN prompt and enable the profile. Android prefers native
 HTTP/3 MASQUE. If UDP or HTTP/3 is unavailable, it automatically falls back to
-four encrypted HTTP/2 lanes on the same port. Authentication, certificate, and
-invalid-configuration failures do not trigger a fallback.
+independent encrypted HTTP/2 lanes on the same port. Authentication,
+certificate, and invalid-configuration failures do not trigger a fallback.
 
 Profiles are stored locally, tokens are encrypted with Android Keystore, and
 only one profile can be active. The app supports bounded reconnects, optional
 reconnect after device restart, live traffic statistics, and a local diagnostic
 log that excludes tokens and authorization headers.
 
-Swipe an inactive profile across its **full width**, **right to edit** or
-**left to delete**. Partial swipes return to their starting position without
-performing an action. Profile cards have no visible Edit/Delete buttons;
+Swipe an inactive profile at least halfway across its card, **right to edit**
+or **left to delete**. The action stays armed through a small retreat, gives
+haptic feedback, and then animates through; shorter swipes return to their
+starting position. Profile cards have no visible Edit/Delete buttons;
 equivalent accessibility actions are available on the profile name.
 Deletion requires confirmation and is no longer part of the editor. Disconnect
 an active or reconnecting profile before editing or deleting it. Deleting a
@@ -363,7 +364,9 @@ The connection summary shows the effective tunnel MTU. **Log** updates while
 open and includes connection setup details, MTU selection, assigned address,
 DNS, transport, and fallback/retry information. Automatic selection is
 distinguished from a server-configured MTU; the value stays fixed until the
-next connection. The log retains the latest 200 events, includes millisecond
+next connection. When an HTTP/2 fallback attempt ends, per-lane diagnostics
+record drop totals, queue high-water marks, oldest queued-packet age, and
+reconnect counts. The log retains the latest 200 events, includes millisecond
 timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but
 logs can contain server/network addresses and the device name, so
 share them privately.

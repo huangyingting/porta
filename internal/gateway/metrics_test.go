@@ -15,6 +15,10 @@ func TestMetricsRenderPrometheusFormat(t *testing.T) {
 	metrics.droppedFromClient()
 	metrics.DatagramOversize()
 	metrics.queueOldestDrops.Add(2)
+	metrics.queueTailDrops.Add(4)
+	metrics.queueExpiredDrops.Add(5)
+	metrics.adjustQueueBytes(2, 4096)
+	metrics.laneCollapsedGroups.Add(1)
 	metrics.mtuFragmented.Add(3)
 
 	recorder := httptest.NewRecorder()
@@ -31,9 +35,14 @@ func TestMetricsRenderPrometheusFormat(t *testing.T) {
 		"# HELP porta_datagram_oversize_total Outgoing datagram payload-limit errors requiring capsule fallback.",
 		`porta_router_dropped_packets_total{reason="queue_oldest"} 2`,
 		`porta_router_dropped_packets_total{reason="queue_full"} 0`,
+		`porta_router_dropped_packets_total{reason="queue_tail"} 4`,
+		`porta_router_dropped_packets_total{reason="queue_expired"} 5`,
 		`porta_router_dropped_packets_total{reason="session_closed"} 0`,
 		`porta_router_dropped_packets_total{reason="invalid_tun_packet"} 0`,
 		`porta_router_dropped_packets_total{reason="no_session"} 0`,
+		`porta_router_queue_bytes{lane="2"} 4096`,
+		`porta_router_queue_bytes_high_water{lane="2"} 4096`,
+		`porta_http2_collapsed_lane_groups_total 1`,
 		`porta_mtu_packets_total{action="fragmented"} 3`,
 		`porta_mtu_packets_total{action="icmp_sent"} 0`,
 		`porta_mtu_packets_total{action="icmp_suppressed"} 0`,

@@ -11,26 +11,31 @@ its protocol fingerprint.
 ```text
 Linux TUN / Windows Wintun / Android VpnService
                        |
-                MASQUE CONNECT-IP
+                  IP tunnel
                        |
           +------------+------------+
           |                         |
-   HTTP/3 QUIC Datagrams       HTTP/2 capsules
-   (capsules when needed)     (desktop fallback)
+   HTTP/3 MASQUE Datagrams    multi-lane HTTP/2 framing
+   (capsules when needed)       (native fallback)
           |                         |
           +------------+------------+
                        |
-                 Porta gateway <---- Android four-lane HTTP/2 fallback
+                 Porta gateway
                        |
                    Linux TUN
                        |
             kernel routing + operator NAT
 ```
 
-The standard endpoint is the RFC 9484 default URI template expanded for an
+The standard MASQUE endpoint is the RFC 9484 default URI template expanded for an
 unrestricted tunnel: `/.well-known/masque/ip/*/*/`. HTTP/2 and HTTP/3 requests
 use Extended CONNECT with `:protocol=connect-ip` and
 `Capsule-Protocol: ?1`.
+
+Native clients prefer that endpoint over HTTP/3. Their HTTP/2 fallback uses
+two-byte length-prefixed packets over independent `POST /v1/tunnel` streams
+instead of one ordered MASQUE stream, limiting a lost outer TCP segment to the
+flows assigned to one lane.
 
 The client sends an ADDRESS_REQUEST capsule for IPv4. The gateway responds with
 an ADDRESS_ASSIGN `/32` lease and a ROUTE_ADVERTISEMENT covering IPv4. HTTP/3
@@ -118,7 +123,7 @@ maximum path MTU or continuous tunnel resizing. QUIC manages its own outer
 path MTU independently. If its datagram limit later shrinks, ordinary packets
 still use the reliable capsule fallback described below. Selection runs again
 on reconnect; a changed lease MTU can recreate the client TUN. HTTP/2,
-Android's private HTTP/2 lanes, and HTTP/3 without Datagrams keep the configured
+native private HTTP/2 lanes, and HTTP/3 without Datagrams keep the configured
 MTU because their streams can segment data without UDP-sized inner packets.
 
 ## Protocol compatibility
@@ -137,10 +142,18 @@ authentication, lease, or routing change increments the protocol version;
 additive behavior should use negotiated capabilities where possible rather
 than forcing an application release lockstep.
 
-The persistent client registry stores only SHA-256 token hashes. Each account
-has an enabled state and a device limit. The loopback-only admin API manages
-accounts, token rotation, and device enrollment without restarting the tunnel
-service.
+The persistent client registry stores only SHA-256 token hashes and maintains
+an in-memory hash index, keeping authentication lookup independent of account
+count. Each account has an enabled state and a device limit. The loopback-only
+admin API manages accounts, token rotation, and device enrollment without
+restarting the tunnel service. Throttled forward-proxy LastSeen changes are
+coalesced and written outside the authentication lock, with a final durable
+flush during shutdown.
+
+Traffic accounting uses connection-local atomic counters, so relay reads and
+writes do not contend on the usage store lock. Completed sessions request a
+short debounced persistence pass, active sessions are checkpointed
+periodically, and shutdown performs a final crash-safe flush before returning.
 
 ## Gateway routing
 
@@ -159,10 +172,20 @@ router and client receive queues pass those buffers onward without another
 payload copy. Reusable decoder buffers are used only where TUN writes finish
 before the next read; they must never be queued for asynchronous consumers.
 Stream encoders reuse header storage and serialize capsule writes and flushes.
-Android HTTP/2 uploads flush bounded batches of packets already in the queue,
-without waiting to fill a batch. Fragmented IPv4 datagrams hash only their
-protocol and addresses so all fragments remain on the same data lane; only
-unfragmented DNS traffic receives the dedicated DNS lane.
+HTTP/2 uploads flush bounded batches of packets already in the queue, without
+waiting to fill a batch. Queues are bounded by both bytes and packet count,
+expire stale traffic, preserve queued TCP prefixes with tail drop, and prefer
+new control traffic over replaceable datagrams. New flows choose the
+least-loaded healthy data lane and remain pinned until idle expiry. Fragmented
+IPv4 datagrams include their fragment identifier in the flow key so all
+fragments remain on one lane.
+
+The HTTPS forward proxy keeps each CONNECT tunnel as one ordered TCP stream.
+It races interleaved IPv4 and IPv6 destination attempts with a short stagger,
+caches only fully validated public DNS answers for 30 seconds, and rejects the
+whole answer set if any address is private or reserved. Downstream response
+writes are coalesced up to 128 KiB or two milliseconds before a protocol flush;
+the final partial buffer is flushed when the copy direction completes.
 
 ## Transport behavior
 
@@ -225,15 +248,21 @@ and discards stale queued packets. Initial DNS and authenticated bootstrap are
 outside the guard. Recovery journals allow crash restart without physical DNS,
 but cannot discover previously unknown hostname addresses while protected.
 
-## Android HTTP/2 fallback
+## Native HTTP/2 fallback
 
-The Android fallback uses the private media type
+The native fallback uses the private media type
 `application/x-porta-packets` and two-byte length-prefixed IPv4 packets over
-`POST /v1/tunnel`. Android opens four independent HTTP/2 connections for this
-fallback, reserves lane zero for DNS, and consistently distributes other IP
-flows across three data lanes. Each lane has its own TCP loss domain, reducing
-but not eliminating TCP head-of-line blocking. All four lanes are mandatory;
-the gateway rejects headerless or partial single-lane requests.
+`POST /v1/tunnel`. Clients declare two through four lanes and use independent
+HTTP/2 transports so each lane has its own TCP congestion and loss domain.
+Lane zero prioritizes DNS, ICMP, TCP acknowledgements, and small control
+datagrams. Other flows are pinned across the healthy data lanes. Startup
+requires the control lane and one data lane; remaining lanes can join later,
+and an interrupted lane reconnects without tearing down healthy siblings.
+
+This reduces, but cannot eliminate, TCP head-of-line blocking or TCP-over-TCP
+congestion effects. A reverse proxy that multiplexes logical lanes onto one
+backend HTTP/2 connection restores a shared loss domain; the gateway detects
+and reports that condition.
 
 ## Roadmap
 

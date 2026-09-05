@@ -39,15 +39,18 @@ class PacketFilterTest {
         packet[23] = 53
         assertTrue(http2PacketLane(packet, 4) == 0)
 
-        packet[22] = 1
-        packet[23] = 187.toByte()
-        val lane = http2PacketLane(packet, 4)
+        val dataPacket = packet.copyOf(300)
+        dataPacket[2] = 1
+        dataPacket[3] = 44
+        dataPacket[22] = 1
+        dataPacket[23] = 187.toByte()
+        val lane = http2PacketLane(dataPacket, 4)
         assertTrue(lane in 1..3)
-        packet[4] = 0x12
-        packet[5] = 0x34
-        packet[10] = 0x56
-        packet[11] = 0x78
-        assertTrue(http2PacketLane(packet, 4) == lane)
+        dataPacket[4] = 0x12
+        dataPacket[5] = 0x34
+        dataPacket[10] = 0x56
+        dataPacket[11] = 0x78
+        assertTrue(http2PacketLane(dataPacket, 4) == lane)
     }
 
     @Test
@@ -102,9 +105,6 @@ class PacketFilterTest {
             packet[23] = (255 - offset).toByte()
             assertEquals(firstLane, http2PacketLane(packet, 4))
         }
-        packet[4] = 0x56
-        packet[5] = 0x78
-        assertEquals(firstLane, http2PacketLane(packet, 4))
     }
 
     @Test

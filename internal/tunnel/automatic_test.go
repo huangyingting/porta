@@ -7,8 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,9 +18,6 @@ import (
 )
 
 func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
-	if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
-		t.Skip("set GODEBUG=http2xconnect=1 to exercise HTTP/2 Extended CONNECT")
-	}
 	handler, router, dev := testGateway(t, false)
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true

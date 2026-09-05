@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +27,7 @@ import (
 const (
 	clientRegistryVersion = 2
 	maxDeviceNonces       = 2048
+	proxyMetadataDebounce = time.Second
 )
 
 var (
@@ -33,15 +35,42 @@ var (
 	errClientDisabled     = errors.New("client is disabled")
 	errDeviceLimit        = errors.New("client device limit reached")
 	errDeviceDraining     = errors.New("device sessions are being disconnected")
+	errRegistryClosed     = errors.New("client registry is closed")
+	dummyTokenDigest      = sha256.Sum256(nil)
 )
 
+type tokenIndexEntry struct {
+	clientIndex int
+	digest      [sha256.Size]byte
+}
+
 type clientRegistry struct {
-	mu       sync.Mutex
-	path     string
-	clients  []clientRecord
-	sessions map[registryDeviceKey]map[*activeClientSession]struct{}
-	retiring map[registryDeviceKey]bool
-	nonces   map[registryDeviceKey]*deviceNonceWindow
+	mu               sync.Mutex
+	path             string
+	logger           *slog.Logger
+	clients          []clientRecord
+	tokenIndex       map[[sha256.Size]byte]tokenIndexEntry
+	sessions         map[registryDeviceKey]map[*activeClientSession]struct{}
+	retiring         map[registryDeviceKey]int
+	retiringAccounts map[string]int
+	nonces           map[registryDeviceKey]*deviceNonceWindow
+
+	persistMu          sync.Mutex
+	durabilityMu       sync.Mutex
+	nextPersistSeq     uint64
+	persistedSeq       uint64
+	writeState         func([]byte) error
+	syncDirectory      func(*os.File) error
+	durabilityErr      error
+	metadataDirty      bool
+	metadataVersion    uint64
+	metadataDebounce   time.Duration
+	metadataWake       chan struct{}
+	metadataStop       chan struct{}
+	metadataDone       chan struct{}
+	metadataWorkerOpen bool
+	closed             bool
+	closeErr           error
 }
 
 type registryDeviceKey struct {
@@ -127,7 +156,13 @@ func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("client registry path is required")
 	}
-	registry := &clientRegistry{path: path}
+	registry := &clientRegistry{
+		path:             path,
+		logger:           slog.Default(),
+		metadataDebounce: proxyMetadataDebounce,
+	}
+	registry.writeState = registry.writeStateFile
+	registry.syncDirectory = func(directory *os.File) error { return directory.Sync() }
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if strings.TrimSpace(bootstrapToken) == "" {
@@ -146,6 +181,7 @@ func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 			Enabled:    true,
 			CreatedAt:  time.Now().UTC(),
 		}}
+		registry.rebuildTokenIndexLocked()
 		if err := registry.persistLocked(); err != nil {
 			return nil, err
 		}
@@ -167,6 +203,7 @@ func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 		}
 	}
 	registry.clients = state.Clients
+	registry.rebuildTokenIndexLocked()
 	return registry, nil
 }
 
@@ -177,6 +214,9 @@ func (r *clientRegistry) AuthenticateDeviceSession(parent context.Context, token
 	defer r.mu.Unlock()
 	if err := parent.Err(); err != nil {
 		return gateway.ClientIdentity{}, nil, nil, err
+	}
+	if r.closed {
+		return gateway.ClientIdentity{}, nil, nil, errRegistryClosed
 	}
 	identity, err := r.authenticateDeviceLocked(token, proof, method, path)
 	if err != nil {
@@ -190,6 +230,9 @@ func (r *clientRegistry) AuthenticateProxySession(parent context.Context, token 
 	defer r.mu.Unlock()
 	if err := parent.Err(); err != nil {
 		return gateway.ClientIdentity{}, nil, nil, err
+	}
+	if r.closed {
+		return gateway.ClientIdentity{}, nil, nil, errRegistryClosed
 	}
 	identity, err := r.authenticateProxyLocked(token)
 	if err != nil {
@@ -229,12 +272,15 @@ func (r *clientRegistry) authenticateDeviceLocked(token string, proof deviceauth
 	if err != nil {
 		return gateway.ClientIdentity{}, err
 	}
+	if r.retiringAccounts[client.ID] > 0 {
+		return gateway.ClientIdentity{}, errDeviceDraining
+	}
 	encodedKey, signedAt, err := deviceauth.Verify(proof, token, method, path, time.Now().UTC())
 	if err != nil {
 		return gateway.ClientIdentity{}, errClientUnauthorized
 	}
 	key := registryDeviceKey{client.ID, proof.DeviceID}
-	if r.retiring[key] {
+	if r.retiring[key] > 0 {
 		return gateway.ClientIdentity{}, errDeviceDraining
 	}
 	if r.nonceSeenLocked(key, proof.Nonce, signedAt) {
@@ -285,9 +331,12 @@ func (r *clientRegistry) authenticateProxyLocked(token string) (gateway.ClientId
 	if err != nil {
 		return gateway.ClientIdentity{}, err
 	}
+	if r.retiringAccounts[client.ID] > 0 {
+		return gateway.ClientIdentity{}, errDeviceDraining
+	}
 	deviceID := forwardproxy.DeviceID
 	key := registryDeviceKey{client.ID, deviceID}
-	if r.retiring[key] {
+	if r.retiring[key] > 0 {
 		return gateway.ClientIdentity{}, errDeviceDraining
 	}
 	now := time.Now().UTC()
@@ -297,12 +346,8 @@ func (r *clientRegistry) authenticateProxyLocked(token string) (gateway.ClientId
 			continue
 		}
 		if now.Sub(device.LastSeen) >= time.Minute {
-			previous := device.LastSeen
 			device.LastSeen = now
-			if err := r.persistLocked(); err != nil {
-				device.LastSeen = previous
-				return gateway.ClientIdentity{}, err
-			}
+			r.markMetadataDirtyLocked()
 		}
 		return registryIdentity(*client, deviceID), nil
 	}
@@ -323,18 +368,20 @@ func (r *clientRegistry) authenticateProxyLocked(token string) (gateway.ClientId
 }
 
 func (r *clientRegistry) clientForTokenLocked(token string) (*clientRecord, error) {
-	tokenHash := hashToken(token)
-	for clientIndex := range r.clients {
-		client := &r.clients[clientIndex]
-		if subtle.ConstantTimeCompare([]byte(client.TokenHash), []byte(tokenHash)) != 1 {
-			continue
-		}
-		if !client.Enabled {
-			return nil, errClientDisabled
-		}
-		return client, nil
+	tokenDigest := sha256.Sum256([]byte(token))
+	entry, exists := r.tokenIndex[tokenDigest]
+	if !exists {
+		entry.digest = dummyTokenDigest
 	}
-	return nil, errClientUnauthorized
+	hashMatches := subtle.ConstantTimeCompare(entry.digest[:], tokenDigest[:])
+	if !exists || entry.clientIndex < 0 || entry.clientIndex >= len(r.clients) || hashMatches != 1 {
+		return nil, errClientUnauthorized
+	}
+	client := &r.clients[entry.clientIndex]
+	if !client.Enabled {
+		return nil, errClientDisabled
+	}
+	return client, nil
 }
 
 func (r *clientRegistry) nonceSeenLocked(key registryDeviceKey, nonce string, signedAt time.Time) bool {
@@ -385,19 +432,13 @@ func (r *clientRegistry) rememberNonceLocked(key registryDeviceKey, nonce string
 }
 
 func (r *clientRegistry) AuthenticatePortal(token string) (clientPortalIdentity, error) {
-	tokenHash := hashToken(token)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, client := range r.clients {
-		if subtle.ConstantTimeCompare([]byte(client.TokenHash), []byte(tokenHash)) != 1 {
-			continue
-		}
-		if !client.Enabled {
-			return clientPortalIdentity{}, errClientDisabled
-		}
-		return clientPortalIdentity{ID: client.ID, Name: client.Name}, nil
+	client, err := r.clientForTokenLocked(token)
+	if err != nil {
+		return clientPortalIdentity{}, err
 	}
-	return clientPortalIdentity{}, errClientUnauthorized
+	return clientPortalIdentity{ID: client.ID, Name: client.Name}, nil
 }
 
 func (r *clientRegistry) PortalClientActive(clientID, tokenHash string) bool {
@@ -459,6 +500,7 @@ func (r *clientRegistry) Create(name string, maxDevices int) (clientSummary, str
 		r.clients = r.clients[:len(r.clients)-1]
 		return clientSummary{}, "", err
 	}
+	r.rebuildTokenIndexLocked()
 	return summarizeClient(client, nil, usage.Snapshot{}), token, nil
 }
 
@@ -515,6 +557,7 @@ func (r *clientRegistry) RotateToken(id string) (string, error) {
 		client.TokenHash = previous
 		return "", err
 	}
+	r.rebuildTokenIndexLocked()
 	r.deleteAccountNoncesLocked(id)
 	stopped = r.sessionsLocked(id, "")
 	return token, nil
@@ -537,6 +580,7 @@ func (r *clientRegistry) Delete(id string) error {
 			r.clients = previous
 			return err
 		}
+		r.rebuildTokenIndexLocked()
 		r.deleteAccountNoncesLocked(id)
 		stopped = r.sessionsLocked(id, "")
 		return nil
@@ -561,7 +605,7 @@ func (r *clientRegistry) forgetDevice(clientID, deviceID string, store *usage.St
 				store.DeleteDevice(clientID, deviceID)
 			}
 			r.mu.Lock()
-			delete(r.retiring, key)
+			r.endDeviceRetirementLocked(key)
 			r.mu.Unlock()
 		}
 	}()
@@ -582,9 +626,9 @@ func (r *clientRegistry) forgetDevice(clientID, deviceID string, store *usage.St
 		delete(r.nonces, key)
 		stopped = r.sessionsLocked(clientID, deviceID)
 		if r.retiring == nil {
-			r.retiring = make(map[registryDeviceKey]bool)
+			r.retiring = make(map[registryDeviceKey]int)
 		}
-		r.retiring[key] = true
+		r.retiring[key]++
 		retired = true
 		return nil
 	}
@@ -616,10 +660,39 @@ func (r *clientRegistry) Disconnect(clientID, deviceID string) (int, error) {
 			return 0, os.ErrNotExist
 		}
 	}
+	if deviceID == "" {
+		if r.retiringAccounts == nil {
+			r.retiringAccounts = make(map[string]int)
+		}
+		r.retiringAccounts[clientID]++
+	} else {
+		key := registryDeviceKey{clientID, deviceID}
+		if r.retiring == nil {
+			r.retiring = make(map[registryDeviceKey]int)
+		}
+		r.retiring[key]++
+	}
 	stopped := r.sessionsLocked(clientID, deviceID)
 	r.mu.Unlock()
 	drainClientSessions(stopped)
+	r.mu.Lock()
+	if deviceID == "" {
+		r.retiringAccounts[clientID]--
+		if r.retiringAccounts[clientID] == 0 {
+			delete(r.retiringAccounts, clientID)
+		}
+	} else {
+		r.endDeviceRetirementLocked(registryDeviceKey{clientID, deviceID})
+	}
+	r.mu.Unlock()
 	return len(stopped), nil
+}
+
+func (r *clientRegistry) endDeviceRetirementLocked(key registryDeviceKey) {
+	r.retiring[key]--
+	if r.retiring[key] == 0 {
+		delete(r.retiring, key)
+	}
 }
 
 func (r *clientRegistry) sessionsLocked(accountID, deviceID string) []*activeClientSession {
@@ -653,17 +726,180 @@ func (r *clientRegistry) findLocked(id string) *clientRecord {
 	return nil
 }
 
+func (r *clientRegistry) rebuildTokenIndexLocked() {
+	r.tokenIndex = make(map[[sha256.Size]byte]tokenIndexEntry, len(r.clients))
+	for index := range r.clients {
+		decoded, err := hex.DecodeString(r.clients[index].TokenHash)
+		if err != nil || len(decoded) != sha256.Size {
+			continue
+		}
+		var digest [sha256.Size]byte
+		copy(digest[:], decoded)
+		if _, exists := r.tokenIndex[digest]; !exists {
+			r.tokenIndex[digest] = tokenIndexEntry{clientIndex: index, digest: digest}
+		}
+	}
+}
+
+func (r *clientRegistry) markMetadataDirtyLocked() {
+	r.metadataDirty = true
+	r.metadataVersion++
+	if !r.metadataWorkerOpen {
+		r.metadataWake = make(chan struct{}, 1)
+		r.metadataStop = make(chan struct{})
+		r.metadataDone = make(chan struct{})
+		r.metadataWorkerOpen = true
+		go r.runMetadataPersister()
+	}
+	select {
+	case r.metadataWake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *clientRegistry) runMetadataPersister() {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	timerActive := false
+	persistFailed := false
+	defer func() {
+		timer.Stop()
+		close(r.metadataDone)
+	}()
+	for {
+		select {
+		case <-r.metadataWake:
+			if !timerActive {
+				r.mu.Lock()
+				delay := r.metadataDebounce
+				r.mu.Unlock()
+				timer.Reset(delay)
+				timerActive = true
+			}
+		case <-timer.C:
+			timerActive = false
+			if err := r.flushMetadata(); err != nil {
+				if !persistFailed {
+					r.logger.Error("persist client registry metadata", "error", err)
+				}
+				persistFailed = true
+				r.mu.Lock()
+				delay := r.metadataDebounce
+				r.mu.Unlock()
+				timer.Reset(delay)
+				timerActive = true
+			} else if persistFailed {
+				r.logger.Info("client registry metadata persistence recovered")
+				persistFailed = false
+			}
+		case <-r.metadataStop:
+			err := r.flushMetadata()
+			if err == nil && persistFailed {
+				r.logger.Info("client registry metadata persistence recovered")
+			}
+			r.mu.Lock()
+			r.closeErr = err
+			r.mu.Unlock()
+			return
+		}
+	}
+}
+
+func (r *clientRegistry) flushMetadata() error {
+	r.mu.Lock()
+	if !r.metadataDirty {
+		r.mu.Unlock()
+		return nil
+	}
+	version := r.metadataVersion
+	data, sequence, err := r.snapshotLocked()
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := r.persistSnapshot(sequence, data); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.metadataVersion == version {
+		r.metadataDirty = false
+	}
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *clientRegistry) Close() error {
+	r.mu.Lock()
+	if !r.closed {
+		r.closed = true
+		if r.metadataWorkerOpen {
+			close(r.metadataStop)
+		}
+	}
+	done := r.metadataDone
+	err := r.closeErr
+	r.mu.Unlock()
+	if done == nil {
+		return errors.Join(err, r.retryDurabilitySync())
+	}
+	<-done
+	r.mu.Lock()
+	err = r.closeErr
+	r.mu.Unlock()
+	return errors.Join(err, r.retryDurabilitySync())
+}
+
 func (r *clientRegistry) persistLocked() error {
+	data, sequence, err := r.snapshotLocked()
+	if err != nil {
+		return err
+	}
+	if err := r.persistSnapshot(sequence, data); err != nil {
+		return err
+	}
+	r.metadataDirty = false
+	return nil
+}
+
+func (r *clientRegistry) snapshotLocked() ([]byte, uint64, error) {
 	state := registryState{Version: clientRegistryVersion, Clients: r.clients}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode client registry: %w", err)
+		return nil, 0, fmt.Errorf("encode client registry: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
+	r.nextPersistSeq++
+	return data, r.nextPersistSeq, nil
+}
+
+func (r *clientRegistry) persistSnapshot(sequence uint64, data []byte) error {
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	if sequence <= r.persistedSeq {
+		return nil
+	}
+	if err := r.writeState(data); err != nil {
+		return err
+	}
+	r.persistedSeq = sequence
+	return nil
+}
+
+func (r *clientRegistry) writeStateFile(data []byte) error {
+	directoryPath := filepath.Dir(r.path)
+	if err := os.MkdirAll(directoryPath, 0o700); err != nil {
 		return fmt.Errorf("create client registry directory: %w", err)
 	}
-	temp, err := os.CreateTemp(filepath.Dir(r.path), ".clients-*")
+	directory, err := os.Open(directoryPath)
+	if err != nil {
+		return fmt.Errorf("open client registry directory: %w", err)
+	}
+	defer func() {
+		if err := directory.Close(); err != nil {
+			r.logger.Warn("close client registry directory", "error", err)
+		}
+	}()
+	temp, err := os.CreateTemp(directoryPath, ".clients-*")
 	if err != nil {
 		return fmt.Errorf("create client registry temporary file: %w", err)
 	}
@@ -687,10 +923,45 @@ func (r *clientRegistry) persistLocked() error {
 	if err := os.Rename(tempName, r.path); err != nil {
 		return fmt.Errorf("replace client registry: %w", err)
 	}
-	if runtimeDir, err := os.Open(filepath.Dir(r.path)); err == nil {
-		_ = runtimeDir.Sync()
-		_ = runtimeDir.Close()
+	if err := r.syncDirectory(directory); err != nil {
+		err = fmt.Errorf("sync client registry directory after commit: %w", err)
+		r.setDurabilityError(err)
+		r.logger.Error("client registry update committed without directory sync", "error", err)
+		return nil
 	}
+	r.setDurabilityError(nil)
+	return nil
+}
+
+func (r *clientRegistry) setDurabilityError(err error) {
+	r.durabilityMu.Lock()
+	r.durabilityErr = err
+	r.durabilityMu.Unlock()
+}
+
+func (r *clientRegistry) currentDurabilityError() error {
+	r.durabilityMu.Lock()
+	defer r.durabilityMu.Unlock()
+	return r.durabilityErr
+}
+
+func (r *clientRegistry) retryDurabilitySync() error {
+	if r.currentDurabilityError() == nil {
+		return nil
+	}
+	directory, err := os.Open(filepath.Dir(r.path))
+	if err != nil {
+		return fmt.Errorf("reopen client registry directory for sync: %w", err)
+	}
+	defer func() {
+		if err := directory.Close(); err != nil {
+			r.logger.Warn("close client registry directory", "error", err)
+		}
+	}()
+	if err := r.syncDirectory(directory); err != nil {
+		return fmt.Errorf("retry client registry directory sync: %w", err)
+	}
+	r.setDurabilityError(nil)
 	return nil
 }
 

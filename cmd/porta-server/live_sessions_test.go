@@ -78,9 +78,9 @@ func TestRegistryRevocationsCancelAndDrainSessions(t *testing.T) {
 			if action == "forget" && otherCtx.Err() != nil {
 				t.Fatal("forget canceled another device")
 			}
-			if action == "forget" {
+			if action == "forget" || action == "disconnect" {
 				if _, err := authenticateTestDevice(registry, sessionTestToken, "phone"); !errors.Is(err, errDeviceDraining) {
-					t.Fatalf("device re-enrolled before old usage drained: %v", err)
+					t.Fatalf("device reconnected before old sessions drained: %v", err)
 				}
 			}
 			close(drained)
@@ -252,8 +252,9 @@ func TestLiveVPNRevocation(t *testing.T) {
 						t.Fatal("client did not observe revocation")
 					}
 				}
-				if active := store.Snapshot().Clients[id.AccountID].ActiveSessions; active != 0 {
-					t.Fatalf("usage still has %d active sessions after revocation", active)
+				snapshot := store.Snapshot()
+				if active := snapshot.Clients[id.AccountID].ActiveSessions; active != 0 {
+					t.Fatalf("usage still has %d active sessions after revocation: %#v", active, snapshot.Devices)
 				}
 			})
 		}

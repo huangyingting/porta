@@ -1,6 +1,7 @@
 package forwardproxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -23,6 +24,12 @@ const (
 	defaultMaxConnections = 128
 	tunnelIdleTimeout     = 5 * time.Minute
 	copyBufferSize        = 64 << 10
+	responseBufferSize    = 128 << 10
+	responseFlushInterval = 2 * time.Millisecond
+	destinationTimeout    = 10 * time.Second
+	dnsCacheTTL           = 30 * time.Second
+	dnsCacheEntries       = 256
+	happyEyeballsDelay    = 250 * time.Millisecond
 	DeviceID              = "forward-proxy"
 )
 
@@ -59,6 +66,10 @@ type Handler struct {
 	slots            chan struct{}
 	usage            *usage.Store
 	dial             func(context.Context, string, string) (net.Conn, error)
+	resolve          func(context.Context, string) ([]netip.Addr, error)
+	dialAddress      func(context.Context, string, string) (net.Conn, error)
+	dnsCache         *addressCache
+	now              func() time.Time
 }
 
 func New(config Config) (*Handler, error) {
@@ -84,7 +95,12 @@ func New(config Config) (*Handler, error) {
 		camouflage:       config.Camouflage,
 		slots:            make(chan struct{}, config.MaxConnections),
 		usage:            config.Usage,
+		resolve:          resolveHost,
+		dnsCache:         newAddressCache(dnsCacheEntries, dnsCacheTTL),
+		now:              time.Now,
 	}
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+	handler.dialAddress = dialer.DialContext
 	handler.dial = handler.dialPublic
 	return handler, nil
 }
@@ -132,7 +148,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"remote", remoteHost(r.RemoteAddr),
 	)
 	h.serveConnect(w, r, target, identity)
-	h.logger.Info("forward proxy request complete",
+	h.logger.Debug("forward proxy request complete",
 		"account_id", identity.AccountID,
 		"device_id", identity.DeviceID,
 		"method", r.Method,
@@ -187,7 +203,11 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target st
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	clientWriter := &flushWriter{writer: w, controller: http.NewResponseController(w)}
+	clientWriter := newFlushWriter(w, responseBufferSize, responseFlushInterval)
+	clientWriter.onFailure = func(error) {
+		closeTunnelEndpoints(upstream, r.Body, clientWriter)
+	}
+	defer clientWriter.Close()
 	stop := onSessionCancel(r.Context(), func() {
 		closeTunnelEndpoints(upstream, r.Body, clientWriter)
 	})
@@ -220,7 +240,15 @@ func (h *Handler) serveHijackedConnect(ctx context.Context, w http.ResponseWrite
 	if err := buffered.Flush(); err != nil {
 		return
 	}
-	copyStreamTunnel(ctx, upstream, buffered.Reader, &writeTimeoutConn{Conn: client})
+	copyStreamTunnel(
+		ctx,
+		upstream,
+		struct {
+			io.Reader
+			io.Closer
+		}{Reader: buffered.Reader, Closer: client},
+		&writeTimeoutConn{Conn: client},
+	)
 }
 
 func onSessionCancel(ctx context.Context, interrupt func()) func() {
@@ -244,30 +272,25 @@ func (h *Handler) dialPublic(ctx context.Context, network, address string) (net.
 	if port != "443" {
 		return nil, fmt.Errorf("%w: port %s", errDestinationDenied, port)
 	}
-	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, destinationTimeout)
 	defer cancel()
-	addresses, err := resolveHost(resolveCtx, host)
-	if err != nil {
-		return nil, err
-	}
-	for _, address := range addresses {
-		if !publicAddress(address) {
-			return nil, fmt.Errorf("%w: %s", errDestinationDenied, address)
+	addresses, ok := h.dnsCache.Get(host, h.now())
+	if !ok {
+		addresses, err = h.resolve(dialCtx, host)
+		if err != nil {
+			return nil, err
 		}
-	}
-	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	var lastErr error
-	for _, address := range addresses {
-		connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(address.String(), port))
-		if err == nil {
-			return connection, nil
+		for _, address := range addresses {
+			if !publicAddress(address) {
+				return nil, fmt.Errorf("%w: %s", errDestinationDenied, address)
+			}
 		}
-		lastErr = err
+		h.dnsCache.Put(host, addresses, h.now())
 	}
-	if lastErr == nil {
-		lastErr = errors.New("destination has no addresses")
+	if len(addresses) == 0 {
+		return nil, errors.New("destination has no addresses")
 	}
-	return nil, lastErr
+	return dialHappyEyeballs(dialCtx, h.dialAddress, network, port, addresses, happyEyeballsDelay)
 }
 
 func resolveHost(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -388,7 +411,12 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 		<-done
 		<-done
 	case completed := <-done:
-		if completed.direction == 1 || completed.err != nil {
+		if completed.direction == 1 && completed.err == nil {
+			closeTunnelInput(upstream, clientReader)
+			<-done
+			return
+		}
+		if completed.err != nil {
 			closeTunnelEndpoints(upstream, clientReader, clientWriter)
 			<-done
 			return
@@ -396,10 +424,20 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 		select {
 		case <-ctx.Done():
 			closeTunnelEndpoints(upstream, clientReader, clientWriter)
-		case <-done:
+		case completed = <-done:
+			if completed.err != nil {
+				closeTunnelEndpoints(upstream, clientReader, clientWriter)
+			}
 			return
 		}
 		<-done
+	}
+}
+
+func closeTunnelInput(upstream net.Conn, clientReader io.Reader) {
+	_ = upstream.Close()
+	if closer, ok := clientReader.(io.Closer); ok {
+		_ = closer.Close()
 	}
 }
 
@@ -407,13 +445,20 @@ func copyTunnelStream(destination io.Writer, source io.Reader) error {
 	buffer := copyBufferPool.Get().(*[]byte)
 	defer copyBufferPool.Put(buffer)
 	_, err := io.CopyBuffer(destination, source, *buffer)
+	if err == nil {
+		if flusher, ok := destination.(interface{ Flush() error }); ok {
+			err = flusher.Flush()
+		}
+	}
 	return err
 }
 
 func closeTunnelEndpoints(upstream net.Conn, clientReader io.Reader, clientWriter io.Writer) {
 	// Closing is terminal: an in-flight idle deadline refresh cannot undo it.
 	_ = upstream.Close()
-	if closer, ok := clientWriter.(io.Closer); ok {
+	if aborter, ok := clientWriter.(interface{ Abort() error }); ok {
+		_ = aborter.Abort()
+	} else if closer, ok := clientWriter.(io.Closer); ok {
 		_ = closer.Close()
 	}
 	if closer, ok := clientReader.(io.Closer); ok {
@@ -424,8 +469,17 @@ func closeTunnelEndpoints(upstream net.Conn, clientReader io.Reader, clientWrite
 type flushWriter struct {
 	writer     http.ResponseWriter
 	controller *http.ResponseController
-	mu         sync.Mutex
+	buffer     *bufio.Writer
+	writeMu    sync.Mutex
+	stateMu    sync.Mutex
 	closed     bool
+	pending    int
+	threshold  int
+	interval   time.Duration
+	timer      *time.Timer
+	timerID    uint64
+	failOnce   sync.Once
+	onFailure  func(error)
 }
 
 type idleConn struct {
@@ -505,33 +559,146 @@ func (c *idleConn) CloseWrite() error {
 }
 
 func (w *flushWriter) Write(data []byte) (int, error) {
-	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	if w.isClosed() {
 		return 0, net.ErrClosed
 	}
+	if len(data) == 0 {
+		return 0, w.flushLocked()
+	}
+	if w.buffer == nil {
+		w.buffer = bufio.NewWriterSize(w.writer, w.threshold)
+	}
+	n, err := w.buffer.Write(data)
+	w.pending += n
+	if err == nil && w.pending >= w.threshold {
+		w.stopTimerLocked()
+		err = w.flushLocked()
+	} else if err == nil && w.pending == n {
+		w.startTimerLocked()
+	}
+	return n, err
+}
+
+func (w *flushWriter) Close() error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	w.stopTimerLocked()
+	if w.isClosed() {
+		return nil
+	}
+	err := w.flushLocked()
+	w.stateMu.Lock()
+	w.closed = true
+	w.stateMu.Unlock()
+	return err
+}
+
+func (w *flushWriter) Abort() error {
+	w.stateMu.Lock()
+	if w.closed {
+		w.stateMu.Unlock()
+		return nil
+	}
+	w.closed = true
+	w.stateMu.Unlock()
+	err := w.controller.SetWriteDeadline(time.Now())
+	w.writeMu.Lock()
+	w.stopTimerLocked()
+	w.writeMu.Unlock()
+	return err
+}
+
+func (w *flushWriter) Flush() error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	w.stopTimerLocked()
+	if w.isClosed() {
+		return net.ErrClosed
+	}
+	return w.flushLocked()
+}
+
+func (w *flushWriter) flushLocked() error {
 	_ = w.controller.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
-	w.mu.Unlock()
-	n, err := w.writer.Write(data)
+	var err error
+	if w.pending > 0 && w.buffer != nil {
+		err = w.buffer.Flush()
+	}
 	if err == nil {
 		if flushErr := w.controller.Flush(); !errors.Is(flushErr, http.ErrNotSupported) {
 			err = flushErr
 		}
 	}
-	w.mu.Lock()
-	if !w.closed {
-		// Bound only a blocked write, not a healthy upload-only tunnel.
+	w.pending = 0
+	if !w.isClosed() {
+		// Bound only an in-flight write, not a healthy upload-only tunnel.
 		_ = w.controller.SetWriteDeadline(time.Time{})
 	}
-	w.mu.Unlock()
-	return n, err
+	return err
 }
 
-func (w *flushWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.closed = true
-	return w.controller.SetWriteDeadline(time.Now())
+func (w *flushWriter) isClosed() bool {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	return w.closed
+}
+
+func (w *flushWriter) startTimerLocked() {
+	if w.interval <= 0 || w.timer != nil {
+		return
+	}
+	w.timerID++
+	timerID := w.timerID
+	w.timer = time.AfterFunc(w.interval, func() {
+		w.flushPending(timerID)
+	})
+}
+
+func (w *flushWriter) stopTimerLocked() {
+	w.timerID++
+	if w.timer == nil {
+		return
+	}
+	w.timer.Stop()
+	w.timer = nil
+}
+
+func (w *flushWriter) flushPending(timerID uint64) {
+	w.writeMu.Lock()
+	if w.timerID != timerID {
+		w.writeMu.Unlock()
+		return
+	}
+	w.timer = nil
+	w.timerID++
+	if w.pending == 0 || w.isClosed() {
+		w.writeMu.Unlock()
+		return
+	}
+	err := w.flushLocked()
+	w.writeMu.Unlock()
+	if err != nil {
+		w.failOnce.Do(func() {
+			_ = w.Abort()
+			if w.onFailure != nil {
+				w.onFailure(err)
+			}
+		})
+	}
+}
+
+func newFlushWriter(writer http.ResponseWriter, threshold int, interval time.Duration) *flushWriter {
+	if threshold <= 0 {
+		threshold = responseBufferSize
+	}
+	return &flushWriter{
+		writer:     writer,
+		controller: http.NewResponseController(writer),
+		threshold:  threshold,
+		interval:   interval,
+	}
 }
 
 func writeProxyError(w http.ResponseWriter, err error) {

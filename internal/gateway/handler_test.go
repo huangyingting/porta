@@ -148,8 +148,12 @@ func TestParseLaneConfig(t *testing.T) {
 
 	request.Header.Set(laneIndexHeader, "1")
 	request.Header.Set(laneCountHeader, "2")
+	if _, err := parseLaneConfig(request); err != nil {
+		t.Fatalf("two-lane configuration rejected: %v", err)
+	}
+	request.Header.Set(laneCountHeader, "5")
 	if _, err := parseLaneConfig(request); err == nil {
-		t.Fatal("non-four-lane configuration accepted")
+		t.Fatal("too many lanes accepted")
 	}
 }
 

@@ -72,7 +72,7 @@ func ensureExtendedConnect() error {
 	return syscall.Exec(executable, os.Args, environment)
 }
 
-func run() error {
+func run() (returnErr error) {
 	address := flag.String("listen", ":8443", "listen address (TCP and UDP normally, TCP only behind a proxy)")
 	acmeDomain := flag.String("acme-domain", "", "domain for automatic Let's Encrypt certificates (required unless using --behind-proxy or static TLS)")
 	acmeEmail := flag.String("acme-email", "", "contact email for Let's Encrypt")
@@ -103,6 +103,14 @@ func run() error {
 	readinessDNSName := flag.String("readiness-dns-name", "", "optional name to resolve through --dns; failures do not gate local readiness")
 	flag.Parse()
 
+	var logHandler slog.Handler
+	if *jsonLogs {
+		logHandler = slog.NewJSONHandler(os.Stderr, nil)
+	} else {
+		logHandler = slog.NewTextHandler(os.Stderr, nil)
+	}
+	logger := slog.New(logHandler)
+
 	token := os.Getenv("PORTA_TOKEN")
 	if token == "" {
 		token = *tokenFlag
@@ -114,6 +122,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	registry.logger = logger
+	defer func() {
+		if err := registry.Close(); err != nil {
+			err = fmt.Errorf("flush client registry: %w", err)
+			if returnErr == nil {
+				returnErr = err
+			} else {
+				logger.Error("flush client registry during shutdown", "error", err)
+			}
+		}
+	}()
 	metricsToken := os.Getenv("PORTA_METRICS_TOKEN")
 	if metricsToken == "" {
 		metricsToken = *metricsTokenFlag
@@ -146,13 +165,6 @@ func run() error {
 		}
 	}
 
-	var logHandler slog.Handler
-	if *jsonLogs {
-		logHandler = slog.NewJSONHandler(os.Stderr, nil)
-	} else {
-		logHandler = slog.NewTextHandler(os.Stderr, nil)
-	}
-	logger := slog.New(logHandler)
 	if *usageStatePath == "" {
 		*usageStatePath = filepath.Join(filepath.Dir(*clientRegistryPath), "usage.json")
 	}
@@ -299,10 +311,9 @@ func run() error {
 	defer stop()
 	usageCtx, stopUsage := context.WithCancel(context.Background())
 	defer stopUsage()
-	usageDone := make(chan struct{})
+	usageDone := make(chan error, 1)
 	go func() {
-		defer close(usageDone)
-		usageStore.Run(usageCtx, 30*time.Second)
+		usageDone <- usageStore.Run(usageCtx, 30*time.Second)
 	}()
 	tcpServer.BaseContext = func(net.Listener) context.Context { return ctx }
 	var acmeHTTPServer *http.Server
@@ -385,7 +396,13 @@ func run() error {
 		logger.Warn("handlers still active during shutdown", "error", err)
 	}
 	stopUsage()
-	<-usageDone
+	if err := <-usageDone; err != nil {
+		if runErr == nil {
+			runErr = err
+		} else {
+			logger.Error("flush usage state during shutdown", "error", err)
+		}
+	}
 	return runErr
 }
 

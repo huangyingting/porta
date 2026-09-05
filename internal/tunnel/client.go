@@ -59,6 +59,7 @@ const (
 	DeliveryModeUnknown  DeliveryMode = ""
 	DeliveryModeCapsule  DeliveryMode = "capsule"
 	DeliveryModeDatagram DeliveryMode = "datagram"
+	DeliveryModeFramed   DeliveryMode = "framed"
 )
 
 type Conn struct {

@@ -20,7 +20,6 @@ import (
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"golang.org/x/net/http2"
 )
 
 const masqueRequestID uint64 = 1
@@ -119,10 +118,12 @@ func establishMasque(ctx context.Context, config Config) (*Conn, error) {
 		tlsConfig = tlsConfig.Clone()
 	}
 
+	if config.Transport == TransportHTTP2 {
+		return dialFramedHTTP2(ctx, config, endpoint, tlsConfig)
+	}
+
 	var client *masqueClient
 	switch config.Transport {
-	case TransportHTTP2:
-		client, err = dialMasqueHTTP2(ctx, config, endpoint, tlsConfig)
 	case TransportHTTP3:
 		client, err = dialMasqueHTTP3(ctx, config, endpoint, tlsConfig)
 	default:
@@ -175,73 +176,6 @@ func establishMasque(ctx context.Context, config Config) (*Conn, error) {
 		receivePacket: client.receive,
 		closePacket:   client.close,
 	}, nil
-}
-
-func dialMasqueHTTP2(
-	parent context.Context,
-	config Config,
-	endpoint *url.URL,
-	tlsConfig *tls.Config,
-) (*masqueClient, error) {
-	ctx, cancel := context.WithCancel(parent)
-	reader, writer := io.Pipe()
-	transport := &http2.Transport{
-		TLSClientConfig: tlsConfig,
-		ReadIdleTimeout: 30 * time.Second,
-		PingTimeout:     10 * time.Second,
-	}
-	var remoteAddr net.Addr
-	transport.DialTLSContext = func(ctx context.Context, network, address string, tlsOptions *tls.Config) (net.Conn, error) {
-		if config.DialAddress != "" {
-			address = config.DialAddress
-		}
-		connection, err := (&tls.Dialer{Config: tlsOptions}).DialContext(ctx, network, address)
-		if err == nil {
-			remoteAddr = connection.RemoteAddr()
-		}
-		return connection, err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodConnect, endpoint.String(), reader)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	if err := setMasqueHeaders(request, config); err != nil {
-		cancel()
-		return nil, err
-	}
-	request.Header.Set(":protocol", "connect-ip")
-	request.ContentLength = -1
-
-	response, err := timedRoundTrip(ctx, transport, request, config.Timeout)
-	if err != nil {
-		cancel()
-		_ = writer.CloseWithError(err)
-		transport.CloseIdleConnections()
-		return nil, preSessionFailure(fmt.Errorf("open HTTP/2 CONNECT-IP tunnel: %w", err))
-	}
-	if err := validateMasqueResponse(response); err != nil {
-		cancel()
-		_ = writer.CloseWithError(err)
-		_ = response.Body.Close()
-		transport.CloseIdleConnections()
-		return nil, err
-	}
-
-	client := newMasqueClient(ctx, cancel, masque.NewEncoder(writer), masque.NewDecoder(response.Body), response.Header)
-	client.remoteAddr = remoteAddr
-	client.deliveryMode = DeliveryModeCapsule
-	client.closeTransport = func() error {
-		_ = writer.Close()
-		_ = response.Body.Close()
-		transport.CloseIdleConnections()
-		return nil
-	}
-	if err := client.configureMTU(response.Header); err != nil {
-		_ = client.close()
-		return nil, err
-	}
-	return client, nil
 }
 
 func dialMasqueHTTP3(

@@ -8,9 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -159,9 +157,6 @@ func TestHTTP3AutomaticMTUEndToEnd(t *testing.T) {
 }
 
 func TestHTTP2AutomaticMTURetainsConfiguredMTU(t *testing.T) {
-	if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
-		t.Skip("set GODEBUG=http2xconnect=1 to exercise HTTP/2 Extended CONNECT")
-	}
 	handler, router, dev := testMTUGateway(t, false, 1300, true)
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true
@@ -197,8 +192,8 @@ func TestHTTP2AutomaticMTURetainsConfiguredMTU(t *testing.T) {
 	if connection.MTUCeiling != 0 {
 		t.Fatalf("HTTP/2 reported unexpected MTU ceiling %d", connection.MTUCeiling)
 	}
-	if connection.DeliveryMode != tunnel.DeliveryModeCapsule {
-		t.Fatalf("HTTP/2 delivery mode = %q, want capsule", connection.DeliveryMode)
+	if connection.DeliveryMode != tunnel.DeliveryModeFramed {
+		t.Fatalf("HTTP/2 delivery mode = %q, want framed", connection.DeliveryMode)
 	}
 	clientPacket := sizedIPv4Packet(connection.Lease.Address.Addr().As4(), [4]byte{1, 1, 1, 1}, connection.Lease.MTU)
 	if err := connection.Send(clientPacket); err != nil {

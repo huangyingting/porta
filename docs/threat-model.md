@@ -100,12 +100,14 @@ transport fingerprints from network inspection.
   owned server TUN, using `accept_local=1` and loose `rp_filter=2`. Incoming
   client packet sources must still match their authenticated lease. Physical
   interfaces and global reverse-path filtering are not weakened.
-- Android mitigates fallback head-of-line blocking with four independent
-  HTTP/2 connections, including a dedicated DNS lane. Loss can still stall all
-  flows assigned to the affected lane.
+- Native clients mitigate fallback head-of-line blocking with independent
+  HTTP/2 connections, a prioritized control lane, bounded queues, and
+  flow-pinned data lanes. Loss can still stall every flow assigned to the
+  affected lane, and a reverse proxy can accidentally collapse the lanes onto
+  one backend TCP connection.
 - Android prefers native HTTP/3 Extended CONNECT through the bundled Go
-  MASQUE bridge. It falls back to the private four-lane HTTP/2 transport when
-  UDP or HTTP/3 is unavailable.
+  MASQUE bridge. It falls back to the private adaptive multi-lane HTTP/2
+  transport when UDP or HTTP/3 is unavailable.
 - Android relies on the system trust store and does not offer an insecure TLS
   switch.
 - Linux automatic networking uses an owned nftables OUTPUT guard. Windows

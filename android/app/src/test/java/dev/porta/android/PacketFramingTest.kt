@@ -55,4 +55,23 @@ class PacketFramingTest {
             assertEquals(0L, stream.size)
         }
     }
+
+    @Test
+    fun readsIntoReusablePacketBufferWithoutAllocatingFrameArray() {
+        val stream = Buffer()
+            .writeShort(4)
+            .write(byteArrayOf(9, 8, 7, 6))
+            .writeShort(0)
+        val destination = ByteArray(16)
+
+        assertEquals(4, PacketFraming.readInto(stream, destination))
+        assertArrayEquals(byteArrayOf(9, 8, 7, 6), destination.copyOf(4))
+        assertNull(PacketFraming.readInto(stream, destination))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun readIntoRejectsUndersizedDestination() {
+        val stream = Buffer().writeShort(4).write(byteArrayOf(1, 2, 3, 4))
+        PacketFraming.readInto(stream, ByteArray(3))
+    }
 }

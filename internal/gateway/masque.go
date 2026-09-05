@@ -162,13 +162,17 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 
-	var outgoing <-chan []byte
+	var outgoingReady <-chan struct{}
 	ready := c.addressReady
 	for {
 		select {
 		case <-ready:
-			outgoing, ready = session.Outgoing, nil
-		case packet := <-outgoing:
+			outgoingReady, ready = session.ready(), nil
+		case <-outgoingReady:
+			packet, ok := session.dequeue()
+			if !ok {
+				continue
+			}
 			if useDatagrams {
 				send := func(packet []byte) error { return c.sendMasqueIPPacket(packet, stream.SendDatagram, encoder) }
 				if err := c.sendDownlink(sessionCtx, lease, packet, send, usageSession); err != nil {
@@ -176,18 +180,20 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 					return
 				}
 			} else {
+				batchBytes := 0
 			drain:
 				for count := 0; ; count++ {
 					if err := c.sendDownlink(sessionCtx, lease, packet, encoder.WriteIPPacket, usageSession); err != nil {
 						c.Logger.Warn("MASQUE send stopped", "client_id", proof.DeviceID, "error", err)
 						return
 					}
-					if count+1 >= streamPacketBatch {
+					batchBytes += len(packet)
+					if count+1 >= streamPacketBatch || batchBytes >= streamBatchBytes {
 						break
 					}
-					select {
-					case packet = <-session.Outgoing:
-					default:
+					var available bool
+					packet, available = session.dequeue()
+					if !available {
 						break drain
 					}
 				}

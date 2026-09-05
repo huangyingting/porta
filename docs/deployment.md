@@ -222,6 +222,10 @@ proxy requests are rejected, and only public destinations on port 443 are
 permitted.
 DNS results are checked before dialing, and any private, loopback, link-local,
 metadata, multicast, documentation, or benchmark address rejects the request.
+Only complete, validated public address sets enter the bounded 30-second DNS
+cache. IPv4 and IPv6 connection attempts are interleaved with a short stagger
+under one setup timeout, so an unreachable preferred family does not serialize
+the full connection delay.
 Proxy credentials and client-supplied forwarding identity headers are never
 sent to the destination.
 
@@ -235,7 +239,10 @@ password. ZeroOmega supplies the stored credentials after the CONNECT-only
 authentication challenge. All proxy clients for one account are represented by
 one `forward-proxy` enrollment and combined usage record; they cannot be managed
 individually. Porta
-does not serve a public PAC file and does not cache proxy responses.
+does not serve a public PAC file and does not cache proxy responses. Response
+stream writes are flushed after 128 KiB or two milliseconds, whichever comes
+first, preserving interactive latency without forcing a protocol flush for
+every relay-buffer write.
 
 The installer validates port availability before stopping an existing
 gateway. If the new service cannot obtain its certificate or pass the
@@ -281,9 +288,13 @@ the loopback health, readiness, metrics, and API listener.
 The deployment script deliberately does not edit or reload reverse-proxy
 configuration. When another service owns port 443, deploy Porta with
 `--port 8443`. A reverse proxy may forward HTTP/2 requests to that TLS
-listener for Android's four-lane fallback if it supports unbuffered duplex
-streaming, but native MASQUE clients should use `https://vpn.example.com:8443`
-directly so UDP traffic reaches Porta.
+listener for the native multi-lane fallback if it supports unbuffered duplex
+streaming. It must also preserve independent backend TCP connections for the
+logical lanes; multiplexing them onto one upstream HTTP/2 connection defeats
+most of their loss isolation. Porta logs this condition and increments
+`porta_http2_collapsed_lane_groups_total`. Configure an HTTP/1.1 upstream or
+connect clients directly when the metric increases. Native MASQUE clients
+should use `https://vpn.example.com:8443` directly so UDP traffic reaches Porta.
 
 ## Firewall
 
@@ -364,7 +375,12 @@ third-party firewall rules are not interpreted by the Porta rule checker.
 Metrics include `porta_router_dropped_packets_total{reason="..."}` for queue
 overflow, closed/missing sessions and invalid TUN packets, plus
 `porta_datagram_oversize_total` for datagrams carried by capsule fallback. The
-latter is not a dropped-packet counter.
+latter is not a dropped-packet counter. HTTP/2 queue diagnostics include
+`porta_router_queue_bytes{lane="..."}`,
+`porta_router_queue_bytes_high_water{lane="..."}`, and drop reasons
+`queue_tail`, `queue_oldest`, and `queue_expired`. A sustained queue or frequent
+TCP tail drops indicates that an outer TCP lane cannot drain at the offered
+rate; increasing queue limits would add latency rather than fix congestion.
 
 ## Android
 
@@ -380,9 +396,11 @@ as readable metadata.
 The app can store multiple VPN
 server profiles with Android Keystore-encrypted tokens, while allowing only one
 active connection. The status should show **HTTP/3 MASQUE**. If UDP is blocked,
-the app automatically uses four independent encrypted HTTP/2 connections on
-the same configured port. DNS uses a dedicated lane and other flows are hashed
-across three data lanes to limit TCP head-of-line blocking.
+the app starts an encrypted HTTP/2 control lane and one data lane on the same
+configured port, then activates up to two more independent data lanes when
+queue pressure, blocked writes, startup delay, or lane failures justify them.
+Flows remain pinned to the least-loaded healthy data lane; an individual lane
+can reconnect without restarting its healthy siblings.
 
 For the public test deployment:
 
