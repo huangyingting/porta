@@ -213,7 +213,7 @@ func run() error {
 	router := gateway.NewRouter(tunDevice, logger)
 	metrics := &gateway.Metrics{}
 	handler, err := gateway.NewHandler(gateway.HandlerConfig{
-		AuthorizeSession:  registry.AuthenticateSession,
+		AuthorizeSession:  registry.AuthenticateDeviceSession,
 		MetricsToken:      metricsToken,
 		Metrics:           metrics,
 		Usage:             usageStore,
@@ -246,11 +246,11 @@ func run() error {
 	if !*disableForwardProxy {
 		proxyHandler, err := forwardproxy.New(forwardproxy.Config{
 			Next: publicHandler,
-			AuthorizeSession: func(ctx context.Context, token, deviceID string) (forwardproxy.Identity, context.Context, func(), error) {
-				identity, sessionCtx, release, authorizeErr := registry.AuthenticateSession(ctx, token, deviceID)
+			AuthorizeSession: func(ctx context.Context, token, _ string) (forwardproxy.Identity, context.Context, func(), error) {
+				identity, sessionCtx, release, authorizeErr := registry.AuthenticateProxySession(ctx, token)
 				return forwardproxy.Identity{
 					AccountID: identity.AccountID,
-					DeviceID:  deviceID,
+					DeviceID:  forwardproxy.DeviceID,
 				}, sessionCtx, release, authorizeErr
 			},
 			Logger:     logger,

@@ -3,28 +3,60 @@
 package clientid
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+
+	"github.com/huangyingting/porta/internal/deviceauth"
 )
 
-func TestMachineIDFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "machine-id")
-	if id, err := fromMachineIDFile(path); id != "" || !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing OS identity did not fail explicitly: %q, %v", id, err)
-	}
-	if err := os.WriteFile(path, []byte("00112233445566778899aabbccddeeff\n"), 0o600); err != nil {
+func TestPersistentIdentityReusesKeyAndRefreshesName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.json")
+	firstKey, err := loadOrCreate(path, passthrough, passthrough)
+	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := derive("linux", "00112233445566778899aabbccddeeff")
-	if id, err := fromMachineIDFile(path); err != nil || id != want {
-		t.Fatalf("machine ID file was not used: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("uninitialized\n"), 0o600); err != nil {
+	secondKey, err := loadOrCreate(path, passthrough, passthrough)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if id, err := fromMachineIDFile(path); id != "" || err == nil {
-		t.Fatalf("uninitialized OS identity did not fail explicitly: %q, %v", id, err)
+	firstID, _ := deviceauth.DeviceID(firstKey.Public())
+	secondID, _ := deviceauth.DeviceID(secondKey.Public())
+	if firstID != secondID {
+		t.Fatalf("persistent device ID changed: %q != %q", firstID, secondID)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("identity permissions = %v, %v", info, err)
+	}
+}
+
+func TestConcurrentCreationProducesOneIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.json")
+	const workers = 12
+	results := make(chan string, workers)
+	var group sync.WaitGroup
+	for range workers {
+		group.Go(func() {
+			key, err := loadOrCreate(path, passthrough, passthrough)
+			if err != nil {
+				results <- "error:" + err.Error()
+				return
+			}
+			id, _ := deviceauth.DeviceID(key.Public())
+			results <- id
+		})
+	}
+	group.Wait()
+	close(results)
+	var expected string
+	for result := range results {
+		if expected == "" {
+			expected = result
+		}
+		if result != expected {
+			t.Fatalf("concurrent identity mismatch: %q != %q", result, expected)
+		}
 	}
 }

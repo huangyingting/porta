@@ -76,18 +76,12 @@ func Open(path string, protector Protector) (*Store, error) {
 	if err := json.Unmarshal(data, &store.state); err != nil {
 		return nil, fmt.Errorf("decode profile store: %w", err)
 	}
-	if store.state.Version != 1 && store.state.Version != stateVersion {
+	if store.state.Version != stateVersion {
 		return nil, fmt.Errorf("unsupported profile store version %d", store.state.Version)
 	}
 	for index := range store.state.Profiles {
 		if err := validate(store.state.Profiles[index].Profile); err != nil {
 			return nil, fmt.Errorf("profile %d: %w", index+1, err)
-		}
-	}
-	if store.state.Version != stateVersion {
-		store.state.Version = stateVersion
-		if err := store.persistLocked(); err != nil {
-			return nil, fmt.Errorf("upgrade profile store: %w", err)
 		}
 	}
 	return store, nil

@@ -22,6 +22,7 @@ import (
 
 	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/device"
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
@@ -120,7 +121,7 @@ type clientConnection struct {
 	transport  tunnel.Transport
 }
 
-func run(ctx context.Context, resolveIdentity func() (string, error), config Config, observer Observer, dial func(context.Context, tunnel.Config) (*clientConnection, error), openDevice func(string, int) (device.PacketDevice, error)) (runErr error) {
+func run(ctx context.Context, resolveIdentity func() (*clientid.Identity, error), config Config, observer Observer, dial func(context.Context, tunnel.Config) (*clientConnection, error), openDevice func(string, int) (device.PacketDevice, error)) (runErr error) {
 	if strings.TrimSpace(config.ServerURL) == "" || config.Token == "" {
 		return errors.New("server URL and token are required")
 	}
@@ -150,17 +151,19 @@ func run(ctx context.Context, resolveIdentity func() (string, error), config Con
 	if err != nil {
 		return err
 	}
-	deviceID, err := resolveIdentity()
+	identity, err := resolveIdentity()
 	if err != nil {
-		return fmt.Errorf("resolve OS device identity: %w", err)
+		return fmt.Errorf("resolve device identity: %w", err)
 	}
 	tunnelConfig := tunnel.Config{
 		URL:       config.ServerURL,
 		Token:     config.Token,
-		ClientID:  deviceID,
 		Transport: config.Transport,
 		TLSConfig: tlsConfig,
 		Timeout:   15 * time.Second,
+		DeviceProof: func(method, path string) (deviceauth.Proof, error) {
+			return identity.Proof(config.Token, method, path)
+		},
 	}
 	var (
 		tunDevice      device.PacketDevice
@@ -222,7 +225,7 @@ func run(ctx context.Context, resolveIdentity func() (string, error), config Con
 		emitSnapshot(observer, state, message, lease, transport, connectedAt, &totals)
 		return err
 	}
-	emit(observer, Event{State: StateConnecting, Message: "Device ID: " + deviceID + " (OS derived)", Transport: transport})
+	emit(observer, Event{State: StateConnecting, Message: "Device: " + identity.Name + " (" + identity.ID + ")", Transport: transport})
 	emit(observer, Event{State: StateConnecting, Message: "Connecting", Transport: transport})
 	var endpoints []net.Addr
 	if recovery, ok := config.Network.(NetworkRecoveryEndpoints); ok && prepareNetwork != nil {

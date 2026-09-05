@@ -88,6 +88,10 @@ func TestDialerCloseCancelsDial(t *testing.T) {
 		"https://vpn.example.com:8443",
 		"0123456789abcdef",
 		"android-test",
+		"",
+		"",
+		"",
+		"",
 		"127.0.0.1",
 		protector,
 	)

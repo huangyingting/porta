@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
@@ -92,8 +93,8 @@ func establishWithTimeout(ctx context.Context, timeout time.Duration, establish 
 }
 
 func establishMasque(ctx context.Context, config Config) (*Conn, error) {
-	if config.URL == "" || config.Token == "" || config.ClientID == "" {
-		return nil, PermanentError{Err: errors.New("URL, token, and client ID are required")}
+	if config.URL == "" || config.Token == "" || config.DeviceProof == nil {
+		return nil, PermanentError{Err: errors.New("URL, token, and device proof signer are required")}
 	}
 	if config.Transport == "" {
 		config.Transport = TransportHTTP3
@@ -205,7 +206,10 @@ func dialMasqueHTTP2(
 		cancel()
 		return nil, err
 	}
-	setMasqueHeaders(request, config)
+	if err := setMasqueHeaders(request, config); err != nil {
+		cancel()
+		return nil, err
+	}
 	request.Header.Set(":protocol", "connect-ip")
 	request.ContentLength = -1
 
@@ -322,7 +326,13 @@ func dialMasqueHTTP3(
 		Proto:  "connect-ip",
 		Header: make(http.Header),
 	}
-	setMasqueHeaders(request, config)
+	if err := setMasqueHeaders(request, config); err != nil {
+		cancel()
+		stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		_ = clientConnection.CloseWithError(0, "")
+		return nil, err
+	}
 	request.Header.Set(masque.MTUDiscoveryHeader, "1")
 	if err := stream.SendRequestHeader(request); err != nil {
 		cancel()
@@ -607,11 +617,19 @@ func (m *masqueClient) close() error {
 	return result
 }
 
-func setMasqueHeaders(request *http.Request, config Config) {
+func setMasqueHeaders(request *http.Request, config Config) error {
+	if config.DeviceProof == nil {
+		return PermanentError{Err: errors.New("device proof signer is required")}
+	}
+	proof, err := config.DeviceProof(request.Method, request.URL.Path)
+	if err != nil {
+		return PermanentError{Err: fmt.Errorf("create device proof: %w", err)}
+	}
 	request.Header.Set("Authorization", "Bearer "+config.Token)
 	request.Header.Set(http3.CapsuleProtocolHeader, "?1")
-	request.Header.Set("X-Porta-Client-ID", config.ClientID)
+	deviceauth.Apply(request, proof)
 	request.Header.Set(protocol.HeaderVersion, protocol.Version)
+	return nil
 }
 
 func validateMasqueResponse(response *http.Response) error {

@@ -72,4 +72,18 @@ class ProfileSwipeGestureTest {
         assertEquals(ProfileSwipeAction.DELETE, swipe.finish(0f, 100f))
         assertNull(swipe.finish(0f, 100f))
     }
+
+    @Test
+    fun fullCardWidthIsRequiredInBothDirections() {
+        for (width in listOf(296f, 342f, 744f)) {
+            for ((direction, expected) in listOf(1f to ProfileSwipeAction.EDIT, -1f to ProfileSwipeAction.DELETE)) {
+                val partial = ProfileSwipeGesture(8f, width).apply { begin(400f, 100f) }
+                partial.move(400f + direction * width * 0.95f, 102f)
+                assertFalse(partial.isArmed)
+                assertNull(partial.finish(400f + direction * (width - 1f), 102f))
+                val full = ProfileSwipeGesture(8f, width).apply { begin(400f, 100f) }
+                assertEquals(expected, full.finish(400f + direction * width, 102f))
+            }
+        }
+    }
 }

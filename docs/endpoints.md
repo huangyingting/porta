@@ -18,18 +18,37 @@
 
 - `CONNECT /.well-known/masque/ip/*/*/` is the RFC 9484 unrestricted IPv4
   MASQUE endpoint. It requires Extended CONNECT with `:protocol=connect-ip`,
-  `Capsule-Protocol: ?1`, a bearer token, a stable client ID, and a supported
-  Porta protocol version.
+  `Capsule-Protocol: ?1`, a bearer token, a signed native-device proof, and a
+  supported Porta protocol version.
 - `POST /v1/tunnel` is Android's authenticated four-lane HTTP/2 fallback.
-  Requests without valid lane metadata or a supported protocol version are
-  rejected.
+  Every lane carries an independent signed native-device proof; requests
+  without valid lane metadata or a supported protocol version are rejected.
 - Standard HTTP `CONNECT` requests form the authenticated HTTPS forward proxy.
-  The Basic-auth username is a device ID and the password is a client token.
+  The Basic-auth username is ignored and the password is a client token. All
+  forward-proxy requests for an account use the logical device ID
+  `forward-proxy`.
 
-A token identifies a client account. `X-Porta-Client-ID` identifies one device
-under that account. Porta sends optional `X-Porta-DNS` and `X-Porta-MTU`
-response extensions because RFC 9484 does not define DNS or link-MTU
-configuration.
+A token identifies a client account. Native requests additionally send:
+
+- `X-Porta-Client-ID`: the `d-...` fingerprint of the P-256 public key;
+- `X-Porta-Device-Name`: normalized client-reported OS name;
+- `X-Porta-Device-Key`: Base64URL DER SubjectPublicKeyInfo;
+- `X-Porta-Device-Time`: Unix timestamp;
+- `X-Porta-Device-Nonce`: random 16-byte Base64URL nonce;
+- `X-Porta-Device-Signature`: ECDSA signature over the method, path, device
+  fields, timestamp, nonce, and a hash of the account token.
+
+The server derives the ID from the public key, verifies the signature and
+five-minute clock window, and rejects a nonce reused for the same
+account/device while the process remains running. Replay state is bounded to
+2048 recent nonces per device; further proofs are rejected until entries
+expire. Each connection attempt and each Android HTTP/2 lane uses a fresh
+nonce. The nonce cache is intentionally in-memory; a restart forgets it, so TLS
+and the short timestamp window remain part of replay protection. Forward-proxy
+requests do not use this protocol.
+
+Porta sends optional `X-Porta-DNS` and `X-Porta-MTU` response extensions because
+RFC 9484 does not define DNS or link-MTU configuration.
 
 HTTP/3 clients additionally request the optional
 `X-Porta-MTU-Discovery: 1` capability. Server-side `--auto-mtu` is enabled by
@@ -110,9 +129,12 @@ endpoint or an exported Android deep link. Import always requires reviewing
 and saving a new profile, and does not import a device ID or auto-connect/TLS
 override settings.
 
-Android resolves its device ID from `Settings.Secure.ANDROID_ID` when starting
-the VPN, independently of profile storage, QR/paste payloads, and Intent extras.
-The ID is an OS-provided enrollment label, not proof of genuine physical hardware.
+Android reads `Settings.Global.DEVICE_NAME` independently of profile storage,
+QR/paste payloads, and Intent extras, falling back to `Build.MODEL`, then
+`android` if neither is usable. Windows and Linux use their OS machine name.
+Names are normalized to a 1-64-character ASCII format and sent as mutable
+metadata. The immutable enrollment ID is derived from the client-generated
+public key, so duplicate names coexist and renaming does not consume a slot.
 
 ## Session administration
 

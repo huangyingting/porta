@@ -96,7 +96,7 @@ func TestAdminAPIIncludesLiveClientAndDeviceUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := registry.Authenticate("bootstrap-token-0123456789", "phone")
+	identity, err := authenticateTestDevice(registry, "bootstrap-token-0123456789", "phone")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestAdminAPIIncludesLiveClientAndDeviceUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := usageStore.Begin("vpn:test", identity.AccountID, "phone", "masque-h3-datagram", "10.66.0.2", "")
+	session := usageStore.Begin("vpn:test", identity.AccountID, testDeviceID("phone"), "masque-h3-datagram", "10.66.0.2", "")
 	session.AddUploaded(512, 2)
 	session.AddDownloaded(1024, 4)
 	handler := adminHandlerWithUsage(http.NotFoundHandler(), registry, usageStore, testAdminToken)

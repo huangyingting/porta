@@ -13,11 +13,11 @@ func TestClientRegistrySharedTokenAndDeviceLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := registry.Authenticate("bootstrap-token-0123456789", "phone")
+	first, err := authenticateTestDevice(registry, "bootstrap-token-0123456789", "phone")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := registry.Authenticate("bootstrap-token-0123456789", "tablet")
+	second, err := authenticateTestDevice(registry, "bootstrap-token-0123456789", "tablet")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,13 +29,13 @@ func TestClientRegistrySharedTokenAndDeviceLimit(t *testing.T) {
 	if _, err := registry.Update(client.ID, client.Name, 2, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Authenticate("bootstrap-token-0123456789", "laptop"); !errors.Is(err, errDeviceLimit) {
+	if _, err := authenticateTestDevice(registry, "bootstrap-token-0123456789", "laptop"); !errors.Is(err, errDeviceLimit) {
 		t.Fatalf("third device error = %v, want device limit", err)
 	}
-	if err := registry.DeleteDevice(client.ID, "tablet"); err != nil {
+	if err := registry.DeleteDevice(client.ID, testDeviceID("tablet")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Authenticate("bootstrap-token-0123456789", "laptop"); err != nil {
+	if _, err := authenticateTestDevice(registry, "bootstrap-token-0123456789", "laptop"); err != nil {
 		t.Fatalf("replacement device rejected: %v", err)
 	}
 }
@@ -53,7 +53,7 @@ func TestClientRegistryCreateRotateDisableAndPersist(t *testing.T) {
 	if token == "" {
 		t.Fatal("created token is empty")
 	}
-	if _, err := registry.Authenticate(token, "workstation"); err != nil {
+	if _, err := authenticateTestDevice(registry, token, "workstation"); err != nil {
 		t.Fatal(err)
 	}
 	rotated, err := registry.RotateToken(client.ID)
@@ -63,16 +63,16 @@ func TestClientRegistryCreateRotateDisableAndPersist(t *testing.T) {
 	if rotated == token {
 		t.Fatal("token rotation returned the previous token")
 	}
-	if _, err := registry.Authenticate(token, "workstation"); !errors.Is(err, errClientUnauthorized) {
+	if _, err := authenticateTestDevice(registry, token, "workstation"); !errors.Is(err, errClientUnauthorized) {
 		t.Fatalf("old token error = %v", err)
 	}
-	if _, err := registry.Authenticate(rotated, "workstation"); err != nil {
+	if _, err := authenticateTestDevice(registry, rotated, "workstation"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := registry.Update(client.ID, "Engineering", 3, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Authenticate(rotated, "workstation"); !errors.Is(err, errClientDisabled) {
+	if _, err := authenticateTestDevice(registry, rotated, "workstation"); !errors.Is(err, errClientDisabled) {
 		t.Fatalf("disabled client error = %v", err)
 	}
 
@@ -101,11 +101,11 @@ func TestClientRegistryNamespacesSameDeviceAcrossClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := registry.Authenticate("bootstrap-token-0123456789", "phone")
+	first, err := authenticateTestDevice(registry, "bootstrap-token-0123456789", "phone")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := registry.Authenticate(token, "phone")
+	second, err := authenticateTestDevice(registry, token, "phone")
 	if err != nil {
 		t.Fatal(err)
 	}

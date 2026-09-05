@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/protocol"
 )
 
@@ -19,7 +20,7 @@ func TestSessionCancellationInterruptsBlockedStreamWrite(t *testing.T) {
 	}
 	released := make(chan struct{})
 	handler, err := NewHandler(HandlerConfig{
-		AuthorizeSession: func(parent context.Context, _, _ string) (ClientIdentity, context.Context, func(), error) {
+		AuthorizeSession: func(parent context.Context, _ string, _ deviceauth.Proof, _, _ string) (ClientIdentity, context.Context, func(), error) {
 			return ClientIdentity{AccountID: "account", LeaseID: "lease"}, parent, func() { close(released) }, nil
 		},
 		Pool: pool, Router: NewRouter(testPacketDevice{}, nil), MTU: 1100,
@@ -34,7 +35,6 @@ func TestSessionCancellationInterruptsBlockedStreamWrite(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, TunnelPath, body).WithContext(ctx)
 	request.ProtoMajor = 2
 	request.Header.Set("Authorization", "Bearer session-token-0123456789")
-	request.Header.Set("X-Porta-Client-ID", "phone")
 	request.Header.Set("Content-Type", protocol.ContentType)
 	request.Header.Set(protocol.HeaderVersion, protocol.Version)
 	request.Header.Set(laneSessionHeader, "session-test-12345678")
@@ -80,7 +80,7 @@ func TestSessionCancellationInterruptsInitialMasqueResponse(t *testing.T) {
 			}
 			released := make(chan struct{})
 			handler, err := NewHandler(HandlerConfig{
-				AuthorizeSession: func(parent context.Context, _, _ string) (ClientIdentity, context.Context, func(), error) {
+				AuthorizeSession: func(parent context.Context, _ string, _ deviceauth.Proof, _, _ string) (ClientIdentity, context.Context, func(), error) {
 					return ClientIdentity{AccountID: "account", LeaseID: "lease"}, parent, func() { close(released) }, nil
 				},
 				Pool: pool, Router: NewRouter(testPacketDevice{}, nil), MTU: 1100,
@@ -95,7 +95,6 @@ func TestSessionCancellationInterruptsInitialMasqueResponse(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, MasquePath, body).WithContext(ctx)
 			request.Method, request.ProtoMajor, request.Proto = http.MethodConnect, test.proto, connectIPProtocol
 			request.Header.Set("Authorization", "Bearer session-token-0123456789")
-			request.Header.Set("X-Porta-Client-ID", "phone")
 			request.Header.Set(":protocol", connectIPProtocol)
 			request.Header.Set("Capsule-Protocol", "?1")
 			request.Header.Set(protocol.HeaderVersion, protocol.Version)

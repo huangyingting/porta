@@ -28,38 +28,44 @@ internal data class VpnProfile(
 internal class VpnProfileStore(private val context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
-    fun profiles(): List<VpnProfile> {
-        val stored = readProfiles() ?: return emptyList()
-        if (stored.needsUpgrade && !write(stored.profiles)) {
-            Log.e(TAG, "Could not upgrade profile storage; existing encrypted records were retained")
-        }
-        return stored.profiles
-    }
+    fun profiles(): List<VpnProfile> = readProfiles() ?: emptyList()
 
-    private data class StoredProfiles(val profiles: List<VpnProfile>, val needsUpgrade: Boolean)
-
-    private fun readProfiles(): StoredProfiles? {
-        val encoded = preferences.getString(KEY_PROFILES, null) ?: return StoredProfiles(emptyList(), false)
+    private fun readProfiles(): List<VpnProfile>? {
+        val encoded = preferences.getString(KEY_PROFILES, null) ?: return emptyList()
         return try {
             val entries = JSONArray(encoded)
+            for (index in 0 until entries.length()) {
+                val entry = entries.getJSONObject(index)
+                if (entry.optInt(KEY_VERSION, LEGACY_PROFILE_VERSION) == LEGACY_PROFILE_VERSION) {
+                    clearLegacyProfiles()
+                    return emptyList()
+                }
+            }
             val profiles = mutableListOf<VpnProfile>()
-            var needsUpgrade = false
             for (index in 0 until entries.length()) {
                 val entry = entries.getJSONObject(index)
                 val profile = decode(entry) ?: return null
                 profiles += profile
-                if (entry.optInt(KEY_VERSION, 1) != ProfileTokenFormat.VERSION) needsUpgrade = true
             }
-            StoredProfiles(profiles, needsUpgrade)
+            profiles
         } catch (error: JSONException) {
             Log.e(TAG, "Could not read VPN profiles", error)
             null
         }
     }
 
+    @SuppressLint("ApplySharedPref")
+    private fun clearLegacyProfiles() {
+        Log.w(TAG, "Clearing unsupported legacy VPN profiles")
+        preferences.edit()
+            .remove(KEY_PROFILES)
+            .remove(KEY_SELECTED_PROFILE)
+            .commit()
+    }
+
     fun save(profile: VpnProfile): Boolean {
         val stored = readProfiles() ?: return false
-        val updated = stored.profiles.filterNot { it.id == profile.id }.toMutableList()
+        val updated = stored.filterNot { it.id == profile.id }.toMutableList()
         if (profile.autoConnect) {
             for (index in updated.indices) {
                 updated[index] = updated[index].copy(autoConnect = false)
@@ -71,7 +77,7 @@ internal class VpnProfileStore(private val context: Context) {
 
     fun delete(profileId: String): Boolean {
         val stored = readProfiles() ?: return false
-        return write(stored.profiles.filterNot { it.id == profileId })
+        return write(stored.filterNot { it.id == profileId })
     }
 
     fun selectedProfileId(): String? = preferences.getString(KEY_SELECTED_PROFILE, null)
@@ -114,7 +120,9 @@ internal class VpnProfileStore(private val context: Context) {
 
     private fun decode(entry: JSONObject): VpnProfile? {
         return try {
-            val version = entry.optInt(KEY_VERSION, 1)
+            if (entry.getInt(KEY_VERSION) != ProfileTokenFormat.VERSION) {
+                throw JSONException("Unsupported profile storage version")
+            }
             val profile = VpnProfile(
                 id = entry.getString(KEY_ID),
                 name = entry.getString(KEY_NAME),
@@ -128,14 +136,7 @@ internal class VpnProfileStore(private val context: Context) {
                 encryptionKey(),
                 GCMParameterSpec(128, Base64.decode(entry.getString(KEY_IV), Base64.NO_WRAP)),
             )
-            cipher.updateAAD(
-                ProfileTokenFormat.associatedData(
-                    profile.id,
-                    profile.server,
-                    version,
-                    if (version == 1) entry.getString(KEY_PREVIOUS_CLIENT_ID) else null,
-                ),
-            )
+            cipher.updateAAD(ProfileTokenFormat.associatedData(profile.id, profile.server))
             profile.copy(
                 token = cipher.doFinal(Base64.decode(entry.getString(KEY_TOKEN), Base64.NO_WRAP))
                     .toString(Charsets.UTF_8),
@@ -184,10 +185,10 @@ internal class VpnProfileStore(private val context: Context) {
         private const val KEY_NAME = "name"
         private const val KEY_SERVER = "server"
         private const val KEY_VERSION = "version"
-        private const val KEY_PREVIOUS_CLIENT_ID = "client_id"
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_IV = "iv"
         private const val KEY_TOKEN = "token"
+        private const val LEGACY_PROFILE_VERSION = 1
     }
 }
 

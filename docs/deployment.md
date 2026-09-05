@@ -209,7 +209,7 @@ fallback.
 ## Forward proxy
 
 The forward proxy uses the same client accounts managed by the admin UI. The
-Basic-auth username is a stable device ID and the password is the client token:
+Basic-auth username is ignored and the password is the client token:
 
 ```sh
 curl --proxy https://vpn.example.com:8443 \
@@ -229,10 +229,12 @@ Valid Basic credentials activate the proxy. Porta returns a standard `407`
 challenge only for CONNECT requests so browser extensions can supply stored
 credentials. Ordinary unauthenticated requests still fall through to the
 landing or unsupported-request behavior.
-Configure ZeroOmega with type **HTTPS**, the Porta hostname and port, a stable
-device ID such as `chrome-zeroomega` as the username, and the client token as
-the password. ZeroOmega supplies the stored credentials after the CONNECT-only
-authentication challenge. Porta
+Configure ZeroOmega with type **HTTPS**, enter the Porta hostname and port, put
+any value in its required username field, and use the client token as the
+password. ZeroOmega supplies the stored credentials after the CONNECT-only
+authentication challenge. All proxy clients for one account are represented by
+one `forward-proxy` enrollment and combined usage record; they cannot be managed
+individually. Porta
 does not serve a public PAC file and does not cache proxy responses.
 
 The installer validates port availability before stopping an existing
@@ -371,8 +373,11 @@ Install the APK, tap **Add profile**, and enter the direct endpoint:
 - Default port 443: `https://vpn.example.com`
 - Alternate port: `https://vpn.example.com:8443`
 
-Give the profile a recognizable name, enter the token and a stable device ID,
-then save it and enable its connection switch. The app can store multiple VPN
+Give the profile a recognizable name and enter the token, then save it and
+enable its connection switch. Android generates the immutable device identity
+in Android Keystore and reports the device name, with a model-name fallback,
+as readable metadata.
+The app can store multiple VPN
 server profiles with Android Keystore-encrypted tokens, while allowing only one
 active connection. The status should show **HTTP/3 MASQUE**. If UDP is blocked,
 the app automatically uses four independent encrypted HTTP/2 connections on

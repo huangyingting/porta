@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"reflect"
@@ -15,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/device"
+	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go"
 )
@@ -67,7 +70,7 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 	defer cancel()
 	calls := 0
 	identityCalls := 0
-	resolveIdentity := func() (string, error) {
+	resolveIdentity := func() (*clientid.Identity, error) {
 		identityCalls++
 		return testIdentity()
 	}
@@ -82,8 +85,9 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 		}
 	}, func(_ context.Context, config tunnel.Config) (*clientConnection, error) {
 		calls++
-		if want, _ := testIdentity(); config.ClientID != want {
-			t.Fatal("retry or fallback lost OS-derived identity")
+		proof, proofErr := config.DeviceProof(http.MethodConnect, gateway.MasquePath)
+		if want, _ := testIdentity(); proofErr != nil || proof.DeviceID != want.ID || proof.Name != want.Name {
+			t.Fatalf("retry or fallback lost device identity: proof=%#v error=%v", proof, proofErr)
 		}
 		if calls <= 2 || config.Transport == tunnel.TransportHTTP3 {
 			return nil, tunnel.TransportUnavailableError{Err: context.DeadlineExceeded}
@@ -98,15 +102,15 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 }
 
 func TestUnavailableIdentityDoesNotDialOrChangeNetworking(t *testing.T) {
-	missing := errors.New("OS identifier unavailable")
+	missing := errors.New("machine name unavailable")
 	network := &recoveryNetwork{}
-	err := run(context.Background(), func() (string, error) { return "", missing },
+	err := run(context.Background(), func() (*clientid.Identity, error) { return nil, missing },
 		Config{ServerURL: "https://192.0.2.1", Token: "token", Network: network}, nil,
 		func(context.Context, tunnel.Config) (*clientConnection, error) {
-			t.Fatal("dialed without an OS identity")
+			t.Fatal("dialed without a machine-name identity")
 			return nil, nil
 		}, func(string, int) (device.PacketDevice, error) {
-			t.Fatal("opened a device without an OS identity")
+			t.Fatal("opened a device without a machine-name identity")
 			return nil, nil
 		})
 	if !errors.Is(err, missing) || network.guard || network.prepared != 0 || network.up != 0 || network.down != 0 {

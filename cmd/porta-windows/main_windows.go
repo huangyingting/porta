@@ -131,7 +131,7 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 	ui.NewStatic(window, ui.OptsStatic().Text("Gateway URL").Position(ui.Dpi(24, 178)))
 	app.server = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 198)).Width(ui.DpiX(560)).Height(ui.DpiY(25)))
 	ui.NewStatic(window, ui.OptsStatic().Text("Device identity").Position(ui.Dpi(24, 236)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Supplied automatically by Windows").
+	ui.NewStatic(window, ui.OptsStatic().Text("Security key + computer name").
 		Position(ui.Dpi(24, 256)).Size(ui.Dpi(270, 25)))
 	ui.NewStatic(window, ui.OptsStatic().Text("Client token").Position(ui.Dpi(310, 236)))
 	app.token = ui.NewEdit(window, ui.OptsEdit().

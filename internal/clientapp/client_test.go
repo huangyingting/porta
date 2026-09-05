@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/device"
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
@@ -66,8 +68,20 @@ func (n testNetwork) Up(ctx context.Context, name string, _ net.Addr, _ tunnel.L
 }
 func (n testNetwork) Down(ctx context.Context) error { return n.down(ctx) }
 
-func testIdentity() (string, error) {
-	return "os-derived-test-device", nil
+var testClientIdentity = func() *clientid.Identity {
+	key, err := deviceauth.GenerateKey()
+	if err != nil {
+		panic(err)
+	}
+	identity, err := clientid.New(key, "Office-PC")
+	if err != nil {
+		panic(err)
+	}
+	return identity
+}()
+
+func testIdentity() (*clientid.Identity, error) {
+	return testClientIdentity, nil
 }
 
 func runTestClient(ctx context.Context, config Config, observer Observer, connection *testConnection, tunDevice *testDevice) error {

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -27,12 +28,12 @@ const (
 )
 
 type Config struct {
-	URL       string
-	Token     string
-	ClientID  string
-	Transport Transport
-	TLSConfig *tls.Config
-	Timeout   time.Duration
+	URL         string
+	Token       string
+	Transport   Transport
+	TLSConfig   *tls.Config
+	Timeout     time.Duration
+	DeviceProof func(method, path string) (deviceauth.Proof, error)
 	// DialAddress pins the physical endpoint while retaining URL's authority
 	// and TLS server name. When set it must contain a literal IP and port.
 	DialAddress string

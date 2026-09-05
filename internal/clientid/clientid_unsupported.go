@@ -7,6 +7,6 @@ import (
 	"runtime"
 )
 
-func Current() (string, error) {
-	return "", fmt.Errorf("automatic OS device identity is not supported on %s", runtime.GOOS)
+func Current() (*Identity, error) {
+	return nil, fmt.Errorf("automatic device identity is not supported on %s", runtime.GOOS)
 }

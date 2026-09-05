@@ -140,8 +140,8 @@ func TestCamouflagePassesInvalidProxyRequestsToWebsite(t *testing.T) {
 		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusTeapot)
 		}),
-		Authorize: func(string, string) (Identity, error) {
-			return Identity{}, context.Canceled
+		AuthorizeSession: func(ctx context.Context, _, _ string) (Identity, context.Context, func(), error) {
+			return Identity{}, ctx, func() {}, context.Canceled
 		},
 		Camouflage: true,
 	})
@@ -161,8 +161,8 @@ func TestCamouflageChallengesUnauthenticatedConnect(t *testing.T) {
 		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusTeapot)
 		}),
-		Authorize: func(string, string) (Identity, error) {
-			return Identity{}, context.Canceled
+		AuthorizeSession: func(ctx context.Context, _, _ string) (Identity, context.Context, func(), error) {
+			return Identity{}, ctx, func() {}, context.Canceled
 		},
 		Camouflage: true,
 	})
@@ -411,11 +411,11 @@ func newTestHandler(t *testing.T) *Handler {
 	t.Helper()
 	handler, err := New(Config{
 		Next: http.NotFoundHandler(),
-		Authorize: func(token, deviceID string) (Identity, error) {
-			if token != testToken || deviceID == "" {
-				return Identity{}, context.Canceled
+		AuthorizeSession: func(ctx context.Context, token, deviceID string) (Identity, context.Context, func(), error) {
+			if token != testToken || deviceID != DeviceID {
+				return Identity{}, ctx, func() {}, context.Canceled
 			}
-			return Identity{AccountID: "account", DeviceID: deviceID}, nil
+			return Identity{AccountID: "account", DeviceID: deviceID}, ctx, func() {}, nil
 		},
 		Camouflage: true,
 	})
@@ -423,6 +423,26 @@ func newTestHandler(t *testing.T) *Handler {
 		t.Fatal(err)
 	}
 	return handler
+}
+
+func TestBasicUsernameIsIgnored(t *testing.T) {
+	handler := newTestHandler(t)
+	for _, username := range []string{"", "phone", "anything is accepted", "invalid/device/name"} {
+		identity, _, release, ok := handler.authenticateSession(
+			context.Background(),
+			basicProxyAuth(username, testToken),
+		)
+		if !ok || identity.DeviceID != DeviceID {
+			t.Fatalf("username %q affected authentication: %+v, %t", username, identity, ok)
+		}
+		release()
+	}
+	if _, _, _, ok := handler.authenticateSession(
+		context.Background(),
+		basicProxyAuth("anything", ""),
+	); ok {
+		t.Fatal("empty token authenticated")
+	}
 }
 
 func basicProxyAuth(username, password string) string {

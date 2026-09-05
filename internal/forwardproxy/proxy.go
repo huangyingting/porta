@@ -23,6 +23,7 @@ const (
 	defaultMaxConnections = 128
 	tunnelIdleTimeout     = 5 * time.Minute
 	copyBufferSize        = 64 << 10
+	DeviceID              = "forward-proxy"
 )
 
 var errDestinationDenied = errors.New("proxy destination denied")
@@ -39,13 +40,10 @@ type Identity struct {
 	DeviceID  string
 }
 
-type AuthorizeFunc func(token, deviceID string) (Identity, error)
-
 type AuthorizeSessionFunc func(context.Context, string, string) (Identity, context.Context, func(), error)
 
 type Config struct {
 	Next             http.Handler
-	Authorize        AuthorizeFunc
 	AuthorizeSession AuthorizeSessionFunc
 	Logger           *slog.Logger
 	Camouflage       bool
@@ -55,7 +53,6 @@ type Config struct {
 
 type Handler struct {
 	next             http.Handler
-	authorize        AuthorizeFunc
 	authorizeSession AuthorizeSessionFunc
 	logger           *slog.Logger
 	camouflage       bool
@@ -68,7 +65,7 @@ func New(config Config) (*Handler, error) {
 	if config.Next == nil {
 		return nil, errors.New("forward proxy fallback handler is required")
 	}
-	if config.Authorize == nil && config.AuthorizeSession == nil {
+	if config.AuthorizeSession == nil {
 		return nil, errors.New("forward proxy authorizer is required")
 	}
 	if config.Logger == nil {
@@ -82,7 +79,6 @@ func New(config Config) (*Handler, error) {
 	}
 	handler := &Handler{
 		next:             config.Next,
-		authorize:        config.Authorize,
 		authorizeSession: config.AuthorizeSession,
 		logger:           config.Logger,
 		camouflage:       config.Camouflage,
@@ -145,42 +141,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-func (h *Handler) authenticate(header string) (Identity, bool) {
-	deviceID, token, ok := proxyCredentials(header)
-	if !ok {
-		return Identity{}, false
-	}
-	identity, err := h.authorize(token, deviceID)
-	return identity, err == nil
-}
-
 func (h *Handler) authenticateSession(parent context.Context, header string) (Identity, context.Context, func(), bool) {
-	deviceID, token, ok := proxyCredentials(header)
+	token, ok := proxyToken(header)
 	if !ok {
 		return Identity{}, nil, nil, false
 	}
-	if h.authorizeSession != nil {
-		identity, ctx, release, err := h.authorizeSession(parent, token, deviceID)
-		return identity, ctx, release, err == nil
-	}
-	identity, err := h.authorize(token, deviceID)
-	return identity, parent, func() {}, err == nil
+	identity, ctx, release, err := h.authorizeSession(parent, token, DeviceID)
+	return identity, ctx, release, err == nil
 }
 
-func proxyCredentials(header string) (string, string, bool) {
+func proxyToken(header string) (string, bool) {
 	const prefix = "Basic "
 	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return "", "", false
+		return "", false
 	}
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
 	if err != nil {
-		return "", "", false
+		return "", false
 	}
-	deviceID, token, ok := strings.Cut(string(decoded), ":")
-	if !ok || deviceID == "" || token == "" {
-		return "", "", false
+	_, token, ok := strings.Cut(string(decoded), ":")
+	if !ok || token == "" {
+		return "", false
 	}
-	return deviceID, token, true
+	return token, true
 }
 
 func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target string, identity Identity) {

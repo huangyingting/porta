@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/usage"
 )
@@ -45,16 +46,13 @@ type ClientIdentity struct {
 	LeaseID   string
 }
 
-type AuthorizeClientFunc func(token, deviceID string) (ClientIdentity, error)
-
-type AuthorizeSessionFunc func(context.Context, string, string) (ClientIdentity, context.Context, func(), error)
+type AuthorizeSessionFunc func(context.Context, string, deviceauth.Proof, string, string) (ClientIdentity, context.Context, func(), error)
 
 func ValidClientID(value string) bool {
 	return validClientID.MatchString(value)
 }
 
 type HandlerConfig struct {
-	AuthorizeClient   AuthorizeClientFunc
 	AuthorizeSession  AuthorizeSessionFunc
 	MetricsToken      string
 	Metrics           *Metrics
@@ -72,7 +70,7 @@ type HandlerConfig struct {
 }
 
 func NewHandler(config HandlerConfig) (http.Handler, error) {
-	if config.AuthorizeClient == nil && config.AuthorizeSession == nil {
+	if config.AuthorizeSession == nil {
 		return nil, errors.New("gateway client authorizer is required")
 	}
 	if config.MetricsToken != "" && len(config.MetricsToken) < 16 {
@@ -131,12 +129,8 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Porta requires HTTP/2 or HTTP/3", http.StatusHTTPVersionNotSupported)
 		return
 	}
-	clientID := r.Header.Get("X-Porta-Client-ID")
-	if !validClientID.MatchString(clientID) {
-		http.Error(w, "invalid client ID", http.StatusBadRequest)
-		return
-	}
-	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), clientID)
+	proof := deviceauth.FromRequest(r)
+	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), proof, r.Method, r.URL.Path)
 	if err != nil {
 		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
@@ -181,9 +175,9 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	stopIO := stopStreamOnCancel(sessionCtx, w, r.Body)
 	defer stopIO()
 	usageSession := c.Usage.Begin(
-		"vpn:"+identity.AccountID+":"+clientID+":"+lanes.sessionID,
+		"vpn:"+identity.AccountID+":"+proof.DeviceID+":"+lanes.sessionID,
 		identity.AccountID,
-		clientID,
+		proof.DeviceID,
 		r.Proto,
 		lease.Address.String(),
 		"",
@@ -193,7 +187,8 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	defer c.Metrics.disconnected()
 	remoteHost := clientAddress(r, c.TrustProxyHeaders)
 	logAttributes := []any{
-		"client_id", clientID,
+		"client_id", proof.DeviceID,
+		"device_name", proof.Name,
 		"account_id", identity.AccountID,
 		"address", lease.Address,
 		"transport", r.Proto,
@@ -202,7 +197,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		"lanes", lanes.count,
 	}
 	c.Logger.Info("tunnel connected", logAttributes...)
-	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
+	defer c.Logger.Info("tunnel disconnected", "client_id", proof.DeviceID, "address", lease.Address)
 
 	w.Header().Set("Content-Type", protocol.ContentType)
 	w.Header().Set("Cache-Control", "no-store")
@@ -294,7 +289,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 			flush(w)
 		case err := <-inboundDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
-				c.Logger.Warn("tunnel receive stopped", "client_id", clientID, "error", err)
+				c.Logger.Warn("tunnel receive stopped", "client_id", proof.DeviceID, "error", err)
 			}
 			return
 		case <-sessionCtx.Done():
@@ -336,24 +331,12 @@ func parseLaneConfig(r *http.Request) (laneConfig, error) {
 	return laneConfig{sessionID: sessionID, index: index, count: count}, nil
 }
 
-func (c HandlerConfig) authorizeClient(header, deviceID string) (ClientIdentity, error) {
-	token, err := bearerToken(header)
-	if err != nil {
-		return ClientIdentity{}, err
-	}
-	return c.AuthorizeClient(token, deviceID)
-}
-
-func (c HandlerConfig) authorizeSession(parent context.Context, header, deviceID string) (ClientIdentity, context.Context, func(), error) {
+func (c HandlerConfig) authorizeSession(parent context.Context, header string, proof deviceauth.Proof, method, path string) (ClientIdentity, context.Context, func(), error) {
 	token, err := bearerToken(header)
 	if err != nil {
 		return ClientIdentity{}, nil, nil, err
 	}
-	if c.AuthorizeSession != nil {
-		return c.AuthorizeSession(parent, token, deviceID)
-	}
-	identity, err := c.AuthorizeClient(token, deviceID)
-	return identity, parent, func() {}, err
+	return c.AuthorizeSession(parent, token, proof, method, path)
 }
 
 func bearerToken(header string) (string, error) {

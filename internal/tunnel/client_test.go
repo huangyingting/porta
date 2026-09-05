@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/certutil"
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go/http3"
@@ -44,7 +45,6 @@ func TestHTTP2MasquePacketRoundTrip(t *testing.T) {
 	testPacketRoundTrip(t, router, dev, tunnel.Config{
 		URL:       server.URL,
 		Token:     testToken,
-		ClientID:  "h2-masque-test",
 		Transport: tunnel.TransportHTTP2,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
 		Timeout:   3 * time.Second,
@@ -106,7 +106,6 @@ func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bo
 	config := tunnel.Config{
 		URL:       "https://" + packetConn.LocalAddr().String(),
 		Token:     testToken,
-		ClientID:  "h3-masque-test",
 		Transport: tunnel.TransportHTTP3,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // test-only certificate
 		Timeout:   3 * time.Second,
@@ -162,11 +161,11 @@ func testMTUGateway(t *testing.T, enableH3Datagrams bool, mtu int, autoMTU bool)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	router := gateway.NewRouter(dev, logger)
 	handler, err := gateway.NewHandler(gateway.HandlerConfig{
-		AuthorizeClient: func(token, deviceID string) (gateway.ClientIdentity, error) {
+		AuthorizeSession: func(parent context.Context, token string, proof deviceauth.Proof, _, _ string) (gateway.ClientIdentity, context.Context, func(), error) {
 			if token != testToken {
-				return gateway.ClientIdentity{}, errors.New("unauthorized")
+				return gateway.ClientIdentity{}, nil, nil, errors.New("unauthorized")
 			}
-			return gateway.ClientIdentity{AccountID: "test", LeaseID: "test-" + deviceID}, nil
+			return gateway.ClientIdentity{AccountID: "test", LeaseID: "test-" + proof.DeviceID}, parent, func() {}, nil
 		},
 		Pool:              pool,
 		Router:            router,
@@ -187,6 +186,7 @@ func testMTUGateway(t *testing.T, enableH3Datagrams bool, mtu int, autoMTU bool)
 // the transport-specific server is listening.
 func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, config tunnel.Config, packetSizes ...int) tunnel.Transport {
 	t.Helper()
+	config = withTestDeviceProof(config)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() {

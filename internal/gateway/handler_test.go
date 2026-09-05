@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/protocol"
 )
 
@@ -33,23 +34,33 @@ func TestClientAddressTrustsProxyHeadersOnlyFromLoopback(t *testing.T) {
 func TestAuthorizedClientPrefersBoundCredential(t *testing.T) {
 	want := ClientIdentity{AccountID: "account-a", LeaseID: "lease-a"}
 	config := HandlerConfig{
-		AuthorizeClient: func(token, deviceID string) (ClientIdentity, error) {
-			if token == "device-token-0123456789" && deviceID == "android-phone" {
-				return want, nil
+		AuthorizeSession: func(parent context.Context, token string, proof deviceauth.Proof, _, _ string) (ClientIdentity, context.Context, func(), error) {
+			if token == "device-token-0123456789" && proof.DeviceID == "android-phone" {
+				return want, parent, func() {}, nil
 			}
-			return ClientIdentity{}, errors.New("unauthorized")
+			return ClientIdentity{}, nil, nil, errors.New("unauthorized")
 		},
 	}
-	identity, err := config.authorizeClient("Bearer device-token-0123456789", "android-phone")
+	identity, err := config.authorizeTestClient("Bearer device-token-0123456789", "android-phone")
 	if err != nil || identity != want {
 		t.Fatalf("authorized identity = %#v, %v", identity, err)
 	}
-	if _, err := config.authorizeClient("Bearer wrong-token-0123456789", "android-phone"); err == nil {
+	if _, err := config.authorizeTestClient("Bearer wrong-token-0123456789", "android-phone"); err == nil {
 		t.Fatal("invalid token was accepted")
 	}
-	if _, err := config.authorizeClient("not-bearer", "android-phone"); err == nil {
+	if _, err := config.authorizeTestClient("not-bearer", "android-phone"); err == nil {
 		t.Fatal("invalid authorization scheme was accepted")
 	}
+}
+
+func (c HandlerConfig) authorizeTestClient(header, deviceID string) (ClientIdentity, error) {
+	identity, _, release, err := c.authorizeSession(
+		context.Background(), header, deviceauth.Proof{DeviceID: deviceID}, http.MethodPost, TunnelPath,
+	)
+	if release != nil {
+		release()
+	}
+	return identity, err
 }
 
 func TestMetricsRequireSeparateCredential(t *testing.T) {
@@ -59,8 +70,8 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 	}
 
 	handler, err := NewHandler(HandlerConfig{
-		AuthorizeClient: func(string, string) (ClientIdentity, error) {
-			return ClientIdentity{AccountID: "test", LeaseID: "test"}, nil
+		AuthorizeSession: func(parent context.Context, _ string, _ deviceauth.Proof, _, _ string) (ClientIdentity, context.Context, func(), error) {
+			return ClientIdentity{AccountID: "test", LeaseID: "test"}, parent, func() {}, nil
 		},
 		MetricsToken: "metrics-token-0123456789",
 		Pool:         pool,
@@ -102,8 +113,10 @@ func TestAdvertisedDNSValidation(t *testing.T) {
 		{"169.254.1.1", false}, {"0.0.0.0", false}, {"224.0.0.1", false},
 	} {
 		_, err := NewHandler(HandlerConfig{
-			AuthorizeClient: func(string, string) (ClientIdentity, error) { return ClientIdentity{}, nil },
-			Pool:            pool, Router: NewRouter(testPacketDevice{}, nil), MTU: 1100, DNS: test.dns,
+			AuthorizeSession: func(parent context.Context, _ string, _ deviceauth.Proof, _, _ string) (ClientIdentity, context.Context, func(), error) {
+				return ClientIdentity{}, parent, func() {}, nil
+			},
+			Pool: pool, Router: NewRouter(testPacketDevice{}, nil), MTU: 1100, DNS: test.dns,
 		})
 		if (err == nil) != test.valid {
 			t.Fatalf("DNS %q validity=%t, error=%v", test.dns, test.valid, err)

@@ -21,40 +21,46 @@ Available packages:
 
 ## Automatic device identity
 
-Native clients obtain device identity from the OS, independently of profiles:
+Native clients manage one signing identity independently of profiles. They
+generate an ECDSA P-256 key locally, derive an immutable `d-...` ID from the
+public-key fingerprint, and sign every tunnel request. Porta stores the public
+key, fingerprint ID, and readable name; the private key is never uploaded.
 
-| Client | OS source | Sent identifier |
+| Client | Private-key storage | Readable name |
 | --- | --- | --- |
-| Linux | `/etc/machine-id` | `l-` plus 22 Base64URL characters (24 total) |
-| Windows desktop and CLI | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (64-bit registry view) | `w-` plus 22 Base64URL characters (24 total) |
-| Android | App-scoped `Settings.Secure.ANDROID_ID` | `a-` plus 11 Base64URL characters (13 total) |
+| Linux | `/var/lib/porta/client-identity.json` for root, or the user's config directory; mode `0600` | OS hostname (`os.Hostname()`) |
+| Windows desktop and CLI | `%ProgramData%\Porta\client-identity.json`, protected with machine-bound Windows DPAPI | OS computer name (`os.Hostname()`) |
+| Android | Non-exportable Android Keystore alias `porta-device-auth-v1`; StrongBox is preferred when available | `Settings.Global.DEVICE_NAME`, falling back to `Build.MODEL` |
 
-Desktop IDs use a stable, Porta-specific HMAC-SHA-256 derivation truncated to
-128 bits. Unpadded Base64URL preserves all 128 desktop identity bits and all
-64 Android ID bits; the compact encoding does not truncate them further.
-The raw desktop machine ID/GUID is not transmitted. No hostname or randomly
-generated fallback is used; an unavailable or invalid OS ID stops connection
-with an explicit error. Network cleanup remains available without an ID.
+Names keep their case and ASCII letters, digits, dots, underscores, and hyphens.
+Each run of other characters, including spaces, becomes one hyphen. Leading and
+trailing dots, underscores, and hyphens are removed, then the name is limited to
+64 characters. For example, `My Tablet` becomes `My-Tablet`. This normalization
+affects only the readable name, not the fingerprint ID.
+
+An unavailable desktop hostname, or one containing no usable ASCII letters or
+digits, stops connection with an explicit error; network cleanup remains
+available. Android falls back to its model name if its device name cannot be
+read or normalized, then to `android` if neither name is usable. Fallbacks are
+reported in the app log. Reading the Android device name requires no special
+permission on standard Android; its availability varies by manufacturer.
 
 There is no editable native device-ID field or `--client-id` override. The
-Windows GUI and CLI, different profiles, and normal reconnects reuse one device
-enrollment per account on the same OS installation. Linux and Windows identities
-are machine-wide, including across local users; Android identity is scoped to
-the Android user, signing key, and device. Renaming a desktop does not change its
-ID. Reinstall/reset or changing the underlying OS identifier can change it;
-cloned OS installations can share an ID.
+Windows GUI and CLI, different profiles, reconnects, and HTTP/3-to-HTTP/2
+fallbacks reuse the locally stored key. The name is read when a connection
+starts and retained throughout that connection. Renaming the device changes
+only the server-displayed name on the next connection. Different devices may
+have identical names because enrollment and limits are keyed by fingerprint.
 
-Existing Windows profiles are upgraded atomically without their old device-ID
-fields, preserving settings and the original DPAPI-protected tokens. Existing
-Android profiles also retain their encrypted credentials during migration.
-Old server enrollments are not automatically removed. An administrator may
-need to forget an old entry if an account is full when upgrading.
-The compact text format introduced in 0.1.15 changes the IDs sent by earlier
-clients once, without changing saved credentials or the underlying identity bits.
-
-These IDs are stable enrollment labels, **not hardware attestation**. The device
-limit counts claimed identities, not provably distinct physical machines.
-Direct forward-proxy clients retain user-chosen labels as described below.
+Deleting the Linux/Windows identity file or clearing/uninstalling the Android
+app creates a new key and therefore a new enrollment. Copying the Linux
+software-key file also clones that identity. Windows DPAPI prevents an exported
+file from decrypting on another machine. Android Keystore keys are normally
+non-exportable and may be hardware-backed, but Porta does not request or verify
+key attestation. Rooted/modified clients and privileged local attackers remain
+outside this identity guarantee. Device limits count enrolled keys, not
+provably distinct physical hardware. Forward proxy is the token-only exception
+described below.
 
 ## Linux CLI
 
@@ -316,24 +322,23 @@ For manual setup, tap **Add profile**, then **Enter manually**, and enter:
 - the direct gateway URL, including the port when it is not 443;
 - the client token.
 
-Android supplies device identity automatically from `Settings.Secure.ANDROID_ID`.
-Porta sends `a-<Base64URL-encoded Android ID>` for every profile on the same Android user and
-app-signing identity. There is no editable device-ID field, no device ID in
-QR/paste configuration, and no random/model-name fallback. If Android cannot
-provide a usable ID, connection is refused with a visible error.
+Android generates one ECDSA P-256 key under the Android Keystore alias
+`porta-device-auth-v1`. It requests StrongBox where Android reports it as
+available, then falls back to the ordinary Android Keystore if StrongBox key
+generation is unavailable. The same key is shared by all profiles. Clearing app
+data or uninstalling normally deletes it, so the next installation creates a
+new enrollment.
 
-This OS identifier is scoped to the signing key, Android user, and device.
-Repeated imports and normal reconnects reuse the same enrollment within an
-account instead of consuming new slots. Factory reset, another Android user/work
-profile, or a signing-key change can produce another ID. It is **not hardware
-attestation**: emulators also have IDs, and modified clients can spoof the value.
+Android reads `Settings.Global.DEVICE_NAME` when starting a connection. If it
+is missing, denied, or unusable after normalization, the app uses `Build.MODEL`,
+then `android`. The fallback reason and Android API version are logged without
+exception contents. The name is not the device ID: changing it updates metadata
+for the existing key. No `ANDROID_ID`, IMEI, serial number, or profile-provided
+device ID is used.
 
-On upgrade, existing encrypted profiles are authenticated using their previous
-storage binding and rewritten without per-profile device IDs. Server addresses,
-tokens, selected profiles, and reconnect preferences are preserved. Connections
-use the OS ID immediately, rather than retaining an old editable/UUID identity.
-Old server-side enrollments are not automatically removed; an administrator may
-need to forget an old entry to make room for this one-time identity transition.
+There is no device identity in QR/paste configuration. Porta does not currently
+send or verify Android key-attestation certificates, so hardware-backed status
+is local diagnostic information rather than proof to the server.
 
 Approve Android's VPN prompt and enable the profile. Android prefers native
 HTTP/3 MASQUE. If UDP or HTTP/3 is unavailable, it automatically falls back to
@@ -345,8 +350,10 @@ only one profile can be active. The app supports bounded reconnects, optional
 reconnect after device restart, live traffic statistics, and a local diagnostic
 log that excludes tokens and authorization headers.
 
-Swipe an inactive profile **right to edit** or **left to delete**. Separate
-**Edit** and **Delete** buttons provide the same actions without gestures.
+Swipe an inactive profile across its **full width**, **right to edit** or
+**left to delete**. Partial swipes return to their starting position without
+performing an action. Profile cards have no visible Edit/Delete buttons;
+equivalent accessibility actions are available on the profile name.
 Deletion requires confirmation and is no longer part of the editor. Disconnect
 an active or reconnecting profile before editing or deleting it. Deleting a
 local profile does not revoke its token or free its server-side device slot;
@@ -358,14 +365,14 @@ DNS, transport, and fallback/retry information. Automatic selection is
 distinguished from a server-configured MTU; the value stays fixed until the
 next connection. The log retains the latest 200 events, includes millisecond
 timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but
-logs can contain server/network addresses and the OS-provided device ID, so
+logs can contain server/network addresses and the device name, so
 share them privately.
 
 ## Forward proxy clients
 
-The HTTPS forward proxy uses a stable, user-chosen device label as the Basic-auth
-username and the client token as the password. Ordinary proxy clients do not
-automatically obtain Porta's native OS-derived identity:
+The HTTPS forward proxy ignores the Basic-auth username and authenticates only
+the client token supplied as the password. All proxy clients using one account
+share one logical `forward-proxy` enrollment and one combined usage record:
 
 ```sh
 curl --proxy https://vpn.example.com:8443 \
@@ -374,6 +381,7 @@ curl --proxy https://vpn.example.com:8443 \
 ```
 
 For ZeroOmega, select an **HTTPS proxy**, enter the Porta hostname and port,
-use a stable device label as the username, and use the client token as the
-password. Porta supports only HTTPS `CONNECT` to public destinations on port
-443; it does not provide a PAC file or cache responses.
+put any value in the required username field, and use the client token as the
+password. The username cannot distinguish, limit, disconnect, or report
+individual proxy installations. Porta supports only HTTPS `CONNECT` to public
+destinations on port 443; it does not provide a PAC file or cache responses.

@@ -1,78 +1,60 @@
 package clientid
 
 import (
-	"encoding/base64"
-	"encoding/hex"
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-func TestOSDerivedIdentityIsStableAndPrivate(t *testing.T) {
-	const machineID = "00112233445566778899aabbccddeeff"
-	for _, platform := range []string{"linux", "windows"} {
-		t.Run(platform, func(t *testing.T) {
-			value := machineID
-			if platform == "windows" {
-				value = "00112233-4455-6677-8899-aabbccddeeff"
+func TestReadableMachineNames(t *testing.T) {
+	validID := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	for _, test := range []struct{ name, want string }{
+		{"DESKTOP-123", "DESKTOP-123"},
+		{"workstation.example", "workstation.example"},
+		{"My Tablet", "My-Tablet"},
+		{"  .._John's / Tablet_..  ", "John-s-Tablet"},
+		{"Lab_PC-01", "Lab_PC-01"},
+		{"123", "123"},
+		{"Pad \U0001f4f1", "Pad"},
+		{"\u5e73\u677f-01", "01"},
+		{"tablet\r\nInjected: header", "tablet-Injected-header"},
+		{strings.Repeat("a", 80), strings.Repeat("a", 64)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := fromName(test.name)
+			if err != nil || got != test.want || !validID.MatchString(got) {
+				t.Fatalf("fromName(%q) = %q, %v; want %q", test.name, got, err, test.want)
 			}
-			first, err := derive(platform, value)
-			if err != nil {
-				t.Fatal(err)
-			}
-			second, err := derive(platform, " \n"+strings.ToUpper(value)+"\r\n")
-			if err != nil || first != second {
-				t.Fatalf("OS identity changed with equivalent formatting: %v", err)
-			}
-			if !regexp.MustCompile(`^`+platform[:1]+`-[A-Za-z0-9_-]{22}$`).MatchString(first) || len(first) != 24 {
-				t.Fatalf("invalid device ID format: %q", first)
-			}
-			if strings.Contains(first, machineID) || strings.Contains(first, value) {
-				t.Fatal("device ID exposes the system-wide identity")
-			}
-			other, err := derive(platform, strings.ReplaceAll(value, "00112233", "11223344"))
-			if err != nil || first == other {
-				t.Fatalf("different OS identities were not distinguished: %v", err)
+			again, err := fromName(got)
+			if err != nil || again != got {
+				t.Fatalf("normalization is not stable: %q, %v", again, err)
 			}
 		})
 	}
-	linux, _ := derive("linux", machineID)
-	windows, _ := derive("windows", "00112233-4455-6677-8899-aabbccddeeff")
-	if strings.TrimPrefix(linux, "l-") == strings.TrimPrefix(windows, "w-") {
-		t.Fatal("identity derivation is not platform scoped")
+}
+
+func TestUnavailableMachineNameFailsExplicitly(t *testing.T) {
+	for _, name := range []string{"", " \r\n ", ".._--", "\u5e73\u677f", "\x00"} {
+		if got, err := fromName(name); got != "" || err == nil {
+			t.Fatalf("unusable machine name %q returned %q, %v", name, got, err)
+		}
+	}
+	missing := errors.New("hostname unavailable")
+	got, err := fromHostname(func() (string, error) { return "partial-name", missing })
+	if got != "" || !errors.Is(err, missing) {
+		t.Fatalf("hostname failure was hidden: %q, %v", got, err)
 	}
 }
 
-func TestInvalidOSIdentityHasNoFallback(t *testing.T) {
-	for _, test := range []struct{ platform, value string }{
-		{"linux", ""}, {"linux", "uninitialized"}, {"linux", "laptop"},
-		{"linux", strings.Repeat("0", 32)}, {"linux", strings.Repeat("1", 31)},
-		{"linux", strings.Repeat("1", 33)}, {"linux", strings.Repeat("g", 32)},
-		{"linux", "00112233-4455-6677-8899-aabbccddeeff"},
-		{"windows", ""}, {"windows", "00112233445566778899aabbccddeeff"},
-		{"windows", "00000000-0000-0000-0000-000000000000"},
-		{"windows", "00112233-4455-6677-8899-aabbccddeefg"},
-		{"windows", "0011223-34455-6677-8899-aabbccddeeff"},
-		{"other", "00112233445566778899aabbccddeeff"},
-	} {
-		if id, err := derive(test.platform, test.value); err == nil || id != "" {
-			t.Fatalf("invalid %s identity produced a fallback: %q, %v", test.platform, id, err)
-		}
-	}
-}
-
-func TestDerivationDoesNotChangeAcrossReleases(t *testing.T) {
-	for _, test := range []struct{ platform, value, want, digest string }{
-		{"linux", "00112233445566778899aabbccddeeff", "l-zDTW4gZ4UzLuzoCrppILZg", "cc34d6e206785332eece80aba6920b66"},
-		{"windows", "00112233-4455-6677-8899-aabbccddeeff", "w-_F9iEn_PCIp5yd5n3sB3Cw", "fc5f62127fcf088a79c9de67dec0770b"},
-	} {
-		got, err := derive(test.platform, test.value)
-		if err != nil || got != test.want {
-			t.Fatalf("persistent %s device identity changed: %q, %v", test.platform, got, err)
-		}
-		decoded, err := base64.RawURLEncoding.DecodeString(got[2:])
-		if err != nil || hex.EncodeToString(decoded) != test.digest {
-			t.Fatal("compact encoding discarded or changed identity bits")
+func TestRenamingChangesOnlyTheDisplayName(t *testing.T) {
+	name := "Office-PC"
+	hostname := func() (string, error) { return name, nil }
+	for _, current := range []string{"Office-PC", "Office-PC", "Home-PC"} {
+		name = current
+		got, err := fromHostname(hostname)
+		if err != nil || got != current {
+			t.Fatalf("machine name not used directly: %q, %v", got, err)
 		}
 	}
 }

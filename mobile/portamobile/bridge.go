@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
@@ -17,11 +19,23 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/buildinfo"
+	"github.com/huangyingting/porta/internal/deviceauth"
+	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
 func Version() string {
 	return buildinfo.Version
+}
+
+func DeviceID(publicKey []byte) (string, error) {
+	return deviceauth.DeviceIDFromEncoded(publicKey)
+}
+
+func DeviceProofMessage(token, method, path, deviceID, deviceName, timestamp, nonce string) []byte {
+	return deviceauth.Message(deviceauth.Proof{
+		DeviceID: deviceID, Name: deviceName, Timestamp: timestamp, Nonce: nonce,
+	}, token, method, path)
 }
 
 const transportUnavailablePrefix = "transport unavailable: "
@@ -57,16 +71,16 @@ func NewDialer() *Dialer {
 
 // Dial creates and protects a UDP socket before starting QUIC. remoteIP must
 // be a numeric address resolved through Android's selected underlying Network.
-func Dial(serverURL, token, clientID, remoteIP string, protector Protector) (*Session, error) {
-	return dial(context.Background(), serverURL, token, clientID, remoteIP, protector)
+func Dial(serverURL, token, deviceName, publicKey, timestamp, nonce, signature, remoteIP string, protector Protector) (*Session, error) {
+	return dial(context.Background(), serverURL, token, deviceName, publicKey, timestamp, nonce, signature, remoteIP, protector)
 }
 
 // Dial creates a native session that is canceled when the Dialer is closed.
-func (d *Dialer) Dial(serverURL, token, clientID, remoteIP string, protector Protector) (*Session, error) {
+func (d *Dialer) Dial(serverURL, token, deviceName, publicKey, timestamp, nonce, signature, remoteIP string, protector Protector) (*Session, error) {
 	if d == nil || d.ctx == nil {
 		return nil, errors.New("configuration: dialer is closed")
 	}
-	return dial(d.ctx, serverURL, token, clientID, remoteIP, protector)
+	return dial(d.ctx, serverURL, token, deviceName, publicKey, timestamp, nonce, signature, remoteIP, protector)
 }
 
 // Close cancels a pending Dial call.
@@ -77,9 +91,21 @@ func (d *Dialer) Close() {
 	d.once.Do(d.cancel)
 }
 
-func dial(ctx context.Context, serverURL, token, clientID, remoteIP string, protector Protector) (*Session, error) {
+func dial(ctx context.Context, serverURL, token, deviceName, publicKey, timestamp, nonce, signature, remoteIP string, protector Protector) (*Session, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	encodedKey, err := base64.RawURLEncoding.DecodeString(publicKey)
+	if err != nil {
+		return nil, errors.New("configuration: device public key is invalid")
+	}
+	clientID, err := deviceauth.DeviceIDFromEncoded(encodedKey)
+	if err != nil {
+		return nil, fmt.Errorf("configuration: %w", err)
+	}
+	proof := deviceauth.Proof{
+		DeviceID: clientID, Name: deviceName, PublicKey: publicKey,
+		Timestamp: timestamp, Nonce: nonce, Signature: signature,
 	}
 	endpoint, address, err := endpointAddress(serverURL, remoteIP)
 	if err != nil {
@@ -98,9 +124,14 @@ func dial(ctx context.Context, serverURL, token, clientID, remoteIP string, prot
 	}
 
 	conn, err := tunnel.Dial(ctx, tunnel.Config{
-		URL:        endpoint.String(),
-		Token:      token,
-		ClientID:   clientID,
+		URL:   endpoint.String(),
+		Token: token,
+		DeviceProof: func(method, path string) (deviceauth.Proof, error) {
+			if method != http.MethodConnect || path != gateway.MasquePath {
+				return deviceauth.Proof{}, errors.New("unexpected native device proof target")
+			}
+			return proof, nil
+		},
 		Transport:  tunnel.TransportHTTP3,
 		TLSConfig:  &tls.Config{MinVersion: tls.VersionTLS12, ServerName: endpoint.Hostname()},
 		Timeout:    15 * time.Second,

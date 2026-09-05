@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
@@ -35,14 +36,14 @@ func TestRegistryRevocationsCancelAndDrainSessions(t *testing.T) {
 			var contexts []context.Context
 			var releases []func()
 			for range 4 {
-				id, ctx, release, err := registry.AuthenticateSession(context.Background(), sessionTestToken, "phone")
+				id, ctx, release, err := authenticateTestDeviceSession(registry, context.Background(), sessionTestToken, "phone")
 				if err != nil {
 					t.Fatal(err)
 				}
 				identity = id
 				contexts, releases = append(contexts, ctx), append(releases, release)
 			}
-			_, otherCtx, releaseOther, err := registry.AuthenticateSession(context.Background(), sessionTestToken, "laptop")
+			_, otherCtx, releaseOther, err := authenticateTestDeviceSession(registry, context.Background(), sessionTestToken, "laptop")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -78,7 +79,7 @@ func TestRegistryRevocationsCancelAndDrainSessions(t *testing.T) {
 				t.Fatal("forget canceled another device")
 			}
 			if action == "forget" {
-				if _, err := registry.Authenticate(sessionTestToken, "phone"); !errors.Is(err, errDeviceDraining) {
+				if _, err := authenticateTestDevice(registry, sessionTestToken, "phone"); !errors.Is(err, errDeviceDraining) {
 					t.Fatalf("device re-enrolled before old usage drained: %v", err)
 				}
 			}
@@ -91,7 +92,7 @@ func TestRegistryRevocationsCancelAndDrainSessions(t *testing.T) {
 			case <-time.After(3 * time.Second):
 				t.Fatal("revocation failed to drain")
 			}
-			_, err = registry.Authenticate(sessionTestToken, "phone")
+			_, err = authenticateTestDevice(registry, sessionTestToken, "phone")
 			wantRejected := action == "disable" || action == "delete" || action == "rotate"
 			if (err != nil) != wantRejected {
 				t.Fatalf("subsequent authentication error = %v", err)
@@ -103,7 +104,7 @@ func TestRegistryRevocationsCancelAndDrainSessions(t *testing.T) {
 func TestRegistryAuthenticationRevocationRace(t *testing.T) {
 	for range 20 {
 		registry := sessionTestRegistry(t)
-		id, err := registry.Authenticate(sessionTestToken, "phone")
+		id, err := authenticateTestDevice(registry, sessionTestToken, "phone")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,7 +113,7 @@ func TestRegistryAuthenticationRevocationRace(t *testing.T) {
 		for range 12 {
 			workers.Go(func() {
 				<-start
-				_, ctx, release, err := registry.AuthenticateSession(context.Background(), sessionTestToken, "phone")
+				_, ctx, release, err := authenticateTestDeviceSession(registry, context.Background(), sessionTestToken, "phone")
 				if err != nil {
 					return
 				}
@@ -134,7 +135,7 @@ func TestRegistryAuthenticationRevocationRace(t *testing.T) {
 
 func TestFailedRegistryMutationDoesNotCancelSessions(t *testing.T) {
 	registry := sessionTestRegistry(t)
-	id, ctx, release, err := registry.AuthenticateSession(context.Background(), sessionTestToken, "phone")
+	id, ctx, release, err := authenticateTestDeviceSession(registry, context.Background(), sessionTestToken, "phone")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +147,7 @@ func TestFailedRegistryMutationDoesNotCancelSessions(t *testing.T) {
 	if ctx.Err() != nil {
 		t.Fatal("failed mutation revoked a valid session")
 	}
-	if _, err := registry.Authenticate(sessionTestToken, "phone"); err != nil {
+	if _, err := authenticateTestDevice(registry, sessionTestToken, "phone"); err != nil {
 		t.Fatalf("failed mutation did not restore account: %v", err)
 	}
 }
@@ -165,7 +166,7 @@ func TestLiveVPNRevocation(t *testing.T) {
 				}
 				store, _ := usage.Open("", nil)
 				handler, err := gateway.NewHandler(gateway.HandlerConfig{
-					AuthorizeSession: registry.AuthenticateSession, Pool: pool,
+					AuthorizeSession: registry.AuthenticateDeviceSession, Pool: pool,
 					Router: gateway.NewRouter(sessionTestDevice{}, nil), MTU: 1100,
 					Usage: store, EnableH3Datagrams: true,
 					Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -174,7 +175,7 @@ func TestLiveVPNRevocation(t *testing.T) {
 					t.Fatal(err)
 				}
 				serverURL, client := sessionTestServer(t, handler, strings.HasPrefix(transport, "h3"))
-				id, err := registry.Authenticate(sessionTestToken, "phone")
+				id, err := authenticateTestDevice(registry, sessionTestToken, "phone")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -190,12 +191,12 @@ func TestLiveVPNRevocation(t *testing.T) {
 							t.Fatal(err)
 						}
 						request.Header.Set("Authorization", "Bearer "+sessionTestToken)
-						request.Header.Set("X-Porta-Client-ID", "phone")
 						request.Header.Set("Content-Type", protocol.ContentType)
 						request.Header.Set(protocol.HeaderVersion, protocol.Version)
 						request.Header.Set("X-Porta-Lane-Session", "test-session-12345678")
 						request.Header.Set("X-Porta-Lane", fmt.Sprint(lane))
 						request.Header.Set("X-Porta-Lanes", "4")
+						proofForRequest(t, request, "phone", sessionTestToken)
 						response, err := client.Do(request)
 						if err != nil {
 							t.Fatal(err)
@@ -217,8 +218,11 @@ func TestLiveVPNRevocation(t *testing.T) {
 						proto = tunnel.TransportHTTP3
 					}
 					connection, err := tunnel.Dial(ctx, tunnel.Config{
-						URL: serverURL, Token: sessionTestToken, ClientID: "phone", Transport: proto,
+						URL: serverURL, Token: sessionTestToken, Transport: proto,
 						TLSConfig: &tls.Config{InsecureSkipVerify: true}, Timeout: time.Second,
+						DeviceProof: func(method, path string) (deviceauth.Proof, error) {
+							return testDeviceProof("phone", sessionTestToken, method, path)
+						},
 					})
 					if err != nil {
 						t.Fatal(err)
@@ -258,18 +262,18 @@ func TestLiveVPNRevocation(t *testing.T) {
 
 func TestAdminDisconnectPreservesToken(t *testing.T) {
 	registry := sessionTestRegistry(t)
-	id, ctx, release, err := registry.AuthenticateSession(context.Background(), sessionTestToken, "phone")
+	id, ctx, release, err := authenticateTestDeviceSession(registry, context.Background(), sessionTestToken, "phone")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
 	go func() { <-ctx.Done(); release() }()
 	handler := adminHandler(http.NotFoundHandler(), registry, testAdminToken)
-	response := adminRequest(t, handler, http.MethodPost, "/api/clients/"+id.AccountID+"/devices/phone/disconnect", "")
+	response := adminRequest(t, handler, http.MethodPost, "/api/clients/"+id.AccountID+"/devices/"+testDeviceID("phone")+"/disconnect", "")
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"disconnected_sessions":1`) {
 		t.Fatalf("disconnect response = %d: %s", response.Code, response.Body.String())
 	}
-	if _, err := registry.Authenticate(sessionTestToken, "phone"); err != nil {
+	if _, err := authenticateTestDevice(registry, sessionTestToken, "phone"); err != nil {
 		t.Fatalf("disconnect revoked token: %v", err)
 	}
 }
@@ -294,7 +298,7 @@ func revokeTestSession(registry *clientRegistry, accountID, action string) error
 		_, err := registry.RotateToken(accountID)
 		return err
 	case "forget":
-		return registry.DeleteDevice(accountID, "phone")
+		return registry.DeleteDevice(accountID, testDeviceID("phone"))
 	case "disconnect":
 		_, err := registry.Disconnect(accountID, "")
 		return err

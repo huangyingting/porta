@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
+
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/quic-go/quic-go/http3"
@@ -54,7 +56,14 @@ func TestMasqueProtocolHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setMasqueHeaders(request, Config{ClientID: "laptop", Token: "secret"})
+	if err := setMasqueHeaders(request, Config{
+		Token: "secret",
+		DeviceProof: func(string, string) (deviceauth.Proof, error) {
+			return deviceauth.Proof{DeviceID: "d-AAAAAAAAAAAAAAAAAAAAAA"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if got := request.Header.Get(protocol.HeaderVersion); got != protocol.Version {
 		t.Fatalf("protocol version = %q, want %q", got, protocol.Version)
 	}

@@ -2,24 +2,12 @@ package clientprofile
 
 import (
 	"bytes"
-	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/huangyingting/porta/internal/tunnel"
 )
-
-type unavailableProtector struct{}
-
-func (unavailableProtector) Protect([]byte) ([]byte, error) {
-	return nil, errors.New("secret protection unavailable")
-}
-
-func (unavailableProtector) Unprotect([]byte) ([]byte, error) {
-	return nil, errors.New("secret protection unavailable")
-}
 
 type testProtector struct{}
 
@@ -162,103 +150,12 @@ func TestStoreAutomaticDefaultPreservesExplicitTransport(t *testing.T) {
 	}
 }
 
-func TestOldProfilesDiscardDeviceIDsWithoutChangingSettingsOrSecrets(t *testing.T) {
+func TestStoreRejectsLegacyState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "profiles.json")
-	store, err := Open(path, testProtector{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	original, err := store.Save(Profile{
-		Name: "Original", ServerURL: "https://gateway", Transport: tunnel.TransportHTTP2,
-		CAPath: "private-ca.pem", Thumbprint: "pinned-certificate", Reconnect: false,
-	}, "retained-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	protected := store.state.Profiles[0].ProtectedToken
-	legacyData := oldProfileData(t, store)
-	if err := os.WriteFile(path, legacyData, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// DPAPI blobs do not bind the old device ID, so migration must only copy them.
-	migrated, err := Open(path, unavailableProtector{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if profiles := migrated.List(); len(profiles) != 1 || profiles[0] != original {
-		t.Fatalf("migration changed profile settings: %+v", profiles)
-	}
-	if migrated.state.Profiles[0].ProtectedToken != protected {
-		t.Fatal("migration changed the protected token")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(data, []byte("client_id")) || bytes.Contains(data, []byte("old-editable-device")) {
-		t.Fatal("obsolete per-profile identity survived migration")
-	}
-	reopened, err := Open(path, testProtector{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token, err := reopened.Token(original.ID); err != nil || token != "retained-token" {
-		t.Fatalf("migrated token could not be recovered: %v", err)
-	}
-	if reopened.state.Version != stateVersion {
-		t.Fatal("profile store was not upgraded")
-	}
-}
-
-func TestInvalidOldProfileDoesNotPartiallyMigrate(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "profiles.json")
-	store, err := Open(path, testProtector{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Save(Profile{Name: "Valid", ServerURL: "https://gateway"}, "token"); err != nil {
-		t.Fatal(err)
-	}
-	invalid := store.state.Profiles[0]
-	invalid.ID = "invalid-profile"
-	invalid.Name = ""
-	store.state.Profiles = append(store.state.Profiles, invalid)
-	original := oldProfileData(t, store)
-	if err := os.WriteFile(path, original, 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":1,"profiles":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Open(path, testProtector{}); err == nil {
-		t.Fatal("invalid profile was silently accepted or dropped")
+		t.Fatal("legacy profile state was accepted")
 	}
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(original, after) {
-		t.Fatal("failed migration rewrote the original record set")
-	}
-}
-
-func oldProfileData(t *testing.T, store *Store) []byte {
-	t.Helper()
-	profiles := make([]map[string]json.RawMessage, len(store.state.Profiles))
-	for index, record := range store.state.Profiles {
-		data, err := json.Marshal(record)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := json.Unmarshal(data, &profiles[index]); err != nil {
-			t.Fatal(err)
-		}
-		profiles[index]["client_id"] = json.RawMessage(`"old-editable-device"`)
-	}
-	data, err := json.Marshal(struct {
-		Version  int                          `json:"version"`
-		Profiles []map[string]json.RawMessage `json:"profiles"`
-	}{1, profiles})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
 }

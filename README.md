@@ -101,14 +101,17 @@ root, iproute2, nftables, and systemd-resolved's local stub are required.
 Desktop clients default to HTTP/3 with safe HTTP/2 fallback. See the
 [client guide](docs/clients.md) for protection boundaries, manual networking,
 and `--cleanup-network` recovery after a crash.
-Native clients supply OS-derived device IDs automatically; device identity is
-not an editable profile setting or CLI option.
+Native clients generate a persistent P-256 signing key locally. Its public-key
+fingerprint is the immutable device ID; the Android device/model name or
+Windows/Linux machine name is separate readable metadata. Renaming a device
+updates its displayed name without consuming another enrollment. The private
+key is never sent to Porta.
 
 ### Windows client
 
 Extract `porta-client-windows-amd64.zip` and launch `porta.exe` as
-administrator. Add a profile with the gateway URL, client token, and a stable
-device ID.
+administrator. Add a profile with the gateway URL and client token. Windows keeps one
+machine-protected signing identity and reports the computer name separately.
 
 ### Android client
 
@@ -119,16 +122,18 @@ access key. Install the APK matching your device architecture.
 The download page has a separate profile QR: in Porta, choose **Add profile**
 then **Scan QR code**, review the server, and save. On the same phone, use
 **Copy setup** on the download page, then **Add profile > Paste setup** in Porta.
-Imports create a local profile and do not connect automatically. Android supplies
-the device ID automatically; it is not imported or editable.
+Imports create a local profile and do not connect automatically. Android keeps
+one app-wide signing key in Android Keystore and uses the device name, or model
+fallback, only as the readable name. Identity is not imported or editable.
 **Enter manually** remains available. Keep both codes private; access links
 expire after eight hours, while profile codes contain the client token.
 Android uses HTTP/3 when available and falls back to HTTP/2 automatically.
 
 ### Forward proxy
 
-Use a stable device ID as the Basic-auth username and the client token as the
-password:
+Use any Basic-auth username and the client token as the password. Porta ignores
+the username and groups all forward-proxy activity for the account under one
+`forward-proxy` device:
 
 ```sh
 curl --proxy https://vpn.example.com:8443 \

@@ -37,7 +37,7 @@ func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
 	}
 	config := tunnel.Config{
 		URL: "https://vpn.example.invalid:" + port, DialAddress: server.Listener.Addr().String(),
-		Token: testToken, ClientID: "automatic-test", Transport: tunnel.TransportAuto,
+		Token: testToken, Transport: tunnel.TransportAuto,
 		Timeout: time.Second,
 		TLSConfig: &tls.Config{
 			InsecureSkipVerify: true, // test server certificate; identity assertion below
@@ -57,7 +57,7 @@ func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
 func TestInvalidPinnedEndpointIsPermanent(t *testing.T) {
 	for _, address := range []string{"vpn.example.com:443", "127.0.0.1:0", "0.0.0.0:443", "[ff02::1]:443"} {
 		_, err := tunnel.Dial(context.Background(), tunnel.Config{
-			URL: "https://vpn.example.invalid", Token: testToken, ClientID: "invalid-pin",
+			URL: "https://vpn.example.invalid", Token: testToken,
 			Transport: tunnel.TransportAuto, DialAddress: address, Timeout: time.Second,
 		})
 		if err == nil || tunnel.IsTransportUnavailable(err) || tunnel.IsRetryable(err) {
@@ -116,10 +116,10 @@ func TestRejectedHTTP3DoesNotDowngrade(t *testing.T) {
 			}
 			go func() { _ = server.Serve(udp) }()
 			t.Cleanup(func() { _ = server.Close(); _ = udp.Close() })
-			connection, err := tunnel.Dial(context.Background(), tunnel.Config{
-				URL: tcpServer.URL, Token: testToken, ClientID: "no-downgrade", Transport: tunnel.TransportAuto,
+			connection, err := tunnel.Dial(context.Background(), withTestDeviceProof(tunnel.Config{
+				URL: tcpServer.URL, Token: testToken, Transport: tunnel.TransportAuto,
 				TLSConfig: &tls.Config{InsecureSkipVerify: !test.verifyTLS}, Timeout: 500 * time.Millisecond,
-			})
+			}))
 			if connection != nil {
 				_ = connection.Close()
 				t.Fatal("rejected session returned a connection")

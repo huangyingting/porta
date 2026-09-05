@@ -1,48 +1,89 @@
 package dev.porta.android
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.math.BigInteger
-import java.util.Base64
 
 class AndroidDeviceIdentityTest {
     @Test
-    fun usesOnlyTheOsProvidedIdentifierWithAStableNamespace() {
-        assertEquals("a-ASNFZ4mrze8", deviceIdentityFromAndroidId("0123456789abcdef"))
-        assertEquals("a-ASNFZ4mrze8", deviceIdentityFromAndroidId("0123456789ABCDEF"))
-        repeat(10) {
-            assertEquals("a-ASNFZ4mrze8", deviceIdentityFromAndroidId("0123456789abcdef"))
+    fun deviceNameTakesPrecedenceOverModelWithoutAddingASuffix() {
+        assertEquals("My-Tablet", deviceIdentityFromNames(
+            readDeviceName = { "My Tablet" },
+            model = "Pixel Tablet",
+            reportFallback = { error("A usable device name must not need a fallback") },
+        ))
+    }
+
+    @Test
+    fun normalizesNamesForTheServerWithoutHashingThem() {
+        val examples = listOf(
+            "DESKTOP-123" to "DESKTOP-123",
+            "workstation.example" to "workstation.example",
+            "My Tablet" to "My-Tablet",
+            "  .._John's / Tablet_..  " to "John-s-Tablet",
+            "Lab_PC-01" to "Lab_PC-01",
+            "123" to "123",
+            "Pad \uD83D\uDCF1" to "Pad",
+            "\u5e73\u677f-01" to "01",
+            "tablet\r\nInjected: header" to "tablet-Injected-header",
+            "a".repeat(80) to "a".repeat(64),
+        )
+        for ((name, expected) in examples) {
+            val actual = requireNotNull(deviceIdentityFromName(name))
+            assertEquals(expected, actual)
+            assertTrue(actual.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")))
+            assertEquals(actual, deviceIdentityFromName(actual))
         }
-        assertNotEquals(deviceIdentityFromAndroidId("1234"), deviceIdentityFromAndroidId("5678"))
     }
 
     @Test
-    fun unavailableOrInvalidIdsNeverGenerateAFallback() {
-        for (value in listOf(null, "", "0", "0000000000000000", "unknown", "Pixel-10-Pro",
-            "123456789abcdef01", "1234 ", " 1234", "1234\n", "-1234", "abcd-1234")) {
-            assertNull(value, deviceIdentityFromAndroidId(value))
+    fun missingOrUnusableNamesUseTheModelAndReportTheFallback() {
+        for (name in listOf(null, "", " \r\n ", ".._--", "\u5e73\u677f", "\u0000")) {
+            assertNull(deviceIdentityFromName(name))
+            val messages = mutableListOf<String>()
+            assertEquals("Pixel-Tablet", deviceIdentityFromNames({ name }, "Pixel Tablet") { messages.add(it) })
+            assertEquals(listOf("Device name missing or unsupported; using model name"), messages)
         }
     }
 
     @Test
-    fun acceptsTheDocumentedUnsigned64BitHexRange() {
-        assertEquals("a-AAAAAAAAAAE", deviceIdentityFromAndroidId("1"))
-        assertEquals("a-__________8", deviceIdentityFromAndroidId("ffffffffffffffff"))
-        assertEquals(deviceIdentityFromAndroidId("1"), deviceIdentityFromAndroidId("0000000000000001"))
+    fun deniedLookupUsesTheModelWithoutLoggingTheExceptionContents() {
+        val messages = mutableListOf<String>()
+        val identity = deviceIdentityFromNames(
+            { throw SecurityException("private exception details") }, "SM-X610",
+        ) { messages.add(it) }
+        assertEquals("SM-X610", identity)
+        assertEquals(listOf("Device name access denied; using model name"), messages)
     }
 
     @Test
-    fun compactEncodingPreservesEveryBitAndHasFixedLength() {
-        for (value in listOf("1", "0123456789abcdef", "8000000000000000", "ffffffffffffffff")) {
-            val identity = requireNotNull(deviceIdentityFromAndroidId(value))
-            assertEquals(13, identity.length)
-            assertTrue(identity.matches(Regex("a-[A-Za-z0-9_-]{11}")))
-            val decoded = Base64.getUrlDecoder().decode(identity.removePrefix("a-"))
-            assertEquals(8, decoded.size)
-            assertEquals(value.padStart(16, '0'), BigInteger(1, decoded).toString(16).padStart(16, '0'))
+    fun unavailableNamesStillProduceAValidLabelWithAnExplicitWarning() {
+        for (model in listOf(null, "", "unknown", "UNKNOWN", "\u5e73\u677f", ".._--")) {
+            val messages = mutableListOf<String>()
+            assertEquals("android", deviceIdentityFromNames({ null }, model) { messages.add(it) })
+            assertEquals(listOf("Device name missing or unsupported and model name unavailable; using android"), messages)
+        }
+    }
+
+    @Test
+    fun everyNewConnectionReadsTheCurrentDeviceName() {
+        var name = "Office Tablet"
+        val lookup = { name }
+        repeat(3) {
+            assertEquals("Office-Tablet", deviceIdentityFromNames(lookup, "Pixel Tablet") { error(it) })
+        }
+        name = "Home Tablet"
+        assertEquals("Home-Tablet", deviceIdentityFromNames(lookup, "Pixel Tablet") { error(it) })
+    }
+
+    @Test
+    fun unexpectedLookupFailuresAreNotSilentlyHidden() {
+        assertThrows(IllegalStateException::class.java) {
+            deviceIdentityFromNames(
+                { throw IllegalStateException("unexpected failure") }, "Pixel Tablet",
+            ) { error("An unexpected failure must propagate") }
         }
     }
 }

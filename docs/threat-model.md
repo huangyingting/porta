@@ -5,6 +5,11 @@
 - TLS 1.3 protects HTTP/3 traffic; the TLS configuration also permits the TLS
   version required by HTTP/2 implementations.
 - A bearer token hash is checked in constant time before a lease is allocated.
+- Native tunnel clients also prove possession of an ECDSA P-256 private key on
+  every request. The signature binds the account-token hash, HTTP method and
+  path, fingerprint ID, readable name, timestamp, and random nonce. The server
+  rejects timestamps outside five minutes and duplicate nonces seen by the
+  running process.
 - The client registry persists SHA-256 token hashes only; newly generated
   tokens are displayed once to the administrator. Bounded eight-hour client
   browser sessions retain encrypted token material in server memory so the
@@ -61,15 +66,27 @@ transport fingerprints from network inspection.
 
 - Client accounts identify administrative access groups, not human users.
   Devices sharing one token have equal network privileges.
-- Native clients use OS-derived identity: app-scoped `ANDROID_ID` on Android,
-  a Porta-specific digest of `MachineGuid` on Windows, and a Porta-specific
-  digest of `/etc/machine-id` on Linux. Native IDs are not editable profile
-  settings; direct Basic-auth proxy clients still use user-chosen labels.
-  Device IDs are still client-reported
-  enrollment labels: emulators and modified clients can supply IDs, and sharing
-  or spoofing an ID cannot be prevented by this mechanism. Device quotas do not
-  constitute hardware attestation or count provably distinct physical machines.
-  A genuine-device guarantee requires a separate verifiable attestation design.
+- Native clients generate their signing keys locally. The public-key
+  fingerprint is the immutable enrollment ID; the normalized Android
+  device/model name or Windows/Linux machine name is mutable metadata and may
+  reveal a user-chosen label. Duplicate names coexist and renaming does not
+  create another enrollment.
+- Android Keystore keys are non-exportable through normal APIs and may be
+  StrongBox/hardware-backed, but Porta does not verify an attestation chain.
+  Windows uses machine-bound DPAPI, which prevents an identity file copied to a
+  different machine from decrypting. Linux stores a mode-0600 software key,
+  which a privileged attacker can copy. Clearing app data, uninstalling, or
+  deleting an identity file creates a new enrollment. Modified clients,
+  compromised endpoints, local privilege, and server compromise remain outside
+  the guarantee. Device quotas count enrolled keys, not attested physical
+  hardware.
+- Replay nonces are cached only in server memory. After a restart, a captured
+  request proof could be replayed until its five-minute timestamp window
+  expires. TLS normally prevents network capture; a reverse proxy terminating
+  TLS can observe both the bearer token and proof and must be fully trusted.
+- Forward-proxy Basic usernames are ignored, so every proxy client using an
+  account token shares one token-only `forward-proxy` enrollment and cannot be
+  managed or attributed individually.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.

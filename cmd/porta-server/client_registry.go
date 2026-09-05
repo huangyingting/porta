@@ -17,11 +17,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
+	"github.com/huangyingting/porta/internal/forwardproxy"
 	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/usage"
 )
 
-const clientRegistryVersion = 1
+const (
+	clientRegistryVersion = 2
+	maxDeviceNonces       = 2048
+)
 
 var (
 	errClientUnauthorized = errors.New("client token is invalid")
@@ -36,11 +41,17 @@ type clientRegistry struct {
 	clients  []clientRecord
 	sessions map[registryDeviceKey]map[*activeClientSession]struct{}
 	retiring map[registryDeviceKey]bool
+	nonces   map[registryDeviceKey]*deviceNonceWindow
 }
 
 type registryDeviceKey struct {
 	accountID string
 	deviceID  string
+}
+
+type deviceNonceWindow struct {
+	values     map[string]time.Time
+	nextExpiry time.Time
 }
 
 type activeClientSession struct {
@@ -60,6 +71,8 @@ type clientRecord struct {
 
 type deviceRecord struct {
 	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	PublicKey string    `json:"public_key,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
 }
@@ -89,6 +102,7 @@ type clientSummary struct {
 
 type deviceSummary struct {
 	ID                string     `json:"id"`
+	Name              string     `json:"name"`
 	FirstSeen         time.Time  `json:"first_seen"`
 	LastSeen          time.Time  `json:"last_seen"`
 	ActiveSessions    int        `json:"active_sessions"`
@@ -156,24 +170,35 @@ func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 	return registry, nil
 }
 
-func (r *clientRegistry) Authenticate(token, deviceID string) (gateway.ClientIdentity, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.authenticateLocked(token, deviceID)
-}
-
-// AuthenticateSession registers cancellation under the same lock as authentication.
+// AuthenticateDeviceSession registers cancellation under the same lock as authentication.
 // release must run after all packet/copy workers and usage accounting have drained.
-func (r *clientRegistry) AuthenticateSession(parent context.Context, token, deviceID string) (gateway.ClientIdentity, context.Context, func(), error) {
+func (r *clientRegistry) AuthenticateDeviceSession(parent context.Context, token string, proof deviceauth.Proof, method, path string) (gateway.ClientIdentity, context.Context, func(), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := parent.Err(); err != nil {
 		return gateway.ClientIdentity{}, nil, nil, err
 	}
-	identity, err := r.authenticateLocked(token, deviceID)
+	identity, err := r.authenticateDeviceLocked(token, proof, method, path)
 	if err != nil {
 		return gateway.ClientIdentity{}, nil, nil, err
 	}
+	return r.registerSessionLocked(parent, identity, proof.DeviceID)
+}
+
+func (r *clientRegistry) AuthenticateProxySession(parent context.Context, token string) (gateway.ClientIdentity, context.Context, func(), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := parent.Err(); err != nil {
+		return gateway.ClientIdentity{}, nil, nil, err
+	}
+	identity, err := r.authenticateProxyLocked(token)
+	if err != nil {
+		return gateway.ClientIdentity{}, nil, nil, err
+	}
+	return r.registerSessionLocked(parent, identity, forwardproxy.DeviceID)
+}
+
+func (r *clientRegistry) registerSessionLocked(parent context.Context, identity gateway.ClientIdentity, deviceID string) (gateway.ClientIdentity, context.Context, func(), error) {
 	ctx, cancel := context.WithCancel(parent)
 	key := registryDeviceKey{identity.AccountID, deviceID}
 	session := &activeClientSession{cancel: cancel, done: make(chan struct{})}
@@ -199,10 +224,105 @@ func (r *clientRegistry) AuthenticateSession(parent context.Context, token, devi
 	}, nil
 }
 
-func (r *clientRegistry) authenticateLocked(token, deviceID string) (gateway.ClientIdentity, error) {
-	if !gateway.ValidClientID(deviceID) {
+func (r *clientRegistry) authenticateDeviceLocked(token string, proof deviceauth.Proof, method, path string) (gateway.ClientIdentity, error) {
+	client, err := r.clientForTokenLocked(token)
+	if err != nil {
+		return gateway.ClientIdentity{}, err
+	}
+	encodedKey, signedAt, err := deviceauth.Verify(proof, token, method, path, time.Now().UTC())
+	if err != nil {
 		return gateway.ClientIdentity{}, errClientUnauthorized
 	}
+	key := registryDeviceKey{client.ID, proof.DeviceID}
+	if r.retiring[key] {
+		return gateway.ClientIdentity{}, errDeviceDraining
+	}
+	if r.nonceSeenLocked(key, proof.Nonce, signedAt) {
+		return gateway.ClientIdentity{}, errClientUnauthorized
+	}
+	canonicalKey := base64.RawURLEncoding.EncodeToString(encodedKey)
+	now := time.Now().UTC()
+	for deviceIndex := range client.Devices {
+		device := &client.Devices[deviceIndex]
+		if device.ID != proof.DeviceID {
+			continue
+		}
+		if device.PublicKey != canonicalKey {
+			return gateway.ClientIdentity{}, errClientUnauthorized
+		}
+		previous := *device
+		device.Name = proof.Name
+		if previous.Name != device.Name || now.Sub(previous.LastSeen) >= time.Minute {
+			device.LastSeen = now
+			if err := r.persistLocked(); err != nil {
+				*device = previous
+				return gateway.ClientIdentity{}, err
+			}
+		}
+		r.rememberNonceLocked(key, proof.Nonce, signedAt)
+		return registryIdentity(*client, proof.DeviceID), nil
+	}
+	if len(client.Devices) >= client.MaxDevices {
+		return gateway.ClientIdentity{}, errDeviceLimit
+	}
+	client.Devices = append(client.Devices, deviceRecord{
+		ID:        proof.DeviceID,
+		Name:      proof.Name,
+		PublicKey: canonicalKey,
+		FirstSeen: now,
+		LastSeen:  now,
+	})
+	if err := r.persistLocked(); err != nil {
+		client.Devices = client.Devices[:len(client.Devices)-1]
+		return gateway.ClientIdentity{}, err
+	}
+	r.rememberNonceLocked(key, proof.Nonce, signedAt)
+	return registryIdentity(*client, proof.DeviceID), nil
+}
+
+func (r *clientRegistry) authenticateProxyLocked(token string) (gateway.ClientIdentity, error) {
+	client, err := r.clientForTokenLocked(token)
+	if err != nil {
+		return gateway.ClientIdentity{}, err
+	}
+	deviceID := forwardproxy.DeviceID
+	key := registryDeviceKey{client.ID, deviceID}
+	if r.retiring[key] {
+		return gateway.ClientIdentity{}, errDeviceDraining
+	}
+	now := time.Now().UTC()
+	for deviceIndex := range client.Devices {
+		device := &client.Devices[deviceIndex]
+		if device.ID != deviceID {
+			continue
+		}
+		if now.Sub(device.LastSeen) >= time.Minute {
+			previous := device.LastSeen
+			device.LastSeen = now
+			if err := r.persistLocked(); err != nil {
+				device.LastSeen = previous
+				return gateway.ClientIdentity{}, err
+			}
+		}
+		return registryIdentity(*client, deviceID), nil
+	}
+	if len(client.Devices) >= client.MaxDevices {
+		return gateway.ClientIdentity{}, errDeviceLimit
+	}
+	client.Devices = append(client.Devices, deviceRecord{
+		ID:        deviceID,
+		Name:      "Forward proxy",
+		FirstSeen: now,
+		LastSeen:  now,
+	})
+	if err := r.persistLocked(); err != nil {
+		client.Devices = client.Devices[:len(client.Devices)-1]
+		return gateway.ClientIdentity{}, err
+	}
+	return registryIdentity(*client, deviceID), nil
+}
+
+func (r *clientRegistry) clientForTokenLocked(token string) (*clientRecord, error) {
 	tokenHash := hashToken(token)
 	for clientIndex := range r.clients {
 		client := &r.clients[clientIndex]
@@ -210,42 +330,58 @@ func (r *clientRegistry) authenticateLocked(token, deviceID string) (gateway.Cli
 			continue
 		}
 		if !client.Enabled {
-			return gateway.ClientIdentity{}, errClientDisabled
+			return nil, errClientDisabled
 		}
-		if r.retiring[registryDeviceKey{client.ID, deviceID}] {
-			return gateway.ClientIdentity{}, errDeviceDraining
-		}
-		now := time.Now().UTC()
-		for deviceIndex := range client.Devices {
-			device := &client.Devices[deviceIndex]
-			if device.ID != deviceID {
+		return client, nil
+	}
+	return nil, errClientUnauthorized
+}
+
+func (r *clientRegistry) nonceSeenLocked(key registryDeviceKey, nonce string, signedAt time.Time) bool {
+	now := time.Now().UTC()
+	if signedAt.Add(deviceauth.MaxClockSkew).Before(now) {
+		return true
+	}
+	window := r.nonces[key]
+	if window == nil {
+		return false
+	}
+	if !window.nextExpiry.After(now) {
+		window.nextExpiry = time.Time{}
+		for value, expires := range window.values {
+			if !expires.After(now) {
+				delete(window.values, value)
 				continue
 			}
-			if now.Sub(device.LastSeen) >= time.Minute {
-				previous := device.LastSeen
-				device.LastSeen = now
-				if err := r.persistLocked(); err != nil {
-					device.LastSeen = previous
-					return gateway.ClientIdentity{}, err
-				}
+			if window.nextExpiry.IsZero() || expires.Before(window.nextExpiry) {
+				window.nextExpiry = expires
 			}
-			return registryIdentity(*client, deviceID), nil
 		}
-		if len(client.Devices) >= client.MaxDevices {
-			return gateway.ClientIdentity{}, errDeviceLimit
+		if len(window.values) == 0 {
+			delete(r.nonces, key)
+			return false
 		}
-		client.Devices = append(client.Devices, deviceRecord{
-			ID:        deviceID,
-			FirstSeen: now,
-			LastSeen:  now,
-		})
-		if err := r.persistLocked(); err != nil {
-			client.Devices = client.Devices[:len(client.Devices)-1]
-			return gateway.ClientIdentity{}, err
-		}
-		return registryIdentity(*client, deviceID), nil
 	}
-	return gateway.ClientIdentity{}, errClientUnauthorized
+	if _, exists := window.values[nonce]; exists {
+		return true
+	}
+	return len(window.values) >= maxDeviceNonces
+}
+
+func (r *clientRegistry) rememberNonceLocked(key registryDeviceKey, nonce string, signedAt time.Time) {
+	if r.nonces == nil {
+		r.nonces = make(map[registryDeviceKey]*deviceNonceWindow)
+	}
+	window := r.nonces[key]
+	if window == nil {
+		window = &deviceNonceWindow{values: make(map[string]time.Time)}
+		r.nonces[key] = window
+	}
+	expires := signedAt.Add(deviceauth.MaxClockSkew)
+	window.values[nonce] = expires
+	if window.nextExpiry.IsZero() || expires.Before(window.nextExpiry) {
+		window.nextExpiry = expires
+	}
 }
 
 func (r *clientRegistry) AuthenticatePortal(token string) (clientPortalIdentity, error) {
@@ -379,6 +515,7 @@ func (r *clientRegistry) RotateToken(id string) (string, error) {
 		client.TokenHash = previous
 		return "", err
 	}
+	r.deleteAccountNoncesLocked(id)
 	stopped = r.sessionsLocked(id, "")
 	return token, nil
 }
@@ -400,6 +537,7 @@ func (r *clientRegistry) Delete(id string) error {
 			r.clients = previous
 			return err
 		}
+		r.deleteAccountNoncesLocked(id)
 		stopped = r.sessionsLocked(id, "")
 		return nil
 	}
@@ -441,6 +579,7 @@ func (r *clientRegistry) forgetDevice(clientID, deviceID string, store *usage.St
 			client.Devices = previous
 			return err
 		}
+		delete(r.nonces, key)
 		stopped = r.sessionsLocked(clientID, deviceID)
 		if r.retiring == nil {
 			r.retiring = make(map[registryDeviceKey]bool)
@@ -450,6 +589,14 @@ func (r *clientRegistry) forgetDevice(clientID, deviceID string, store *usage.St
 		return nil
 	}
 	return os.ErrNotExist
+}
+
+func (r *clientRegistry) deleteAccountNoncesLocked(accountID string) {
+	for key := range r.nonces {
+		if key.accountID == accountID {
+			delete(r.nonces, key)
+		}
+	}
 }
 
 func (r *clientRegistry) Disconnect(clientID, deviceID string) (int, error) {
@@ -570,6 +717,29 @@ func validateStoredClient(client clientRecord) error {
 			return fmt.Errorf("duplicate device ID %q", device.ID)
 		}
 		seen[device.ID] = struct{}{}
+		if device.ID == forwardproxy.DeviceID {
+			if device.PublicKey != "" || device.Name != "Forward proxy" {
+				return errors.New("invalid forward proxy device")
+			}
+		} else {
+			if device.Name == "" || !gateway.ValidClientID(device.Name) {
+				return fmt.Errorf("invalid device name %q", device.Name)
+			}
+			encodedKey, err := base64.RawURLEncoding.DecodeString(device.PublicKey)
+			if err != nil || len(encodedKey) == 0 {
+				return fmt.Errorf("invalid public key for device %q", device.ID)
+			}
+			if base64.RawURLEncoding.EncodeToString(encodedKey) != device.PublicKey {
+				return fmt.Errorf("non-canonical public key for device %q", device.ID)
+			}
+			derivedID, err := deviceauth.DeviceIDFromEncoded(encodedKey)
+			if err != nil {
+				return fmt.Errorf("invalid public key for device %q: %w", device.ID, err)
+			}
+			if derivedID != device.ID {
+				return fmt.Errorf("public key does not match device ID %q", device.ID)
+			}
+		}
 	}
 	if len(client.Devices) > client.MaxDevices {
 		return errors.New("enrolled devices exceed device limit")
@@ -614,6 +784,7 @@ func summarizeClient(client clientRecord, devices []deviceRecord, snapshot usage
 		deviceUsage := usage.Device(snapshot, client.ID, device.ID)
 		summary.Devices = append(summary.Devices, deviceSummary{
 			ID:                device.ID,
+			Name:              device.Name,
 			FirstSeen:         device.FirstSeen,
 			LastSeen:          device.LastSeen,
 			ActiveSessions:    deviceUsage.ActiveSessions,

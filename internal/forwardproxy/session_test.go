@@ -27,6 +27,9 @@ func TestSessionCancellationInterruptsLiveConnect(t *testing.T) {
 				Next: http.NotFoundHandler(), Usage: store,
 				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 				AuthorizeSession: func(parent context.Context, _, deviceID string) (Identity, context.Context, func(), error) {
+					if deviceID != DeviceID {
+						t.Errorf("forward proxy device ID = %q", deviceID)
+					}
 					ctx, stop := context.WithCancel(parent)
 					registered <- stop
 					return Identity{AccountID: "account", DeviceID: deviceID}, ctx, func() { stop(); close(released) }, nil
@@ -118,7 +121,7 @@ func TestSessionCancellationInterruptsLiveConnect(t *testing.T) {
 			if _, err := reader.Read(make([]byte, 1)); err == nil {
 				t.Fatal("client stream survived revocation")
 			}
-			device := usage.Device(store.Snapshot(), "account", "phone")
+			device := usage.Device(store.Snapshot(), "account", DeviceID)
 			if device.ActiveSessions != 0 || device.BytesUploaded != 7 || device.BytesDownloaded != 7 {
 				t.Fatalf("usage was not fully drained: %+v", device)
 			}

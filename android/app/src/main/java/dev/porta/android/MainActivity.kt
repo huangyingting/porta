@@ -460,6 +460,13 @@ class MainActivity : Activity() {
         val anotherProfileActive = activeProfileId != null && activeProfileId != profile.id &&
             isActiveStatus(TunnelService.currentStatus())
         val controls = mutableListOf<View>()
+        val nameLabel = TextView(this).apply {
+            text = profile.name
+            textSize = 16f
+            setTextColor(COLOR_TEXT)
+            setTypeface(typeface, Typeface.BOLD)
+            maxLines = 1
+        }
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(17), dp(16), dp(13), dp(14))
@@ -482,13 +489,7 @@ class MainActivity : Activity() {
             })
             top.addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(TextView(this@MainActivity).apply {
-                    text = profile.name
-                    textSize = 16f
-                    setTextColor(COLOR_TEXT)
-                    setTypeface(typeface, Typeface.BOLD)
-                    maxLines = 1
-                })
+                addView(nameLabel)
                 addView(TextView(this@MainActivity).apply {
                     text = profile.server.removePrefix("https://")
                     textSize = 12f
@@ -525,38 +526,13 @@ class MainActivity : Activity() {
                     setTextColor(if (active) COLOR_ACCENT else COLOR_MUTED)
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 })
-                for ((label, action) in listOf(
-                    R.string.edit to ProfileSwipeAction.EDIT,
-                    R.string.delete to ProfileSwipeAction.DELETE,
-                )) {
-                    addView(Button(this@MainActivity).apply {
-                        controls += this
-                        setText(label)
-                        contentDescription = getString(
-                            if (action == ProfileSwipeAction.EDIT) R.string.edit_named_profile else R.string.delete_named_profile,
-                            profile.name,
-                        )
-                        textSize = 12f
-                        isAllCaps = false
-                        setTextColor(if (active) COLOR_MUTED else if (action == ProfileSwipeAction.EDIT) COLOR_ACCENT else COLOR_DELETE)
-                        setTypeface(typeface, Typeface.BOLD)
-                        background = rounded(COLOR_CARD, 8f)
-                        setPadding(dp(10), 0, dp(10), 0)
-                        minWidth = 0
-                        minimumWidth = dp(54)
-                        minHeight = 0
-                        minimumHeight = dp(44)
-                        isEnabled = !active
-                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44))
-                        setOnClickListener { profileAction(profile, action) }
-                    })
-                }
             })
         }
         return SwipeProfileLayout(
             this,
             card,
             controls,
+            nameLabel,
             canSwipe = { !profileIsActive(profile.id) },
             onAction = { profileAction(profile, it) },
             editColor = COLOR_ACCENT_DARK,
@@ -835,13 +811,6 @@ class MainActivity : Activity() {
             isActiveStatus(TunnelService.currentStatus())
         ) {
             Toast.makeText(this, R.string.disconnect_active_profile, Toast.LENGTH_SHORT).show()
-            renderProfiles()
-            return
-        }
-        try {
-            androidDeviceIdentity(this)
-        } catch (_: DeviceIdentityUnavailableException) {
-            Toast.makeText(this, R.string.device_identity_unavailable, Toast.LENGTH_LONG).show()
             renderProfiles()
             return
         }

@@ -4,11 +4,13 @@ import android.content.Context
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import android.widget.TextView
 
@@ -16,6 +18,7 @@ internal class SwipeProfileLayout(
     context: Context,
     private val card: View,
     private val controls: List<View>,
+    private val nameLabel: TextView,
     private val canSwipe: () -> Boolean,
     private val onAction: (ProfileSwipeAction) -> Unit,
     editColor: Int,
@@ -35,6 +38,31 @@ internal class SwipeProfileLayout(
         addView(card, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         isClickable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+        nameLabel.importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        nameLabel.accessibilityDelegate = object : AccessibilityDelegate() {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                if (canSwipe()) {
+                    info.addAction(AccessibilityNodeInfo.AccessibilityAction(
+                        R.id.profile_action_edit, context.getString(R.string.edit_named_profile, nameLabel.text),
+                    ))
+                    info.addAction(AccessibilityNodeInfo.AccessibilityAction(
+                        R.id.profile_action_delete, context.getString(R.string.delete_named_profile, nameLabel.text),
+                    ))
+                }
+            }
+
+            override fun performAccessibilityAction(host: View, action: Int, arguments: Bundle?): Boolean {
+                val profileAction = when (action) {
+                    R.id.profile_action_edit -> ProfileSwipeAction.EDIT
+                    R.id.profile_action_delete -> ProfileSwipeAction.DELETE
+                    else -> return super.performAccessibilityAction(host, action, arguments)
+                }
+                if (!canSwipe()) return false
+                onAction(profileAction)
+                return true
+            }
+        }
     }
 
     override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
@@ -100,13 +128,13 @@ internal class SwipeProfileLayout(
             control.isShown && bounds.contains(event.x.toInt(), event.y.toInt())
         }
         armed = false
-        gesture = ProfileSwipeGesture(touchSlop, maxOf(dp(72).toFloat(), width * 0.28f))
+        gesture = ProfileSwipeGesture(touchSlop, maxOf(width.toFloat(), touchSlop + 1f))
         if (!blocked) gesture.begin(event.x, event.y)
     }
 
     private fun showDrag() {
         val distance = gesture.displacement
-        card.translationX = distance.coerceIn(-width * 0.42f, width * 0.42f)
+        card.translationX = distance.coerceIn(-width.toFloat(), width.toFloat())
         editLabel.visibility = if (distance > 0) VISIBLE else INVISIBLE
         deleteLabel.visibility = if (distance < 0) VISIBLE else INVISIBLE
         editLabel.alpha = if (gesture.isArmed) 1f else 0.65f

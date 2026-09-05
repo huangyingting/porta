@@ -88,32 +88,38 @@ class TunnelService : VpnService() {
             stopTunnel("Invalid tunnel configuration")
             return START_NOT_STICKY
         }
-        val clientId = try {
-            androidDeviceIdentity(this)
-        } catch (_: DeviceIdentityUnavailableException) {
-            stopTunnel(getString(R.string.device_identity_unavailable))
-            return START_NOT_STICKY
-        }
         currentProfileId = profileId.ifBlank { server }
         currentProfileName = profileLabel.ifBlank { profileName(server) }
         currentSessionId = runGeneration
-        uploadedBytes.set(0)
-        downloadedBytes.set(0)
-        currentSnapshot = TrafficSnapshot()
-        resetConnectionDetailsState()
-        logEvent("Porta ${Portamobile.version()}; protocol ${PacketFraming.VERSION}")
-        logEvent("Device ID: ${redactDiagnosticMessage(clientId, token)} (Android supplied)")
-        logEvent("Connecting ${currentProfileName} to ${redactDiagnosticMessage(server, token)}")
-
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIFICATION_ID, notification("Connecting"))
         }
+        val deviceIdentity = try {
+            androidDeviceIdentity(this)
+        } catch (error: DeviceIdentityUnavailableException) {
+            logEvent("Device identity failed: ${error.message.orEmpty()}")
+            stopTunnel(getString(R.string.device_identity_unavailable))
+            return START_NOT_STICKY
+        }
+        val clientId = deviceIdentity.id
+        uploadedBytes.set(0)
+        downloadedBytes.set(0)
+        currentSnapshot = TrafficSnapshot()
+        resetConnectionDetailsState()
+        logEvent("Porta ${Portamobile.version()}; protocol ${PacketFraming.VERSION}")
+        logEvent(
+            "Device: ${redactDiagnosticMessage(deviceIdentity.name, token)} " +
+                "(${redactDiagnosticMessage(clientId, token)}; " +
+                if (deviceIdentity.hardwareBacked) "hardware-backed key)" else "Android Keystore key)",
+        )
+        logEvent("Connecting ${currentProfileName} to ${redactDiagnosticMessage(server, token)}")
+
         sendStatus("Connecting")
         startStats(runGeneration)
         worker = Thread(
-            { runTunnel(server, token, clientId, runGeneration, startId) },
+            { runTunnel(server, token, deviceIdentity, runGeneration, startId) },
             "porta-transport",
         ).also { it.start() }
         return START_NOT_STICKY
@@ -132,10 +138,11 @@ class TunnelService : VpnService() {
     private fun runTunnel(
         server: String,
         token: String,
-        clientId: String,
+        deviceIdentity: AndroidDeviceIdentity,
         runGeneration: Long,
         startId: Int,
     ) {
+        val clientId = deviceIdentity.id
         val client = OkHttpClient.Builder()
             .dns(object : Dns {
                 override fun lookup(hostname: String) = selectedNetwork.get()
@@ -184,7 +191,7 @@ class TunnelService : VpnService() {
                         connectNativeOnce(
                             server,
                             token,
-                            clientId,
+                            deviceIdentity,
                             network,
                             attemptActive,
                             attemptToken,
@@ -204,7 +211,7 @@ class TunnelService : VpnService() {
                             client,
                             server,
                             token,
-                            clientId,
+                            deviceIdentity,
                             attemptActive,
                             vpnReady,
                             attemptToken,
@@ -249,7 +256,7 @@ class TunnelService : VpnService() {
     private fun connectNativeOnce(
         server: String,
         token: String,
-        clientId: String,
+        deviceIdentity: AndroidDeviceIdentity,
         network: Network,
         attemptActive: AtomicBoolean,
         attemptToken: ConnectionAttemptToken,
@@ -303,7 +310,18 @@ class TunnelService : VpnService() {
             for (remoteAddress in remoteAddresses) {
                 try {
                     if (!isRunActive(runGeneration)) throw InterruptedException("Tunnel stopped")
-                    session = dialer.dial(server, token, clientId, remoteAddress, protector)
+                    val proof = deviceIdentity.proof(token, "CONNECT", MASQUE_PATH)
+                    session = dialer.dial(
+                        server,
+                        token,
+                        deviceIdentity.name,
+                        proof.publicKey,
+                        proof.timestamp,
+                        proof.nonce,
+                        proof.signature,
+                        remoteAddress,
+                        protector,
+                    )
                     connected = true
                     break
                 } catch (error: Exception) {
@@ -429,7 +447,7 @@ class TunnelService : VpnService() {
         client: OkHttpClient,
         server: String,
         token: String,
-        clientId: String,
+        deviceIdentity: AndroidDeviceIdentity,
         attemptActive: AtomicBoolean,
         vpnReady: CountDownLatch,
         attemptToken: ConnectionAttemptToken,
@@ -457,7 +475,7 @@ class TunnelService : VpnService() {
                     laneClient,
                     server,
                     token,
-                    clientId,
+                    deviceIdentity,
                     sessionId,
                     laneIndex,
                     laneQueues[laneIndex],
@@ -583,7 +601,7 @@ class TunnelService : VpnService() {
         client: OkHttpClient,
         server: String,
         token: String,
-        clientId: String,
+        deviceIdentity: AndroidDeviceIdentity,
         sessionId: String,
         laneIndex: Int,
         outboundQueue: ArrayBlockingQueue<ByteArray>,
@@ -599,28 +617,36 @@ class TunnelService : VpnService() {
     ) {
         val attemptCall = AtomicReference<Call?>()
         val requestBody = TunRequestBody(active, uploadReady, attemptCall, outboundQueue, runGeneration)
-        val request = Request.Builder()
-            .url(server.trimEnd('/') + "/v1/tunnel")
-            .header("Authorization", "Bearer $token")
-            .header("X-Porta-Version", PacketFraming.VERSION)
-            .header("X-Porta-Client-ID", clientId)
-            .header(HEADER_LANE_SESSION, sessionId)
-            .header(HEADER_LANE_INDEX, laneIndex.toString())
-            .header(HEADER_LANE_COUNT, HTTP2_LANE_COUNT.toString())
-            .post(requestBody)
-            .build()
-        val activeCall = client.newCall(request)
-        attemptCall.set(activeCall)
-        synchronized(this) {
-            if (!isRunActive(runGeneration) || !active.get()) {
-                activeCall.cancel()
-                return
-            }
-            http2Calls.add(activeCall)
-            sessionCalls.add(activeCall)
-        }
+        var activeCall: Call? = null
         try {
-            activeCall.execute().use { response ->
+            val proof = deviceIdentity.proof(token, "POST", TUNNEL_PATH)
+            val request = Request.Builder()
+                .url(server.trimEnd('/') + TUNNEL_PATH)
+                .header("Authorization", "Bearer $token")
+                .header("X-Porta-Version", PacketFraming.VERSION)
+                .header("X-Porta-Client-ID", deviceIdentity.id)
+                .header("X-Porta-Device-Name", deviceIdentity.name)
+                .header("X-Porta-Device-Key", proof.publicKey)
+                .header("X-Porta-Device-Time", proof.timestamp)
+                .header("X-Porta-Device-Nonce", proof.nonce)
+                .header("X-Porta-Device-Signature", proof.signature)
+                .header(HEADER_LANE_SESSION, sessionId)
+                .header(HEADER_LANE_INDEX, laneIndex.toString())
+                .header(HEADER_LANE_COUNT, HTTP2_LANE_COUNT.toString())
+                .post(requestBody)
+                .build()
+            val call = client.newCall(request)
+            activeCall = call
+            attemptCall.set(call)
+            synchronized(this) {
+                if (!isRunActive(runGeneration) || !active.get()) {
+                    call.cancel()
+                    return
+                }
+                http2Calls.add(call)
+                sessionCalls.add(call)
+            }
+            call.execute().use { response ->
                 if (!response.isSuccessful) {
                     if (response.code == 426) {
                         val minimum = response.header(HEADER_PROTOCOL_MIN_VERSION).orEmpty()
@@ -684,12 +710,22 @@ class TunnelService : VpnService() {
                 }
             }
         } catch (error: Exception) {
-            if (isRunActive(runGeneration) && active.get()) errors.offer(error)
+            if (isRunActive(runGeneration) && active.get()) {
+                errors.offer(
+                    if (error is DeviceIdentityUnavailableException) {
+                        PermanentTunnelException(error.message ?: "Could not sign the device request")
+                    } else {
+                        error
+                    },
+                )
+            }
         } finally {
-            activeCall.cancel()
+            activeCall?.cancel()
             requestBody.stop()
-            http2Calls.remove(activeCall)
-            sessionCalls.remove(activeCall)
+            activeCall?.let {
+                http2Calls.remove(it)
+                sessionCalls.remove(it)
+            }
         }
     }
 
@@ -1141,6 +1177,8 @@ class TunnelService : VpnService() {
         private const val HEADER_PROTOCOL_VERSION = "X-Porta-Version"
         private const val HEADER_PROTOCOL_MIN_VERSION = "X-Porta-Min-Version"
         private const val HEADER_PROTOCOL_MAX_VERSION = "X-Porta-Max-Version"
+        private const val TUNNEL_PATH = "/v1/tunnel"
+        private const val MASQUE_PATH = "/.well-known/masque/ip/*/*/"
         private const val HEADER_LANE_SESSION = "X-Porta-Lane-Session"
         private const val HEADER_LANE_INDEX = "X-Porta-Lane"
         private const val HEADER_LANE_COUNT = "X-Porta-Lanes"

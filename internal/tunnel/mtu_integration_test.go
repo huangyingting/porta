@@ -180,10 +180,10 @@ func TestHTTP2AutomaticMTURetainsConfiguredMTU(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	connection, err := tunnel.Dial(ctx, tunnel.Config{
-		URL: server.URL, Token: testToken, ClientID: "mtu-h2", Transport: tunnel.TransportHTTP2,
+	connection, err := tunnel.Dial(ctx, withTestDeviceProof(tunnel.Config{
+		URL: server.URL, Token: testToken, Transport: tunnel.TransportHTTP2,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, Timeout: 3 * time.Second, // test-only certificate
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,10 +244,10 @@ func startMTUTestHTTP3(t *testing.T, handler http.Handler, datagrams bool) tunne
 			t.Error(err)
 		}
 	})
-	return tunnel.Config{
-		URL: "https://" + conn.LocalAddr().String(), Token: testToken, ClientID: "mtu-h3", Transport: tunnel.TransportHTTP3,
+	return withTestDeviceProof(tunnel.Config{
+		URL: "https://" + conn.LocalAddr().String(), Token: testToken, Transport: tunnel.TransportHTTP3,
 		TLSConfig: &tls.Config{InsecureSkipVerify: true}, Timeout: 3 * time.Second, // test-only certificate
-	}
+	})
 }
 
 func receiveMTUPacket(t *testing.T, connection *tunnel.Conn) []byte {

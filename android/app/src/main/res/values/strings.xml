@@ -36,8 +36,8 @@
     <string name="token_unchanged_hint">Leave blank to keep current token</string>
     <string name="gateway_label">Gateway</string>
     <string name="token_label">Access token</string>
-    <string name="device_identity_automatic">Device identity is supplied automatically by Android.</string>
-    <string name="device_identity_unavailable">Android device ID is unavailable. Connection cannot start.</string>
+    <string name="device_identity_automatic">Device identity uses a security key; the device or model name is shown for recognition.</string>
+    <string name="device_identity_unavailable">Could not load this device’s security key. See Log for details.</string>
     <string name="security_note">Protected by TLS and Android VPN security</string>
     <string name="auto_connect">Reconnect after device restart</string>
     <string name="secure_storage_failed">Could not store the token securely</string>
@@ -64,7 +64,7 @@
     <string name="no_profiles">No VPN profiles</string>
     <string name="no_profiles_detail">Add a server profile to start a secure connection.</string>
     <string name="edit">Edit</string>
-    <string name="profile_swipe_hint">Swipe right to edit, left to delete.</string>
+    <string name="profile_swipe_hint">Swipe across the full card: right to edit, left to delete.</string>
     <string name="edit_named_profile">Edit %1$s</string>
     <string name="delete_named_profile">Delete %1$s</string>
     <string name="delete_profile">Delete profile?</string>

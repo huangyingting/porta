@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/usage"
@@ -40,12 +41,8 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Capsule-Protocol: ?1 is required", http.StatusBadRequest)
 		return
 	}
-	clientID := r.Header.Get("X-Porta-Client-ID")
-	if !validClientID.MatchString(clientID) {
-		http.Error(w, "invalid client ID", http.StatusBadRequest)
-		return
-	}
-	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), clientID)
+	proof := deviceauth.FromRequest(r)
+	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), proof, r.Method, r.URL.Path)
 	if err != nil {
 		c.Metrics.authenticationFailed()
 		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
@@ -129,7 +126,7 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 	usageSession := c.Usage.Begin(
 		"",
 		identity.AccountID,
-		clientID,
+		proof.DeviceID,
 		transportName,
 		lease.Address.String(),
 		"",
@@ -137,8 +134,8 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 	defer usageSession.Close()
 	c.Metrics.connected()
 	defer c.Metrics.disconnected()
-	c.Logger.Info("tunnel connected", "client_id", clientID, "account_id", identity.AccountID, "address", lease.Address, "transport", transportName, "remote", remoteHost)
-	defer c.Logger.Info("tunnel disconnected", "client_id", clientID, "address", lease.Address)
+	c.Logger.Info("tunnel connected", "client_id", proof.DeviceID, "device_name", proof.Name, "account_id", identity.AccountID, "address", lease.Address, "transport", transportName, "remote", remoteHost)
+	defer c.Logger.Info("tunnel disconnected", "client_id", proof.DeviceID, "address", lease.Address)
 
 	encoder := masque.NewEncoder(writer)
 	var assigned atomic.Bool
@@ -175,14 +172,14 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 			if useDatagrams {
 				send := func(packet []byte) error { return c.sendMasqueIPPacket(packet, stream.SendDatagram, encoder) }
 				if err := c.sendDownlink(sessionCtx, lease, packet, send, usageSession); err != nil {
-					c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
+					c.Logger.Warn("MASQUE send stopped", "client_id", proof.DeviceID, "error", err)
 					return
 				}
 			} else {
 			drain:
 				for count := 0; ; count++ {
 					if err := c.sendDownlink(sessionCtx, lease, packet, encoder.WriteIPPacket, usageSession); err != nil {
-						c.Logger.Warn("MASQUE send stopped", "client_id", clientID, "error", err)
+						c.Logger.Warn("MASQUE send stopped", "client_id", proof.DeviceID, "error", err)
 						return
 					}
 					if count+1 >= streamPacketBatch {
@@ -198,7 +195,7 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 			}
 		case err := <-inboundDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
-				c.Logger.Warn("MASQUE receive stopped", "client_id", clientID, "error", err)
+				c.Logger.Warn("MASQUE receive stopped", "client_id", proof.DeviceID, "error", err)
 			}
 			return
 		case <-sessionCtx.Done():
