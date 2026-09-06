@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Porta</title>
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <main class="shell">
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48"><path d="M24 4 40 10v12c0 10.4-6.5 18.3-16 22C14.5 40.3 8 32.4 8 22V10l16-6Z"/><path d="M18 24.5 22 28l8-9"/></svg>
+        </div>
+        <div>
+          <div class="brand-row"><h1>Porta</h1><span id="version" class="version"></span></div>
+          <p>Private network access</p>
+        </div>
+      </div>
+      <nav class="header-actions" aria-label="Primary">
+        <button id="home-action" class="text-action hidden" type="button">Home</button>
+        <button id="activity-action" class="text-action" type="button">Activity</button>
+        <button id="add-action" class="icon-action" type="button" aria-label="Add profile">+</button>
+      </nav>
+    </header>
+
+    <section id="error-banner" class="error-banner hidden" role="alert">
+      <span id="error-message"></span>
+      <button id="dismiss-error" type="button" aria-label="Dismiss error">×</button>
+    </section>
+
+    <section id="home-view">
+      <section class="status-card card" aria-live="polite">
+        <span id="status-dot" class="status-dot offline"></span>
+        <div class="status-copy">
+          <h2 id="status-title">Disconnected</h2>
+          <p id="status-detail">Choose a profile to connect securely.</p>
+        </div>
+        <button id="primary-connect" class="primary compact" type="button" disabled>Connect</button>
+      </section>
+
+      <section class="traffic-card card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">TRAFFIC</p>
+            <h2>Private tunnel</h2>
+          </div>
+          <span id="traffic-state" class="live-label">IDLE</span>
+        </div>
+        <canvas id="traffic-chart" height="124" aria-label="Recent upload and download rates"></canvas>
+        <div class="traffic-values">
+          <div><span class="traffic-swatch download"></span><span>Download</span><strong id="download-rate">0 B/s</strong></div>
+          <div><span class="traffic-swatch upload"></span><span>Upload</span><strong id="upload-rate">0 B/s</strong></div>
+        </div>
+        <div class="connection-meta">
+          <span id="connection-address">No address</span>
+          <span id="connection-duration">00:00:00</span>
+          <span id="connection-total">0 B received · 0 B sent</span>
+        </div>
+      </section>
+
+      <section class="profiles-section">
+        <div class="section-heading profiles-heading">
+          <div>
+            <p class="eyebrow">VPN PROFILES</p>
+            <h2>Your gateways</h2>
+          </div>
+          <p>Choose a card, then connect.</p>
+        </div>
+        <div id="profiles" class="profile-list"></div>
+        <section id="empty-state" class="empty-state card hidden">
+          <div class="empty-icon" aria-hidden="true">+</div>
+          <h2>Add your first profile</h2>
+          <p>Use the gateway URL and client token from your Porta access page.</p>
+          <button id="empty-add" class="primary" type="button">Add profile</button>
+        </section>
+      </section>
+
+      <footer>
+        Tokens stay protected by Windows DPAPI. Closing or minimizing keeps Porta available in the notification area.
+      </footer>
+    </section>
+
+    <section id="activity-view" class="hidden">
+      <section class="activity-card card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ACTIVITY</p>
+            <h2>Connection timeline</h2>
+          </div>
+          <button id="restore-action" class="secondary" type="button" disabled>Restore network</button>
+        </div>
+        <pre id="activity-log" tabindex="0" aria-label="Porta connection activity"></pre>
+      </section>
+    </section>
+
+    <section id="editor" class="editor-panel hidden" aria-labelledby="editor-title">
+      <form id="profile-form" class="editor-card card" autocomplete="off">
+        <div class="editor-header">
+          <div>
+            <p class="eyebrow">PROFILE</p>
+            <h2 id="editor-title">Add profile</h2>
+          </div>
+          <button id="editor-close" class="text-action" type="button">Cancel</button>
+        </div>
+        <input id="profile-id" type="hidden">
+        <label>Profile name<input id="profile-name" maxlength="80" required placeholder="Home"></label>
+        <label>Gateway URL<input id="profile-server" type="url" required value="https://" spellcheck="false"></label>
+        <label>Transport
+          <select id="profile-transport">
+            <option value="auto">Automatic (recommended)</option>
+            <option value="h3">HTTP/3 only</option>
+            <option value="h2">HTTP/2 only</option>
+          </select>
+        </label>
+        <label>Client token <span id="token-hint">Required for a new profile</span>
+          <input id="profile-token" type="password" autocomplete="new-password" spellcheck="false">
+        </label>
+        <div class="editor-actions">
+          <button id="delete-profile" class="danger-action hidden" type="button">Delete</button>
+          <span class="action-spacer"></span>
+          <button id="cancel-edit" class="secondary" type="button">Cancel</button>
+          <button class="primary" type="submit">Save profile</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

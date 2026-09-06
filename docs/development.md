@@ -4,7 +4,10 @@
 
 Go builds require Go 1.26 or newer. Android builds additionally require JDK 17,
 Android SDK 35, Android NDK 27.2.12479018, and matching `gomobile` and `gobind`
-binaries on `PATH`.
+binaries on `PATH`. The Windows desktop uses the pinned Wails v3 module and
+Microsoft Edge WebView2. Production builds must include the `production` build
+tag; the frontend is embedded HTML, CSS, and JavaScript and does not require
+Node.js or an npm build.
 
 ## Local validation
 
@@ -59,6 +62,9 @@ requires `ip`, `nft`, `sysctl`, `unshare`, and passwordless `sudo`.
 Windows networking script regressions use isolated PowerShell mocks. They run
 when `pwsh` is on `PATH`, or with Windows PowerShell on Windows; otherwise those
 tests are explicitly skipped. The Windows CI job runs the platform packages.
+It builds the Wails desktop with the `production` tag, smoke-tests WebView2
+startup, verifies the pinned Wintun archive, and uploads the complete Windows
+ZIP as a workflow artifact.
 It also requires live BFE acceptance with `PORTA_WFP_NATIVE_TEST=1`, bypassing
 the Go test result cache. Run the same acceptance locally from elevated Windows:
 

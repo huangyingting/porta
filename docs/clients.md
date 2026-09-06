@@ -119,11 +119,20 @@ DPAPI, configures routes, DNS, and the negotiated Windows IP-interface MTU,
 and restores Porta-owned network state on
 intentional disconnect. An interrupted run keeps the guard active; a reconnect
 resumes the protected tunnel, while explicit cleanup removes the guard.
-The desktop presents a focused profile editor, live connection state, tunnel
-address and traffic statistics, and an on-device activity log. Porta snapshots,
+The desktop uses an Android-inspired dashboard with profile cards, live
+connection state, tunnel traffic and an on-device activity timeline. Profile
+editing stays within the main window rather than opening another dialog.
+Closing or minimizing hides Porta in the notification area. Its native tray
+menu can open the window, connect or disconnect, show Activity, restore retained
+network state, or quit safely. Porta snapshots,
 applies, and restores the Wintun IPv4 MTU through the native Windows IP Helper
 API. This avoids depending on PowerShell's `NlMtuBytes` projection, which can be
 empty for otherwise usable Wintun adapters.
+
+The desktop interface is rendered by the pinned Wails v3 runtime and requires
+the Microsoft Edge WebView2 Runtime. It is included with Windows 11 and current
+Windows 10 installations; install the Evergreen WebView2 Runtime if Windows
+reports that it is missing.
 
 For terminal automation with the same automatic networking and protection:
 

@@ -41,7 +41,7 @@ build-windows:
 	curl --fail --silent --show-error --location -o bin/wintun-0.14.1.zip https://www.wintun.net/builds/wintun-0.14.1.zip
 	printf '%s  %s\n' 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51 bin/wintun-0.14.1.zip | sha256sum -c -
 	unzip -p bin/wintun-0.14.1.zip wintun/bin/amd64/wintun.dll > bin/windows-amd64/wintun.dll
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w -H=windowsgui" -o bin/windows-amd64/porta.exe ./cmd/porta-windows
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -tags production -trimpath -ldflags="-s -w -H=windowsgui" -o bin/windows-amd64/porta.exe ./cmd/porta-windows
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o bin/windows-amd64/porta-cli.exe ./cmd/porta-client
 	$(GO) run ./scripts/package-windows.go bin/porta-client-windows-amd64.zip bin/windows-amd64
 

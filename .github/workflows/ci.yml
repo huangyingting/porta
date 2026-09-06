@@ -66,7 +66,7 @@ jobs:
       - name: Build Windows applications
         shell: pwsh
         run: |
-          go build -trimpath -ldflags="-s -w -H=windowsgui" -o porta.exe ./cmd/porta-windows
+          go build -tags production -trimpath -ldflags="-s -w -H=windowsgui" -o porta.exe ./cmd/porta-windows
           go build -trimpath -ldflags="-s -w" -o porta-cli.exe ./cmd/porta-client
       - name: Smoke test desktop startup
         shell: pwsh
@@ -75,6 +75,22 @@ jobs:
           Start-Sleep -Seconds 3
           if ($process.HasExited) { throw "Porta desktop client exited during startup" }
           Stop-Process -Id $process.Id
+      - name: Package Windows applications
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $expected = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+          if ((Get-FileHash wintun.zip -Algorithm SHA256).Hash -ne $expected) {
+            throw "Wintun archive checksum mismatch"
+          }
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll .
+          go run ./scripts/package-windows.go porta-client-windows-amd64.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: porta-client-windows-amd64
+          path: porta-client-windows-amd64.zip
+          if-no-files-found: error
 
   android:
     runs-on: ubuntu-latest
