@@ -252,9 +252,22 @@ func TestLiveVPNRevocation(t *testing.T) {
 						t.Fatal("client did not observe revocation")
 					}
 				}
-				snapshot := store.Snapshot()
-				if active := snapshot.Clients[id.AccountID].ActiveSessions; active != 0 {
-					t.Fatalf("usage still has %d active sessions after revocation: %#v", active, snapshot.Devices)
+				// Disconnect and forget preserve valid credentials, so the
+				// transport may reconnect immediately. Stop the client before
+				// checking that all accounting sessions have drained.
+				if action == "disconnect" || action == "forget" {
+					cancel()
+				}
+				deadline := time.Now().Add(time.Second)
+				for {
+					snapshot := store.Snapshot()
+					if snapshot.Clients[id.AccountID].ActiveSessions == 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("usage sessions did not drain after client shutdown: %#v", snapshot.Devices)
+					}
+					time.Sleep(time.Millisecond)
 				}
 			})
 		}

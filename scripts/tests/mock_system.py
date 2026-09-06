@@ -225,7 +225,7 @@ elif name == "ss":
 elif name == "make":
     binary = safe(Path.cwd() / "bin/porta-server")
     binary.parent.mkdir(exist_ok=True)
-    binary.write_text("#!/bin/sh\nprintf 'client-downloads\\n'\n")
+    binary.write_text("#!/bin/sh\nprintf 'client-downloads\\nlanding-template-dir\\n'\n")
     binary.chmod(0o755)
 elif name == "mv":
     source, destination = map(safe, args[-2:])

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/huangyingting/porta/internal/deviceauth"
@@ -45,15 +46,18 @@ type tokenIndexEntry struct {
 }
 
 type clientRegistry struct {
-	mu               sync.Mutex
-	path             string
-	logger           *slog.Logger
-	clients          []clientRecord
-	tokenIndex       map[[sha256.Size]byte]tokenIndexEntry
-	sessions         map[registryDeviceKey]map[*activeClientSession]struct{}
-	retiring         map[registryDeviceKey]int
-	retiringAccounts map[string]int
-	nonces           map[registryDeviceKey]*deviceNonceWindow
+	mu                sync.Mutex
+	path              string
+	logger            *slog.Logger
+	clients           []clientRecord
+	tokenIndex        map[[sha256.Size]byte]tokenIndexEntry
+	sessions          map[registryDeviceKey]map[*activeClientSession]struct{}
+	retiring          map[registryDeviceKey]int
+	retiringAccounts  map[string]int
+	disconnectEpoch   atomic.Uint64
+	accountDisconnect map[string]uint64
+	deviceDisconnect  map[registryDeviceKey]uint64
+	nonces            map[registryDeviceKey]*deviceNonceWindow
 
 	persistMu          sync.Mutex
 	durabilityMu       sync.Mutex
@@ -210,6 +214,7 @@ func openClientRegistry(path, bootstrapToken string) (*clientRegistry, error) {
 // AuthenticateDeviceSession registers cancellation under the same lock as authentication.
 // release must run after all packet/copy workers and usage accounting have drained.
 func (r *clientRegistry) AuthenticateDeviceSession(parent context.Context, token string, proof deviceauth.Proof, method, path string) (gateway.ClientIdentity, context.Context, func(), error) {
+	attemptEpoch := r.disconnectEpoch.Load()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := parent.Err(); err != nil {
@@ -218,7 +223,7 @@ func (r *clientRegistry) AuthenticateDeviceSession(parent context.Context, token
 	if r.closed {
 		return gateway.ClientIdentity{}, nil, nil, errRegistryClosed
 	}
-	identity, err := r.authenticateDeviceLocked(token, proof, method, path)
+	identity, err := r.authenticateDeviceLocked(token, proof, method, path, attemptEpoch)
 	if err != nil {
 		return gateway.ClientIdentity{}, nil, nil, err
 	}
@@ -226,6 +231,7 @@ func (r *clientRegistry) AuthenticateDeviceSession(parent context.Context, token
 }
 
 func (r *clientRegistry) AuthenticateProxySession(parent context.Context, token string) (gateway.ClientIdentity, context.Context, func(), error) {
+	attemptEpoch := r.disconnectEpoch.Load()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := parent.Err(); err != nil {
@@ -234,7 +240,7 @@ func (r *clientRegistry) AuthenticateProxySession(parent context.Context, token 
 	if r.closed {
 		return gateway.ClientIdentity{}, nil, nil, errRegistryClosed
 	}
-	identity, err := r.authenticateProxyLocked(token)
+	identity, err := r.authenticateProxyLocked(token, attemptEpoch)
 	if err != nil {
 		return gateway.ClientIdentity{}, nil, nil, err
 	}
@@ -267,21 +273,18 @@ func (r *clientRegistry) registerSessionLocked(parent context.Context, identity 
 	}, nil
 }
 
-func (r *clientRegistry) authenticateDeviceLocked(token string, proof deviceauth.Proof, method, path string) (gateway.ClientIdentity, error) {
+func (r *clientRegistry) authenticateDeviceLocked(token string, proof deviceauth.Proof, method, path string, attemptEpoch uint64) (gateway.ClientIdentity, error) {
 	client, err := r.clientForTokenLocked(token)
 	if err != nil {
 		return gateway.ClientIdentity{}, err
 	}
-	if r.retiringAccounts[client.ID] > 0 {
+	key := registryDeviceKey{client.ID, proof.DeviceID}
+	if r.authenticationBlockedLocked(client.ID, key, attemptEpoch) {
 		return gateway.ClientIdentity{}, errDeviceDraining
 	}
 	encodedKey, signedAt, err := deviceauth.Verify(proof, token, method, path, time.Now().UTC())
 	if err != nil {
 		return gateway.ClientIdentity{}, errClientUnauthorized
-	}
-	key := registryDeviceKey{client.ID, proof.DeviceID}
-	if r.retiring[key] > 0 {
-		return gateway.ClientIdentity{}, errDeviceDraining
 	}
 	if r.nonceSeenLocked(key, proof.Nonce, signedAt) {
 		return gateway.ClientIdentity{}, errClientUnauthorized
@@ -326,17 +329,14 @@ func (r *clientRegistry) authenticateDeviceLocked(token string, proof deviceauth
 	return registryIdentity(*client, proof.DeviceID), nil
 }
 
-func (r *clientRegistry) authenticateProxyLocked(token string) (gateway.ClientIdentity, error) {
+func (r *clientRegistry) authenticateProxyLocked(token string, attemptEpoch uint64) (gateway.ClientIdentity, error) {
 	client, err := r.clientForTokenLocked(token)
 	if err != nil {
 		return gateway.ClientIdentity{}, err
 	}
-	if r.retiringAccounts[client.ID] > 0 {
-		return gateway.ClientIdentity{}, errDeviceDraining
-	}
 	deviceID := forwardproxy.DeviceID
 	key := registryDeviceKey{client.ID, deviceID}
-	if r.retiring[key] > 0 {
+	if r.authenticationBlockedLocked(client.ID, key, attemptEpoch) {
 		return gateway.ClientIdentity{}, errDeviceDraining
 	}
 	now := time.Now().UTC()
@@ -664,12 +664,20 @@ func (r *clientRegistry) Disconnect(clientID, deviceID string) (int, error) {
 		if r.retiringAccounts == nil {
 			r.retiringAccounts = make(map[string]int)
 		}
+		if r.accountDisconnect == nil {
+			r.accountDisconnect = make(map[string]uint64)
+		}
+		r.accountDisconnect[clientID] = r.disconnectEpoch.Add(1)
 		r.retiringAccounts[clientID]++
 	} else {
 		key := registryDeviceKey{clientID, deviceID}
 		if r.retiring == nil {
 			r.retiring = make(map[registryDeviceKey]int)
 		}
+		if r.deviceDisconnect == nil {
+			r.deviceDisconnect = make(map[registryDeviceKey]uint64)
+		}
+		r.deviceDisconnect[key] = r.disconnectEpoch.Add(1)
 		r.retiring[key]++
 	}
 	stopped := r.sessionsLocked(clientID, deviceID)
@@ -677,15 +685,25 @@ func (r *clientRegistry) Disconnect(clientID, deviceID string) (int, error) {
 	drainClientSessions(stopped)
 	r.mu.Lock()
 	if deviceID == "" {
+		r.accountDisconnect[clientID] = r.disconnectEpoch.Add(1)
 		r.retiringAccounts[clientID]--
 		if r.retiringAccounts[clientID] == 0 {
 			delete(r.retiringAccounts, clientID)
 		}
 	} else {
-		r.endDeviceRetirementLocked(registryDeviceKey{clientID, deviceID})
+		key := registryDeviceKey{clientID, deviceID}
+		r.deviceDisconnect[key] = r.disconnectEpoch.Add(1)
+		r.endDeviceRetirementLocked(key)
 	}
 	r.mu.Unlock()
 	return len(stopped), nil
+}
+
+func (r *clientRegistry) authenticationBlockedLocked(accountID string, key registryDeviceKey, attemptEpoch uint64) bool {
+	return r.retiringAccounts[accountID] > 0 ||
+		r.retiring[key] > 0 ||
+		r.accountDisconnect[accountID] > attemptEpoch ||
+		r.deviceDisconnect[key] > attemptEpoch
 }
 
 func (r *clientRegistry) endDeviceRetirementLocked(key registryDeviceKey) {

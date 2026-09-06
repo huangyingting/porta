@@ -2,7 +2,8 @@
 
 ## Public browser routes
 
-- `GET /` serves the neutral Porta landing page.
+- `GET /` serves a randomly selected bundled or operator-provided Porta
+  landing template.
 - `POST /access` exchanges an administrator or active client token for a
   short-lived, role-scoped browser session.
 - `GET /join#invite=...` opens QR onboarding. The fragment is handled only by

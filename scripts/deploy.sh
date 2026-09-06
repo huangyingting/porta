@@ -316,6 +316,8 @@ chmod 0755 "$server_binary"
 server_help=$("$server_binary" --help 2>&1)
 grep -q -- 'client-downloads' <<<"$server_help" ||
   die "selected server release does not support the required client download portal"
+grep -q -- 'landing-template-dir' <<<"$server_help" ||
+  die "selected server release does not support custom landing templates"
 
 lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'
@@ -494,7 +496,7 @@ for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
   backup_file "/etc/systemd/system/$unit" "$unit"
 done
 deployment_started=true
-install -d -m 0755 /usr/local/libexec/porta /etc/porta /var/lib/porta/downloads
+install -d -m 0755 /usr/local/libexec/porta /etc/porta /etc/porta/landing /var/lib/porta/downloads
 install -m 0755 "$server_binary" /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
   /usr/local/libexec/porta/
@@ -578,7 +580,7 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $auto_mtu_argument --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $auto_mtu_argument --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $auto_mtu_argument; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure

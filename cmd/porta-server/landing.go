@@ -1,8 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 const landingHTML = `<!doctype html>
@@ -10,6 +15,7 @@ const landingHTML = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
   <meta name="theme-color" content="#f5f6fa">
   <link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml">
   <title>Porta · Digital product studio</title>
@@ -63,8 +69,145 @@ const landingHTML = `<!doctype html>
 </html>
 `
 
+const landingAccessHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
+  <meta name="theme-color" content="#10131d">
+  <link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml">
+  <title>Porta · Focused access</title>
+  <style>
+    @font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-style:normal;font-weight:200 900;font-display:swap}
+    :root{color-scheme:dark;font-family:"Mona Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--ink:#f4f5fb;--muted:#a5a9b8;--line:rgba(255,255,255,.11);--violet:#9b91ff;--mint:#77e2cc;font-feature-settings:"cv11","ss01","ss03";font-synthesis:none}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;color:var(--ink);background:#10131d;overflow-x:hidden}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at 14% 18%,rgba(119,226,204,.14),transparent 28rem),radial-gradient(circle at 88% 72%,rgba(116,97,255,.2),transparent 34rem)}
+    .page{position:relative;width:min(1060px,calc(100% - 40px));min-height:100vh;margin:auto;display:grid;grid-template-rows:auto 1fr auto}
+    header{height:72px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}
+    .brand{display:flex;align-items:center;gap:11px;font-size:15px;font-weight:780;letter-spacing:-.025em}.brand img{width:31px;height:31px}.edition{color:#858b9c;font-size:10px;font-weight:700;letter-spacing:.13em;text-transform:uppercase}
+    main{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.72fr);gap:clamp(42px,8vw,100px);align-items:center;padding:48px 0}
+    .eyebrow{color:var(--mint);font-size:11px;font-weight:760;letter-spacing:.16em;text-transform:uppercase}
+    h1{max-width:650px;margin:18px 0;font-size:clamp(50px,7.2vw,84px);font-weight:630;line-height:.92;letter-spacing:-.065em}h1 em{font-style:normal;color:var(--violet)}
+    .lead{max-width:540px;margin:0;color:var(--muted);font-size:clamp(15px,1.5vw,18px);line-height:1.65;letter-spacing:-.01em}
+    .access-link{display:inline-flex;align-items:center;gap:12px;margin-top:31px;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:#f3f4f8;color:#171923;padding:12px 18px;text-decoration:none;font-size:12px;font-weight:780;box-shadow:0 16px 34px rgba(0,0,0,.24)}.access-link:after{content:"→";font-size:14px}
+    .panel{position:relative;min-height:390px;border:1px solid var(--line);border-radius:30px;background:linear-gradient(155deg,rgba(255,255,255,.08),rgba(255,255,255,.025));box-shadow:0 32px 80px rgba(0,0,0,.22);overflow:hidden}
+    .panel:before,.panel:after{content:"";position:absolute;border-radius:50%}.panel:before{width:230px;height:230px;right:-50px;top:-58px;border:1px solid rgba(155,145,255,.32);box-shadow:0 0 0 44px rgba(155,145,255,.045),0 0 0 88px rgba(155,145,255,.025)}.panel:after{width:140px;height:140px;left:42px;bottom:44px;background:linear-gradient(145deg,var(--mint),#7365ff);box-shadow:0 25px 55px rgba(82,73,201,.34);animation:drift 7s ease-in-out infinite}
+    .panel-copy{position:absolute;left:24px;right:24px;top:24px;z-index:1;padding:17px;border:1px solid rgba(255,255,255,.1);border-radius:15px;background:rgba(13,16,25,.62);backdrop-filter:blur(16px)}.panel-copy small{display:block;color:#7f8597;font-size:9px;font-weight:760;letter-spacing:.15em;text-transform:uppercase}.panel-copy strong{display:block;margin-top:7px;font-size:15px;letter-spacing:-.02em}
+    .index{position:absolute;right:24px;bottom:22px;z-index:1;color:#b2accf;font-size:10px;font-weight:800;letter-spacing:.16em}
+    footer{min-height:58px;display:flex;align-items:center;justify-content:space-between;gap:20px;border-top:1px solid var(--line);color:#747a8c;font-size:10px}
+    @keyframes drift{0%,100%{transform:translateY(0) rotate(-5deg)}50%{transform:translateY(-14px) rotate(4deg)}}@media(prefers-reduced-motion:reduce){.panel:after{animation:none}}
+    @media(max-width:780px){main{grid-template-columns:1fr;gap:34px;padding:40px 0}.panel{min-height:320px}h1{font-size:clamp(47px,12vw,68px)}}
+    @media(max-width:520px){.page{width:min(100% - 24px,1060px)}header{height:62px}.edition{display:none}main{padding:32px 0;gap:28px}.panel{min-height:280px;border-radius:23px}.panel:after{width:112px;height:112px;left:30px}.access-link{margin-top:25px}footer{align-items:flex-start;flex-direction:column;justify-content:center;gap:4px}}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><span class="edition">Private workspace</span></header>
+    <main>
+      <section>
+        <div class="eyebrow">Welcome to Porta</div>
+        <h1>A clear way <em>in.</em></h1>
+        <p class="lead">Approved users can continue to their Porta workspace from one focused, carefully designed starting point.</p>
+        <a class="access-link" href="/access">Get access</a>
+      </section>
+      <section class="panel" aria-label="Abstract geometric artwork">
+        <div class="panel-copy"><small>Designed for focus</small><strong>Everything begins with a clear entry point.</strong></div>
+        <span class="index">PORTA / 02</span>
+      </section>
+    </main>
+    <footer><span>Porta</span><span>Focused access for approved users</span></footer>
+  </div>
+</body>
+</html>
+`
+
+const (
+	robotsText             = "User-agent: *\nDisallow: /\n"
+	robotsDirectives       = "noindex, nofollow, noarchive, nosnippet, noimageindex"
+	maxLandingTemplateSize = 1 << 20
+)
+
+type landingTemplateSet struct {
+	pages       []string
+	randomIndex func(int) int
+}
+
+var bundledLandingTemplates = newLandingTemplateSet([]string{
+	landingHTML,
+	landingAccessHTML,
+	landingEditorialHTML,
+	landingGridHTML,
+	landingGalleryHTML,
+	landingMinimalHTML,
+})
+
+func newLandingTemplateSet(pages []string) landingTemplateSet {
+	return landingTemplateSet{
+		pages:       append([]string(nil), pages...),
+		randomIndex: rand.IntN,
+	}
+}
+
+func loadLandingTemplateSet(directory string) (landingTemplateSet, error) {
+	if strings.TrimSpace(directory) == "" {
+		return bundledLandingTemplates, nil
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return landingTemplateSet{}, fmt.Errorf("read landing template directory: %w", err)
+	}
+	pages := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name()), ".html") {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return landingTemplateSet{}, fmt.Errorf("inspect landing template %q: %w", entry.Name(), err)
+		}
+		if info.Size() > maxLandingTemplateSize {
+			return landingTemplateSet{}, fmt.Errorf("landing template %q exceeds the 1 MiB limit", entry.Name())
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return landingTemplateSet{}, fmt.Errorf("read landing template %q: %w", entry.Name(), err)
+		}
+		if len(content) > maxLandingTemplateSize {
+			return landingTemplateSet{}, fmt.Errorf("landing template %q exceeds the 1 MiB limit", entry.Name())
+		}
+		if len(strings.TrimSpace(string(content))) == 0 {
+			return landingTemplateSet{}, fmt.Errorf("landing template %q is empty", entry.Name())
+		}
+		pages = append(pages, string(content))
+	}
+	if len(pages) == 0 {
+		return bundledLandingTemplates, nil
+	}
+	return newLandingTemplateSet(pages), nil
+}
+
+func (templates landingTemplateSet) selectPage() string {
+	if len(templates.pages) == 0 {
+		panic("landing template set is empty")
+	}
+	if len(templates.pages) == 1 {
+		return templates.pages[0]
+	}
+	return templates.pages[templates.randomIndex(len(templates.pages))]
+}
+
 func publicSiteHandler(next http.Handler, landingEnabled bool) http.Handler {
+	return publicSiteHandlerWithTemplates(next, landingEnabled, bundledLandingTemplates)
+}
+
+func publicSiteHandlerWithTemplates(next http.Handler, landingEnabled bool, templates landingTemplateSet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			serveRobots(w, r)
+			return
+		}
 		if serveWebFont(w, r) {
 			return
 		}
@@ -73,7 +216,7 @@ func publicSiteHandler(next http.Handler, landingEnabled bool) http.Handler {
 		}
 		if isOperationalPath(r.URL.Path) {
 			if landingEnabled && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-				serveLandingPage(w, r)
+				serveLandingPage(w, r, templates.selectPage())
 			} else {
 				http.NotFound(w, r)
 			}
@@ -87,7 +230,7 @@ func publicSiteHandler(next http.Handler, landingEnabled bool) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		serveLandingPage(w, r)
+		serveLandingPage(w, r, templates.selectPage())
 	})
 }
 
@@ -95,26 +238,31 @@ func isOperationalPath(path string) bool {
 	return path == "/healthz" || path == "/readyz" || path == "/metrics"
 }
 
-func serveLandingPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "public, max-age=300")
+func serveLandingPage(w http.ResponseWriter, r *http.Request, content string) {
+	setCrawlerPolicy(w)
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; font-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	switch r.URL.Path {
-	case "/robots.txt":
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if r.Method == http.MethodGet {
-			_, _ = io.WriteString(w, "User-agent: *\nDisallow:\n")
-		}
-	default:
-		serveLandingPageContent(w, r)
+	serveLandingPageContent(w, r, content)
+}
+
+func serveRobots(w http.ResponseWriter, r *http.Request) {
+	setCrawlerPolicy(w)
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if r.Method == http.MethodGet {
+		_, _ = io.WriteString(w, robotsText)
 	}
 }
 
-func serveLandingPageContent(w http.ResponseWriter, r *http.Request) {
+func setCrawlerPolicy(w http.ResponseWriter) {
+	w.Header().Set("X-Robots-Tag", robotsDirectives)
+}
+
+func serveLandingPageContent(w http.ResponseWriter, r *http.Request, content string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodGet {
-		_, _ = io.WriteString(w, landingHTML)
+		_, _ = io.WriteString(w, content)
 	}
 }

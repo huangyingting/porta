@@ -325,7 +325,8 @@ class AutomationTests(unittest.TestCase):
         deploy.write_text(source)
         for directory in (
             "usr/local/bin", "usr/local/libexec/porta", "etc/porta/tls",
-            "etc/sysctl.d", "etc/systemd/system", "var/lib/porta/downloads", "run/lock",
+            "etc/porta/landing", "etc/sysctl.d", "etc/systemd/system",
+            "var/lib/porta/downloads", "run/lock",
         ):
             (self.root / "system" / directory).mkdir(parents=True, exist_ok=True)
         if existing:
@@ -338,6 +339,7 @@ class AutomationTests(unittest.TestCase):
                 "etc/porta/porta.env": "PORTA_TOKEN=old-client\nPORTA_ADMIN_TOKEN=old-admin\n",
                 "etc/porta/tls/server.crt": "certificate:old",
                 "etc/porta/tls/server.key": "key:old",
+                "etc/porta/landing/custom.html": "<h1>custom landing</h1>",
                 "etc/systemd/system/porta.service": "old service --acme-domain old.example\n",
                 "var/lib/porta/downloads/CLIENT_VERSION": "v0.1.3",
                 "var/lib/porta/downloads/old-client": "old client",
@@ -444,6 +446,12 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--egress-interface eth0", unit)
         self.assertIn("--mtu 1400", unit)
         self.assertIn("--auto-mtu=true", unit)
+        self.assertIn("--landing-template-dir", unit)
+        self.assertTrue((self.root / "system/etc/porta/landing").is_dir())
+        self.assertEqual(
+            (self.root / "system/etc/porta/landing/custom.html").read_text(),
+            "<h1>custom landing</h1>",
+        )
         self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=true", unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", unit)
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
@@ -472,6 +480,7 @@ class AutomationTests(unittest.TestCase):
         setup = next(line for line in unit.splitlines() if line.startswith("ExecStartPost="))
         self.assertIn("--auto-mtu=true", start)
         self.assertIn("--mtu 1400", unit)
+        self.assertIn("--landing-template-dir /etc/porta/landing", start)
         self.assertIn("--auto-mtu=true", setup)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
@@ -479,7 +488,7 @@ class AutomationTests(unittest.TestCase):
         self.run_deploy(deploy, "--build-local", "--admin-port", "80", success=False)
         self.assertNotIn("stopped_helpers", self.state())
 
-    def release_assets(self):
+    def release_assets(self, landing_templates=True):
         release = self.root / "release"
         release.mkdir()
         assets = [
@@ -490,8 +499,13 @@ class AutomationTests(unittest.TestCase):
         ]
         checksums = []
         for name in assets:
-            data = (b"#!/bin/sh\nprintf 'client-downloads\\n'\n"
-                    if name.startswith("porta-server") else name.encode())
+            if name.startswith("porta-server"):
+                features = "client-downloads\\n"
+                if landing_templates:
+                    features += "landing-template-dir\\n"
+                data = f"#!/bin/sh\nprintf '{features}'\n".encode()
+            else:
+                data = name.encode()
             (release / name).write_bytes(data)
             checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
         (release / "SHA256SUMS").write_text("".join(checksums))
@@ -511,6 +525,14 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue((downloads / "porta-client-windows-amd64.zip").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_release_without_landing_templates_fails_before_stopping_service(self):
+        deploy = self.prepare_deploy()
+        before = self.snapshot()
+        self.release_assets(landing_templates=False)
+        self.run_deploy(deploy, success=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("stopped_helpers", self.state())
 
     def test_download_checksum_failure_leaves_installation_untouched(self):
         deploy = self.prepare_deploy()

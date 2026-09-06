@@ -206,6 +206,7 @@ func adminAuthorized(header, expected string) bool {
 }
 
 func setAdminSecurityHeaders(w http.ResponseWriter) {
+	setCrawlerPolicy(w)
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")

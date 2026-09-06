@@ -202,9 +202,16 @@ grep ' porta-android-arm64-v8a.apk$' SHA256SUMS | sha256sum -c -
 ```
 
 Only the listed release filenames are served. There is no directory listing,
-and unauthenticated requests retain the camouflage landing behavior.
+and unauthenticated requests retain the neutral landing behavior.
 Authenticated GitHub release downloads remain available as an operator
 fallback.
+
+The public listener serves a restrictive `/robots.txt` and sends
+`X-Robots-Tag: noindex, nofollow, noarchive, nosnippet, noimageindex` on
+landing and HTML portal responses. These directives discourage compliant
+search engines and archival crawlers, but they are not access control and
+cannot prevent a scraper that chooses to ignore them. Tunnel and forward-proxy
+handshakes are unchanged.
 
 ## Forward proxy
 
@@ -255,10 +262,27 @@ backups.
 
 ## Landing page and role-based portal
 
-Porta serves a compact, neutral studio landing page to ordinary browser
-requests by default. The page contains no VPN, tunnel, gateway, or transport
-language. Its single token field routes administrator tokens to the admin
-console and active client tokens to the download page. The resulting
+Porta randomly selects one of its six bundled, responsive landing templates for
+each ordinary browser request. Operators can replace that pool with custom
+full-page HTML files by placing one or more regular `.html` files in
+`/etc/porta/landing` and restarting the service:
+
+```sh
+sudo install -m 0644 my-landing-page.html /etc/porta/landing/
+sudo systemctl restart porta
+```
+
+Files are loaded in filename order at startup, and one is selected randomly
+for each response. An empty directory keeps the bundled templates. Each file
+is limited to 1 MiB. The landing response policy permits inline CSS and
+same-origin fonts and images, but blocks scripts, external resources, framing,
+and form submissions to other origins. Porta also sends `Cache-Control:
+no-store` and the crawler directives described above for every template.
+Direct runs can use `--landing-template-dir /absolute/path`.
+
+Each bundled page routes its access action to the same role-based portal.
+Administrator tokens open the admin console and active client tokens open the
+download page. The resulting
 role-scoped session expires after eight hours and uses a `Secure`, `HttpOnly`,
 `SameSite=Strict` cookie. Tokens are not placed in URLs or browser storage.
 

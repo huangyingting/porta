@@ -59,8 +59,8 @@ QUIC handshakes, connection duration, packet sizes, timing, and traffic volume.
 Endpoint security software can observe the VPN API, TUN interface, routes, and
 process. The project does not include browser-fingerprint mimicry, domain
 fronting, traffic-shape forgery, or mechanisms intended to defeat an explicit
-security policy. The browser-facing Porta landing page does not conceal
-transport fingerprints from network inspection.
+security policy. Bundled and operator-provided browser landing templates do
+not conceal transport fingerprints from network inspection.
 
 ## Operational boundaries
 

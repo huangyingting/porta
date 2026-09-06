@@ -440,6 +440,7 @@ func serveLandingError(w http.ResponseWriter, r *http.Request) {
 }
 
 func setPortalSecurityHeaders(w http.ResponseWriter) {
+	setCrawlerPolicy(w)
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")

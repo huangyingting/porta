@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,7 +14,7 @@ func TestPublicSiteServesPortaLandingPage(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Fatal("ordinary browser request reached the tunnel handler")
 	})
-	handler := publicSiteHandler(next, true)
+	handler := publicSiteHandlerWithTemplates(next, true, newLandingTemplateSet([]string{landingHTML}))
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://vpn.example.com/", nil))
@@ -50,6 +51,135 @@ func TestPublicSiteServesPortaLandingPage(t *testing.T) {
 	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "font-src 'self'") {
 		t.Fatalf("landing CSP = %q", policy)
 	}
+	if directives := response.Header().Get("X-Robots-Tag"); directives != robotsDirectives {
+		t.Fatalf("X-Robots-Tag = %q", directives)
+	}
+	if !strings.Contains(response.Body.String(), `<meta name="robots" content="`+robotsDirectives+`">`) {
+		t.Fatal("landing page is missing crawler directives")
+	}
+}
+
+func TestPublicSiteSelectsFromLandingTemplatePool(t *testing.T) {
+	call := 0
+	templates := landingTemplateSet{
+		pages: []string{"<html><h1>first</h1></html>", "<html><h1>second</h1></html>"},
+		randomIndex: func(limit int) int {
+			index := call % limit
+			call++
+			return index
+		},
+	}
+	handler := publicSiteHandlerWithTemplates(http.NotFoundHandler(), true, templates)
+	for _, expected := range []string{"first", "second", "first"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://vpn.example.com/", nil))
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("response %d = %q, want template %q", call, response.Body.String(), expected)
+		}
+		if cacheControl := response.Header().Get("Cache-Control"); cacheControl != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", cacheControl)
+		}
+		if directives := response.Header().Get("X-Robots-Tag"); directives != robotsDirectives {
+			t.Fatalf("X-Robots-Tag = %q", directives)
+		}
+	}
+}
+
+func TestLoadLandingTemplateSetUsesCustomHTMLFiles(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "b.html"), []byte("<h1>second custom page</h1>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "a.HTML"), []byte("<h1>first custom page</h1>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "notes.txt"), []byte("ignored"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	templates, err := loadLandingTemplateSet(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(templates.pages) != 2 {
+		t.Fatalf("template count = %d, want 2", len(templates.pages))
+	}
+	if !strings.Contains(templates.pages[0], "first custom page") ||
+		!strings.Contains(templates.pages[1], "second custom page") {
+		t.Fatalf("templates were not loaded in filename order: %#v", templates.pages)
+	}
+}
+
+func TestLoadLandingTemplateSetFallsBackToBundledPages(t *testing.T) {
+	templates, err := loadLandingTemplateSet(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(templates.pages) != 6 {
+		t.Fatalf("bundled template count = %d, want 6", len(templates.pages))
+	}
+	seen := make(map[string]struct{}, len(templates.pages))
+	for index, page := range templates.pages {
+		if !strings.Contains(page, "<title>Porta") ||
+			!strings.Contains(page, "<h1>") ||
+			!strings.Contains(page, `src="/assets/porta-mark.svg"`) ||
+			!strings.Contains(page, `href="/access"`) ||
+			!strings.Contains(page, `font-family:"Mona Sans"`) ||
+			!strings.Contains(page, "@media") ||
+			!strings.Contains(page, `<meta name="robots" content="`+robotsDirectives+`">`) {
+			t.Fatalf("bundled template %d is missing required landing content", index)
+		}
+		for _, term := range []string{"network", "vpn", "gateway", "tunnel", "http/3", "self-hosted"} {
+			if strings.Contains(strings.ToLower(page), term) {
+				t.Fatalf("bundled template %d exposes service term %q", index, term)
+			}
+		}
+		if _, exists := seen[page]; exists {
+			t.Fatalf("bundled template %d duplicates another page", index)
+		}
+		seen[page] = struct{}{}
+	}
+}
+
+func TestLoadLandingTemplateSetRejectsEmptyHTML(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "empty.html"), []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadLandingTemplateSet(directory); err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("load error = %v, want empty template error", err)
+	}
+}
+
+func TestLoadLandingTemplateSetRejectsOversizedHTML(t *testing.T) {
+	directory := t.TempDir()
+	content := make([]byte, maxLandingTemplateSize+1)
+	if err := os.WriteFile(filepath.Join(directory, "large.html"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadLandingTemplateSet(directory); err == nil || !strings.Contains(err.Error(), "exceeds the 1 MiB limit") {
+		t.Fatalf("load error = %v, want size limit error", err)
+	}
+}
+
+func TestPublicSiteDisallowsCrawlersWhenLandingIsDisabled(t *testing.T) {
+	handler := publicSiteHandler(http.NotFoundHandler(), false)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://vpn.example.com/robots.txt", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	if response.Body.String() != robotsText {
+		t.Fatalf("robots.txt = %q", response.Body.String())
+	}
+	if directives := response.Header().Get("X-Robots-Tag"); directives != robotsDirectives {
+		t.Fatalf("X-Robots-Tag = %q", directives)
+	}
+
+	head := httptest.NewRecorder()
+	handler.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "https://vpn.example.com/robots.txt", nil))
+	if head.Code != http.StatusOK || head.Body.Len() != 0 {
+		t.Fatalf("HEAD response = %d with %d body bytes", head.Code, head.Body.Len())
+	}
 }
 
 func TestPublicSiteConcealsOperationalEndpoints(t *testing.T) {
@@ -80,6 +210,9 @@ func TestPublicSitePreservesTunnelRequests(t *testing.T) {
 
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("tunnel status = %d, want 202", response.Code)
+	}
+	if directives := response.Header().Get("X-Robots-Tag"); directives != "" {
+		t.Fatalf("tunnel response received crawler directives %q", directives)
 	}
 }
 

@@ -39,6 +39,9 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 	if accessPage.Code != http.StatusOK || !strings.Contains(accessPage.Body.String(), `action="/access"`) {
 		t.Fatalf("access page = %d %q", accessPage.Code, accessPage.Body.String())
 	}
+	if directives := accessPage.Header().Get("X-Robots-Tag"); directives != robotsDirectives {
+		t.Fatalf("access page X-Robots-Tag = %q", directives)
+	}
 
 	adminCookie := portalSignIn(t, handler, testAdminToken, "/portal/admin")
 	adminPage := portalRequest(handler, http.MethodGet, "/portal/admin", adminCookie)

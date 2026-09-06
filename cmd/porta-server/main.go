@@ -82,6 +82,7 @@ func run() (returnErr error) {
 	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
 	landingPage := flag.Bool("landing-page", true, "serve the Porta landing page to ordinary browser requests")
+	landingTemplateDirectory := flag.String("landing-template-dir", "", "directory containing custom .html landing templates (empty uses bundled templates)")
 	disableForwardProxy := flag.Bool("disable-forward-proxy", false, "disable the authenticated HTTPS CONNECT proxy on the public listener")
 	clientDownloads := flag.String("client-downloads", "", "absolute directory containing published client release artifacts (empty disables downloads)")
 	adminAddress := flag.String("admin-listen", "127.0.0.1:9090", "loopback address for the admin UI, health, readiness, and metrics (empty disables)")
@@ -164,6 +165,13 @@ func run() (returnErr error) {
 			return errors.New("--client-downloads must name a directory")
 		}
 	}
+	landingTemplates := bundledLandingTemplates
+	if *landingPage {
+		landingTemplates, err = loadLandingTemplateSet(*landingTemplateDirectory)
+		if err != nil {
+			return err
+		}
+	}
 
 	if *usageStatePath == "" {
 		*usageStatePath = filepath.Join(filepath.Dir(*clientRegistryPath), "usage.json")
@@ -242,7 +250,7 @@ func run() (returnErr error) {
 	if err != nil {
 		return err
 	}
-	publicHandler := publicSiteHandler(handler, *landingPage)
+	publicHandler := publicSiteHandlerWithTemplates(handler, *landingPage, landingTemplates)
 	publicHandler, err = newPortalHandler(portalConfig{
 		Next:               publicHandler,
 		Registry:           registry,

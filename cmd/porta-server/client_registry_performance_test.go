@@ -134,6 +134,23 @@ func TestClientRegistryTokenIndexConcurrentRotation(t *testing.T) {
 	}
 }
 
+func TestAuthenticationEpochFenceRejectsPreDisconnectAttempts(t *testing.T) {
+	key := registryDeviceKey{accountID: "account", deviceID: "device"}
+	registry := &clientRegistry{
+		accountDisconnect: map[string]uint64{"account": 4},
+		deviceDisconnect:  map[registryDeviceKey]uint64{key: 6},
+	}
+	if !registry.authenticationBlockedLocked("account", key, 3) {
+		t.Fatal("account disconnect did not reject an older authentication attempt")
+	}
+	if !registry.authenticationBlockedLocked("account", key, 5) {
+		t.Fatal("device disconnect did not reject an older authentication attempt")
+	}
+	if registry.authenticationBlockedLocked("account", key, 6) {
+		t.Fatal("post-disconnect authentication attempt was rejected")
+	}
+}
+
 func TestClientRegistryPostCommitSyncFailureKeepsInstalledToken(t *testing.T) {
 	const initialToken = "bootstrap-token-0123456789"
 	path := t.TempDir() + "/clients.json"
