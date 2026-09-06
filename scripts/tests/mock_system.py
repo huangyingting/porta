@@ -189,7 +189,19 @@ elif name == "openssl":
         print(path.read_text().strip().split(":")[-1])
 elif name == "curl":
     url = next(arg for arg in args if arg.startswith(("http://", "https://")))
-    if "--output" in args:
+    if "--write-out" in args:
+        if state.get("fail_health"):
+            code = 22
+        else:
+            output_format = args[args.index("--write-out") + 1]
+            output = output_format.replace(
+                "%{http_code}", state.get("public_status", "200")
+            ).replace(
+                "%{content_type}",
+                state.get("public_content_type", "text/html; charset=utf-8"),
+            )
+            print(output, end="")
+    elif "--output" in args:
         output = safe(args[args.index("--output") + 1])
         asset = "release.json" if "/releases/" in url else url.rsplit("/", 1)[1]
         if asset == state.get("fail_download"):
@@ -200,7 +212,7 @@ elif name == "curl":
         if state.get("fail_health"):
             code = 22
         else:
-            print("<title>Porta · Digital product studio</title>")
+            print("<title>Porta</title>")
 elif name == "gh":
     if args[:2] == ["release", "view"]:
         if "release_draft" not in state:

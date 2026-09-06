@@ -650,11 +650,16 @@ for _ in $(seq 1 30); do
 done
 curl --silent --show-error --fail --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
-landing_page=$(curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
+landing_probe=$(curl --silent --show-error --fail --head --output /dev/null \
+  --write-out '%{http_code}|%{content_type}' --connect-timeout 5 --max-time 30 \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
   die "gateway admin endpoint is ready but public TLS is unavailable"
-grep -q '<title>Porta · Digital product studio</title>' <<<"$landing_page" ||
-  die "public endpoint did not return the expected landing page"
+landing_status=${landing_probe%%|*}
+landing_content_type=${landing_probe#*|}
+[[ $landing_status == 200 ]] ||
+  die "public endpoint returned HTTP $landing_status instead of the landing page"
+[[ $landing_content_type == text/html* ]] ||
+  die "public endpoint did not return an HTML landing page"
 systemctl is-active --quiet porta.service ||
   die "gateway exited after its readiness check"
 ss -H -ltnp "sport = :$port" | grep -q '"porta-server"' ||

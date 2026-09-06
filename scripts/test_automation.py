@@ -399,6 +399,16 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
+    def test_deploy_public_redirect_rolls_back(self):
+        deploy = self.prepare_deploy()
+        before = self.snapshot()
+        cert, key = self.certificate_pair("source", "new")
+        self.update_state(public_status="302")
+        self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key,
+                        success=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(self.state()["active"]["porta.service"])
+
     def test_failed_static_to_acme_upgrade_restores_certificate_timer(self):
         deploy = self.prepare_deploy()
         before = self.snapshot()
