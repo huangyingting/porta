@@ -145,7 +145,12 @@ elif name == "ip":
         print("default via 192.0.2.1 dev eth0")
 elif name == "nft":
     if args[:2] == ["list", "table"]:
-        code = 0 if state.get("nft_table") else 1
+        table = " ".join(args[2:4])
+        tables = state.get("nft_tables")
+        if tables is None:
+            code = 0 if table == "ip porta" and state.get("nft_table") else 1
+        else:
+            code = 0 if tables.get(table) else 1
     elif args == ["-f", "-"]:
         with unlocked_state():
             transaction = sys.stdin.read()
@@ -153,12 +158,25 @@ elif name == "nft":
         if state.get("fail_nft"):
             code = 1
         else:
-            state["nft_table"] = transaction
+            tables = dict(state.get("nft_tables", {}))
+            if not tables and state.get("nft_table"):
+                tables["ip porta"] = state["nft_table"]
+            for table in ("ip porta", "inet porta_guard"):
+                if f"delete table {table}" in transaction:
+                    tables.pop(table, None)
+                if f"table {table} {{" in transaction:
+                    tables[table] = transaction
+            state["nft_tables"] = tables
+            state["nft_table"] = transaction if tables else ""
     elif args[:2] == ["delete", "table"]:
         if state.get("fail_nft"):
             code = 1
         else:
-            state["nft_table"] = ""
+            table = " ".join(args[2:4])
+            tables = dict(state.get("nft_tables", {}))
+            tables.pop(table, None)
+            state["nft_tables"] = tables
+            state["nft_table"] = "" if not tables else state.get("nft_table", "")
     else:
         raise RuntimeError(f"nontransactional nft invocation: {args}")
 elif name == "iptables":
@@ -237,7 +255,7 @@ elif name == "ss":
 elif name == "make":
     binary = safe(Path.cwd() / "bin/porta-server")
     binary.parent.mkdir(exist_ok=True)
-    binary.write_text("#!/bin/sh\nprintf 'client-downloads\\nlanding-template-dir\\n'\n")
+    binary.write_text("#!/bin/sh\nprintf 'client-downloads\\nlanding-template-dir\\ntrust-proxy-headers\\n'\n")
     binary.chmod(0o755)
 elif name == "mv":
     source, destination = map(safe, args[-2:])

@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/huangyingting/porta/internal/abuse"
+	"github.com/huangyingting/porta/internal/clientip"
 	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/protocol"
 )
@@ -16,17 +19,17 @@ func TestClientAddressTrustsProxyHeadersOnlyFromLoopback(t *testing.T) {
 	request.Header.Set("X-Forwarded-For", "192.0.2.123, 198.51.100.8")
 
 	request.RemoteAddr = "127.0.0.1:1234"
-	if got := clientAddress(request, true); got != "198.51.100.8" {
+	if got := clientip.String(request, true); got != "198.51.100.8" {
 		t.Fatalf("trusted proxy address = %q, want 198.51.100.8", got)
 	}
 
 	request.RemoteAddr = "203.0.113.9:1234"
-	if got := clientAddress(request, true); got != "203.0.113.9" {
+	if got := clientip.String(request, true); got != "203.0.113.9" {
 		t.Fatalf("untrusted proxy address = %q, want 203.0.113.9", got)
 	}
 
 	request.RemoteAddr = "127.0.0.1:1234"
-	if got := clientAddress(request, false); got != "127.0.0.1" {
+	if got := clientip.String(request, false); got != "127.0.0.1" {
 		t.Fatalf("disabled proxy address = %q, want 127.0.0.1", got)
 	}
 }
@@ -50,6 +53,70 @@ func TestAuthorizedClientPrefersBoundCredential(t *testing.T) {
 	}
 	if _, err := config.authorizeTestClient("not-bearer", "android-phone"); err == nil {
 		t.Fatal("invalid authorization scheme was accepted")
+	}
+}
+
+func TestTunnelAuthenticationFailuresAreRateLimitedBeforeAuthorizer(t *testing.T) {
+	policies := map[abuse.Surface]abuse.Policy{
+		abuse.NativeAuthentication: {Burst: 1, RefillInterval: time.Hour},
+		abuse.ProxyAuthentication:  {Burst: 1, RefillInterval: time.Hour},
+		abuse.PortalAuthentication: {Burst: 1, RefillInterval: time.Hour},
+		abuse.InvitationRedemption: {Burst: 1, RefillInterval: time.Hour},
+	}
+	guard, err := abuse.New(policies, 16, time.Hour, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewPool("10.66.0.0/29")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizerCalls := 0
+	handler, err := NewHandler(HandlerConfig{
+		AuthorizeSession: func(parent context.Context, _ string, _ deviceauth.Proof, _, _ string) (ClientIdentity, context.Context, func(), error) {
+			authorizerCalls++
+			return ClientIdentity{}, parent, func() {}, errors.New("unauthorized")
+		},
+		Pool:              pool,
+		Router:            NewRouter(testPacketDevice{}, nil),
+		MTU:               1300,
+		Abuse:             guard,
+		TrustProxyHeaders: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(forwarded string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, TunnelPath, http.NoBody)
+		r.Proto = "HTTP/2.0"
+		r.ProtoMajor = 2
+		r.RemoteAddr = "127.0.0.1:1234"
+		r.Header.Set("X-Forwarded-For", forwarded)
+		r.Header.Set(protocol.HeaderVersion, protocol.Version)
+		r.Header.Set("Authorization", "Bearer invalid-token-0123456789")
+		r.Header.Set("Content-Type", protocol.ContentType)
+		r.Header.Set(laneSessionHeader, "0123456789abcdef")
+		r.Header.Set(laneIndexHeader, "0")
+		r.Header.Set(laneCountHeader, "2")
+		return r
+	}
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, request("192.0.2.30"))
+	if first.Code != http.StatusUnauthorized {
+		t.Fatalf("first failure status = %d", first.Code)
+	}
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, request("192.0.2.30"))
+	if second.Code != http.StatusTooManyRequests || second.Header().Get("Retry-After") == "" {
+		t.Fatalf("limited failure = %d %v", second.Code, second.Header())
+	}
+	otherClient := httptest.NewRecorder()
+	handler.ServeHTTP(otherClient, request("192.0.2.31"))
+	if otherClient.Code != http.StatusUnauthorized {
+		t.Fatalf("independent proxied client status = %d", otherClient.Code)
+	}
+	if authorizerCalls != 2 {
+		t.Fatalf("authorizer calls = %d, want 2", authorizerCalls)
 	}
 }
 

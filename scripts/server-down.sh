@@ -28,14 +28,22 @@ if [[ -n "$external_interface" ]] && command -v iptables >/dev/null && iptables 
     fi
   done
 fi
-if nft list table ip porta >/dev/null 2>&1; then
-  nft delete table ip porta || status=1
+nft_cleanup=$(
+  if nft list table ip porta >/dev/null 2>&1; then
+    echo "delete table ip porta"
+  fi
+  if nft list table inet porta_guard >/dev/null 2>&1; then
+    echo "delete table inet porta_guard"
+  fi
+)
+if [[ -n $nft_cleanup ]] && ! printf '%s\n' "$nft_cleanup" | nft -f -; then
+  status=1
 fi
 if ip link show dev "$tun_interface" >/dev/null 2>&1; then
   ip link set dev "$tun_interface" down || status=1
 fi
 if [[ $status -eq 0 ]]; then
-  echo "removed nftables table 'ip porta' and lowered $tun_interface"
+  echo "removed Porta nftables tables and lowered $tun_interface"
 else
   echo "could not completely remove Porta networking for $tun_interface" >&2
 fi

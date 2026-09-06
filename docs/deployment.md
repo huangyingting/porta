@@ -95,7 +95,8 @@ The default deployment:
 - advertises `1.1.1.1` and selects HTTP/3 MTU automatically between 1100 and
   the default 1400 ceiling; custom advertised DNS must be a
   numeric unicast IPv4 address, not loopback or link-local;
-- installs narrowly scoped nftables NAT and forwarding rules;
+- installs narrowly scoped nftables NAT, forwarding, and public-input guard
+  rules;
 - installs hardened systemd services;
 - either renews its own Let's Encrypt certificate or synchronizes externally
   managed certificate files every six hours;
@@ -136,7 +137,7 @@ filtering. These interface-local settings disappear with the TUN.
 The network helper also defaults to automatic mode:
 
 ```sh
-sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0
+sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443
 ```
 
 Use the actual interface/address/pool values. When selecting fixed mode in a
@@ -311,11 +312,14 @@ the loopback health, readiness, metrics, and API listener.
 
 The deployment script deliberately does not edit or reload reverse-proxy
 configuration. When another service owns port 443, deploy Porta with
-`--port 8443`. A reverse proxy may forward HTTP/2 requests to that TLS
-listener for the native multi-lane fallback if it supports unbuffered duplex
-streaming. It must also preserve independent backend TCP connections for the
-logical lanes; multiplexing them onto one upstream HTTP/2 connection defeats
-most of their loss isolation. Porta logs this condition and increments
+`--port 8443`. A reverse proxy may forward HTTP/2 requests to that TLS listener
+for the native multi-lane fallback if it supports unbuffered duplex streaming.
+Add `--trust-proxy-headers` when the proxy connects from loopback so
+authentication limits use each forwarded client address. Porta ignores those
+headers from non-loopback peers. The proxy must replace or safely append
+`X-Forwarded-For`; it must also preserve independent backend TCP connections
+for the logical lanes. Multiplexing them onto one upstream HTTP/2 connection
+defeats most of their loss isolation. Porta logs this condition and increments
 `porta_http2_collapsed_lane_groups_total`. Configure an HTTP/1.1 upstream or
 connect clients directly when the metric increases. Native MASQUE clients
 should use `https://vpn.example.com:8443` directly so UDP traffic reaches Porta.
@@ -329,8 +333,39 @@ TCP 443 (or configured port): HTTP/2 over TLS
 UDP 443 (or configured port): HTTP/3/QUIC MASQUE
 ```
 
+Deployment installs a separate `inet porta_guard` nftables table with an
+accept-policy input chain at priority `-10`. It matches only the configured
+external interface and Porta port; it does not change the host-wide firewall
+policy or rules for Caddy, SSH, or other services. Per-source IPv4 and IPv6
+meters drop only excessive new traffic:
+
+- TCP initial SYNs: 200 per second with a 400-packet burst;
+- UDP new-flow packets: 500 per second with a 1000-packet burst.
+
+Each dynamic meter is capped at 65,535 source entries with a ten-second source
+timeout. Established traffic, unrelated ports, and ICMP/ICMPv6 PMTU feedback
+do not match these drop rules. Forwarding/NAT and input-guard tables are
+replaced in one nftables transaction and removed together when the service
+stops.
+
 The deployment script does not modify UFW, firewalld, Azure NSGs, AWS security
-groups, or other perimeter policy. Open the port in every applicable layer.
+groups, or other cloud perimeter policy. Open the selected TCP and UDP port in
+every applicable layer.
+
+For Azure, keep the NSG as the first VM-independent filter:
+
+- allow the Porta port on both TCP and UDP;
+- retain TCP 80/443 and UDP 443 only when another service such as Caddy needs
+  them;
+- keep the loopback admin port closed externally;
+- restrict SSH to known administration source ranges;
+- remove broad inbound allow rules that make narrower rules ineffective.
+
+An NSG is an L3/L4 allow/deny gate, not a per-source rate limiter. Use Azure
+DDoS IP Protection or Network Protection when the public IP needs managed
+volumetric-attack mitigation. The NSG, Azure DDoS service, host nftables
+meters, transport admission, and authentication limiter protect different
+resource boundaries and should be used together.
 
 ## Clients and credentials
 
@@ -384,10 +419,13 @@ HTTP-01 challenges and stores its ACME account and certificates under
 
 `/readyz` returns a component report, not an unconditional success. Required
 checks cover the TUN link and gateway address, pool/default routes, IPv4
-forwarding, and the deployed Porta nftables forwarding/NAT rules. Missing or
-failed required checks return HTTP 503. Deployment passes the expected egress
-interface; manual runs can set `--egress-interface`. A routed deployment without
-NAT can use `--readiness-require-nat=false`.
+forwarding, and the deployed Porta nftables forwarding/NAT and public-input
+guard rules. The guard check validates its interface, port, protocol, state,
+per-source meters, rates, bounds, and drop verdicts. Missing or failed required
+checks return HTTP 503. Deployment passes the expected egress interface; manual
+runs can set `--egress-interface`. A routed deployment without NAT can use
+`--readiness-require-nat=false`. Reverse-proxy backend mode does not require the
+public-input guard because its listener must be loopback-only.
 
 Checks share the `--readiness-timeout` budget (default three seconds). Optional
 `--readiness-egress-url` and `--readiness-dns-name` probes report outbound HTTP
@@ -405,6 +443,13 @@ latter is not a dropped-packet counter. HTTP/2 queue diagnostics include
 `queue_tail`, `queue_oldest`, and `queue_expired`. A sustained queue or frequent
 TCP tail drops indicates that an outer TCP lane cannot drain at the offered
 rate; increasing queue limits would add latency rather than fix congestion.
+Public admission metrics are
+`porta_public_connections{transport="tcp|quic"}`,
+`porta_public_connections_total{transport="tcp|quic"}`,
+`porta_public_connection_rejections_total{transport="...",reason="..."}`, and
+`porta_quic_retries_total`. Authentication pressure is reported by
+`porta_abuse_rejections_total{surface="native|proxy|portal|invitation"}`.
+Source addresses are never metric labels.
 
 ## Android
 

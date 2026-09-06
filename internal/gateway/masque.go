@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/huangyingting/porta/internal/abuse"
+	"github.com/huangyingting/porta/internal/clientip"
 	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
@@ -41,6 +43,14 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Capsule-Protocol: ?1 is required", http.StatusBadRequest)
 		return
 	}
+	if !requireProtocolVersion(w, r) {
+		return
+	}
+	refund, ok := c.reserveAuthentication(r, abuse.NativeAuthentication)
+	if !ok {
+		writeRateLimited(w)
+		return
+	}
 	proof := deviceauth.FromRequest(r)
 	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), proof, r.Method, r.URL.Path)
 	if err != nil {
@@ -49,11 +59,9 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	refund()
 	defer release()
 	r = r.WithContext(sessionParent)
-	if !requireProtocolVersion(w, r) {
-		return
-	}
 
 	lease, err := c.Pool.Acquire(identity.LeaseID)
 	if err != nil {
@@ -96,7 +104,7 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 	}
 	w.WriteHeader(http.StatusOK)
 
-	remoteHost := clientAddress(r, c.TrustProxyHeaders)
+	remoteHost := clientip.String(r, c.TrustProxyHeaders)
 	transportName := "masque-h2-capsule"
 	var stream *http3.Stream
 	reader := io.Reader(r.Body)

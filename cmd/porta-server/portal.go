@@ -18,6 +18,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/huangyingting/porta/internal/abuse"
+	"github.com/huangyingting/porta/internal/clientip"
 )
 
 const (
@@ -52,6 +55,7 @@ type portalConfig struct {
 	DownloadsDirectory string
 	TrustProxyHeaders  bool
 	Logger             *slog.Logger
+	Abuse              *abuse.Guard
 }
 
 type portalHandler struct {
@@ -65,6 +69,7 @@ type portalHandler struct {
 	trustProxyHeaders  bool
 	downloadTicketKey  [32]byte
 	tokenCipher        cipher.AEAD
+	abuse              *abuse.Guard
 	mu                 sync.Mutex
 	sessions           map[string]portalSession
 }
@@ -97,6 +102,7 @@ func newPortalHandler(config portalConfig) (http.Handler, error) {
 		trustProxyHeaders:  config.TrustProxyHeaders,
 		downloadTicketKey:  downloadTicketKey,
 		tokenCipher:        tokenCipher,
+		abuse:              config.Abuse,
 		sessions:           make(map[string]portalSession),
 	}, nil
 }
@@ -149,6 +155,19 @@ func (p *portalHandler) signIn(w http.ResponseWriter, r *http.Request) {
 		serveLandingError(w, r)
 		return
 	}
+	refund := func() {}
+	if p.abuse != nil {
+		var allowed bool
+		refund, allowed = p.abuse.Reserve(
+			abuse.PortalAuthentication,
+			clientip.Address(r, p.trustProxyHeaders),
+		)
+		if !allowed {
+			w.Header().Set("Retry-After", "5")
+			serveAccessPageResponse(w, r, true, http.StatusTooManyRequests)
+			return
+		}
+	}
 	session := portalSession{ExpiresAt: time.Now().Add(portalSessionTTL)}
 	destination := "/portal/downloads"
 	if adminAuthorized("Bearer "+token, p.adminToken) {
@@ -168,6 +187,7 @@ func (p *portalHandler) signIn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	refund()
 	p.startSession(w, r, session, destination)
 }
 
@@ -483,7 +503,7 @@ func sameOriginPortalRequest(r *http.Request, trustProxyHeaders bool) bool {
 }
 
 func portalRequestHost(r *http.Request, trustProxyHeaders bool) string {
-	if trustProxyHeaders {
+	if trustProxyHeaders && clientip.Address(r, false).IsLoopback() {
 		forwardedHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
 		if forwardedHost != "" && !strings.Contains(forwardedHost, ",") {
 			return forwardedHost

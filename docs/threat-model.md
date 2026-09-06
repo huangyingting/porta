@@ -27,6 +27,14 @@
   lease, preventing one client from spoofing another client address.
 - Packet lengths, IP versions, header lengths, total lengths, and destinations
   are validated before packets cross trust boundaries.
+- The direct listener caps accepted TCP and QUIC connections before expensive
+  application work. Both transports have per-source connection caps, HTTP/2
+  and QUIC stream/window bounds are explicit, and QUIC address validation becomes
+  mandatory only when the bounded unvalidated-handshake budget is exhausted.
+- Authentication failures use a bounded per-source and per-surface token
+  limiter. Successful authentication refunds its reservation, so established
+  sessions do not consume failure budget. Overflow uses fixed shards rather
+  than allocating unbounded attacker-controlled state.
 - Tokens are accepted through environment variables or the admin UI and are
   never intentionally logged.
 - The access invitation travels in a URL fragment, which is removed before
@@ -48,6 +56,9 @@
   cache directory and expose the challenge listener only as required.
 - Restrict gateway egress, rate-limit the public endpoint, rotate credentials,
   and retain only privacy-appropriate operational logs.
+- Apply cloud-edge allow rules and managed DDoS protection where available.
+  Deployment owns only Porta's narrowly scoped host nftables tables and does
+  not configure the provider firewall.
 - Review the NAT script for the host's real external interface. Running a VPN
   gateway can turn a compromised credential into an egress relay.
 - Ensure use is permitted by the network owner and applicable law.
@@ -87,6 +98,10 @@ not conceal transport fingerprints from network inspection.
 - Forward-proxy Basic usernames are ignored, so every proxy client using an
   account token shares one token-only `forward-proxy` enrollment and cannot be
   managed or attributed individually.
+- The host input guard limits excessive new packets on Porta's configured
+  interface and port. It is not volumetric DDoS protection: traffic still
+  reaches the VM, distributed sources can stay below each source limit, and
+  cloud-edge filtering remains an operator responsibility.
 - The HTTP/2 DATAGRAM-capsule transport inherits TCP head-of-line blocking.
   HTTP/3 uses QUIC Datagrams and therefore does not serialize packet delivery
   on the CONNECT stream, but Datagrams may be lost or reordered.

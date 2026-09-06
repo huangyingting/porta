@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/netip"
 	"regexp"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/huangyingting/porta/internal/abuse"
+	"github.com/huangyingting/porta/internal/clientip"
 	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/usage"
@@ -69,6 +70,7 @@ type HandlerConfig struct {
 	KeepaliveInterval time.Duration
 	Logger            *slog.Logger
 	Readiness         *Readiness
+	Abuse             *abuse.Guard
 }
 
 func NewHandler(config HandlerConfig) (http.Handler, error) {
@@ -131,16 +133,6 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Porta requires HTTP/2 or HTTP/3", http.StatusHTTPVersionNotSupported)
 		return
 	}
-	proof := deviceauth.FromRequest(r)
-	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), proof, r.Method, r.URL.Path)
-	if err != nil {
-		c.Metrics.authenticationFailed()
-		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	defer release()
-	r = r.WithContext(sessionParent)
 	if !requireProtocolVersion(w, r) {
 		return
 	}
@@ -154,6 +146,22 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	refund, ok := c.reserveAuthentication(r, abuse.NativeAuthentication)
+	if !ok {
+		writeRateLimited(w)
+		return
+	}
+	proof := deviceauth.FromRequest(r)
+	identity, sessionParent, release, err := c.authorizeSession(r.Context(), r.Header.Get("Authorization"), proof, r.Method, r.URL.Path)
+	if err != nil {
+		c.Metrics.authenticationFailed()
+		w.Header().Set("WWW-Authenticate", `Bearer realm="porta"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	refund()
+	defer release()
+	r = r.WithContext(sessionParent)
 	lease, err := c.Pool.AcquireGroup(identity.LeaseID, lanes.sessionID)
 	if err != nil {
 		http.Error(w, "no tunnel addresses available", http.StatusServiceUnavailable)
@@ -195,7 +203,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	defer usageSession.Close()
 	c.Metrics.connected()
 	defer c.Metrics.disconnected()
-	remoteHost := clientAddress(r, c.TrustProxyHeaders)
+	remoteHost := clientip.String(r, c.TrustProxyHeaders)
 	logAttributes := []any{
 		"client_id", proof.DeviceID,
 		"device_name", proof.Name,
@@ -361,10 +369,22 @@ func bearerToken(header string) (string, error) {
 		return "", errors.New("missing bearer token")
 	}
 	token := strings.TrimPrefix(header, prefix)
-	if len(token) < 16 {
+	if len(token) < 16 || len(token) > 512 {
 		return "", errors.New("invalid bearer token")
 	}
 	return token, nil
+}
+
+func (c HandlerConfig) reserveAuthentication(r *http.Request, surface abuse.Surface) (func(), bool) {
+	if c.Abuse == nil {
+		return func() {}, true
+	}
+	return c.Abuse.Reserve(surface, clientip.Address(r, c.TrustProxyHeaders))
+}
+
+func writeRateLimited(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "5")
+	http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
 }
 
 func stopStreamOnCancel(ctx context.Context, w http.ResponseWriter, body io.Closer) func() {
@@ -385,26 +405,6 @@ func onSessionCancel(ctx context.Context, interrupt func()) func() {
 			<-done
 		}
 	}
-}
-
-func clientAddress(r *http.Request, trustProxyHeaders bool) string {
-	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		remoteHost = r.RemoteAddr
-	}
-	if !trustProxyHeaders || !net.ParseIP(remoteHost).IsLoopback() {
-		return remoteHost
-	}
-	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	for index := len(forwarded) - 1; index >= 0; index-- {
-		if address := net.ParseIP(strings.TrimSpace(forwarded[index])); address != nil {
-			return address.String()
-		}
-	}
-	if address := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); address != nil {
-		return address.String()
-	}
-	return remoteHost
 }
 
 func authorized(header, expected string) bool {

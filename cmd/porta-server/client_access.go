@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/huangyingting/porta/internal/abuse"
+	"github.com/huangyingting/porta/internal/clientip"
 	"github.com/skip2/go-qrcode"
 )
 
@@ -209,6 +211,19 @@ func (p *portalHandler) redeemClientAccess(w http.ResponseWriter, r *http.Reques
 		p.serveJoin(w, r, errClientAccess.Error(), http.StatusBadRequest)
 		return
 	}
+	refund := func() {}
+	if p.abuse != nil {
+		var allowed bool
+		refund, allowed = p.abuse.Reserve(
+			abuse.InvitationRedemption,
+			clientip.Address(r, p.trustProxyHeaders),
+		)
+		if !allowed {
+			w.Header().Set("Retry-After", "5")
+			p.serveJoin(w, r, errClientAccess.Error(), http.StatusTooManyRequests)
+			return
+		}
+	}
 	claim, err := openClientAccess(p.adminToken, origin, r.PostForm.Get("ticket"), time.Now())
 	if err != nil {
 		p.serveJoin(w, r, errClientAccess.Error(), http.StatusUnauthorized)
@@ -224,6 +239,7 @@ func (p *portalHandler) redeemClientAccess(w http.ResponseWriter, r *http.Reques
 		p.serveJoin(w, r, errClientAccess.Error(), http.StatusUnauthorized)
 		return
 	}
+	refund()
 	p.startSession(w, r, session, "/portal/downloads")
 }
 

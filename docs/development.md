@@ -50,6 +50,12 @@ firewall rules, or sysctls are changed. Ordinary
 Go runs skip this opt-in test; Linux CI runs the isolated target explicitly.
 Do not enable the environment variable directly against host networking.
 
+`make test-native-firewall` runs the production `server-up.sh` and
+`server-down.sh` inside a disposable network namespace. It validates native
+nftables parsing, atomic replacement, the IPv4/IPv6 TCP and UDP source meters,
+and complete cleanup without changing the host firewall or interfaces. It
+requires `ip`, `nft`, `sysctl`, `unshare`, and passwordless `sudo`.
+
 Windows networking script regressions use isolated PowerShell mocks. They run
 when `pwsh` is on `PATH`, or with Windows PowerShell on Windows; otherwise those
 tests are explicitly skipped. The Windows CI job runs the platform packages.

@@ -10,6 +10,15 @@ func TestMetricsRenderPrometheusFormat(t *testing.T) {
 	metrics := &Metrics{}
 	metrics.connected()
 	metrics.authenticationFailed()
+	metrics.PublicConnectionOpened("tcp")
+	metrics.PublicConnectionOpened("quic")
+	metrics.PublicConnectionClosed("quic")
+	metrics.PublicConnectionRejected("tcp", "source")
+	metrics.PublicConnectionRejected("quic", "global")
+	metrics.PublicConnectionRejected("quic", "source")
+	metrics.PublicConnectionRejected("quic", "unverified")
+	metrics.QUICRetry()
+	metrics.AbuseRejected("portal")
 	metrics.receivedFromClient()
 	metrics.sentToClient()
 	metrics.droppedFromClient()
@@ -28,6 +37,15 @@ func TestMetricsRenderPrometheusFormat(t *testing.T) {
 		"porta_active_tunnels 1",
 		"porta_connections_total 1",
 		"porta_auth_failures_total 1",
+		`porta_public_connections{transport="tcp"} 1`,
+		`porta_public_connections{transport="quic"} 0`,
+		`porta_public_connections_total{transport="quic"} 1`,
+		`porta_public_connection_rejections_total{transport="tcp",reason="source"} 1`,
+		`porta_public_connection_rejections_total{transport="quic",reason="global"} 1`,
+		`porta_public_connection_rejections_total{transport="quic",reason="source"} 1`,
+		`porta_public_connection_rejections_total{transport="quic",reason="unverified"} 1`,
+		"porta_quic_retries_total 1",
+		`porta_abuse_rejections_total{surface="portal"} 1`,
 		"porta_packets_from_client_total 1",
 		"porta_packets_to_client_total 1",
 		"porta_dropped_packets_from_client_total 1",

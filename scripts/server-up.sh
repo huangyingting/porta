@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 4 || $# -gt 5 ]]; then
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> [--auto-mtu=BOOL]" >&2
-  echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0" >&2
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--auto-mtu=BOOL]" >&2
+  echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443" >&2
   exit 2
 fi
 
@@ -11,8 +11,9 @@ tun_interface=$1
 gateway_cidr=$2
 pool_cidr=$3
 external_interface=$4
+public_port=$5
 auto_mtu=true
-case "${5:---auto-mtu=true}" in
+case "${6:---auto-mtu=true}" in
   --auto-mtu|--auto-mtu=true) ;;
   --auto-mtu=false) auto_mtu=false ;;
   *) echo "invalid MTU mode; use --auto-mtu=true or --auto-mtu=false" >&2; exit 2 ;;
@@ -22,8 +23,14 @@ esac
    $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $tun_interface != "$external_interface" &&
    $gateway_cidr =~ ^[0-9.]+/[0-9]+$ &&
-   $pool_cidr =~ ^[0-9.]+/[0-9]+$ ]] || {
-  echo "invalid interface or IPv4 CIDR" >&2
+   $pool_cidr =~ ^[0-9.]+/[0-9]+$ &&
+   $public_port =~ ^[0-9]{1,5}$ ]] || {
+  echo "invalid interface, IPv4 CIDR, or public port" >&2
+  exit 2
+}
+public_port=$((10#$public_port))
+(( public_port >= 1 && public_port <= 65535 )) || {
+  echo "invalid public port" >&2
   exit 2
 }
 
@@ -46,6 +53,9 @@ fi
   if nft list table ip porta >/dev/null 2>&1; then
     echo "delete table ip porta"
   fi
+  if nft list table inet porta_guard >/dev/null 2>&1; then
+    echo "delete table inet porta_guard"
+  fi
   cat <<EOF
 table ip porta {
   chain forward {
@@ -60,6 +70,15 @@ table ip porta {
     oifname "$external_interface" ip saddr $pool_cidr masquerade
   }
 }
+table inet porta_guard {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "$external_interface" meta nfproto ipv4 tcp dport $public_port ct state new tcp flags & (fin | syn | rst | ack) == syn meter tcp4 size 65535 { ip saddr timeout 10s limit rate over 200/second burst 400 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv6 tcp dport $public_port ct state new tcp flags & (fin | syn | rst | ack) == syn meter tcp6 size 65535 { ip6 saddr timeout 10s limit rate over 200/second burst 400 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv4 udp dport $public_port ct state new meter udp4 size 65535 { ip saddr timeout 10s limit rate over 500/second burst 1000 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv6 udp dport $public_port ct state new meter udp6 size 65535 { ip6 saddr timeout 10s limit rate over 500/second burst 1000 packets } counter drop
+  }
+}
 EOF
 } | nft -f -
 
@@ -70,4 +89,4 @@ if command -v iptables >/dev/null && iptables -w -S DOCKER-USER >/dev/null 2>&1;
     iptables -w -I DOCKER-USER 2 -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT
 fi
 
-echo "configured $tun_interface; nftables table 'ip porta' contains the forwarding rules"
+echo "configured $tun_interface; Porta nftables forwarding and public-input guards are active"

@@ -21,16 +21,18 @@ import (
 )
 
 type forwardingReadinessConfig struct {
-	Interface       string
-	Gateway         netip.Addr
-	Pool            netip.Prefix
-	EgressInterface string
-	RequireNAT      bool
-	AutoMTU         bool
-	Timeout         time.Duration
-	EgressURL       string
-	DNSName         string
-	DNSAddress      string
+	Interface         string
+	Gateway           netip.Addr
+	Pool              netip.Prefix
+	EgressInterface   string
+	RequireNAT        bool
+	RequireInputGuard bool
+	PublicPort        int
+	AutoMTU           bool
+	Timeout           time.Duration
+	EgressURL         string
+	DNSName           string
+	DNSAddress        string
 }
 
 type readinessDependencies struct {
@@ -74,6 +76,9 @@ func localReadinessDependencies() readinessDependencies {
 func newForwardingReadiness(config forwardingReadinessConfig, deps readinessDependencies) (*gateway.Readiness, error) {
 	if config.Timeout <= 0 {
 		return nil, errors.New("--readiness-timeout must be positive")
+	}
+	if config.RequireInputGuard && (config.PublicPort < 1 || config.PublicPort > 65535) {
+		return nil, errors.New("public listener port is invalid for input-guard readiness")
 	}
 	if config.EgressURL != "" {
 		u, err := url.Parse(config.EgressURL)
@@ -148,14 +153,18 @@ func newForwardingReadiness(config forwardingReadinessConfig, deps readinessDepe
 			return checkPortaRules(ctx, config, deps, false)
 		}},
 		{Name: "porta_nat_rules", Required: config.RequireNAT},
+		{Name: "porta_input_guard", Required: config.RequireInputGuard},
 		{Name: "external_egress"},
 		{Name: "external_dns"},
 	}
 	if config.RequireNAT {
 		checks[6].Probe = func(ctx context.Context) error { return checkPortaRules(ctx, config, deps, true) }
 	}
+	if config.RequireInputGuard {
+		checks[7].Probe = func(ctx context.Context) error { return checkPortaInputGuard(ctx, config, deps) }
+	}
 	if config.EgressURL != "" {
-		checks[7].Probe = func(ctx context.Context) error {
+		checks[8].Probe = func(ctx context.Context) error {
 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.EgressURL, nil)
 			if err != nil {
 				return err
@@ -173,7 +182,7 @@ func newForwardingReadiness(config forwardingReadinessConfig, deps readinessDepe
 		}
 	}
 	if config.DNSName != "" {
-		checks[8].Probe = func(ctx context.Context) error {
+		checks[9].Probe = func(ctx context.Context) error {
 			return deps.LookupDNS(ctx, config.DNSAddress, config.DNSName)
 		}
 	}
@@ -278,10 +287,11 @@ func readinessEgress(ctx context.Context, config forwardingReadinessConfig, deps
 }
 
 type nftReadinessChain struct {
-	Name   string `json:"name"`
-	Type   string `json:"type"`
-	Hook   string `json:"hook"`
-	Policy string `json:"policy"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Hook     string `json:"hook"`
+	Priority int    `json:"prio"`
+	Policy   string `json:"policy"`
 }
 
 type nftReadinessRule struct {
@@ -334,6 +344,180 @@ func checkPortaRules(ctx context.Context, config forwardingReadinessConfig, deps
 		return errors.New("Porta outbound/established-return forwarding rules are missing or preceded by other rules")
 	}
 	return nil
+}
+
+func checkPortaInputGuard(ctx context.Context, config forwardingReadinessConfig, deps readinessDependencies) error {
+	egress, err := readinessEgress(ctx, config, deps)
+	if err != nil {
+		return err
+	}
+	data, err := deps.Command(ctx, "nft", "-j", "list", "table", "inet", "porta_guard")
+	if err != nil {
+		return err
+	}
+	var table struct {
+		Entries []struct {
+			Chain *nftReadinessChain `json:"chain"`
+			Rule  *nftReadinessRule  `json:"rule"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &table); err != nil {
+		return fmt.Errorf("decode Porta input guard: %w", err)
+	}
+	foundChain := false
+	var rules []nftReadinessRule
+	for _, entry := range table.Entries {
+		if chain := entry.Chain; chain != nil && chain.Name == "input" {
+			foundChain = chain.Type == "filter" && chain.Hook == "input" &&
+				chain.Priority == -10 && chain.Policy == "accept"
+		}
+		if rule := entry.Rule; rule != nil && rule.Chain == "input" {
+			rules = append(rules, *rule)
+		}
+	}
+	if !foundChain {
+		return errors.New("Porta input guard base chain is missing or has the wrong hook/type/priority/policy")
+	}
+	expected := []inputGuardRule{
+		{Protocol: "tcp", AddressProtocol: "ip", Meter: "tcp4", Rate: 200, Burst: 400, TCPFlags: true},
+		{Protocol: "tcp", AddressProtocol: "ip6", Meter: "tcp6", Rate: 200, Burst: 400, TCPFlags: true},
+		{Protocol: "udp", AddressProtocol: "ip", Meter: "udp4", Rate: 500, Burst: 1000},
+		{Protocol: "udp", AddressProtocol: "ip6", Meter: "udp6", Rate: 500, Burst: 1000},
+	}
+	if len(rules) != len(expected) {
+		return fmt.Errorf("Porta input guard has %d rules, want %d", len(rules), len(expected))
+	}
+	for index := range expected {
+		if !matchesInputGuardRule(rules[index], egress, config.PublicPort, expected[index]) {
+			return fmt.Errorf("Porta input guard rule %d is missing or malformed", index+1)
+		}
+	}
+	return nil
+}
+
+type inputGuardRule struct {
+	Protocol        string
+	AddressProtocol string
+	Meter           string
+	Rate            int
+	Burst           int
+	TCPFlags        bool
+}
+
+func matchesInputGuardRule(rule nftReadinessRule, iface string, port int, expected inputGuardRule) bool {
+	wantExpressions := 6
+	if expected.TCPFlags {
+		wantExpressions++
+	}
+	if len(rule.Expr) != wantExpressions ||
+		!matchesMeta(rule.Expr[0], "iifname", iface) ||
+		!matchesPayload(rule.Expr[1], expected.Protocol, "dport", float64(port)) ||
+		!matchesNewState(rule.Expr[2]) {
+		return false
+	}
+	index := 3
+	if expected.TCPFlags {
+		if !matchesInitialSYN(rule.Expr[index]) {
+			return false
+		}
+		index++
+	}
+	return matchesInputMeter(rule.Expr[index], expected) &&
+		rule.Expr[index+1]["counter"] != nil &&
+		hasNullVerdict(rule.Expr[index+2], "drop")
+}
+
+func matchesMeta(expr map[string]any, key, value string) bool {
+	match, ok := expr["match"].(map[string]any)
+	if !ok || match["op"] != "==" || match["right"] != value {
+		return false
+	}
+	left, _ := match["left"].(map[string]any)
+	meta, _ := left["meta"].(map[string]any)
+	return meta["key"] == key
+}
+
+func matchesPayload(expr map[string]any, protocol, field string, right any) bool {
+	match, ok := expr["match"].(map[string]any)
+	if !ok || match["op"] != "==" || match["right"] != right {
+		return false
+	}
+	left, _ := match["left"].(map[string]any)
+	payload, _ := left["payload"].(map[string]any)
+	return payload["protocol"] == protocol && payload["field"] == field
+}
+
+func matchesNewState(expr map[string]any) bool {
+	match, ok := expr["match"].(map[string]any)
+	if !ok || (match["op"] != "in" && match["op"] != "==") {
+		return false
+	}
+	left, _ := match["left"].(map[string]any)
+	ct, _ := left["ct"].(map[string]any)
+	if ct["key"] != "state" {
+		return false
+	}
+	switch value := match["right"].(type) {
+	case string:
+		return value == "new"
+	case []any:
+		return len(value) == 1 && value[0] == "new"
+	case map[string]any:
+		set, _ := value["set"].([]any)
+		return len(set) == 1 && set[0] == "new"
+	default:
+		return false
+	}
+}
+
+func matchesInitialSYN(expr map[string]any) bool {
+	match, ok := expr["match"].(map[string]any)
+	if !ok || match["op"] != "==" || match["right"] != "syn" {
+		return false
+	}
+	left, _ := match["left"].(map[string]any)
+	bitwise, _ := left["&"].([]any)
+	if len(bitwise) != 2 {
+		return false
+	}
+	payloadWrapper, _ := bitwise[0].(map[string]any)
+	payload, _ := payloadWrapper["payload"].(map[string]any)
+	flags, _ := bitwise[1].([]any)
+	return payload["protocol"] == "tcp" && payload["field"] == "flags" &&
+		len(flags) == 4 && slices.Contains(flags, any("fin")) &&
+		slices.Contains(flags, any("syn")) && slices.Contains(flags, any("rst")) &&
+		slices.Contains(flags, any("ack"))
+}
+
+func matchesInputMeter(expr map[string]any, expected inputGuardRule) bool {
+	meter, ok := expr["meter"].(map[string]any)
+	if !ok || meter["name"] != expected.Meter || meter["size"] != float64(65535) {
+		return false
+	}
+	key, _ := meter["key"].(map[string]any)
+	elem, _ := key["elem"].(map[string]any)
+	value, _ := elem["val"].(map[string]any)
+	payload, _ := value["payload"].(map[string]any)
+	if payload["protocol"] != expected.AddressProtocol || payload["field"] != "saddr" ||
+		elem["timeout"] != float64(10) {
+		return false
+	}
+	statement, _ := meter["stmt"].(map[string]any)
+	limit, _ := statement["limit"].(map[string]any)
+	if _, ok := limit["rate_unit"]; ok {
+		return false
+	}
+	if _, ok := limit["burst_unit"]; ok {
+		return false
+	}
+	return limit["rate"] == float64(expected.Rate) &&
+		limit["burst"] == float64(expected.Burst) &&
+		limit["per"] == "second" && limit["inv"] == true
+}
+
+func hasNullVerdict(expr map[string]any, verdict string) bool {
+	value, ok := expr[verdict]
+	return ok && value == nil
 }
 
 func matchesPortaRule(rule nftReadinessRule, input, output string, pool netip.Prefix, established bool, verdict string) bool {

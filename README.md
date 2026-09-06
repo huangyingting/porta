@@ -64,8 +64,8 @@ sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
 
 Allow both TCP and UDP on the selected tunnel port. Automatic Let's Encrypt
 also requires public TCP port 80. The installer configures systemd, TUN,
-forwarding, NAT, certificate renewal or synchronization, client downloads, and
-the loopback operations listener.
+forwarding, NAT, a Porta-scoped nftables input guard, certificate renewal or
+synchronization, client downloads, and the loopback operations listener.
 
 The HTTPS forward proxy is enabled by default. Add
 `--disable-forward-proxy` only for a VPN-only deployment.

@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/huangyingting/porta/internal/abuse"
+	"github.com/huangyingting/porta/internal/clientip"
 	"github.com/huangyingting/porta/internal/usage"
 )
 
@@ -50,26 +52,30 @@ type Identity struct {
 type AuthorizeSessionFunc func(context.Context, string, string) (Identity, context.Context, func(), error)
 
 type Config struct {
-	Next             http.Handler
-	AuthorizeSession AuthorizeSessionFunc
-	Logger           *slog.Logger
-	Camouflage       bool
-	MaxConnections   int
-	Usage            *usage.Store
+	Next              http.Handler
+	AuthorizeSession  AuthorizeSessionFunc
+	Logger            *slog.Logger
+	Camouflage        bool
+	MaxConnections    int
+	Usage             *usage.Store
+	Abuse             *abuse.Guard
+	TrustProxyHeaders bool
 }
 
 type Handler struct {
-	next             http.Handler
-	authorizeSession AuthorizeSessionFunc
-	logger           *slog.Logger
-	camouflage       bool
-	slots            chan struct{}
-	usage            *usage.Store
-	dial             func(context.Context, string, string) (net.Conn, error)
-	resolve          func(context.Context, string) ([]netip.Addr, error)
-	dialAddress      func(context.Context, string, string) (net.Conn, error)
-	dnsCache         *addressCache
-	now              func() time.Time
+	next              http.Handler
+	authorizeSession  AuthorizeSessionFunc
+	logger            *slog.Logger
+	camouflage        bool
+	slots             chan struct{}
+	usage             *usage.Store
+	dial              func(context.Context, string, string) (net.Conn, error)
+	resolve           func(context.Context, string) ([]netip.Addr, error)
+	dialAddress       func(context.Context, string, string) (net.Conn, error)
+	dnsCache          *addressCache
+	now               func() time.Time
+	abuse             *abuse.Guard
+	trustProxyHeaders bool
 }
 
 func New(config Config) (*Handler, error) {
@@ -89,15 +95,17 @@ func New(config Config) (*Handler, error) {
 		config.Usage, _ = usage.Open("", config.Logger)
 	}
 	handler := &Handler{
-		next:             config.Next,
-		authorizeSession: config.AuthorizeSession,
-		logger:           config.Logger,
-		camouflage:       config.Camouflage,
-		slots:            make(chan struct{}, config.MaxConnections),
-		usage:            config.Usage,
-		resolve:          resolveHost,
-		dnsCache:         newAddressCache(dnsCacheEntries, dnsCacheTTL),
-		now:              time.Now,
+		next:              config.Next,
+		authorizeSession:  config.AuthorizeSession,
+		logger:            config.Logger,
+		camouflage:        config.Camouflage,
+		slots:             make(chan struct{}, config.MaxConnections),
+		usage:             config.Usage,
+		resolve:           resolveHost,
+		dnsCache:          newAddressCache(dnsCacheEntries, dnsCacheTTL),
+		now:               time.Now,
+		abuse:             config.Abuse,
+		trustProxyHeaders: config.TrustProxyHeaders,
 	}
 	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
 	handler.dialAddress = dialer.DialContext
@@ -114,6 +122,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.next.ServeHTTP(w, r)
 		return
 	}
+	refund := func() {}
+	if h.abuse != nil {
+		var allowed bool
+		refund, allowed = h.abuse.Reserve(
+			abuse.ProxyAuthentication,
+			clientip.Address(r, h.trustProxyHeaders),
+		)
+		if !allowed {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "too many proxy authentication attempts", http.StatusTooManyRequests)
+			return
+		}
+	}
 	identity, sessionCtx, release, ok := h.authenticateSession(r.Context(), r.Header.Get("Proxy-Authorization"))
 	if !ok {
 		if h.camouflage && r.Method != http.MethodConnect {
@@ -124,6 +145,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
+	refund()
 	defer release()
 	r = r.WithContext(sessionCtx)
 	if r.Method != http.MethodConnect {
@@ -145,7 +167,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"device_id", identity.DeviceID,
 		"method", r.Method,
 		"target", target,
-		"remote", remoteHost(r.RemoteAddr),
+		"remote", clientip.String(r, h.trustProxyHeaders),
 	)
 	h.serveConnect(w, r, target, identity)
 	h.logger.Debug("forward proxy request complete",
@@ -176,7 +198,7 @@ func proxyToken(header string) (string, bool) {
 		return "", false
 	}
 	_, token, ok := strings.Cut(string(decoded), ":")
-	if !ok || token == "" {
+	if !ok || len(token) < 16 || len(token) > 512 {
 		return "", false
 	}
 	return token, true
@@ -711,14 +733,6 @@ func writeProxyError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, "proxy destination unavailable", http.StatusBadGateway)
-}
-
-func remoteHost(address string) string {
-	host, _, err := net.SplitHostPort(address)
-	if err == nil {
-		return host
-	}
-	return address
 }
 
 var _ http.Handler = (*Handler)(nil)

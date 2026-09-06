@@ -82,7 +82,7 @@ func TestNativeMTUFeedback(t *testing.T) {
 	}
 	network.run("ip", "neigh", "add", "198.18.0.2", "lladdr", peer.HardwareAddr.String(),
 		"nud", "permanent", "dev", outName)
-	helperArgs := []string{"../../scripts/server-up.sh", tunName, "10.66.0.1/24", "10.66.0.0/24", outName}
+	helperArgs := []string{"../../scripts/server-up.sh", tunName, "10.66.0.1/24", "10.66.0.0/24", outName, "8443"}
 	network.run("bash", append(append([]string(nil), helperArgs...), "--auto-mtu=false")...)
 	network.check(tunName+"/accept_local", "0")
 	network.check(tunName+"/rp_filter", "1")

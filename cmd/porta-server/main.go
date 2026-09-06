@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/huangyingting/porta/internal/abuse"
 	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/device"
 	"github.com/huangyingting/porta/internal/forwardproxy"
@@ -81,6 +82,7 @@ func run() (returnErr error) {
 	tlsCert := flag.String("tls-cert", "", "static TLS certificate file (reloaded when replaced)")
 	tlsKey := flag.String("tls-key", "", "static TLS private key file (reloaded when replaced)")
 	behindProxy := flag.Bool("behind-proxy", false, "serve plaintext HTTP/2 for a TLS-terminating reverse proxy (disables ACME and HTTP/3)")
+	trustProxyHeaders := flag.Bool("trust-proxy-headers", false, "trust client IP forwarding headers from a loopback reverse proxy")
 	landingPage := flag.Bool("landing-page", true, "serve the Porta landing page to ordinary browser requests")
 	landingTemplateDirectory := flag.String("landing-template-dir", "", "directory containing custom .html landing templates (empty uses bundled templates)")
 	disableForwardProxy := flag.Bool("disable-forward-proxy", false, "disable the authenticated HTTPS CONNECT proxy on the public listener")
@@ -206,6 +208,18 @@ func run() (returnErr error) {
 			return err
 		}
 	}
+	publicPort := 0
+	if !*behindProxy {
+		_, portText, err := net.SplitHostPort(*address)
+		if err != nil {
+			return fmt.Errorf("parse public listen address: %w", err)
+		}
+		publicPort, err = strconv.Atoi(portText)
+		if err != nil || publicPort < 1 || publicPort > 65535 {
+			return errors.New("public listen address must use a fixed port from 1 to 65535")
+		}
+	}
+	trustForwardedClientIP := *behindProxy || *trustProxyHeaders
 	var pool *gateway.Pool
 	if *leaseState == "" {
 		pool, err = gateway.NewPool(*poolCIDR)
@@ -217,7 +231,8 @@ func run() (returnErr error) {
 	}
 	readiness, err := newForwardingReadiness(forwardingReadinessConfig{
 		Interface: *interfaceName, Gateway: pool.Gateway(), Pool: netip.MustParsePrefix(*poolCIDR).Masked(),
-		EgressInterface: *egressInterface, RequireNAT: *readinessNAT, Timeout: *readinessTimeout,
+		EgressInterface: *egressInterface, RequireNAT: *readinessNAT,
+		RequireInputGuard: !*behindProxy, PublicPort: publicPort, Timeout: *readinessTimeout,
 		AutoMTU:   *autoMTU,
 		EgressURL: *readinessEgressURL, DNSName: *readinessDNSName, DNSAddress: *dns,
 	}, localReadinessDependencies())
@@ -232,6 +247,9 @@ func run() (returnErr error) {
 
 	router := gateway.NewRouter(tunDevice, logger)
 	metrics := &gateway.Metrics{}
+	abuseGuard := abuse.NewDefault(func(surface abuse.Surface) {
+		metrics.AbuseRejected(surface.String())
+	})
 	handler, err := gateway.NewHandler(gateway.HandlerConfig{
 		AuthorizeSession:  registry.AuthenticateDeviceSession,
 		MetricsToken:      metricsToken,
@@ -243,9 +261,10 @@ func run() (returnErr error) {
 		MTU:               *mtu,
 		AutoMTU:           *autoMTU,
 		EnableH3Datagrams: true,
-		TrustProxyHeaders: *behindProxy,
+		TrustProxyHeaders: trustForwardedClientIP,
 		Logger:            logger,
 		Readiness:         readiness,
+		Abuse:             abuseGuard,
 	})
 	if err != nil {
 		return err
@@ -257,8 +276,9 @@ func run() (returnErr error) {
 		AdminToken:         adminToken,
 		Admin:              adminHandlerWithUsage(http.NotFoundHandler(), registry, usageStore, adminToken),
 		DownloadsDirectory: *clientDownloads,
-		TrustProxyHeaders:  *behindProxy,
+		TrustProxyHeaders:  trustForwardedClientIP,
 		Logger:             logger,
+		Abuse:              abuseGuard,
 	})
 	if err != nil {
 		return err
@@ -273,9 +293,11 @@ func run() (returnErr error) {
 					DeviceID:  forwardproxy.DeviceID,
 				}, sessionCtx, release, authorizeErr
 			},
-			Logger:     logger,
-			Camouflage: true,
-			Usage:      usageStore,
+			Logger:            logger,
+			Camouflage:        true,
+			Usage:             usageStore,
+			Abuse:             abuseGuard,
+			TrustProxyHeaders: trustForwardedClientIP,
 		})
 		if err != nil {
 			return err
@@ -299,19 +321,21 @@ func run() (returnErr error) {
 		MaxHeaderBytes:    16 << 10,
 	}
 	if !*behindProxy {
-		if err := http2.ConfigureServer(tcpServer, &http2.Server{}); err != nil {
+		if err := http2.ConfigureServer(tcpServer, boundedHTTP2Server()); err != nil {
 			return fmt.Errorf("configure HTTP/2: %w", err)
 		}
 	}
-	var quicServer *http3.Server
+	tcpListener, err := net.Listen("tcp", *address)
+	if err != nil {
+		return fmt.Errorf("listen on public TCP address: %w", err)
+	}
+	admissionListener := newTCPAdmissionListener(tcpListener, metrics)
+	var quicServer *ownedHTTP3Server
 	if !*behindProxy {
-		quicServer = &http3.Server{
-			Addr:            *address,
-			Handler:         publicHandler,
-			TLSConfig:       http3TLSConfig(tlsConfig),
-			EnableDatagrams: true,
-			MaxHeaderBytes:  16 << 10,
-			IdleTimeout:     90 * time.Second,
+		quicServer, err = newOwnedHTTP3Server(*address, publicHandler, tlsConfig, metrics)
+		if err != nil {
+			_ = admissionListener.Close()
+			return fmt.Errorf("listen on public UDP address: %w", err)
 		}
 	}
 
@@ -346,10 +370,10 @@ func run() (returnErr error) {
 	errCh := make(chan error, 5)
 	go func() { errCh <- router.Run(ctx) }()
 	if *behindProxy {
-		go func() { errCh <- tcpServer.ListenAndServe() }()
+		go func() { errCh <- tcpServer.Serve(admissionListener) }()
 	} else {
-		go func() { errCh <- tcpServer.ListenAndServeTLS("", "") }()
-		go func() { errCh <- quicServer.ListenAndServe() }()
+		go func() { errCh <- tcpServer.ServeTLS(admissionListener, "", "") }()
+		go func() { errCh <- quicServer.Serve() }()
 	}
 	if acmeHTTPServer != nil {
 		go func() { errCh <- acmeHTTPServer.ListenAndServe() }()
@@ -444,7 +468,7 @@ func normalizeDomain(domain string) string {
 }
 
 func proxyBackendHandler(handler http.Handler) http.Handler {
-	return h2c.NewHandler(handler, &http2.Server{})
+	return h2c.NewHandler(handler, boundedHTTP2Server())
 }
 
 func validateProxyListenAddress(address string) error {

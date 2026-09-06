@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/huangyingting/porta/internal/abuse"
 )
 
 func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
@@ -171,6 +173,7 @@ func TestPortalClientSessionRevokedWhenTokenRotates(t *testing.T) {
 func TestPortalTrustsForwardedHostOnlyInBehindProxyMode(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/clients", nil)
 	request.Host = "127.0.0.1:8080"
+	request.RemoteAddr = "127.0.0.1:1234"
 	request.Header.Set("Origin", "https://porta.example.com")
 	request.Header.Set("X-Forwarded-Host", "porta.example.com")
 	if sameOriginPortalRequest(request, false) {
@@ -178,6 +181,10 @@ func TestPortalTrustsForwardedHostOnlyInBehindProxyMode(t *testing.T) {
 	}
 	if !sameOriginPortalRequest(request, true) {
 		t.Fatal("trusted forwarded host was rejected in behind-proxy mode")
+	}
+	request.RemoteAddr = "192.0.2.50:1234"
+	if sameOriginPortalRequest(request, true) {
+		t.Fatal("forwarded host from a public peer was trusted")
 	}
 }
 
@@ -209,6 +216,63 @@ func portalSignIn(t *testing.T, handler http.Handler, token, destination string)
 		t.Fatalf("session cookies = %#v", cookies)
 	}
 	return cookies[0]
+}
+
+func TestPortalAuthenticationIsRateLimitedAndSuccessRefundsCapacity(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), "client-token-0123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := newPortalHandler(portalConfig{
+		Next:       http.NotFoundHandler(),
+		Registry:   registry,
+		AdminToken: testAdminToken,
+		Admin:      http.NotFoundHandler(),
+		Abuse:      newTestAbuseGuard(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(remoteAddr, token string) *http.Request {
+		form := url.Values{"token": {token}}
+		r := httptest.NewRequest(http.MethodPost, "/access", strings.NewReader(form.Encode()))
+		r.RemoteAddr = remoteAddr
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return r
+	}
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, request("192.0.2.40:1234", "invalid-token-0123456789"))
+	if first.Code != http.StatusUnauthorized {
+		t.Fatalf("first failure status = %d", first.Code)
+	}
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, request("192.0.2.40:1234", "invalid-token-0123456789"))
+	if second.Code != http.StatusTooManyRequests || second.Header().Get("Retry-After") == "" {
+		t.Fatalf("limited failure = %d %v", second.Code, second.Header())
+	}
+	for i := 0; i < 2; i++ {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request("192.0.2.41:1234", "client-token-0123456789"))
+		if response.Code != http.StatusSeeOther {
+			t.Fatalf("successful login %d status = %d", i, response.Code)
+		}
+	}
+}
+
+func newTestAbuseGuard(t *testing.T) *abuse.Guard {
+	t.Helper()
+	policies := map[abuse.Surface]abuse.Policy{
+		abuse.NativeAuthentication: {Burst: 1, RefillInterval: time.Hour},
+		abuse.ProxyAuthentication:  {Burst: 1, RefillInterval: time.Hour},
+		abuse.PortalAuthentication: {Burst: 1, RefillInterval: time.Hour},
+		abuse.InvitationRedemption: {Burst: 1, RefillInterval: time.Hour},
+	}
+	guard, err := abuse.New(policies, 16, time.Hour, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
 }
 
 func portalRequest(handler http.Handler, method, path string, cookie *http.Cookie) *httptest.ResponseRecorder {

@@ -46,6 +46,41 @@ func accessTestRedeem(p *portalHandler, ticket, origin string) *httptest.Respons
 	return response
 }
 
+func TestInvitationRedemptionFailuresAreRateLimited(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), accessTestToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := newPortalHandler(portalConfig{
+		Next:       http.NotFoundHandler(),
+		Registry:   registry,
+		AdminToken: testAdminToken,
+		Admin:      http.NotFoundHandler(),
+		Abuse:      newTestAbuseGuard(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, accessTestOrigin+"/join/redeem",
+			strings.NewReader(url.Values{"ticket": {"invalid-invitation-ticket"}}.Encode()))
+		r.RemoteAddr = "192.0.2.42:1234"
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.Header.Set("Origin", accessTestOrigin)
+		return r
+	}
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, request())
+	if first.Code != http.StatusUnauthorized {
+		t.Fatalf("first failure status = %d", first.Code)
+	}
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, request())
+	if second.Code != http.StatusTooManyRequests || second.Header().Get("Retry-After") == "" {
+		t.Fatalf("limited failure = %d %v", second.Code, second.Header())
+	}
+}
+
 func TestClientAccessDownloadThenProfileQR(t *testing.T) {
 	portal, registry := accessTestPortal(t)
 	body, err := json.Marshal(clientAccessInput{Origin: accessTestOrigin, Token: accessTestToken})

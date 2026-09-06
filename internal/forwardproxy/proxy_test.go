@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/huangyingting/porta/internal/abuse"
 )
 
 const testToken = "proxy-token-0123456789"
@@ -448,6 +450,50 @@ func TestBasicUsernameIsIgnored(t *testing.T) {
 		basicProxyAuth("anything", ""),
 	); ok {
 		t.Fatal("empty token authenticated")
+	}
+}
+
+func TestProxyAuthenticationFailuresAreRateLimited(t *testing.T) {
+	policies := map[abuse.Surface]abuse.Policy{
+		abuse.NativeAuthentication: {Burst: 1, RefillInterval: time.Hour},
+		abuse.ProxyAuthentication:  {Burst: 1, RefillInterval: time.Hour},
+		abuse.PortalAuthentication: {Burst: 1, RefillInterval: time.Hour},
+		abuse.InvitationRedemption: {Burst: 1, RefillInterval: time.Hour},
+	}
+	guard, err := abuse.New(policies, 16, time.Hour, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizerCalls := 0
+	handler, err := New(Config{
+		Next: http.NotFoundHandler(),
+		AuthorizeSession: func(ctx context.Context, _, _ string) (Identity, context.Context, func(), error) {
+			authorizerCalls++
+			return Identity{}, ctx, func() {}, errors.New("unauthorized")
+		},
+		Abuse: guard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
+		r.RemoteAddr = "192.0.2.31:1234"
+		r.Header.Set("Proxy-Authorization", basicProxyAuth("ignored", "invalid-token-0123456789"))
+		return r
+	}
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, request())
+	if first.Code != http.StatusProxyAuthRequired {
+		t.Fatalf("first failure status = %d", first.Code)
+	}
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, request())
+	if second.Code != http.StatusTooManyRequests || second.Header().Get("Retry-After") == "" {
+		t.Fatalf("limited failure = %d %v", second.Code, second.Header())
+	}
+	if authorizerCalls != 1 {
+		t.Fatalf("authorizer calls = %d, want 1", authorizerCalls)
 	}
 }
 

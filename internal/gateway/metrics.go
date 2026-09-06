@@ -11,6 +11,11 @@ type Metrics struct {
 	activeTunnels            atomic.Int64
 	connectionsTotal         atomic.Uint64
 	authFailures             atomic.Uint64
+	publicConnections        [2]atomic.Int64
+	publicConnectionsTotal   [2]atomic.Uint64
+	publicConnectionRejected [5]atomic.Uint64
+	quicRetries              atomic.Uint64
+	abuseRejected            [4]atomic.Uint64
 	packetsFromClient        atomic.Uint64
 	packetsToClient          atomic.Uint64
 	droppedPacketsFromClient atomic.Uint64
@@ -29,6 +34,62 @@ type Metrics struct {
 	mtuICMPSent              atomic.Uint64
 	mtuICMPSuppressed        atomic.Uint64
 	mtuICMPRateLimited       atomic.Uint64
+}
+
+func (m *Metrics) PublicConnectionOpened(transport string) {
+	if index := publicTransportIndex(transport); index >= 0 {
+		m.publicConnections[index].Add(1)
+		m.publicConnectionsTotal[index].Add(1)
+	}
+}
+
+func (m *Metrics) PublicConnectionClosed(transport string) {
+	if index := publicTransportIndex(transport); index >= 0 {
+		m.publicConnections[index].Add(-1)
+	}
+}
+
+func (m *Metrics) PublicConnectionRejected(transport, reason string) {
+	switch transport + ":" + reason {
+	case "tcp:global":
+		m.publicConnectionRejected[0].Add(1)
+	case "tcp:source":
+		m.publicConnectionRejected[1].Add(1)
+	case "quic:global":
+		m.publicConnectionRejected[2].Add(1)
+	case "quic:source":
+		m.publicConnectionRejected[3].Add(1)
+	case "quic:unverified":
+		m.publicConnectionRejected[4].Add(1)
+	}
+}
+
+func (m *Metrics) QUICRetry() {
+	m.quicRetries.Add(1)
+}
+
+func (m *Metrics) AbuseRejected(surface string) {
+	switch surface {
+	case "native":
+		m.abuseRejected[0].Add(1)
+	case "proxy":
+		m.abuseRejected[1].Add(1)
+	case "portal":
+		m.abuseRejected[2].Add(1)
+	case "invitation":
+		m.abuseRejected[3].Add(1)
+	}
+}
+
+func publicTransportIndex(transport string) int {
+	switch transport {
+	case "tcp":
+		return 0
+	case "quic":
+		return 1
+	default:
+		return -1
+	}
 }
 
 // DatagramOversize records a datagram payload-limit error requiring capsule
@@ -97,6 +158,43 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	for _, metric := range metrics {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", metric.name, metric.help, metric.name, metric.kind, metric.name, metric.value)
+	}
+	_, _ = io.WriteString(w, "# HELP porta_public_connections Current accepted public transport connections.\n# TYPE porta_public_connections gauge\n")
+	for index, transport := range []string{"tcp", "quic"} {
+		_, _ = fmt.Fprintf(w, "porta_public_connections{transport=%q} %d\n", transport, m.publicConnections[index].Load())
+	}
+	_, _ = io.WriteString(w, "# HELP porta_public_connections_total Accepted public transport connections.\n# TYPE porta_public_connections_total counter\n")
+	for index, transport := range []string{"tcp", "quic"} {
+		_, _ = fmt.Fprintf(w, "porta_public_connections_total{transport=%q} %d\n", transport, m.publicConnectionsTotal[index].Load())
+	}
+	_, _ = io.WriteString(w, "# HELP porta_public_connection_rejections_total Public transport connections rejected by admission controls.\n# TYPE porta_public_connection_rejections_total counter\n")
+	for index, rejection := range []struct {
+		transport string
+		reason    string
+	}{
+		{"tcp", "global"},
+		{"tcp", "source"},
+		{"quic", "global"},
+		{"quic", "source"},
+		{"quic", "unverified"},
+	} {
+		_, _ = fmt.Fprintf(
+			w,
+			"porta_public_connection_rejections_total{transport=%q,reason=%q} %d\n",
+			rejection.transport,
+			rejection.reason,
+			m.publicConnectionRejected[index].Load(),
+		)
+	}
+	_, _ = fmt.Fprintf(
+		w,
+		"# HELP porta_quic_retries_total QUIC handshakes required to validate their source address under pressure.\n"+
+			"# TYPE porta_quic_retries_total counter\nporta_quic_retries_total %d\n",
+		m.quicRetries.Load(),
+	)
+	_, _ = io.WriteString(w, "# HELP porta_abuse_rejections_total Authentication attempts rejected by the bounded failure limiter.\n# TYPE porta_abuse_rejections_total counter\n")
+	for index, surface := range []string{"native", "proxy", "portal", "invitation"} {
+		_, _ = fmt.Fprintf(w, "porta_abuse_rejections_total{surface=%q} %d\n", surface, m.abuseRejected[index].Load())
 	}
 	_, _ = io.WriteString(w, "# HELP porta_router_dropped_packets_total Packets dropped by the gateway router by reason.\n# TYPE porta_router_dropped_packets_total counter\n")
 	for _, drop := range []struct {

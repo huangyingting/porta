@@ -147,12 +147,15 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual((destination / "server.key").read_text(), "key:new")
 
     def test_nft_rules_are_replaced_in_one_transaction(self):
-        self.update_state(nft_table="old", docker=True)
-        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0")
+        self.update_state(nft_table="old", nft_tables={"ip porta": "old", "inet porta_guard": "old"}, docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
         transaction = self.state()["nft_transaction"]
-        self.assertTrue(transaction.startswith("delete table ip porta\n"))
+        self.assertTrue(transaction.startswith("delete table ip porta\ndelete table inet porta_guard\n"))
         self.assertIn('iifname "porta0" drop', transaction)
         self.assertIn("ip saddr 10.66.0.0/24 masquerade", transaction)
+        self.assertIn('iifname "eth0" meta nfproto ipv4 tcp dport 8443', transaction)
+        self.assertIn('meter tcp4 size 65535', transaction)
+        self.assertIn('meter udp6 size 65535', transaction)
         mutations = [call for call in self.commands() if call[:2] == ["nft", "-f"]]
         self.assertEqual(len(mutations), 1)
         self.assertEqual(len(self.state()["iptables_rules"]), 2)
@@ -212,15 +215,26 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue(self.state()["active"]["other.service"])
 
     def test_nft_failure_preserves_previous_table(self):
-        self.update_state(nft_table="old", fail_nft=True, docker=True)
+        old_tables = {"ip porta": "old", "inet porta_guard": "old guard"}
+        self.update_state(nft_table="old", nft_tables=old_tables, fail_nft=True, docker=True)
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
-                        "eth0", success=False)
+                        "eth0", "8443", success=False)
         self.assertEqual(self.state()["nft_table"], "old")
+        self.assertEqual(self.state()["nft_tables"], old_tables)
         self.assertFalse(any(call[0] == "iptables" for call in self.commands()))
+
+    def test_nft_setup_rejects_invalid_public_port_before_mutation(self):
+        for port in ("0", "65536", "not-a-port"):
+            with self.subTest(port=port):
+                self.run_script(
+                    "server-up.sh", "porta0", "10.66.0.1/24",
+                    "10.66.0.0/24", "eth0", port, success=False,
+                )
+        self.assertFalse((self.root / "commands.jsonl").exists())
 
     def test_automatic_mtu_scopes_icmp_acceptance_to_owned_tun(self):
         self.run_script("server-up.sh", "porta.0", "10.66.0.1/24",
-                        "10.66.0.0/24", "eth0")
+                        "10.66.0.0/24", "eth0", "8443")
         calls = self.commands()
         self.assertIn(["sysctl", "-w", "net/ipv4/conf/porta.0/accept_local=1"], calls)
         self.assertIn(["sysctl", "-w", "net/ipv4/conf/porta.0/rp_filter=2"], calls)
@@ -231,7 +245,7 @@ class AutomationTests(unittest.TestCase):
 
     def test_fixed_mtu_does_not_change_source_validation(self):
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
-                        "eth0", "--auto-mtu=false")
+                        "eth0", "8443", "--auto-mtu=false")
         self.assertFalse(any("accept_local" in " ".join(call) or "rp_filter" in " ".join(call)
                              for call in self.commands()))
 
@@ -244,23 +258,26 @@ class AutomationTests(unittest.TestCase):
         script.write_text((ROOT / "scripts/server-up.sh").read_text().replace(
             "/proc/sys", str(proc)
         ))
-        self.run_script(str(script), "porta.0", "10.66.0.1/24", "10.66.0.0/24", "eth0")
+        self.run_script(str(script), "porta.0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
         self.assertIn(["sysctl", "-w", "net/ipv6/conf/porta.0/disable_ipv6=1"],
                       self.commands())
 
     def test_down_removes_duplicates_and_is_idempotent(self):
-        self.update_state(nft_table="old", docker=True)
-        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0")
+        self.update_state(nft_table="old", nft_tables={"ip porta": "old", "inet porta_guard": "old"}, docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
         self.update_state(iptables_rules=self.state()["iptables_rules"] * 2)
         self.run_script("server-down.sh", "porta0", "eth0")
         self.run_script("server-down.sh", "porta0", "eth0")
         self.assertEqual(self.state()["iptables_rules"], [])
         self.assertEqual(self.state()["nft_table"], "")
+        self.assertEqual(self.state()["nft_tables"], {})
 
     def test_down_reports_failed_table_deletion(self):
-        self.update_state(nft_table="old", fail_nft=True)
+        old_tables = {"ip porta": "old", "inet porta_guard": "old guard"}
+        self.update_state(nft_table="old", nft_tables=old_tables, fail_nft=True)
         self.run_script("server-down.sh", "porta0", "eth0", success=False)
         self.assertEqual(self.state()["nft_table"], "old")
+        self.assertEqual(self.state()["nft_tables"], old_tables)
         self.assertIn(["ip", "link", "set", "dev", "porta0", "down"], self.commands())
 
     def version_file(self, value):
@@ -448,7 +465,8 @@ class AutomationTests(unittest.TestCase):
         cert, key = self.certificate_pair("source", "new")
         environment = (self.root / "system/etc/porta/porta.env").read_bytes()
         self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key,
-                        "--port", "08443", "--admin-port", "00081")
+                        "--port", "08443", "--admin-port", "00081",
+                        "--trust-proxy-headers")
         self.assertEqual((self.root / "system/etc/porta/porta.env").read_bytes(), environment)
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--listen :8443", unit)
@@ -457,12 +475,13 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--mtu 1400", unit)
         self.assertIn("--auto-mtu=true", unit)
         self.assertIn("--landing-template-dir", unit)
+        self.assertIn("--trust-proxy-headers", unit)
         self.assertTrue((self.root / "system/etc/porta/landing").is_dir())
         self.assertEqual(
             (self.root / "system/etc/porta/landing/custom.html").read_text(),
             "<h1>custom landing</h1>",
         )
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --auto-mtu=true", unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", unit)
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
@@ -473,7 +492,7 @@ class AutomationTests(unittest.TestCase):
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1280", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=true", unit)
 
     def test_deploy_fixed_mtu_disables_discovery_and_helper_settings(self):
         deploy = self.prepare_deploy(timer=False)
@@ -482,7 +501,7 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--auto-mtu=false", unit)
         self.assertNotIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1100", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 --auto-mtu=false", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=false", unit)
 
     def test_bundled_service_uses_automatic_mtu_defaults(self):
         unit = (ROOT / "deploy/porta.service").read_text()
@@ -492,13 +511,14 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--mtu 1400", unit)
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
         self.assertIn("--auto-mtu=true", setup)
+        self.assertIn("eth0 8443 --auto-mtu=true", setup)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
         deploy = self.prepare_deploy()
         self.run_deploy(deploy, "--build-local", "--admin-port", "80", success=False)
         self.assertNotIn("stopped_helpers", self.state())
 
-    def release_assets(self, landing_templates=True):
+    def release_assets(self, landing_templates=True, proxy_headers=True):
         release = self.root / "release"
         release.mkdir()
         assets = [
@@ -511,6 +531,8 @@ class AutomationTests(unittest.TestCase):
         for name in assets:
             if name.startswith("porta-server"):
                 features = "client-downloads\\n"
+                if proxy_headers:
+                    features += "trust-proxy-headers\\n"
                 if landing_templates:
                     features += "landing-template-dir\\n"
                 data = f"#!/bin/sh\nprintf '{features}'\n".encode()
@@ -541,6 +563,14 @@ class AutomationTests(unittest.TestCase):
         before = self.snapshot()
         self.release_assets(landing_templates=False)
         self.run_deploy(deploy, success=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("stopped_helpers", self.state())
+
+    def test_release_without_proxy_header_support_fails_only_when_requested(self):
+        deploy = self.prepare_deploy()
+        before = self.snapshot()
+        self.release_assets(proxy_headers=False)
+        self.run_deploy(deploy, "--trust-proxy-headers", success=False)
         self.assertEqual(self.snapshot(), before)
         self.assertNotIn("stopped_helpers", self.state())
 

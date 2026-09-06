@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: check-version test test-automation test-race test-native-mtu vet build build-windows android clean
+.PHONY: check-version test test-automation test-race test-native-mtu test-native-firewall vet build build-windows android clean
 
 check-version:
 	./scripts/check-version.sh
@@ -22,6 +22,9 @@ test-native-mtu:
 	cd internal/gateway; \
 	sudo -n unshare --net -- env PORTA_MTU_NATIVE_TEST=1 "$$directory/gateway.test" \
 		-test.run '^TestNativeMTU' -test.count=1 -test.v -test.timeout=30s
+
+test-native-firewall:
+	./scripts/test-server-firewall.sh
 
 vet:
 	$(GO) vet ./...

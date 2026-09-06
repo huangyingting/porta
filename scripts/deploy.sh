@@ -24,6 +24,7 @@ Options:
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU ceiling (default: 1400)
   --auto-mtu[=BOOL]         Automatic HTTP/3 MTU selection (default: true)
+  --trust-proxy-headers     Trust client IP headers from a loopback reverse proxy
   --disable-forward-proxy   Disable authenticated HTTPS CONNECT proxying
   --reset-leases            Archive leases incompatible with a changed pool
   --release VERSION         GitHub release to deploy (default: latest)
@@ -61,6 +62,7 @@ gateway_cidr=
 dns=1.1.1.1
 mtu=1400
 auto_mtu=true
+trust_proxy_headers=false
 forward_proxy=true
 release=latest
 build_local=false
@@ -83,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --mtu) require_value "$@"; mtu=$2; shift 2 ;;
     --auto-mtu|--auto-mtu=true) auto_mtu=true; shift ;;
     --auto-mtu=false) auto_mtu=false; shift ;;
+    --trust-proxy-headers) trust_proxy_headers=true; shift ;;
     --disable-forward-proxy) forward_proxy=false; shift ;;
     --reset-leases) reset_leases=true; shift ;;
     --release) require_value "$@"; release=$2; shift 2 ;;
@@ -318,6 +321,9 @@ grep -q -- 'client-downloads' <<<"$server_help" ||
   die "selected server release does not support the required client download portal"
 grep -q -- 'landing-template-dir' <<<"$server_help" ||
   die "selected server release does not support custom landing templates"
+if $trust_proxy_headers && ! grep -q -- 'trust-proxy-headers' <<<"$server_help"; then
+  die "selected server release does not support trusted reverse-proxy client addresses"
+fi
 
 lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'
@@ -564,6 +570,10 @@ forward_proxy_argument=
 if ! $forward_proxy; then
   forward_proxy_argument="--disable-forward-proxy"
 fi
+trust_proxy_argument=
+if $trust_proxy_headers; then
+  trust_proxy_argument="--trust-proxy-headers"
+fi
 auto_mtu_argument="--auto-mtu=$auto_mtu"
 
 if systemctl cat docker.service >/dev/null 2>&1; then
@@ -580,8 +590,8 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $auto_mtu_argument --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
-ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $auto_mtu_argument; sleep 0.1; done; exit 1'
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port $auto_mtu_argument; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
 RestartSec=2

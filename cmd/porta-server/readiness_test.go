@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -29,10 +30,41 @@ const readyNftTable = `{"nftables":[
    {"masquerade":null}]}}
 ]}`
 
+const readyNftGuard = `{"nftables":[
+ {"chain":{"name":"input","type":"filter","hook":"input","prio":-10,"policy":"accept"}},
+ {"rule":{"chain":"input","expr":[
+   {"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},
+   {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8443}},
+   {"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"new"}},
+   {"match":{"op":"==","left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},["fin","syn","rst","ack"]]},"right":"syn"}},
+   {"meter":{"key":{"elem":{"val":{"payload":{"protocol":"ip","field":"saddr"}},"timeout":10}},"stmt":{"limit":{"rate":200,"burst":400,"per":"second","inv":true}},"size":65535,"name":"tcp4"}},
+   {"counter":{"packets":0,"bytes":0}},{"drop":null}]}},
+ {"rule":{"chain":"input","expr":[
+   {"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},
+   {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8443}},
+   {"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"new"}},
+   {"match":{"op":"==","left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},["fin","syn","rst","ack"]]},"right":"syn"}},
+   {"meter":{"key":{"elem":{"val":{"payload":{"protocol":"ip6","field":"saddr"}},"timeout":10}},"stmt":{"limit":{"rate":200,"burst":400,"per":"second","inv":true}},"size":65535,"name":"tcp6"}},
+   {"counter":{"packets":0,"bytes":0}},{"drop":null}]}},
+ {"rule":{"chain":"input","expr":[
+   {"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},
+   {"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":8443}},
+   {"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"new"}},
+   {"meter":{"key":{"elem":{"val":{"payload":{"protocol":"ip","field":"saddr"}},"timeout":10}},"stmt":{"limit":{"rate":500,"burst":1000,"per":"second","inv":true}},"size":65535,"name":"udp4"}},
+   {"counter":{"packets":0,"bytes":0}},{"drop":null}]}},
+ {"rule":{"chain":"input","expr":[
+   {"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},
+   {"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":8443}},
+   {"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"new"}},
+   {"meter":{"key":{"elem":{"val":{"payload":{"protocol":"ip6","field":"saddr"}},"timeout":10}},"stmt":{"limit":{"rate":500,"burst":1000,"per":"second","inv":true}},"size":65535,"name":"udp6"}},
+   {"counter":{"packets":0,"bytes":0}},{"drop":null}]}}
+]}`
+
 func readyTestConfig() forwardingReadinessConfig {
 	return forwardingReadinessConfig{
 		Interface: "porta0", Gateway: netip.MustParseAddr("10.66.0.1"), Pool: netip.MustParsePrefix("10.66.0.0/24"),
-		EgressInterface: "eth0", RequireNAT: true, Timeout: time.Second, DNSAddress: "1.1.1.1",
+		EgressInterface: "eth0", RequireNAT: true, RequireInputGuard: true, PublicPort: 8443,
+		Timeout: time.Second, DNSAddress: "1.1.1.1",
 	}
 }
 
@@ -47,6 +79,9 @@ func readyTestDependencies() readinessDependencies {
 		ReadFile: func(string) ([]byte, error) { return []byte("1\n"), nil },
 		Command: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			if name == "nft" {
+				if strings.Contains(strings.Join(args, " "), "inet porta_guard") {
+					return []byte(readyNftGuard), nil
+				}
 				return []byte(readyNftTable), nil
 			}
 			if strings.Contains(strings.Join(args, " "), "default") {
@@ -75,7 +110,7 @@ func TestForwardingReadinessNftStateEncodings(t *testing.T) {
 			deps := readyTestDependencies()
 			command := deps.Command
 			deps.Command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-				if name == "nft" {
+				if name == "nft" && !strings.Contains(strings.Join(args, " "), "inet porta_guard") {
 					return []byte(strings.Replace(readyNftTable, `["established","related"]`, test.states, 1)), nil
 				}
 				return command(ctx, name, args...)
@@ -92,6 +127,82 @@ func TestForwardingReadinessNftStateEncodings(t *testing.T) {
 				t.Fatalf("invalid ct-state did not fail the forwarding check: %+v", report)
 			}
 		})
+	}
+}
+
+func TestInputGuardReadinessRejectsMalformedRules(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"wrong-interface", `"right":"eth0"`, `"right":"eth1"`},
+		{"wrong-port", `"right":8443`, `"right":9443`},
+		{"wrong-protocol", `"protocol":"tcp","field":"dport"`, `"protocol":"udp","field":"dport"`},
+		{"wrong-state", `"right":"new"`, `"right":"established"`},
+		{"wrong-meter-rate", `"rate":200`, `"rate":201`},
+		{"wrong-meter-size", `"size":65535`, `"size":1024`},
+		{"byte-rate-units", `"per":"second","inv":true`, `"per":"second","rate_unit":"mbytes","burst_unit":"mbytes","inv":true`},
+		{"wrong-verdict", `"drop":null`, `"accept":null`},
+		{"wrong-policy", `"policy":"accept"`, `"policy":"drop"`},
+		{"missing-counter", `{"counter":{"packets":0,"bytes":0}},`, ``},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deps := readyTestDependencies()
+			command := deps.Command
+			deps.Command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				data, err := command(ctx, name, args...)
+				if name == "nft" && strings.Contains(strings.Join(args, " "), "inet porta_guard") {
+					data = []byte(strings.Replace(string(data), test.old, test.new, 1))
+				}
+				return data, err
+			}
+			readiness, err := newForwardingReadiness(readyTestConfig(), deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report := readiness.Check(context.Background())
+			if report.Status != "not_ready" || report.Components["porta_input_guard"].Status != "error" {
+				t.Fatalf("malformed guard was accepted: %+v", report)
+			}
+		})
+	}
+}
+
+func TestInputGuardReadinessRejectsMeterBeforeSelectors(t *testing.T) {
+	var document map[string]any
+	if err := json.Unmarshal([]byte(readyNftGuard), &document); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := document["nftables"].([]any)
+	for _, value := range entries {
+		entry, _ := value.(map[string]any)
+		rule, _ := entry["rule"].(map[string]any)
+		expressions, _ := rule["expr"].([]any)
+		if len(expressions) == 7 {
+			expressions[0], expressions[4] = expressions[4], expressions[0]
+			break
+		}
+	}
+	reordered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := readyTestDependencies()
+	command := deps.Command
+	deps.Command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "nft" && strings.Contains(strings.Join(args, " "), "inet porta_guard") {
+			return reordered, nil
+		}
+		return command(ctx, name, args...)
+	}
+	readiness, err := newForwardingReadiness(readyTestConfig(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := readiness.Check(context.Background())
+	if report.Status != "not_ready" || report.Components["porta_input_guard"].Status != "error" {
+		t.Fatalf("meter-first guard was accepted: %+v", report)
 	}
 }
 
@@ -227,6 +338,27 @@ func TestRoutedReadinessDoesNotClaimNATWorking(t *testing.T) {
 	if report.Status != "ready" || report.Components["porta_nat_rules"].Status != "disabled" ||
 		report.Components["porta_nat_rules"].Required {
 		t.Fatalf("routed readiness = %+v", report)
+	}
+}
+
+func TestProxyBackendReadinessDoesNotRequirePublicInputGuard(t *testing.T) {
+	config := readyTestConfig()
+	config.RequireInputGuard = false
+	deps := readyTestDependencies()
+	command := deps.Command
+	deps.Command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "nft" && strings.Contains(strings.Join(args, " "), "inet porta_guard") {
+			return nil, errors.New("guard unavailable")
+		}
+		return command(ctx, name, args...)
+	}
+	readiness, err := newForwardingReadiness(config, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := readiness.Check(context.Background())
+	if report.Status != "ready" || report.Components["porta_input_guard"].Status != "disabled" {
+		t.Fatalf("proxy-backend readiness = %+v", report)
 	}
 }
 
