@@ -91,6 +91,10 @@ func TestPowerShellInitializesIPv4BeforeSnapshottingMTU(t *testing.T) {
 	testPowerShellJournal(t, testPowerShell(t), "192.0.2.1", "", "-DelayedMtu")
 }
 
+func TestPowerShellSkipsUnavailableMTUAfterNativeApply(t *testing.T) {
+	testPowerShellJournal(t, testPowerShell(t), "192.0.2.1", "", "-NativeMtu")
+}
+
 func testPowerShellJournal(t *testing.T, powerShell, endpoint, fail string, extraArgs ...string) {
 	dir := t.TempDir()
 	state := networkState{
@@ -123,7 +127,7 @@ func testPowerShellJournal(t *testing.T, powerShell, endpoint, fail string, extr
 }
 
 const powerShellHarness = `
-param($Helper, $StatePath, $FailPrefix = "", [switch]$MtuOnly, [switch]$DelayedMtu)
+param($Helper, $StatePath, $FailPrefix = "", [switch]$MtuOnly, [switch]$DelayedMtu, [switch]$NativeMtu)
 $ErrorActionPreference = "Stop"
 $global:adapters = @(
     [PSCustomObject]@{Name="Ethernet";InterfaceIndex=7;InterfaceGuid="11111111-1111-1111-1111-111111111111"},
@@ -135,6 +139,11 @@ $global:routes = @(
     [PSCustomObject]@{DestinationPrefix="10.77.0.0/24";InterfaceIndex=7;NextHop="192.0.2.254";RouteMetric=1}
 )
 $initial = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+if ($NativeMtu) {
+    $initial.version = 3
+    $initial | Add-Member -NotePropertyName mtu -NotePropertyValue ([PSCustomObject]@{original=65535;applied=1100;pending=0}) -Force
+    [IO.File]::WriteAllText($StatePath, ($initial | ConvertTo-Json -Depth 10 -Compress))
+}
 $defaultPrefix = "0.0.0.0/0"
 $gateway = "192.0.2.254"
 $hostPrefix = "$($initial.server_ip)/32"
@@ -148,6 +157,7 @@ $baseline = @($global:routes)
 $global:ips = @([PSCustomObject]@{IPAddress="10.0.0.99";PrefixLength=24;InterfaceIndex=77})
 $global:dns = @("9.9.9.9")
 $global:mtu = 1500
+if ($NativeMtu) { $global:mtu = 1100 }
 $global:routeAdds = 0
 $global:failDNSApply = $false
 $global:failMTUApply = $false
@@ -178,6 +188,7 @@ function Get-NetIPInterface {
             @($global:ips | Where-Object { $_.InterfaceIndex -eq 77 -and $_.IPAddress -ne "10.0.0.99" }).Count -eq 0) {
             $reportedMtu = $null
         }
+        if ($NativeMtu -and $InterfaceIndex -eq 77) { $reportedMtu = $null }
         [PSCustomObject]@{InterfaceIndex=$_.InterfaceIndex;InterfaceAlias=$_.Name;ConnectionState="Connected";InterfaceMetric=$metric;Dhcp="Disabled";NlMtuBytes=$reportedMtu}
     }
 }
@@ -236,6 +247,7 @@ function Set-DnsClientServerAddress {
 function Set-NetIPInterface {
     [CmdletBinding()]param($InterfaceIndex,$AddressFamily,$Dhcp,$NlMtuBytes)
     if ($Dhcp) { throw "Untouched DHCP state was changed." }
+    if ($NativeMtu -and $NlMtuBytes) { throw "PowerShell attempted MTU configuration after native apply." }
     if ($DelayedMtu -and @($global:ips | Where-Object {
         $_.InterfaceIndex -eq 77 -and $_.IPAddress -ne "10.0.0.99"
     }).Count -eq 0) {
@@ -269,7 +281,13 @@ if ($failed -ne [bool]$FailPrefix) { throw "Unexpected setup result." }
 $saved = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
 if ($saved.routes.Count -ne 4 -or $global:routeAdds -ne 4) { throw "Crash recovery lost planned route ownership." }
 Assert-DNSRoute "10.77.0.53"
-if ($global:mtu -ne 1100 -or $saved.mtu.original -ne 1500) { throw "Negotiated MTU not applied to Windows IP interface." }
+if ($global:mtu -ne 1100 -or (-not $NativeMtu -and $saved.mtu.original -ne 1500)) { throw "Negotiated MTU not applied to Windows IP interface." }
+if ($NativeMtu) {
+    if ($saved.mtu.original -ne 65535 -or $saved.mtu.applied -ne 1100 -or $saved.mtu.pending -ne 0) {
+        throw "Native MTU recovery state was changed by PowerShell."
+    }
+    return
+}
 if (-not $FailPrefix) {
     & $Helper up $StatePath "10.0.0.3/24" "10.77.0.53"
     if (@($global:ips | Where-Object { $_.IPAddress -eq "10.0.0.2" }).Count -ne 0) { throw "Stale lease address retained." }

@@ -50,6 +50,12 @@ func testRunner(t *testing.T) *Runner {
 		t.Fatal(err)
 	}
 	runner.guard = &fakeGuard{}
+	currentMTU := uint32(1500)
+	runner.readInterfaceMTU = func(uint64) (uint32, error) { return currentMTU, nil }
+	runner.updateInterfaceMTU = func(_ uint64, mtu uint32) error {
+		currentMTU = mtu
+		return nil
+	}
 	runner.runCommand = func(context.Context, ...string) (string, error) { return "", nil }
 	t.Cleanup(func() {
 		runner.mu.Lock()
@@ -116,7 +122,7 @@ func TestActivationBeforeNetworkMutationAndNoUpdateGap(t *testing.T) {
 	if err := runner.Reconfigure(context.Background(), "Porta", testRemote(), lease); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"guard", "prepare", "up", "guard", "prepare", "up"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"guard", "prepare", "configure-interface", "up", "guard", "prepare", "configure-interface", "up"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("update opened protection gap: %v", calls)
 	}
 	if err := runner.Down(context.Background()); err != nil {
@@ -166,6 +172,8 @@ func TestCancellationRetainsJournalAndProtectionUntilExplicitDown(t *testing.T) 
 		t.Fatal("journal alone is not activation proof")
 	}
 	reopened.guard = &fakeGuard{}
+	reopened.readInterfaceMTU = func(uint64) (uint32, error) { return 1280, nil }
+	reopened.updateInterfaceMTU = func(uint64, uint32) error { return nil }
 	reopened.runCommand = func(context.Context, ...string) (string, error) { return "", nil }
 	// Simulate process death: the OS releases the ownership handle, but neither
 	// the WFP objects nor the journal are removed.
@@ -394,7 +402,7 @@ func TestRecreatedTunnelIsReboundWithoutGuardRemoval(t *testing.T) {
 	if err := runner.Reconfigure(context.Background(), "Porta", testRemote(), testLease()); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"retire-interface", "guard", "prepare", "up"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"retire-interface", "guard", "prepare", "configure-interface", "up"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("unsafe rebind sequence: %v", calls)
 	}
 }
@@ -537,5 +545,98 @@ func TestMTUIsValidatedAndPassedToWindows(t *testing.T) {
 		if (err == nil) != (mtu == 1100) || called != (mtu == 1100) {
 			t.Fatalf("MTU %d: helper called=%t error=%v", mtu, called, err)
 		}
+	}
+}
+
+func TestNativeMTUIsJournaledBeforePowerShell(t *testing.T) {
+	runner := testRunner(t)
+	var applied []uint32
+	runner.readInterfaceMTU = func(luid uint64) (uint32, error) {
+		if luid != 77 {
+			t.Fatalf("MTU queried for LUID %d", luid)
+		}
+		return 65535, nil
+	}
+	runner.updateInterfaceMTU = func(luid uint64, mtu uint32) error {
+		var saved networkState
+		data, err := os.ReadFile(runner.statePath)
+		if err != nil || json.Unmarshal(data, &saved) != nil {
+			t.Fatalf("read MTU ownership before mutation: %v", err)
+		}
+		if luid != 77 || saved.Version != nativeMTUStateVersion || saved.MTU == nil || saved.MTU.Original != 65535 || saved.MTU.Pending != int(mtu) {
+			t.Fatalf("MTU mutation preceded versioned exact ownership journal: LUID=%d version=%d state=%+v", luid, saved.Version, saved.MTU)
+		}
+		applied = append(applied, mtu)
+		return nil
+	}
+	runner.runCommand = func(_ context.Context, args ...string) (string, error) {
+		if args[0] != "up" {
+			return "", nil
+		}
+		var saved networkState
+		data, err := os.ReadFile(runner.statePath)
+		if err != nil || json.Unmarshal(data, &saved) != nil {
+			t.Fatalf("read native MTU state before PowerShell: %v", err)
+		}
+		if saved.Version != nativeMTUStateVersion || saved.MTU == nil || saved.MTU.Applied != 1280 || saved.MTU.Pending != 0 {
+			t.Fatalf("PowerShell invoked before native MTU completed: version=%d state=%+v", saved.Version, saved.MTU)
+		}
+		return "", nil
+	}
+	if err := runner.Up(context.Background(), "Porta", testRemote(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(applied, []uint32{1280}) {
+		t.Fatalf("native MTU updates = %v", applied)
+	}
+}
+
+func TestNativeMTUFailureRetainsRecoveryOwnership(t *testing.T) {
+	runner := testRunner(t)
+	failure := errors.New("native MTU failure")
+	runner.readInterfaceMTU = func(uint64) (uint32, error) { return 1500, nil }
+	runner.updateInterfaceMTU = func(uint64, uint32) error { return failure }
+	runner.runCommand = func(_ context.Context, args ...string) (string, error) {
+		if args[0] == "up" {
+			t.Fatal("PowerShell ran after native MTU failure")
+		}
+		return "", nil
+	}
+	if err := runner.Up(context.Background(), "Porta", testRemote(), testLease()); !errors.Is(err, failure) {
+		t.Fatalf("MTU failure = %v", err)
+	}
+	saved, err := NewRunner(runner.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.state.MTU == nil || saved.state.MTU.Original != 1500 || saved.state.MTU.Pending != 1280 || saved.state.MTU.Applied != 0 {
+		t.Fatalf("failed native MTU lost recovery ownership: %+v", saved.state.MTU)
+	}
+}
+
+func TestNativeMTUIsRestoredBeforePowerShellCleanup(t *testing.T) {
+	runner := testRunner(t)
+	current := uint32(1500)
+	var updates []uint32
+	runner.readInterfaceMTU = func(uint64) (uint32, error) { return current, nil }
+	runner.updateInterfaceMTU = func(_ uint64, mtu uint32) error {
+		current = mtu
+		updates = append(updates, mtu)
+		return nil
+	}
+	runner.runCommand = func(_ context.Context, args ...string) (string, error) {
+		if args[0] == "down" && runner.state.MTU != nil {
+			t.Fatal("PowerShell cleanup started before native MTU restoration completed")
+		}
+		return "", nil
+	}
+	if err := runner.Up(context.Background(), "Porta", testRemote(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updates, []uint32{1280, 1500}) {
+		t.Fatalf("native MTU update sequence = %v", updates)
 	}
 }

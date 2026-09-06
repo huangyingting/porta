@@ -11,7 +11,7 @@ import (
 func TestRecoveryJournalRejectsIncompleteOwnership(t *testing.T) {
 	for name, damage := range map[string]func(*networkState){
 		"missing version":  func(s *networkState) { s.Version = 0 },
-		"future version":   func(s *networkState) { s.Version = 3 },
+		"future version":   func(s *networkState) { s.Version = 4 },
 		"interface":        func(s *networkState) { s.Interface = "" },
 		"guard identity":   func(s *networkState) { s.GuardKey = "" },
 		"adapter identity": func(s *networkState) { s.InterfaceGUID = "" },

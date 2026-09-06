@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("prepare", "up", "down", "retire-interface")][string]$Operation,
+    [ValidateSet("prepare", "configure-interface", "up", "down", "retire-interface")][string]$Operation,
     [string]$StatePath,
     [string]$AddressCidr,
     [string]$DnsServer,
@@ -7,7 +7,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($state.version -ne 2) {
+if ($state.version -notin @(2, 3)) {
     throw "Restore legacy journals with their original client; exact address/DNS ownership is unavailable."
 }
 
@@ -205,20 +205,23 @@ if ($existing.Count -eq 0) {
     Save-State
     New-NetIPAddress -InterfaceIndex $index -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) -ErrorAction Stop | Out-Null
 }
-if (-not $state.mtu) {
-    $current = @(Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)
-    if ($current.Count -ne 1 -or -not $current[0].NlMtuBytes) {
-        throw "Cannot snapshot the tunnel interface MTU after configuring its IPv4 address."
+if ($Operation -eq "configure-interface") { return }
+if (-not ($state.mtu -and $state.mtu.applied -eq $Mtu -and -not $state.mtu.pending)) {
+    if (-not $state.mtu) {
+        $current = @(Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)
+        if ($current.Count -ne 1 -or -not $current[0].NlMtuBytes) {
+            throw "Cannot snapshot the tunnel interface MTU."
+        }
+        Set-StateField "mtu" ([PSCustomObject]@{original=[uint32]$current[0].NlMtuBytes; applied=0; pending=$Mtu})
+    } else {
+        $state.mtu.pending = $Mtu
     }
-    Set-StateField "mtu" ([PSCustomObject]@{original=[uint32]$current[0].NlMtuBytes; applied=0; pending=$Mtu})
-} else {
-    $state.mtu.pending = $Mtu
+    Save-State
+    Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -NlMtuBytes $Mtu -ErrorAction Stop
+    $state.mtu.applied = $Mtu
+    $state.mtu.pending = 0
+    Save-State
 }
-Save-State
-Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -NlMtuBytes $Mtu -ErrorAction Stop
-$state.mtu.applied = $Mtu
-$state.mtu.pending = 0
-Save-State
 Add-OwnedRoute "dns" "$DnsServer/32" $index "0.0.0.0" 1
 if (-not $state.dns) {
     $current = @(Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)

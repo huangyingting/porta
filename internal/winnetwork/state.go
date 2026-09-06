@@ -21,7 +21,7 @@ func validJournalGUID(value string) bool {
 }
 
 func (s networkState) validate() error {
-	if s.Version != 2 {
+	if s.Version != exactOwnershipStateVersion && s.Version != nativeMTUStateVersion {
 		return fmt.Errorf("unsupported version %d; restore older journals with the client that created them", s.Version)
 	}
 	if strings.TrimSpace(s.Interface) == "" || strings.ContainsRune(s.Interface, 0) || !validJournalGUID(s.GuardKey) {

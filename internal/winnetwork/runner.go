@@ -22,14 +22,21 @@ import (
 
 var ErrStateInUse = errors.New("another Porta process owns this network state; disconnect or close that process first")
 
+const (
+	exactOwnershipStateVersion = 2
+	nativeMTUStateVersion      = 3
+)
+
 type Runner struct {
-	mu         sync.Mutex
-	statePath  string
-	state      networkState
-	protected  bool
-	lock       *os.File
-	guard      guardEngine
-	runCommand func(context.Context, ...string) (string, error)
+	mu                 sync.Mutex
+	statePath          string
+	state              networkState
+	protected          bool
+	lock               *os.File
+	guard              guardEngine
+	readInterfaceMTU   func(uint64) (uint32, error)
+	updateInterfaceMTU func(uint64, uint32) error
+	runCommand         func(context.Context, ...string) (string, error)
 }
 
 type routeState struct {
@@ -80,7 +87,12 @@ func NewRunner(statePath string) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	runner := &Runner{statePath: filepath.Clean(path), guard: nativeGuard{}}
+	runner := &Runner{
+		statePath:          filepath.Clean(path),
+		guard:              nativeGuard{},
+		readInterfaceMTU:   nativeInterfaceMTU,
+		updateInterfaceMTU: setNativeInterfaceMTU,
+	}
 	if err := runner.reloadLocked(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -144,7 +156,7 @@ func (r *Runner) prepareLocked(ctx context.Context, interfaceName string, remote
 	if r.state.Interface != "" && r.state.Interface != interfaceName {
 		return errors.New("saved network state belongs to a different interface; explicitly disconnect it first")
 	}
-	if r.state.Interface != "" && r.state.Version != 2 {
+	if r.state.Interface != "" && r.state.Version != exactOwnershipStateVersion && r.state.Version != nativeMTUStateVersion {
 		return errors.New("legacy network journal lacks exact ownership; restore it with the client version that created it before upgrading")
 	}
 	if r.guard == nil {
@@ -172,7 +184,9 @@ func (r *Runner) prepareLocked(ctx context.Context, interfaceName string, remote
 		}
 	}
 	next := r.state
-	next.Version = 2
+	if next.Version == 0 {
+		next.Version = exactOwnershipStateVersion
+	}
 	next.Interface = interfaceName
 	next.ServerIP = remote.IP.String()
 	next.Endpoint = remote
@@ -229,8 +243,17 @@ func (r *Runner) Up(ctx context.Context, interfaceName string, remoteAddr net.Ad
 	if err := r.prepareLocked(ctx, interfaceName, remoteAddr, true); err != nil {
 		return err
 	}
+	if _, err := r.invoke(ctx, "configure-interface", r.statePath, lease.Address.String(), lease.DNS.String(), fmt.Sprint(lease.MTU)); err != nil {
+		return errors.Join(err, r.reloadLocked())
+	}
+	if err := r.reloadLocked(); err != nil {
+		return err
+	}
+	if err := r.applyMTULocked(lease.MTU); err != nil {
+		return err
+	}
 	_, upErr := r.invoke(ctx, "up", r.statePath, lease.Address.String(), lease.DNS.String(), fmt.Sprint(lease.MTU))
-	// PowerShell journals ownership BEFORE each mutation. Never automatically
+	// Network setup journals ownership BEFORE each mutation. Never automatically
 	// call Down here: a lease/configuration failure must not release protection.
 	return errors.Join(upErr, r.reloadLocked())
 }
@@ -253,6 +276,9 @@ func (r *Runner) Down(ctx context.Context) error {
 		}
 		return r.releaseLocked()
 	}
+	if err := r.restoreMTULocked(); err != nil {
+		return err
+	}
 	_, downErr := r.invoke(ctx, "down", r.statePath)
 	if err := errors.Join(downErr, r.reloadLocked()); err != nil {
 		return err
@@ -274,6 +300,67 @@ func (r *Runner) Down(ctx context.Context) error {
 	}
 	r.state = networkState{}
 	return r.releaseLocked()
+}
+
+func (r *Runner) applyMTULocked(mtu int) error {
+	if r.state.InterfaceLUID == 0 {
+		return errors.New("tunnel interface identity is unavailable for native MTU configuration")
+	}
+	if r.readInterfaceMTU == nil || r.updateInterfaceMTU == nil {
+		return errors.New("native Windows MTU configuration is unavailable")
+	}
+	if r.state.MTU == nil {
+		original, err := r.readInterfaceMTU(r.state.InterfaceLUID)
+		if err != nil {
+			return fmt.Errorf("snapshot tunnel interface MTU with Windows IP Helper API: %w", err)
+		}
+		if original == 0 {
+			return errors.New("Windows IP Helper API returned a zero tunnel interface MTU")
+		}
+		r.state.MTU = &mtuState{Original: original}
+	}
+	r.state.Version = nativeMTUStateVersion
+	r.state.MTU.Pending = mtu
+	if err := r.persistLocked(); err != nil {
+		return err
+	}
+	if err := r.updateInterfaceMTU(r.state.InterfaceLUID, uint32(mtu)); err != nil {
+		return fmt.Errorf("apply tunnel interface MTU with Windows IP Helper API: %w", err)
+	}
+	r.state.MTU.Applied = mtu
+	r.state.MTU.Pending = 0
+	return r.persistLocked()
+}
+
+func (r *Runner) restoreMTULocked() error {
+	if r.state.MTU == nil || r.state.InterfaceLUID == 0 || r.state.InterfaceGUID == "" {
+		return nil
+	}
+	if r.guard == nil {
+		r.guard = nativeGuard{}
+	}
+	currentGUID, err := r.guard.InterfaceGUID(r.state.InterfaceLUID)
+	if err != nil || !strings.EqualFold(currentGUID, r.state.InterfaceGUID) {
+		// PowerShell verifies adapter identity independently and retires the
+		// ownership record if the original adapter no longer exists.
+		return nil
+	}
+	if r.readInterfaceMTU == nil || r.updateInterfaceMTU == nil {
+		return errors.New("native Windows MTU restoration is unavailable")
+	}
+	current, err := r.readInterfaceMTU(r.state.InterfaceLUID)
+	if err != nil {
+		return fmt.Errorf("read tunnel interface MTU for restoration with Windows IP Helper API: %w", err)
+	}
+	owned := (r.state.MTU.Applied != 0 && current == uint32(r.state.MTU.Applied)) ||
+		(r.state.MTU.Pending != 0 && current == uint32(r.state.MTU.Pending))
+	if owned {
+		if err := r.updateInterfaceMTU(r.state.InterfaceLUID, r.state.MTU.Original); err != nil {
+			return fmt.Errorf("restore tunnel interface MTU with Windows IP Helper API: %w", err)
+		}
+	}
+	r.state.MTU = nil
+	return r.persistLocked()
 }
 
 func (r *Runner) acquireLocked() error {

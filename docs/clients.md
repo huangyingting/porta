@@ -120,9 +120,10 @@ and restores Porta-owned network state on
 intentional disconnect. An interrupted run keeps the guard active; a reconnect
 resumes the protected tunnel, while explicit cleanup removes the guard.
 The desktop presents a focused profile editor, live connection state, tunnel
-address and traffic statistics, and an on-device activity log. Fresh Wintun
-adapters receive their IPv4 address before Porta snapshots and applies the
-negotiated MTU, matching the Windows IP stack's initialization order.
+address and traffic statistics, and an on-device activity log. Porta snapshots,
+applies, and restores the Wintun IPv4 MTU through the native Windows IP Helper
+API. This avoids depending on PowerShell's `NlMtuBytes` projection, which can be
+empty for otherwise usable Wintun adapters.
 
 For terminal automation with the same automatic networking and protection:
 
