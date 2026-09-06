@@ -3,7 +3,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -171,11 +174,37 @@ func TestWindowCloseRequiresCompletedSafeExit(t *testing.T) {
 	if controller.CanClose() {
 		t.Fatal("window close was allowed while cleanup was still pending")
 	}
-	controller.mu.Lock()
-	controller.allowClose = true
-	controller.mu.Unlock()
+	controller.allowClose.Store(true)
 	if !controller.CanClose() {
 		t.Fatal("window close was blocked after safe exit was authorized")
+	}
+}
+
+func TestReactivationCancelsPendingExit(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	controller.mu.Lock()
+	controller.quitting = true
+	controller.mu.Unlock()
+	controller.allowClose.Store(true)
+	controller.Reactivate()
+	controller.mu.Lock()
+	quitting := controller.quitting
+	controller.mu.Unlock()
+	if quitting || controller.CanClose() {
+		t.Fatal("second-instance activation did not cancel pending exit")
+	}
+}
+
+func TestCancelledExitDoesNotStartRecovery(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	if err := controller.beginRestore(true); err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	restoring := controller.restoring
+	controller.mu.Unlock()
+	if restoring {
+		t.Fatal("cancelled exit started network recovery")
 	}
 }
 
@@ -194,6 +223,93 @@ func TestResetConnectionClearsLiveDashboardValues(t *testing.T) {
 		!controller.connectedAt.IsZero() || controller.bytesUploaded != 0 || controller.bytesDownloaded != 0 ||
 		controller.uploadRate != 0 || controller.downloadRate != 0 {
 		t.Fatalf("live dashboard values were retained: %+v", controller.Snapshot())
+	}
+}
+
+func TestClearActivityRemovesCurrentAndRotatedLogs(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	controller.activity = []string{"12:00:00  Connected"}
+	for _, path := range []string{controller.logPath, controller.logPath + ".1"} {
+		if err := os.WriteFile(path, []byte("old log"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := controller.ClearActivity(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := controller.Snapshot()
+	if len(snapshot.Activity) != 0 {
+		t.Fatalf("activity was not cleared: %v", snapshot.Activity)
+	}
+	for _, path := range []string{controller.logPath, controller.logPath + ".1"} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s still exists: %v", path, err)
+		}
+	}
+}
+
+func TestClearActivityFencesQueuedLogWrites(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	controller.mu.Lock()
+	controller.appendActivityLocked("Queued before clear")
+	record := controller.activityRecordLocked()
+	controller.mu.Unlock()
+	if err := controller.ClearActivity(); err != nil {
+		t.Fatal(err)
+	}
+	controller.writeActivity(record)
+	if _, err := os.Stat(controller.logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-clear activity recreated the log: %v", err)
+	}
+}
+
+func TestClearActivityFencesQueuedLogFailures(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	controller.mu.Lock()
+	controller.activityEpoch = 1
+	controller.activity = nil
+	controller.logFailure = false
+	controller.mu.Unlock()
+	controller.reportLogFailure(0, errors.New("stale write failed"))
+	snapshot := controller.Snapshot()
+	if len(snapshot.Activity) != 0 || controller.logFailure {
+		t.Fatalf("pre-clear failure repopulated activity: %+v", snapshot.Activity)
+	}
+}
+
+func TestExportActivityWritesWindowsFriendlyLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "porta.log")
+	if err := exportActivity(path, []string{"12:00:00  Connecting", "12:00:01  Connected"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []byte("12:00:00  Connecting\r\n12:00:01  Connected\r\n")
+	if !bytes.Equal(data, expected) {
+		t.Fatalf("exported log = %q", data)
+	}
+}
+
+func TestDialogCancellationIsNotAnError(t *testing.T) {
+	if !isDialogCancellation(errors.New("cancelled by user")) {
+		t.Fatal("native save cancellation was not recognized")
+	}
+	if isDialogCancellation(errors.New("access denied")) || isDialogCancellation(nil) {
+		t.Fatal("non-cancellation error was ignored")
+	}
+}
+
+func TestActivityRecordContinuesAtHistoryLimit(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	controller.activity = make([]string, maxActivityLines)
+	if !controller.appendActivityLocked("new event") {
+		t.Fatal("new activity was not reported at the history limit")
+	}
+	if len(controller.activity) != maxActivityLines ||
+		controller.activity[len(controller.activity)-1] == "" {
+		t.Fatalf("activity history was not trimmed correctly: %d", len(controller.activity))
 	}
 }
 
@@ -216,5 +332,14 @@ func TestFrontendUsesWailsBindingAndInlineEditor(t *testing.T) {
 	if strings.Contains(string(html), "editor-scrim") ||
 		strings.Contains(string(stylesheet), ".editor-panel { position: fixed") {
 		t.Fatal("profile editor regressed to a modal overlay")
+	}
+	for _, control := range []string{"clear-log-action", "save-log-action", "open-log-action"} {
+		if !strings.Contains(string(html), `id="`+control+`"`) {
+			t.Fatalf("frontend is missing %s", control)
+		}
+	}
+	if !strings.Contains(string(stylesheet), "font-size: 12px") ||
+		strings.Contains(string(html), "class=\"ambient") {
+		t.Fatal("frontend regressed from the compact Windows layout")
 	}
 }

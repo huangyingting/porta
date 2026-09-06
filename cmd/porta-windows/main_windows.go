@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"unsafe"
 
 	"github.com/huangyingting/porta/internal/buildinfo"
@@ -37,6 +39,9 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) == 3 && os.Args[1] == "--restart-after" {
+		return restartAfter(os.Args[2])
+	}
 	if buildinfo.IsVersionRequest(os.Args[1:]) {
 		fmt.Println(buildinfo.Version)
 		return nil
@@ -79,6 +84,12 @@ func run() error {
 			Handler: application.BundledAssetFileServer(assets),
 		},
 		Services: []application.Service{application.NewService(controller)},
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "dev.porta.windows",
+			OnSecondInstanceLaunch: func(application.SecondInstanceData) {
+				controller.Reactivate()
+			},
+		},
 		ErrorHandler: func(err error) {
 			controller.reportFrameworkError(err)
 		},
@@ -87,10 +98,10 @@ func run() error {
 		Name:                       "porta-main",
 		Title:                      "Porta " + buildinfo.Version,
 		URL:                        "/",
-		Width:                      920,
-		Height:                     760,
-		MinWidth:                   360,
-		MinHeight:                  540,
+		Width:                      680,
+		Height:                     600,
+		MinWidth:                   440,
+		MinHeight:                  520,
 		InitialPosition:            application.WindowCentered,
 		BackgroundType:             application.BackgroundTypeSolid,
 		BackgroundColour:           application.NewRGBA(8, 17, 31, 255),
@@ -142,6 +153,34 @@ func run() error {
 		controller.publish()
 	})
 	return app.Run()
+}
+
+func restartAfter(value string) error {
+	pid, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || pid == 0 {
+		return errors.New("invalid restart parent process")
+	}
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+	if err == nil {
+		event, waitErr := windows.WaitForSingleObject(handle, 30_000)
+		_ = windows.CloseHandle(handle)
+		if waitErr != nil {
+			return fmt.Errorf("wait for previous instance: %w", waitErr)
+		}
+		if event != windows.WAIT_OBJECT_0 {
+			return errors.New("previous instance did not exit within 30 seconds")
+		}
+	} else if !errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return fmt.Errorf("open previous instance: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable: %w", err)
+	}
+	if err := exec.Command(executable).Start(); err != nil {
+		return fmt.Errorf("start replacement instance: %w", err)
+	}
+	return nil
 }
 
 var (

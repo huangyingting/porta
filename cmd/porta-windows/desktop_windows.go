@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/huangyingting/porta/internal/buildinfo"
@@ -73,8 +75,14 @@ type connectionDisplay struct {
 	tone   string
 }
 
+type activityRecord struct {
+	generation uint64
+	line       string
+}
+
 type DesktopController struct {
 	mu              sync.Mutex
+	logMu           sync.Mutex
 	store           *clientprofile.Store
 	network         *winnetwork.Runner
 	logPath         string
@@ -92,7 +100,8 @@ type DesktopController struct {
 	disconnecting   bool
 	restoring       bool
 	quitting        bool
-	allowClose      bool
+	allowClose      atomic.Bool
+	shutdownCommit  atomic.Bool
 	recovery        bool
 	status          string
 	detail          string
@@ -109,6 +118,7 @@ type DesktopController struct {
 	lastUploaded    uint64
 	lastDownloaded  uint64
 	activity        []string
+	activityEpoch   uint64
 	logFailure      bool
 }
 
@@ -209,10 +219,10 @@ func (d *DesktopController) SaveProfile(input ProfileInput) (DesktopSnapshot, er
 		d.detail = err.Error()
 		d.tone = "danger"
 		d.appendActivityLocked("Save profile failed: " + err.Error())
-		line := d.activity[len(d.activity)-1]
+		record := d.activityRecordLocked()
 		snapshot := d.snapshotLocked()
 		d.mu.Unlock()
-		d.writeActivity(line)
+		d.writeActivity(record)
 		d.publish()
 		return snapshot, err
 	}
@@ -221,9 +231,10 @@ func (d *DesktopController) SaveProfile(input ProfileInput) (DesktopSnapshot, er
 	d.detail = saved.Name + " - " + saved.ServerURL
 	d.tone = "offline"
 	d.appendActivityLocked("Saved profile " + saved.Name)
+	record := d.activityRecordLocked()
 	snapshot := d.snapshotLocked()
 	d.mu.Unlock()
-	d.writeActivity(snapshot.Activity[len(snapshot.Activity)-1])
+	d.writeActivity(record)
 	d.publish()
 	return snapshot, nil
 }
@@ -246,10 +257,10 @@ func (d *DesktopController) DeleteProfile(id string) (DesktopSnapshot, error) {
 		d.detail = err.Error()
 		d.tone = "danger"
 		d.appendActivityLocked("Delete profile failed: " + err.Error())
-		line := d.activity[len(d.activity)-1]
+		record := d.activityRecordLocked()
 		snapshot := d.snapshotLocked()
 		d.mu.Unlock()
-		d.writeActivity(line)
+		d.writeActivity(record)
 		d.publish()
 		return snapshot, err
 	}
@@ -265,9 +276,10 @@ func (d *DesktopController) DeleteProfile(id string) (DesktopSnapshot, error) {
 	}
 	d.tone = "offline"
 	d.appendActivityLocked("Deleted profile " + profile.Name)
+	record := d.activityRecordLocked()
 	snapshot := d.snapshotLocked()
 	d.mu.Unlock()
-	d.writeActivity(snapshot.Activity[len(snapshot.Activity)-1])
+	d.writeActivity(record)
 	d.publish()
 	return snapshot, nil
 }
@@ -304,9 +316,9 @@ func (d *DesktopController) Connect(id string) error {
 	d.tone = "warning"
 	d.resetConnectionLocked()
 	d.appendActivityLocked("Connecting " + profile.Name + " to " + profile.ServerURL)
-	line := d.activity[len(d.activity)-1]
+	record := d.activityRecordLocked()
 	d.mu.Unlock()
-	d.writeActivity(line)
+	d.writeActivity(record)
 	d.publish()
 
 	go d.runConnection(ctx, cancel, profile, token)
@@ -349,12 +361,114 @@ func (d *DesktopController) RestoreNetwork() error {
 	return d.beginRestore(false)
 }
 
+func (d *DesktopController) ClearActivity() error {
+	d.logMu.Lock()
+	err := removeActivityFiles(d.logPath)
+	if err != nil {
+		d.logMu.Unlock()
+		d.recordError("Clear activity failed", err)
+		return err
+	}
+	d.mu.Lock()
+	d.activityEpoch++
+	d.activity = nil
+	d.logFailure = false
+	d.mu.Unlock()
+	d.logMu.Unlock()
+	d.publish()
+	return nil
+}
+
+func (d *DesktopController) SaveActivityLog() (string, error) {
+	d.mu.Lock()
+	app := d.app
+	window := d.window
+	lines := append([]string(nil), d.activity...)
+	d.mu.Unlock()
+	if app == nil {
+		return "", errors.New("desktop application is not ready")
+	}
+	path, err := app.Dialog.SaveFileWithOptions(&application.SaveFileDialogOptions{
+		CanCreateDirectories: true,
+		AllowOtherFileTypes:  true,
+		Title:                "Save Porta activity log",
+		Filename:             "porta-activity-" + time.Now().Format("20060102-150405") + ".log",
+		ButtonText:           "Save",
+		Filters: []application.FileFilter{
+			{DisplayName: "Log files", Pattern: "*.log;*.txt"},
+		},
+		Window: window,
+	}).PromptForSingleSelection()
+	if isDialogCancellation(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("choose activity log destination: %w", err)
+	}
+	if path == "" {
+		return "", nil
+	}
+	if err := exportActivity(path, lines); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (d *DesktopController) OpenLogFolder() (string, error) {
+	directory := filepath.Dir(d.logPath)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create activity log directory: %w", err)
+	}
+	if err := exec.Command("explorer.exe", directory).Start(); err != nil {
+		return "", fmt.Errorf("open activity log directory: %w", err)
+	}
+	return directory, nil
+}
+
 func (d *DesktopController) Show() {
 	d.mu.Lock()
 	window := d.window
 	d.mu.Unlock()
 	if window != nil {
-		window.Show().Focus()
+		showWindow(window)
+	}
+}
+
+func (d *DesktopController) Reactivate() {
+	if d.shutdownCommit.Load() {
+		d.startRestartHelper()
+		return
+	}
+	d.mu.Lock()
+	if d.shutdownCommit.Load() {
+		d.mu.Unlock()
+		d.startRestartHelper()
+		return
+	}
+	d.quitting = false
+	d.allowClose.Store(false)
+	window := d.window
+	d.mu.Unlock()
+	if window != nil {
+		showWindow(window)
+	}
+}
+
+func showWindow(window application.Window) {
+	if window.IsMinimised() {
+		window.UnMinimise()
+	}
+	window.Show().Focus()
+}
+
+func (d *DesktopController) startRestartHelper() {
+	executable, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "porta: locate restart helper:", err)
+		return
+	}
+	if err := exec.Command(executable, "--restart-after", fmt.Sprint(os.Getpid())).Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "porta: start restart helper:", err)
 	}
 }
 
@@ -416,9 +530,7 @@ func (d *DesktopController) Quit() {
 }
 
 func (d *DesktopController) CanClose() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.allowClose
+	return d.allowClose.Load()
 }
 
 func (d *DesktopController) runConnection(
@@ -461,10 +573,10 @@ func (d *DesktopController) runConnection(
 		d.tone = "offline"
 		d.appendActivityLocked("Disconnected")
 	}
-	line := d.activity[len(d.activity)-1]
+	record := d.activityRecordLocked()
 	app := d.app
 	d.mu.Unlock()
-	d.writeActivity(line)
+	d.writeActivity(record)
 	d.publish()
 
 	if quitting && canExitAfterDisconnect(err, recovery) {
@@ -483,7 +595,7 @@ func (d *DesktopController) runConnection(
 
 func (d *DesktopController) handleConnectionEvent(event clientapp.Event) {
 	display := connectionPresentation(event)
-	var activityLine string
+	var activity activityRecord
 	d.mu.Lock()
 	d.status = display.title
 	d.detail = display.detail
@@ -503,21 +615,23 @@ func (d *DesktopController) handleConnectionEvent(event clientapp.Event) {
 	}
 	d.updateRatesLocked(event)
 	if event.State != clientapp.StateConnected || (event.Message != "" && event.Message != "Connected") {
-		previousLines := len(d.activity)
-		d.appendActivityLocked(event.Message)
-		if len(d.activity) > previousLines {
-			activityLine = d.activity[len(d.activity)-1]
+		if d.appendActivityLocked(event.Message) {
+			activity = d.activityRecordLocked()
 		}
 	}
 	d.mu.Unlock()
-	if activityLine != "" {
-		d.writeActivity(activityLine)
+	if activity.line != "" {
+		d.writeActivity(activity)
 	}
 	d.publish()
 }
 
 func (d *DesktopController) beginRestore(exitAfter bool) error {
 	d.mu.Lock()
+	if exitAfter && !d.quitting {
+		d.mu.Unlock()
+		return nil
+	}
 	if d.running {
 		d.mu.Unlock()
 		return errors.New("disconnect before restoring retained network state")
@@ -525,9 +639,6 @@ func (d *DesktopController) beginRestore(exitAfter bool) error {
 	if d.restoring {
 		d.mu.Unlock()
 		return errors.New("network restoration is already in progress")
-	}
-	if exitAfter {
-		d.quitting = true
 	}
 	d.restoring = true
 	d.status = "Restoring network"
@@ -550,7 +661,8 @@ func (d *DesktopController) beginRestore(exitAfter bool) error {
 		d.recovery = recovery
 		app := d.app
 		quitting := d.quitting
-		if safeExit && err != nil {
+		shouldExit := safeExit && quitting
+		if shouldExit && err != nil {
 			d.appendActivityLocked("Network state is owned by another Porta process; exiting without changing it.")
 		} else if err != nil {
 			d.quitting = false
@@ -564,11 +676,11 @@ func (d *DesktopController) beginRestore(exitAfter bool) error {
 			d.tone = "offline"
 			d.appendActivityLocked("Restored network and removed retained protection.")
 		}
-		line := d.activity[len(d.activity)-1]
+		record := d.activityRecordLocked()
 		d.mu.Unlock()
-		d.writeActivity(line)
+		d.writeActivity(record)
 		d.publish()
-		if safeExit {
+		if shouldExit {
 			d.quitApplication(app)
 		} else if err != nil {
 			d.Show()
@@ -584,7 +696,12 @@ func (d *DesktopController) quitApplication(app *application.App) {
 		return
 	}
 	d.mu.Lock()
-	d.allowClose = true
+	if !d.quitting {
+		d.mu.Unlock()
+		return
+	}
+	d.allowClose.Store(true)
+	d.shutdownCommit.Store(true)
 	d.mu.Unlock()
 	app.Quit()
 }
@@ -708,47 +825,68 @@ func (d *DesktopController) publish() {
 	}
 }
 
-func (d *DesktopController) appendActivityLocked(message string) {
+func (d *DesktopController) appendActivityLocked(message string) bool {
 	message = strings.TrimSpace(message)
 	if message == "" {
-		return
+		return false
 	}
 	line := time.Now().Format("15:04:05") + "  " + message
 	d.activity = append(d.activity, line)
 	if len(d.activity) > maxActivityLines {
 		d.activity = append([]string(nil), d.activity[len(d.activity)-maxActivityLines:]...)
 	}
+	return true
 }
 
-func (d *DesktopController) writeActivity(line string) {
-	if strings.TrimSpace(line) == "" || d.logPath == "" {
+func (d *DesktopController) activityRecordLocked() activityRecord {
+	if len(d.activity) == 0 {
+		return activityRecord{}
+	}
+	return activityRecord{generation: d.activityEpoch, line: d.activity[len(d.activity)-1]}
+}
+
+func (d *DesktopController) writeActivity(record activityRecord) {
+	if strings.TrimSpace(record.line) == "" || d.logPath == "" {
 		return
 	}
+	d.logMu.Lock()
+	d.mu.Lock()
+	current := record.generation == d.activityEpoch
+	d.mu.Unlock()
+	var err error
+	if current {
+		err = d.writeActivityFile(record.line)
+	}
+	d.logMu.Unlock()
+	if err != nil {
+		d.reportLogFailure(record.generation, err)
+	}
+}
+
+func (d *DesktopController) writeActivityFile(line string) error {
 	if err := os.MkdirAll(filepath.Dir(d.logPath), 0o700); err != nil {
-		d.reportLogFailure(err)
-		return
+		return err
 	}
 	if info, err := os.Stat(d.logPath); err == nil && info.Size() >= 1<<20 {
+		if err := os.Remove(d.logPath + ".1"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		if err := os.Rename(d.logPath, d.logPath+".1"); err != nil {
-			d.reportLogFailure(err)
-			return
+			return err
 		}
 	}
 	file, err := os.OpenFile(d.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		d.reportLogFailure(err)
-		return
+		return err
 	}
 	_, writeErr := fmt.Fprintln(file, time.Now().Format(time.RFC3339), line)
 	closeErr := file.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		d.reportLogFailure(err)
-	}
+	return errors.Join(writeErr, closeErr)
 }
 
-func (d *DesktopController) reportLogFailure(err error) {
+func (d *DesktopController) reportLogFailure(generation uint64, err error) {
 	d.mu.Lock()
-	if d.logFailure {
+	if generation != d.activityEpoch || d.logFailure {
 		d.mu.Unlock()
 		return
 	}
@@ -764,9 +902,9 @@ func (d *DesktopController) recordError(action string, err error) {
 	d.detail = err.Error()
 	d.tone = "danger"
 	d.appendActivityLocked(action + ": " + err.Error())
-	line := d.activity[len(d.activity)-1]
+	record := d.activityRecordLocked()
 	d.mu.Unlock()
-	d.writeActivity(line)
+	d.writeActivity(record)
 	d.publish()
 }
 
@@ -792,6 +930,34 @@ func loadActivity(path string) []string {
 		filtered = filtered[len(filtered)-maxActivityLines:]
 	}
 	return append([]string(nil), filtered...)
+}
+
+func removeActivityFiles(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	var result error
+	for _, candidate := range []string{path, path + ".1"} {
+		if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("remove %s: %w", filepath.Base(candidate), err))
+		}
+	}
+	return result
+}
+
+func exportActivity(path string, lines []string) error {
+	content := strings.Join(lines, "\r\n")
+	if content != "" {
+		content += "\r\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("save activity log: %w", err)
+	}
+	return nil
+}
+
+func isDialogCancellation(err error) bool {
+	return err != nil && err.Error() == "cancelled by user"
 }
 
 func connectionPresentation(event clientapp.Event) connectionDisplay {

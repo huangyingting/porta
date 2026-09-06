@@ -9,8 +9,6 @@
   <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <div class="ambient ambient-one"></div>
-  <div class="ambient ambient-two"></div>
   <main class="shell">
     <header class="app-header">
       <div class="brand">
@@ -52,7 +50,7 @@
           </div>
           <span id="traffic-state" class="live-label">IDLE</span>
         </div>
-        <canvas id="traffic-chart" height="124" aria-label="Recent upload and download rates"></canvas>
+        <canvas id="traffic-chart" height="84" aria-label="Recent upload and download rates"></canvas>
         <div class="traffic-values">
           <div><span class="traffic-swatch download"></span><span>Download</span><strong id="download-rate">0 B/s</strong></div>
           <div><span class="traffic-swatch upload"></span><span>Upload</span><strong id="upload-rate">0 B/s</strong></div>
@@ -88,13 +86,19 @@
 
     <section id="activity-view" class="hidden">
       <section class="activity-card card">
-        <div class="section-heading">
+        <div class="section-heading activity-heading">
           <div>
             <p class="eyebrow">ACTIVITY</p>
             <h2>Connection timeline</h2>
           </div>
-          <button id="restore-action" class="secondary" type="button" disabled>Restore network</button>
+          <div class="activity-actions">
+            <button id="open-log-action" class="secondary" type="button">Open folder</button>
+            <button id="save-log-action" class="secondary" type="button">Save log...</button>
+            <button id="clear-log-action" class="quiet-danger" type="button">Clear</button>
+            <button id="restore-action" class="secondary" type="button" disabled>Restore network</button>
+          </div>
         </div>
+        <p id="activity-message" class="activity-message hidden" role="status"></p>
         <pre id="activity-log" tabindex="0" aria-label="Porta connection activity"></pre>
       </section>
     </section>

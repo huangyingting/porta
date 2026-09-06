@@ -9,9 +9,13 @@ const state = {
   downloadHistory: Array(54).fill(0),
   uploadHistory: Array(54).fill(0),
   lastTraffic: "",
+  clearArmed: false,
+  clearTimer: null,
+  messageTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
+const chartHeight = 84;
 
 async function call(name, ...args) {
   try {
@@ -67,6 +71,9 @@ function applySnapshot(snapshot) {
   $("activity-log").textContent = snapshot.activity?.length
     ? snapshot.activity.join("\n")
     : "No connection activity yet.";
+  const hasActivity = Boolean(snapshot.activity?.length);
+  $("save-log-action").disabled = !hasActivity;
+  $("clear-log-action").disabled = !hasActivity;
   $("restore-action").disabled =
     !snapshot.recoveryAvailable || snapshot.running || snapshot.restoring;
 
@@ -200,6 +207,47 @@ function closeEditor() {
   state.deleteArmed = false;
 }
 
+function showActivityMessage(message) {
+  window.clearTimeout(state.messageTimer);
+  $("activity-message").textContent = message;
+  $("activity-message").classList.toggle("hidden", !message);
+  if (message) {
+    state.messageTimer = window.setTimeout(() => {
+      $("activity-message").classList.add("hidden");
+    }, 6000);
+  }
+}
+
+function resetClearAction() {
+  window.clearTimeout(state.clearTimer);
+  state.clearArmed = false;
+  $("clear-log-action").textContent = "Clear";
+  $("clear-log-action").classList.remove("confirm");
+}
+
+async function clearActivity() {
+  if (!state.clearArmed) {
+    state.clearArmed = true;
+    $("clear-log-action").textContent = "Confirm clear";
+    $("clear-log-action").classList.add("confirm");
+    state.clearTimer = window.setTimeout(resetClearAction, 3500);
+    return;
+  }
+  await call("ClearActivity");
+  resetClearAction();
+  showActivityMessage("Activity log cleared.");
+}
+
+async function saveActivity() {
+  const path = await call("SaveActivityLog");
+  if (path) showActivityMessage(`Saved to ${path}`);
+}
+
+async function openLogFolder() {
+  const path = await call("OpenLogFolder");
+  if (path) showActivityMessage(`Opened ${path}`);
+}
+
 async function saveProfile(event) {
   event.preventDefault();
   const input = {
@@ -270,11 +318,11 @@ function drawChart() {
   if (!rect.width) return;
   const scale = window.devicePixelRatio || 1;
   canvas.width = Math.max(1, Math.round(rect.width * scale));
-  canvas.height = Math.max(1, Math.round(124 * scale));
+  canvas.height = Math.max(1, Math.round(chartHeight * scale));
   const context = canvas.getContext("2d");
   context.scale(scale, scale);
   const width = rect.width;
-  const height = 124;
+  const height = chartHeight;
   context.clearRect(0, 0, width, height);
   context.strokeStyle = "rgba(148, 163, 184, .10)";
   context.lineWidth = 1;
@@ -342,6 +390,9 @@ $("primary-connect").addEventListener("click", async () => {
 $("restore-action").addEventListener("click", async () => {
   await call("RestoreNetwork");
 });
+$("clear-log-action").addEventListener("click", clearActivity);
+$("save-log-action").addEventListener("click", saveActivity);
+$("open-log-action").addEventListener("click", openLogFolder);
 window.addEventListener("resize", drawChart);
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.view === "editor") closeEditor();

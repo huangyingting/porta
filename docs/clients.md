@@ -122,6 +122,8 @@ resumes the protected tunnel, while explicit cleanup removes the guard.
 The desktop uses an Android-inspired dashboard with profile cards, live
 connection state, tunnel traffic and an on-device activity timeline. Profile
 editing stays within the main window rather than opening another dialog.
+The compact Activity view can clear its local history, export the visible log
+through the native Windows save dialog, or open the log directory in Explorer.
 Closing or minimizing hides Porta in the notification area. Its native tray
 menu can open the window, connect or disconnect, show Activity, restore retained
 network state, or quit safely. Porta snapshots,
