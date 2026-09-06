@@ -190,17 +190,6 @@ if ($state.interface_index -and $state.interface_index -ne $index -and (@($state
 }
 Set-StateField "interface_index" $index
 Set-StateField "interface_guid" (([guid]$tun[0].InterfaceGuid).ToString("B"))
-if (-not $state.mtu) {
-    $current = Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop
-    if (-not $current.NlMtuBytes) { throw "Cannot snapshot the tunnel interface MTU." }
-    Set-StateField "mtu" ([PSCustomObject]@{original=[uint32]$current.NlMtuBytes; applied=0; pending=$Mtu})
-} else {
-    $state.mtu.pending = $Mtu
-}
-Save-State
-Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -NlMtuBytes $Mtu -ErrorAction Stop
-$state.mtu.applied = $Mtu
-$state.mtu.pending = 0
 Save-State
 $parts = $AddressCidr.Split("/")
 $existing = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
@@ -216,6 +205,20 @@ if ($existing.Count -eq 0) {
     Save-State
     New-NetIPAddress -InterfaceIndex $index -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) -ErrorAction Stop | Out-Null
 }
+if (-not $state.mtu) {
+    $current = @(Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)
+    if ($current.Count -ne 1 -or -not $current[0].NlMtuBytes) {
+        throw "Cannot snapshot the tunnel interface MTU after configuring its IPv4 address."
+    }
+    Set-StateField "mtu" ([PSCustomObject]@{original=[uint32]$current[0].NlMtuBytes; applied=0; pending=$Mtu})
+} else {
+    $state.mtu.pending = $Mtu
+}
+Save-State
+Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -NlMtuBytes $Mtu -ErrorAction Stop
+$state.mtu.applied = $Mtu
+$state.mtu.pending = 0
+Save-State
 Add-OwnedRoute "dns" "$DnsServer/32" $index "0.0.0.0" 1
 if (-not $state.dns) {
     $current = @(Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)

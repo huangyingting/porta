@@ -87,6 +87,10 @@ func TestPowerShellMTURestorationWithoutDNS(t *testing.T) {
 	testPowerShellJournal(t, testPowerShell(t), "192.0.2.1", "", "-MtuOnly")
 }
 
+func TestPowerShellInitializesIPv4BeforeSnapshottingMTU(t *testing.T) {
+	testPowerShellJournal(t, testPowerShell(t), "192.0.2.1", "", "-DelayedMtu")
+}
+
 func testPowerShellJournal(t *testing.T, powerShell, endpoint, fail string, extraArgs ...string) {
 	dir := t.TempDir()
 	state := networkState{
@@ -119,7 +123,7 @@ func testPowerShellJournal(t *testing.T, powerShell, endpoint, fail string, extr
 }
 
 const powerShellHarness = `
-param($Helper, $StatePath, $FailPrefix = "", [switch]$MtuOnly)
+param($Helper, $StatePath, $FailPrefix = "", [switch]$MtuOnly, [switch]$DelayedMtu)
 $ErrorActionPreference = "Stop"
 $global:adapters = @(
     [PSCustomObject]@{Name="Ethernet";InterfaceIndex=7;InterfaceGuid="11111111-1111-1111-1111-111111111111"},
@@ -169,7 +173,12 @@ function Get-NetIPInterface {
     $global:adapters | Where-Object { -not $InterfaceIndex -or $_.InterfaceIndex -eq $InterfaceIndex } | ForEach-Object {
         $metric = 10
         if ($_.InterfaceIndex -eq 8) { $metric = 1 }
-        [PSCustomObject]@{InterfaceIndex=$_.InterfaceIndex;InterfaceAlias=$_.Name;ConnectionState="Connected";InterfaceMetric=$metric;Dhcp="Disabled";NlMtuBytes=$global:mtu}
+        $reportedMtu = $global:mtu
+        if ($DelayedMtu -and $InterfaceIndex -eq 77 -and
+            @($global:ips | Where-Object { $_.InterfaceIndex -eq 77 -and $_.IPAddress -ne "10.0.0.99" }).Count -eq 0) {
+            $reportedMtu = $null
+        }
+        [PSCustomObject]@{InterfaceIndex=$_.InterfaceIndex;InterfaceAlias=$_.Name;ConnectionState="Connected";InterfaceMetric=$metric;Dhcp="Disabled";NlMtuBytes=$reportedMtu}
     }
 }
 function New-NetRoute {
@@ -227,6 +236,11 @@ function Set-DnsClientServerAddress {
 function Set-NetIPInterface {
     [CmdletBinding()]param($InterfaceIndex,$AddressFamily,$Dhcp,$NlMtuBytes)
     if ($Dhcp) { throw "Untouched DHCP state was changed." }
+    if ($DelayedMtu -and @($global:ips | Where-Object {
+        $_.InterfaceIndex -eq 77 -and $_.IPAddress -ne "10.0.0.99"
+    }).Count -eq 0) {
+        throw "MTU changed before the fresh tunnel IPv4 interface was initialized."
+    }
     $saved = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
     if ($NlMtuBytes -ne $saved.mtu.pending -and $NlMtuBytes -ne $saved.mtu.original) {
         throw "OS MTU changed without recovery journal."

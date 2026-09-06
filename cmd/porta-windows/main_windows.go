@@ -12,17 +12,51 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/clientapp"
 	"github.com/huangyingting/porta/internal/clientprofile"
+	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/huangyingting/porta/internal/winnetwork"
 	"github.com/rodrigocfd/windigo/co"
 	"github.com/rodrigocfd/windigo/ui"
 	"github.com/rodrigocfd/windigo/win"
+	syswindows "golang.org/x/sys/windows"
 )
 
-const trayMessage co.WM = co.WM_APP + 1
+const (
+	trayMessage     co.WM = co.WM_APP + 1
+	mainWindowStyle       = co.WS_CAPTION | co.WS_SYSMENU | co.WS_CLIPCHILDREN |
+		co.WS_THICKFRAME | co.WS_VISIBLE | co.WS_MINIMIZEBOX | co.WS_MAXIMIZEBOX
+)
+
+type labelStyle struct {
+	control *ui.Static
+	color   win.COLORREF
+	font    win.HFONT
+}
+
+type windowControl interface {
+	Hwnd() win.HWND
+}
+
+type visualStyle struct {
+	background      win.COLORREF
+	field           win.COLORREF
+	primary         win.COLORREF
+	muted           win.COLORREF
+	accent          win.COLORREF
+	warning         win.COLORREF
+	danger          win.COLORREF
+	backgroundBrush win.HBRUSH
+	fieldBrush      win.HBRUSH
+	titleFont       win.HFONT
+	headingFont     win.HFONT
+	bodyFont        win.HFONT
+	labelFont       win.HFONT
+	monoFont        win.HFONT
+}
 
 type application struct {
 	window        *ui.Main
@@ -31,7 +65,9 @@ type application struct {
 	server        *ui.Edit
 	transport     *ui.ComboBox
 	token         *ui.Edit
+	statusDot     *ui.Static
 	status        *ui.Static
+	statusDetail  *ui.Static
 	address       *ui.Static
 	duration      *ui.Static
 	upload        *ui.Static
@@ -41,8 +77,17 @@ type application struct {
 	restore       *ui.Button
 	save          *ui.Button
 	remove        *ui.Button
+	add           *ui.Button
+	showActivity  *ui.Button
+	showProfile   *ui.Button
 	store         *clientprofile.Store
 	network       *winnetwork.Runner
+	style         *visualStyle
+	labels        []labelStyle
+	profileView   []windowControl
+	activityView  []windowControl
+	preferredSize win.SIZE
+	staticColors  map[win.HWND]win.COLORREF
 	items         []clientprofile.Profile
 	selectedID    string
 	cancel        context.CancelFunc
@@ -99,66 +144,124 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	app := newApplication(store, network, filepath.Join(dataDir, "porta.log"))
+	app, err := newApplication(store, network, filepath.Join(dataDir, "porta.log"))
+	if err != nil {
+		return err
+	}
 	app.window.RunAsMain()
+	app.style.close()
 	return nil
 }
 
-func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logPath string) *application {
+func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logPath string) (*application, error) {
+	style, err := newVisualStyle()
+	if err != nil {
+		return nil, err
+	}
+	minimumWidth, minimumHeight := minimumClientSize()
+	preferredWidth, preferredHeight := preferredClientSize()
+	logHeight := minimumHeight - ui.DpiY(245)
 	window := ui.NewMain(
 		ui.OptsMain().
-			Title("Porta " + buildinfo.Version).
-			Size(ui.Dpi(620, 650)).
+			Title("Porta "+buildinfo.Version).
+			Size(minimumWidth, minimumHeight).
 			ClassIconId(101).
-			Style(co.WS_CAPTION | co.WS_SYSMENU | co.WS_CLIPCHILDREN | co.WS_BORDER |
-				co.WS_VISIBLE | co.WS_MINIMIZEBOX),
+			ClassBrush(style.backgroundBrush).
+			Style(mainWindowStyle),
 	)
-	app := &application{window: window, store: store, network: network, logPath: logPath}
+	app := &application{
+		window: window, store: store, network: network, logPath: logPath, style: style,
+		preferredSize: win.SIZE{Cx: int32(preferredWidth), Cy: int32(preferredHeight)},
+		staticColors:  make(map[win.HWND]win.COLORREF),
+	}
+	addLabel := func(text string, x, y, width, height int, font win.HFONT, color win.COLORREF, layout ...ui.LAY) *ui.Static {
+		options := ui.OptsStatic().Text(text).Position(ui.Dpi(x, y)).Size(ui.Dpi(width, height))
+		if len(layout) > 0 {
+			options.Layout(layout[0])
+		}
+		label := ui.NewStatic(window, options)
+		app.labels = append(app.labels, labelStyle{control: label, color: color, font: font})
+		return label
+	}
 
-	ui.NewStatic(window, ui.OptsStatic().Text("PORTA").Position(ui.Dpi(24, 20)).Size(ui.Dpi(100, 24)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Secure connection profiles · v"+buildinfo.Version).Position(ui.Dpi(24, 45)).Size(ui.Dpi(240, 20)))
+	addLabel("Porta", 20, 8, 160, 32, style.titleFont, style.primary)
+	addLabel("Private network access", 20, 38, 260, 18, style.bodyFont, style.muted)
+	addLabel("v"+buildinfo.Version, 390, 16, 70, 22, style.labelFont, style.accent, ui.LAY_MOVE_HOLD)
+
+	app.statusDot = addLabel("●", 20, 60, 20, 26, style.headingFont, style.muted)
+	app.status = addLabel("Disconnected", 46, 58, 280, 26, style.headingFont, style.primary)
+	app.statusDetail = addLabel("Choose a profile or add one to connect securely.", 46, 84, 414, 20, style.bodyFont, style.muted, ui.LAY_RESIZE_HOLD)
+
 	app.profiles = ui.NewComboBox(window, ui.OptsComboBox().
-		Position(ui.Dpi(24, 78)).Width(ui.DpiX(390)).Texts("New profile").Select(0))
-	newButton := ui.NewButton(window, ui.OptsButton().Text("New").Position(ui.Dpi(426, 77)).Width(ui.DpiX(74)))
-	app.remove = ui.NewButton(window, ui.OptsButton().Text("Delete").Position(ui.Dpi(510, 77)).Width(ui.DpiX(74)))
+		Position(ui.Dpi(20, 108)).Width(ui.DpiX(280)).Texts("New profile").Select(0).
+		Layout(ui.LAY_RESIZE_HOLD))
+	app.add = ui.NewButton(window, ui.OptsButton().Text("Add profile").
+		Position(ui.Dpi(310, 107)).Width(ui.DpiX(70)).Layout(ui.LAY_MOVE_HOLD))
+	app.remove = ui.NewButton(window, ui.OptsButton().Text("Delete").
+		Position(ui.Dpi(390, 107)).Width(ui.DpiX(70)).Layout(ui.LAY_MOVE_HOLD))
+	app.profileView = append(app.profileView, app.profiles, app.add, app.remove)
 
-	ui.NewStatic(window, ui.OptsStatic().Text("Profile name").Position(ui.Dpi(24, 120)))
-	app.name = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 140)).Width(ui.DpiX(270)).Height(ui.DpiY(25)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Transport").Position(ui.Dpi(310, 120)))
+	nameLabel := addLabel("PROFILE NAME", 20, 140, 150, 16, style.labelFont, style.muted)
+	app.name = ui.NewEdit(window, ui.OptsEdit().
+		Position(ui.Dpi(20, 156)).Width(ui.DpiX(205)).Height(ui.DpiY(24)))
+	transportLabel := addLabel("TRANSPORT", 235, 140, 150, 16, style.labelFont, style.muted)
 	app.transport = ui.NewComboBox(window, ui.OptsComboBox().
-		Position(ui.Dpi(310, 140)).Width(ui.DpiX(274)).Texts("Automatic", "HTTP/3 only", "HTTP/2 only").Select(0))
+		Position(ui.Dpi(235, 156)).Width(ui.DpiX(225)).
+		Texts("Automatic (recommended)", "HTTP/3 only", "HTTP/2 only").Select(0).
+		Layout(ui.LAY_RESIZE_HOLD))
 
-	ui.NewStatic(window, ui.OptsStatic().Text("Gateway URL").Position(ui.Dpi(24, 178)))
-	app.server = ui.NewEdit(window, ui.OptsEdit().Position(ui.Dpi(24, 198)).Width(ui.DpiX(560)).Height(ui.DpiY(25)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Device identity").Position(ui.Dpi(24, 236)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Security key + computer name").
-		Position(ui.Dpi(24, 256)).Size(ui.Dpi(270, 25)))
-	ui.NewStatic(window, ui.OptsStatic().Text("Client token").Position(ui.Dpi(310, 236)))
+	serverLabel := addLabel("GATEWAY URL", 20, 186, 150, 16, style.labelFont, style.muted)
+	app.server = ui.NewEdit(window, ui.OptsEdit().
+		Position(ui.Dpi(20, 202)).Width(ui.DpiX(440)).Height(ui.DpiY(24)).
+		Layout(ui.LAY_RESIZE_HOLD))
+	tokenLabel := addLabel("CLIENT TOKEN · DPAPI PROTECTED", 20, 232, 240, 16, style.labelFont, style.muted)
 	app.token = ui.NewEdit(window, ui.OptsEdit().
-		Position(ui.Dpi(310, 256)).Width(ui.DpiX(274)).Height(ui.DpiY(25)).
-		CtrlStyle(co.ES_LEFT|co.ES_AUTOHSCROLL|co.ES_PASSWORD))
+		Position(ui.Dpi(20, 248)).Width(ui.DpiX(440)).Height(ui.DpiY(24)).
+		CtrlStyle(co.ES_LEFT|co.ES_AUTOHSCROLL|co.ES_PASSWORD).
+		Layout(ui.LAY_RESIZE_HOLD))
 
-	app.save = ui.NewButton(window, ui.OptsButton().Text("Save profile").Position(ui.Dpi(24, 296)).Width(ui.DpiX(126)))
-	app.restore = ui.NewButton(window, ui.OptsButton().Text("Restore network").Position(ui.Dpi(170, 296)).Width(ui.DpiX(170)))
-	app.connect = ui.NewButton(window, ui.OptsButton().Text("Connect").Position(ui.Dpi(458, 296)).Width(ui.DpiX(126)))
+	app.save = ui.NewButton(window, ui.OptsButton().Text("Save profile").
+		Position(ui.Dpi(20, 274)).Width(ui.DpiX(90)).Layout(ui.LAY_HOLD_MOVE))
+	app.restore = ui.NewButton(window, ui.OptsButton().Text("Restore network").
+		Position(ui.Dpi(120, 274)).Width(ui.DpiX(105)).Layout(ui.LAY_HOLD_MOVE))
+	app.showActivity = ui.NewButton(window, ui.OptsButton().Text("Activity").
+		Position(ui.Dpi(235, 274)).Width(ui.DpiX(80)).Layout(ui.LAY_HOLD_MOVE))
+	app.connect = ui.NewButton(window, ui.OptsButton().Text("Connect").
+		Position(ui.Dpi(345, 274)).Width(ui.DpiX(115)).
+		Layout(ui.LAY_MOVE_MOVE).
+		CtrlStyle(co.BS_DEFPUSHBUTTON))
+	app.profileView = append(app.profileView,
+		nameLabel, app.name, transportLabel, app.transport, serverLabel, app.server,
+		tokenLabel, app.token, app.save, app.restore, app.showActivity,
+	)
 
-	ui.NewStatic(window, ui.OptsStatic().Text("CONNECTION").Position(ui.Dpi(24, 348)).Size(ui.Dpi(120, 18)))
-	app.status = ui.NewStatic(window, ui.OptsStatic().Text("Disconnected").Position(ui.Dpi(24, 372)).Size(ui.Dpi(250, 24)))
-	app.address = ui.NewStatic(window, ui.OptsStatic().Text("Address  —").Position(ui.Dpi(310, 372)).Size(ui.Dpi(274, 20)))
-	app.duration = ui.NewStatic(window, ui.OptsStatic().Text("Duration  —").Position(ui.Dpi(310, 396)).Size(ui.Dpi(274, 20)))
-	app.upload = ui.NewStatic(window, ui.OptsStatic().Text("Upload  0 B").Position(ui.Dpi(24, 410)).Size(ui.Dpi(250, 22)))
-	app.download = ui.NewStatic(window, ui.OptsStatic().Text("Download  0 B").Position(ui.Dpi(310, 426)).Size(ui.Dpi(274, 22)))
-
-	ui.NewStatic(window, ui.OptsStatic().Text("ACTIVITY LOG").Position(ui.Dpi(24, 466)).Size(ui.Dpi(120, 18)))
+	activityTitle := addLabel("CONNECTION ACTIVITY", 20, 112, 220, 20, style.labelFont, style.muted)
+	app.showProfile = ui.NewButton(window, ui.OptsButton().Text("Profile").
+		Position(ui.Dpi(370, 106)).Width(ui.DpiX(90)).Layout(ui.LAY_MOVE_HOLD))
+	addressLabel := addLabel("ADDRESS", 20, 146, 95, 16, style.labelFont, style.muted)
+	durationLabel := addLabel("DURATION", 130, 146, 95, 16, style.labelFont, style.muted)
+	uploadLabel := addLabel("SENT", 240, 146, 95, 16, style.labelFont, style.muted)
+	downloadLabel := addLabel("RECEIVED", 350, 146, 110, 16, style.labelFont, style.muted)
+	app.address = addLabel("—", 20, 164, 100, 22, style.bodyFont, style.primary)
+	app.duration = addLabel("—", 130, 164, 100, 22, style.bodyFont, style.primary)
+	app.upload = addLabel("0 B", 240, 164, 100, 22, style.bodyFont, style.primary)
+	app.download = addLabel("0 B", 350, 164, 110, 22, style.bodyFont, style.primary)
 	app.logs = ui.NewEdit(window, ui.OptsEdit().
-		Position(ui.Dpi(24, 490)).Width(ui.DpiX(560)).Height(ui.DpiY(125)).
+		Position(ui.Dpi(20, 196)).Width(ui.DpiX(440)).Height(logHeight).
+		Layout(ui.LAY_RESIZE_RESIZE).
 		CtrlStyle(co.ES_LEFT|co.ES_MULTILINE|co.ES_AUTOVSCROLL|co.ES_READONLY).
 		WndStyle(co.WS_CHILD|co.WS_VISIBLE|co.WS_VSCROLL))
+	app.activityView = append(app.activityView,
+		activityTitle, app.showProfile, addressLabel, durationLabel, uploadLabel, downloadLabel,
+		app.address, app.duration, app.upload, app.download, app.logs,
+	)
 
 	app.profiles.On().CbnSelChange(app.selectProfile)
-	newButton.On().BnClicked(app.newProfile)
+	app.add.On().BnClicked(app.newProfile)
 	app.save.On().BnClicked(func() { app.saveProfile() })
 	app.remove.On().BnClicked(app.deleteProfile)
+	app.showActivity.On().BnClicked(func() { app.setActivityView(true) })
+	app.showProfile.On().BnClicked(func() { app.setActivityView(false) })
 	app.connect.On().BnClicked(app.toggleConnection)
 	app.restore.On().BnClicked(func() {
 		answer, _ := app.window.Hwnd().MessageBox(
@@ -170,7 +273,10 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 		}
 	})
 	window.On().WmCreate(func(ui.WmCreate) int {
+		app.applyVisualStyle()
+		app.resizeAndCenterInWorkArea()
 		app.addTray()
+		app.setActivityView(false)
 		profiles := app.store.List()
 		if len(profiles) == 0 {
 			app.reloadProfiles("")
@@ -180,16 +286,249 @@ func newApplication(store *clientprofile.Store, network *winnetwork.Runner, logP
 		}
 		app.restore.Hwnd().EnableWindow(network.NeedsCleanup())
 		if network.NeedsCleanup() {
-			setText(app.status, "Network recovery available")
+			app.setConnectionStatus("Network recovery available", "Reconnect to resume, or restore normal connectivity.", style.warning)
 			app.appendLog("Reconnect to resume, or Restore network to remove retained settings.")
 		}
 		return 0
 	})
+	window.On().WmEraseBkgnd(func(event ui.WmEraseBkgnd) int {
+		rect, err := app.window.Hwnd().GetClientRect()
+		if err == nil {
+			_ = event.Hdc().FillRect(&rect, style.backgroundBrush)
+		}
+		return 1
+	})
+	window.On().WmCtlColorStatic(app.colorStatic)
+	window.On().WmCtlColorEdit(func(event ui.WmCtlColor) win.HBRUSH {
+		app.colorControl(event, style.primary, style.field)
+		return style.fieldBrush
+	})
+	window.On().WmCtlColorListBox(func(event ui.WmCtlColor) win.HBRUSH {
+		app.colorControl(event, style.primary, style.field)
+		return style.fieldBrush
+	})
+	window.On().WmCtlColorBtn(func(event ui.WmCtlColor) win.HBRUSH {
+		app.colorControl(event, style.primary, style.background)
+		return style.backgroundBrush
+	})
+	window.On().WmGetMinMaxInfo(func(event ui.WmGetMinMaxInfo) {
+		event.Info().PtMinTrackSize = minimumWindowTrackSize()
+	})
 	window.On().Wm(trayMessage, app.trayEvent)
 	window.On().WmClose(app.close)
 	window.On().WmDestroy(func() { _ = win.Shell_NotifyIcon(co.NIM_DELETE, &app.tray) })
-	return app
+	return app, nil
 }
+
+func minimumClientSize() (int, int) {
+	return ui.DpiX(480), ui.DpiY(305)
+}
+
+func preferredClientSize() (int, int) {
+	minimumWidth, minimumHeight := minimumClientSize()
+	width := ui.DpiX(620)
+	height := ui.DpiY(520)
+	var workArea win.RECT
+	if err := win.SystemParametersInfo(co.SPI_GETWORKAREA, 0, unsafe.Pointer(&workArea), 0); err == nil {
+		frame := win.RECT{Right: int32(width), Bottom: int32(height)}
+		if err := win.AdjustWindowRectEx(&frame, mainWindowStyle, false, 0); err == nil {
+			nonClientWidth := int(frame.Right-frame.Left) - width
+			nonClientHeight := int(frame.Bottom-frame.Top) - height
+			availableClientWidth := int(workArea.Right-workArea.Left) - ui.DpiX(16) - nonClientWidth
+			availableClientHeight := int(workArea.Bottom-workArea.Top) - ui.DpiY(16) - nonClientHeight
+			if availableClientWidth < width {
+				width = availableClientWidth
+			}
+			if availableClientHeight < height {
+				height = availableClientHeight
+			}
+		}
+	}
+	if width < minimumWidth {
+		width = minimumWidth
+	}
+	if height < minimumHeight {
+		height = minimumHeight
+	}
+	return width, height
+}
+
+func minimumWindowTrackSize() win.POINT {
+	width, height := minimumClientSize()
+	rect := win.RECT{Right: int32(width), Bottom: int32(height)}
+	if err := win.AdjustWindowRectEx(&rect, mainWindowStyle, false, 0); err != nil {
+		return win.POINT{X: rect.Right, Y: rect.Bottom}
+	}
+	return win.POINT{X: rect.Right - rect.Left, Y: rect.Bottom - rect.Top}
+}
+
+func newVisualStyle() (*visualStyle, error) {
+	style := &visualStyle{
+		background: win.RGB(8, 17, 31),
+		field:      win.RGB(11, 23, 40),
+		primary:    win.RGB(242, 247, 252),
+		muted:      win.RGB(148, 163, 184),
+		accent:     win.RGB(110, 231, 183),
+		warning:    win.RGB(250, 204, 21),
+		danger:     win.RGB(251, 113, 133),
+	}
+	var err error
+	if style.backgroundBrush, err = newSolidBrush(style.background); err != nil {
+		return nil, fmt.Errorf("create window background: %w", err)
+	}
+	if style.fieldBrush, err = newSolidBrush(style.field); err != nil {
+		style.close()
+		return nil, fmt.Errorf("create field background: %w", err)
+	}
+	fonts := []struct {
+		target *win.HFONT
+		size   int
+		weight co.FW
+		face   string
+	}{
+		{&style.titleFont, 28, co.FW_SEMIBOLD, "Segoe UI"},
+		{&style.headingFont, 18, co.FW_SEMIBOLD, "Segoe UI"},
+		{&style.bodyFont, 14, co.FW_NORMAL, "Segoe UI"},
+		{&style.labelFont, 11, co.FW_SEMIBOLD, "Segoe UI"},
+		{&style.monoFont, 12, co.FW_NORMAL, "Cascadia Mono"},
+	}
+	for _, font := range fonts {
+		*font.target, err = newFont(font.size, font.weight, font.face)
+		if err != nil {
+			style.close()
+			return nil, fmt.Errorf("create %s font: %w", font.face, err)
+		}
+	}
+	return style, nil
+}
+
+func newSolidBrush(color win.COLORREF) (win.HBRUSH, error) {
+	return win.CreateBrushIndirect(&win.LOGBRUSH{Style: co.BRS_SOLID, Color: color})
+}
+
+func newFont(size int, weight co.FW, face string) (win.HFONT, error) {
+	font := win.LOGFONT{
+		Height:        int32(ui.DpiY(-size)),
+		Weight:        weight,
+		CharSet:       co.CHARSET_DEFAULT,
+		OutPrecision:  co.OUT_PRECIS_DEFAULT,
+		ClipPrecision: co.CLIP_PRECIS_DEFAULT,
+		Quality:       co.QUALITY_CLEARTYPE,
+	}
+	font.SetPitch(co.PITCH_VARIABLE)
+	font.SetFamily(co.FF_SWISS)
+	font.SetFaceName(face)
+	return win.CreateFontIndirect(&font)
+}
+
+func (s *visualStyle) close() {
+	for _, font := range []win.HFONT{s.titleFont, s.headingFont, s.bodyFont, s.labelFont, s.monoFont} {
+		if font != 0 {
+			_ = font.DeleteObject()
+		}
+	}
+	for _, brush := range []win.HBRUSH{s.fieldBrush, s.backgroundBrush} {
+		if brush != 0 {
+			_ = brush.DeleteObject()
+		}
+	}
+}
+
+func (a *application) applyVisualStyle() {
+	_ = a.window.Hwnd().DwmSetWindowAttribute(win.DwmAttrUseImmersiveDarkMode(true))
+	_ = a.window.Hwnd().DwmSetWindowAttribute(win.DwmAttrCaptionColor(a.style.background))
+	_ = a.window.Hwnd().DwmSetWindowAttribute(win.DwmAttrTextColor(a.style.primary))
+
+	for _, label := range a.labels {
+		label.control.Hwnd().SendMessage(co.WM_SETFONT, win.WPARAM(label.font), win.LPARAM(1))
+		a.staticColors[label.control.Hwnd()] = label.color
+	}
+	for _, control := range []win.HWND{
+		a.profiles.Hwnd(), a.transport.Hwnd(), a.name.Hwnd(), a.server.Hwnd(), a.token.Hwnd(),
+		a.save.Hwnd(), a.restore.Hwnd(), a.connect.Hwnd(), a.remove.Hwnd(), a.add.Hwnd(),
+		a.showActivity.Hwnd(), a.showProfile.Hwnd(),
+	} {
+		control.SendMessage(co.WM_SETFONT, win.WPARAM(a.style.bodyFont), win.LPARAM(1))
+		setDarkControlTheme(control)
+	}
+	a.logs.Hwnd().SendMessage(co.WM_SETFONT, win.WPARAM(a.style.monoFont), win.LPARAM(1))
+	setDarkControlTheme(a.logs.Hwnd())
+}
+
+func (a *application) resizeAndCenterInWorkArea() {
+	var workArea win.RECT
+	if err := win.SystemParametersInfo(co.SPI_GETWORKAREA, 0, unsafe.Pointer(&workArea), 0); err != nil {
+		return
+	}
+	windowRect := win.RECT{Right: a.preferredSize.Cx, Bottom: a.preferredSize.Cy}
+	if err := win.AdjustWindowRectEx(&windowRect, mainWindowStyle, false, 0); err != nil {
+		return
+	}
+	width := windowRect.Right - windowRect.Left
+	height := windowRect.Bottom - windowRect.Top
+	position := win.POINT{
+		X: workArea.Left + (workArea.Right-workArea.Left-width)/2,
+		Y: workArea.Top + (workArea.Bottom-workArea.Top-height)/2,
+	}
+	_ = a.window.Hwnd().SetWindowPos(
+		0, position, win.SIZE{Cx: width, Cy: height}, co.SWP_NOZORDER|co.SWP_NOACTIVATE,
+	)
+}
+
+func (a *application) setActivityView(show bool) {
+	profileState, activityState := co.SW_SHOW, co.SW_HIDE
+	if show {
+		profileState, activityState = co.SW_HIDE, co.SW_SHOW
+	}
+	for _, control := range a.profileView {
+		control.Hwnd().ShowWindow(profileState)
+	}
+	for _, control := range a.activityView {
+		control.Hwnd().ShowWindow(activityState)
+	}
+	if show {
+		a.logs.SetSelection(-1, -1)
+		a.showProfile.Hwnd().SetFocus()
+	} else {
+		a.profiles.Hwnd().SetFocus()
+	}
+}
+
+func (a *application) colorStatic(event ui.WmCtlColor) win.HBRUSH {
+	if event.HwndControl() == a.logs.Hwnd() {
+		a.colorControl(event, a.style.primary, a.style.field)
+		return a.style.fieldBrush
+	}
+	color := a.style.primary
+	if configured, ok := a.staticColors[event.HwndControl()]; ok {
+		color = configured
+	}
+	a.colorControl(event, color, a.style.background)
+	return a.style.backgroundBrush
+}
+
+func (a *application) colorControl(event ui.WmCtlColor, text, background win.COLORREF) {
+	_, _ = event.Hdc().SetTextColor(text)
+	_, _ = event.Hdc().SetBkColor(background)
+	_, _ = event.Hdc().SetBkMode(co.BKMODE_OPAQUE)
+}
+
+func (a *application) setConnectionStatus(title, detail string, dotColor win.COLORREF) {
+	setText(a.status, title)
+	setText(a.statusDetail, detail)
+	a.staticColors[a.statusDot.Hwnd()] = dotColor
+	_ = a.statusDot.Hwnd().InvalidateRect(nil, true)
+}
+
+func setDarkControlTheme(control win.HWND) {
+	name, err := syswindows.UTF16PtrFromString("DarkMode_Explorer")
+	if err != nil {
+		return
+	}
+	_, _, _ = setWindowTheme.Call(uintptr(control), uintptr(unsafe.Pointer(name)), 0)
+}
+
+var setWindowTheme = syswindows.NewLazySystemDLL("uxtheme.dll").NewProc("SetWindowTheme")
 
 func (a *application) reloadProfiles(selectID string) {
 	a.items = a.store.List()
@@ -223,6 +562,9 @@ func (a *application) loadProfile(profile clientprofile.Profile) {
 	a.server.SetText(profile.ServerURL)
 	a.token.SetText("")
 	a.transport.SelectIndex(transportIndex(profile.Transport))
+	if !a.running && !a.restoring {
+		a.setConnectionStatus("Ready", profile.Name+" · "+profile.ServerURL, a.style.muted)
+	}
 	a.appendLog("Selected profile " + profile.Name)
 }
 
@@ -236,6 +578,7 @@ func (a *application) newProfile() {
 	a.server.SetText("https://")
 	a.transport.SelectIndex(0)
 	a.token.SetText("")
+	a.setConnectionStatus("Add a profile", "Enter the gateway and client token to begin.", a.style.muted)
 	a.name.Hwnd().SetFocus()
 }
 
@@ -303,7 +646,7 @@ func (a *application) toggleConnection() {
 		cancel := a.cancel
 		a.disconnecting = true
 		a.mu.Unlock()
-		setText(a.status, "Disconnecting")
+		a.setConnectionStatus("Disconnecting", "Restoring normal network access…", a.style.warning)
 		a.connect.SetText("Disconnecting…")
 		a.connect.Hwnd().EnableWindow(false)
 		a.updateTray("Disconnecting")
@@ -329,10 +672,11 @@ func (a *application) toggleConnection() {
 	a.mu.Unlock()
 	a.setEditing(false)
 	a.connect.SetText("Cancel")
-	setText(a.address, "Address  —")
-	setText(a.duration, "Duration  —")
-	setText(a.upload, "Upload  0 B")
-	setText(a.download, "Download  0 B")
+	a.setConnectionStatus("Connecting", "Establishing a secure tunnel…", a.style.warning)
+	setText(a.address, "—")
+	setText(a.duration, "—")
+	setText(a.upload, "0 B")
+	setText(a.download, "0 B")
 	a.appendLog("Connecting to " + profile.ServerURL)
 	go func() {
 		defer cancel()
@@ -359,13 +703,13 @@ func (a *application) toggleConnection() {
 			a.connect.Hwnd().EnableWindow(true)
 			if err != nil && err != context.Canceled {
 				a.appendLog("Error: " + err.Error())
-				setText(a.status, "Error")
+				a.setConnectionStatus("Connection error", "Review the activity log, then try again.", a.style.danger)
 				a.updateTray("Error")
 			} else {
-				setText(a.status, "Disconnected")
+				a.setConnectionStatus("Disconnected", "Choose a profile to reconnect securely.", a.style.muted)
 				a.updateTray("Disconnected")
 			}
-			setText(a.address, "Address  —")
+			setText(a.address, "—")
 			if closing && canExitAfterDisconnect(err, a.network.NeedsCleanup()) {
 				a.window.Hwnd().DestroyWindow()
 			} else if closing {
@@ -381,28 +725,58 @@ func (a *application) handleEvent(event clientapp.Event) {
 		if a.disconnecting && event.State != clientapp.StateError && event.State != clientapp.StateDisconnected {
 			return
 		}
-		status := event.Message
-		if event.State == clientapp.StateConnected {
-			status += " (" + strings.ToUpper(string(event.Transport)) + ")"
-		}
-		setText(a.status, status)
-		a.updateTray(status)
+		title, detail, color := a.connectionPresentation(event)
+		a.setConnectionStatus(title, detail, color)
+		a.updateTray(title)
 		if event.State == clientapp.StateConnected {
 			a.connectedAt = event.ConnectedAt
 			a.connect.SetText("Disconnect")
 		}
 		if event.Lease.Address.IsValid() {
-			setText(a.address, "Address  "+event.Lease.Address.String())
+			setText(a.address, event.Lease.Address.String())
 		}
 		if !event.ConnectedAt.IsZero() {
-			setText(a.duration, "Duration  "+formatDuration(time.Since(event.ConnectedAt)))
+			setText(a.duration, formatDuration(time.Since(event.ConnectedAt)))
 		}
-		setText(a.upload, "Upload  "+formatBytes(event.BytesUploaded))
-		setText(a.download, "Download  "+formatBytes(event.BytesDownloaded))
+		setText(a.upload, formatBytes(event.BytesUploaded))
+		setText(a.download, formatBytes(event.BytesDownloaded))
 		if event.State != clientapp.StateConnected || event.Message != "Connected" {
 			a.appendLog(event.Message)
 		}
 	})
+}
+
+func (a *application) connectionPresentation(event clientapp.Event) (string, string, win.COLORREF) {
+	switch event.State {
+	case clientapp.StateConfiguring:
+		return "Configuring network", "Applying private routes, DNS, and tunnel MTU…", a.style.warning
+	case clientapp.StateConnected:
+		detail := "Encrypted tunnel active"
+		switch event.Transport {
+		case tunnel.TransportHTTP3:
+			detail = "HTTP/3 MASQUE · Fast and resilient"
+		case tunnel.TransportHTTP2:
+			detail = "4-lane HTTP/2 fallback · Encrypted"
+		}
+		if event.Lease.MTU > 0 {
+			detail += fmt.Sprintf(" · MTU %d", event.Lease.MTU)
+		}
+		return "Connected", detail, a.style.accent
+	case clientapp.StateReconnecting:
+		return "Reconnecting", "The network changed; restoring the secure tunnel…", a.style.warning
+	case clientapp.StateDisconnecting:
+		return "Disconnecting", "Restoring normal network access…", a.style.warning
+	case clientapp.StateDisconnected:
+		return "Disconnected", "Choose a profile to reconnect securely.", a.style.muted
+	case clientapp.StateError:
+		return "Connection error", "Review the activity log, then try again.", a.style.danger
+	default:
+		detail := "Establishing a secure tunnel…"
+		if strings.HasPrefix(event.Message, "Device:") {
+			detail = strings.TrimPrefix(event.Message, "Device: ")
+		}
+		return "Connecting", detail, a.style.warning
+	}
 }
 
 func (a *application) setEditing(enabled bool) {
@@ -413,6 +787,7 @@ func (a *application) setEditing(enabled bool) {
 	a.token.Hwnd().EnableWindow(enabled)
 	a.save.Hwnd().EnableWindow(enabled)
 	a.remove.Hwnd().EnableWindow(enabled)
+	a.add.Hwnd().EnableWindow(enabled)
 	a.restore.Hwnd().EnableWindow(enabled && a.network.NeedsCleanup())
 }
 
@@ -426,7 +801,7 @@ func (a *application) restoreNetwork() {
 	a.mu.Unlock()
 	a.setEditing(false)
 	a.connect.Hwnd().EnableWindow(false)
-	setText(a.status, "Restoring network")
+	a.setConnectionStatus("Restoring network", "Removing retained routes and leak protection…", a.style.warning)
 	a.updateTray("Restoring network")
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -447,13 +822,13 @@ func (a *application) restoreNetwork() {
 				return
 			}
 			if err != nil {
-				setText(a.status, "Network recovery failed")
+				a.setConnectionStatus("Network recovery failed", "Review the activity log and try Restore network again.", a.style.danger)
 				a.updateTray("Network recovery failed")
 				a.window.Hwnd().ShowWindow(co.SW_RESTORE)
 				a.showError(err)
 				return
 			}
-			setText(a.status, "Disconnected")
+			a.setConnectionStatus("Disconnected", "Normal network access has been restored.", a.style.muted)
 			a.updateTray("Disconnected")
 			a.appendLog("Restored network and removed retained protection.")
 			if closing {
@@ -497,6 +872,7 @@ func (a *application) writeLog(line string) {
 
 func (a *application) showError(err error) {
 	a.appendLog("Error: " + err.Error())
+	a.setConnectionStatus("Action failed", "Review the activity log for details.", a.style.danger)
 	_, _ = a.window.Hwnd().MessageBox(err.Error(), "Porta", co.MB_ICONERROR)
 }
 
@@ -526,7 +902,7 @@ func (a *application) close() {
 	a.disconnecting = true
 	cancel := a.cancel
 	a.mu.Unlock()
-	setText(a.status, "Disconnecting")
+	a.setConnectionStatus("Disconnecting", "Restoring normal network access…", a.style.warning)
 	a.connect.Hwnd().EnableWindow(false)
 	a.updateTray("Disconnecting")
 	cancel()
