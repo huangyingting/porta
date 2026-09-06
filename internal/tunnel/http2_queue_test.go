@@ -179,6 +179,30 @@ func TestHTTP2UploadBatchIsPromptAndBounded(t *testing.T) {
 	}
 }
 
+func TestHTTP2UploadQueueReleasesPacketStorage(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		queue := newHTTP2UploadQueue(defaultHTTP2QueueConfig)
+		now := time.Now()
+		metadata := protocol.PacketMetadata{Class: protocol.PacketClassTCP}
+		queue.enqueue(make([]byte, 80), metadata, now)
+		queue.enqueue(make([]byte, 80), metadata, now)
+		for range 2 {
+			if batch {
+				queue.takeBatch(context.Background(), func() time.Time { return now }, 1, 100)
+			} else {
+				queue.dequeue(now)
+			}
+		}
+		retained := 0
+		for _, item := range queue.items[:cap(queue.items)] {
+			retained += len(item.data)
+		}
+		if retained != 0 {
+			t.Errorf("drained queue (batch=%t) retains %d packet bytes in backing storage", batch, retained)
+		}
+	}
+}
+
 func TestHTTP2FlowPinningUsesLeastLoadedHealthyLane(t *testing.T) {
 	group := newHTTP2RoutingTestGroup()
 	now := time.Unix(400, 0)

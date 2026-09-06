@@ -82,7 +82,7 @@ func loadOrCreate(path string, protect, unprotect func([]byte) ([]byte, error)) 
 	}
 	var key *ecdsa.PrivateKey
 	err := withFileLock(path+".lock", func() error {
-		data, err := os.ReadFile(path)
+		data, err := readIdentityFile(path)
 		if err == nil {
 			key, err = decodeState(data, unprotect)
 			return err

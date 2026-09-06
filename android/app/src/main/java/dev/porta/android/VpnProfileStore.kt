@@ -12,6 +12,8 @@ import org.json.JSONObject
 import java.io.IOException
 import java.security.GeneralSecurityException
 import java.security.KeyStore
+import java.security.KeyStoreException
+import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -27,96 +29,102 @@ internal data class VpnProfile(
 
 internal class VpnProfileStore(private val context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+    private val repository = ProfileRepository(
+        object : ProfileStorage {
+            override fun read(): ProfileStorageState {
+                val archives = preferences.all.filterKeys { it.startsWith(KEY_ARCHIVE_PREFIX) }
+                    .values.mapNotNull { value ->
+                        try {
+                            val archive = JSONObject(value as? String ?: return@mapNotNull null)
+                            ProfileSnapshot(
+                                archive.getString(KEY_PROFILES),
+                                archive.getString(KEY_KEY_ALIAS),
+                                archive.optString(KEY_SELECTED_PROFILE).takeIf { it.isNotEmpty() },
+                            )
+                        } catch (error: JSONException) {
+                            // A damaged archive must not hide healthy active profiles.
+                            // Leave its original preference untouched for later recovery.
+                            Log.e(TAG, "Could not read a profile recovery archive", error)
+                            null
+                        }
+                    }
+                return ProfileStorageState(
+                    ProfileSnapshot(
+                        preferences.getString(KEY_PROFILES, null),
+                        preferences.getString(KEY_KEY_ALIAS, null) ?: KEY_ALIAS,
+                        preferences.getString(KEY_SELECTED_PROFILE, null),
+                    ),
+                    archives,
+                )
+            }
 
-    fun profiles(): List<VpnProfile> = readProfiles() ?: emptyList()
+            @SuppressLint("ApplySharedPref")
+            override fun commit(state: ProfileStorageState): Boolean {
+                val editor = preferences.edit()
+                state.archives.forEach { archive ->
+                    val encoded = JSONObject()
+                        .put(KEY_PROFILES, archive.encoded)
+                        .put(KEY_KEY_ALIAS, archive.keyAlias)
+                        .put(KEY_SELECTED_PROFILE, archive.selectedProfileId).toString()
+                    val id = MessageDigest.getInstance("SHA-256").digest(encoded.toByteArray(Charsets.UTF_8))
+                        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                    editor.putString(KEY_ARCHIVE_PREFIX + id, encoded)
+                }
+                return editor
+                    .putString(KEY_PROFILES, state.current.encoded)
+                    .putString(KEY_KEY_ALIAS, state.current.keyAlias)
+                    .putString(KEY_SELECTED_PROFILE, state.current.selectedProfileId)
+                    .commit()
+            }
+        },
+        object : ProfileCodec {
+            override fun decode(snapshot: ProfileSnapshot): ProfileReadResult = readProfiles(snapshot)
 
-    private fun readProfiles(): List<VpnProfile>? {
-        val encoded = preferences.getString(KEY_PROFILES, null) ?: return emptyList()
+            override fun encode(profiles: List<VpnProfile>, keyAlias: String): String {
+                val entries = JSONArray()
+                profiles.forEach { entries.put(this@VpnProfileStore.encode(it, keyAlias)) }
+                return entries.toString()
+            }
+        },
+    )
+
+    fun read(): Pair<ProfileSnapshot, ProfileReadResult> = repository.read()
+
+    fun profiles(): List<VpnProfile> = read().second.profiles
+
+    private fun readProfiles(snapshot: ProfileSnapshot): ProfileReadResult {
+        val encoded = snapshot.encoded ?: return ProfileReadResult(emptyList())
         return try {
             val entries = JSONArray(encoded)
-            for (index in 0 until entries.length()) {
-                val entry = entries.getJSONObject(index)
-                if (entry.optInt(KEY_VERSION, LEGACY_PROFILE_VERSION) == LEGACY_PROFILE_VERSION) {
-                    clearLegacyProfiles()
-                    return emptyList()
-                }
-            }
             val profiles = mutableListOf<VpnProfile>()
+            var unreadable = 0
             for (index in 0 until entries.length()) {
-                val entry = entries.getJSONObject(index)
-                val profile = decode(entry) ?: return null
-                profiles += profile
+                val entry = entries.optJSONObject(index)
+                val profile = entry?.let { decode(it, snapshot.keyAlias) }
+                if (profile == null) unreadable++ else profiles += profile
             }
-            profiles
+            ProfileReadResult(profiles, unreadableEntries = unreadable)
         } catch (error: JSONException) {
             Log.e(TAG, "Could not read VPN profiles", error)
-            null
+            ProfileReadResult(emptyList(), unreadableDocument = true)
         }
     }
 
-    @SuppressLint("ApplySharedPref")
-    private fun clearLegacyProfiles() {
-        Log.w(TAG, "Clearing unsupported legacy VPN profiles")
-        preferences.edit()
-            .remove(KEY_PROFILES)
-            .remove(KEY_SELECTED_PROFILE)
-            .commit()
+    fun save(profile: VpnProfile): Boolean = write { repository.save(profile) }
+    fun delete(profileId: String): Boolean = write { repository.delete(profileId) }
+    fun recover(expected: ProfileSnapshot): Boolean = write { repository.recover(expected) }
+    fun archiveCount(): Int = repository.archiveCount()
+    fun restoreArchives(): Int {
+        var count = -1
+        write { count = repository.restoreArchives(); count >= 0 }
+        return count
     }
+    fun selectedProfileId(): String? = repository.selectedProfileId()
+    fun select(profileId: String?) { write { repository.select(profileId) } }
 
-    fun save(profile: VpnProfile): Boolean {
-        val stored = readProfiles() ?: if (resetCorruptStorage()) emptyList() else return false
-        val updated = stored.filterNot { it.id == profile.id }.toMutableList()
-        if (profile.autoConnect) {
-            for (index in updated.indices) {
-                updated[index] = updated[index].copy(autoConnect = false)
-            }
-        }
-        updated += profile
-        return write(updated.sortedBy { it.name.lowercase() })
-    }
-
-    fun delete(profileId: String): Boolean {
-        val stored = readProfiles() ?: return false
-        return write(stored.filterNot { it.id == profileId })
-    }
-
-    @SuppressLint("ApplySharedPref")
-    private fun resetCorruptStorage(): Boolean {
-        Log.w(TAG, "Resetting unreadable VPN profile storage")
+    private fun write(action: () -> Boolean): Boolean {
         return try {
-            KeyStore.getInstance(KEYSTORE).apply {
-                load(null)
-                if (containsAlias(KEY_ALIAS)) {
-                    deleteEntry(KEY_ALIAS)
-                }
-            }
-            preferences.edit()
-                .remove(KEY_PROFILES)
-                .remove(KEY_SELECTED_PROFILE)
-                .commit()
-        } catch (error: GeneralSecurityException) {
-            Log.e(TAG, "Could not reset VPN profile storage", error)
-            false
-        } catch (error: IOException) {
-            Log.e(TAG, "Could not reset VPN profile storage", error)
-            false
-        }
-    }
-
-    fun selectedProfileId(): String? = preferences.getString(KEY_SELECTED_PROFILE, null)
-
-    fun select(profileId: String?) {
-        preferences.edit().apply {
-            if (profileId == null) remove(KEY_SELECTED_PROFILE) else putString(KEY_SELECTED_PROFILE, profileId)
-        }.apply()
-    }
-
-    @SuppressLint("ApplySharedPref")
-    private fun write(profiles: List<VpnProfile>): Boolean {
-        return try {
-            val entries = JSONArray()
-            profiles.forEach { entries.put(encode(it)) }
-            preferences.edit().putString(KEY_PROFILES, entries.toString()).commit()
+            action()
         } catch (error: GeneralSecurityException) {
             Log.e(TAG, "Could not encrypt VPN profiles", error)
             false
@@ -126,9 +134,9 @@ internal class VpnProfileStore(private val context: Context) {
         }
     }
 
-    private fun encode(profile: VpnProfile): JSONObject {
+    private fun encode(profile: VpnProfile, keyAlias: String): JSONObject {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, encryptionKey())
+        cipher.init(Cipher.ENCRYPT_MODE, encryptionKey(keyAlias, create = true))
         cipher.updateAAD(ProfileTokenFormat.associatedData(profile.id, profile.server))
         val encrypted = cipher.doFinal(profile.token.toByteArray(Charsets.UTF_8))
         return JSONObject()
@@ -141,7 +149,7 @@ internal class VpnProfileStore(private val context: Context) {
             .put(KEY_TOKEN, Base64.encodeToString(encrypted, Base64.NO_WRAP))
     }
 
-    private fun decode(entry: JSONObject): VpnProfile? {
+    private fun decode(entry: JSONObject, keyAlias: String): VpnProfile? {
         return try {
             if (entry.getInt(KEY_VERSION) != ProfileTokenFormat.VERSION) {
                 throw JSONException("Unsupported profile storage version")
@@ -156,7 +164,7 @@ internal class VpnProfileStore(private val context: Context) {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
                 Cipher.DECRYPT_MODE,
-                encryptionKey(),
+                encryptionKey(keyAlias, create = false),
                 GCMParameterSpec(128, Base64.decode(entry.getString(KEY_IV), Base64.NO_WRAP)),
             )
             cipher.updateAAD(ProfileTokenFormat.associatedData(profile.id, profile.server))
@@ -179,13 +187,16 @@ internal class VpnProfileStore(private val context: Context) {
         }
     }
 
-    private fun encryptionKey(): SecretKey {
+    private fun encryptionKey(keyAlias: String, create: Boolean): SecretKey {
         val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        (keyStore.getKey(keyAlias, null) as? SecretKey)?.let { return it }
+        if (!create || keyStore.containsAlias(keyAlias)) {
+            throw KeyStoreException("The saved profile encryption key is unavailable")
+        }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE).run {
             init(
                 KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
+                    keyAlias,
                     KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
                 )
                     .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -204,6 +215,8 @@ internal class VpnProfileStore(private val context: Context) {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val KEY_PROFILES = "profiles"
         private const val KEY_SELECTED_PROFILE = "selected_profile"
+        private const val KEY_KEY_ALIAS = "key_alias"
+        private const val KEY_ARCHIVE_PREFIX = "recovery_archive:"
         private const val KEY_ID = "id"
         private const val KEY_NAME = "name"
         private const val KEY_SERVER = "server"
@@ -211,7 +224,6 @@ internal class VpnProfileStore(private val context: Context) {
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_IV = "iv"
         private const val KEY_TOKEN = "token"
-        private const val LEGACY_PROFILE_VERSION = 1
     }
 }
 

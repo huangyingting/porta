@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/huangyingting/porta/internal/usage"
@@ -171,7 +170,7 @@ func (a *adminAPI) writeMutation(w http.ResponseWriter, client clientSummary, er
 }
 
 func (a *adminAPI) writeError(w http.ResponseWriter, err error) {
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, errClientNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Client or device not found"})
 		return
 	}

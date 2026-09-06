@@ -19,6 +19,10 @@ func secureIdentityFile(string) error {
 	return fmt.Errorf("persistent device identity is not supported on %s", runtime.GOOS)
 }
 
+func readIdentityFile(string) ([]byte, error) {
+	return nil, fmt.Errorf("persistent device identity is not supported on %s", runtime.GOOS)
+}
+
 func withFileLock(string, func() error) error {
 	return fmt.Errorf("persistent device identity is not supported on %s", runtime.GOOS)
 }

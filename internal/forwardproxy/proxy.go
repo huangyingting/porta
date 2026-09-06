@@ -224,7 +224,6 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target st
 		h.serveHijackedConnect(r.Context(), w, upstream)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 	clientWriter := newFlushWriter(w, responseBufferSize, responseFlushInterval)
 	clientWriter.onFailure = func(error) {
 		closeTunnelEndpoints(upstream, r.Body, clientWriter)
@@ -234,6 +233,7 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request, target st
 		closeTunnelEndpoints(upstream, r.Body, clientWriter)
 	})
 	defer stop()
+	w.WriteHeader(http.StatusOK)
 	if _, err := clientWriter.Write(nil); err != nil {
 		return
 	}
@@ -446,6 +446,7 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 				return
 			}
 			if !halfClosed {
+				_ = upstream.Close()
 				if closer, ok := clientReader.(io.Closer); ok {
 					_ = closer.Close()
 				}
@@ -612,6 +613,12 @@ func (w *flushWriter) Write(data []byte) (int, error) {
 	if w.buffer == nil {
 		w.buffer = bufio.NewWriterSize(w.writer, w.threshold)
 	}
+	if len(data) > w.buffer.Available() {
+		if err := w.beginWrite(); err != nil {
+			return 0, err
+		}
+		defer w.endWrite()
+	}
 	n, err := w.buffer.Write(data)
 	w.pending += n
 	if err == nil && w.pending >= w.threshold {
@@ -644,8 +651,8 @@ func (w *flushWriter) Abort() error {
 		return nil
 	}
 	w.closed = true
-	w.stateMu.Unlock()
 	err := w.controller.SetWriteDeadline(time.Now())
+	w.stateMu.Unlock()
 	w.writeMu.Lock()
 	w.stopTimerLocked()
 	w.writeMu.Unlock()
@@ -663,7 +670,10 @@ func (w *flushWriter) Flush() error {
 }
 
 func (w *flushWriter) flushLocked() error {
-	_ = w.controller.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
+	if err := w.beginWrite(); err != nil {
+		return err
+	}
+	defer w.endWrite()
 	var err error
 	if w.pending > 0 && w.buffer != nil {
 		err = w.buffer.Flush()
@@ -674,11 +684,26 @@ func (w *flushWriter) flushLocked() error {
 		}
 	}
 	w.pending = 0
-	if !w.isClosed() {
+	return err
+}
+
+func (w *flushWriter) beginWrite() error {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	if w.closed {
+		return net.ErrClosed
+	}
+	_ = w.controller.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
+	return nil
+}
+
+func (w *flushWriter) endWrite() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	if !w.closed {
 		// Bound only an in-flight write, not a healthy upload-only tunnel.
 		_ = w.controller.SetWriteDeadline(time.Time{})
 	}
-	return err
 }
 
 func (w *flushWriter) isClosed() bool {

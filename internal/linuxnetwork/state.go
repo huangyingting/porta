@@ -281,9 +281,12 @@ func (s networkState) validate() error {
 				return errors.New("invalid network journal link address")
 			}
 		}
+		if a.Kind != "escape" && (a.LinkAlias != "porta:"+s.Table || a.LinkKind != "tun") {
+			return errors.New("network journal action lacks tunnel ownership")
+		}
 		switch a.Kind {
 		case "alias":
-			if a.LinkAlias == "" {
+			if a.PreviousAlias != "" {
 				return errors.New("invalid network journal link alias")
 			}
 		case "link":

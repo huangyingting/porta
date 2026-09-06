@@ -183,6 +183,28 @@ func TestMasquePacketQueuePreservesDropOldestWithoutExpiry(t *testing.T) {
 	}
 }
 
+func TestPacketQueueReleasesPacketStorage(t *testing.T) {
+	for _, closeQueue := range []bool{false, true} {
+		queue := newPacketQueue(defaultPacketQueueConfig, nil, 0)
+		now := time.Now()
+		queue.enqueue(testIPv4TCPData(1), now)
+		queue.enqueue(testIPv4TCPData(2), now)
+		if closeQueue {
+			queue.close()
+		} else {
+			queue.dequeue(now)
+			queue.dequeue(now)
+		}
+		retained := 0
+		for _, item := range queue.items[:cap(queue.items)] {
+			retained += len(item.data)
+		}
+		if retained != 0 {
+			t.Errorf("empty queue (closed=%t) retains %d packet bytes in backing storage", closeQueue, retained)
+		}
+	}
+}
+
 func testIPv4TCPData(marker byte) []byte {
 	packet := make([]byte, 80)
 	packet[0] = 0x45

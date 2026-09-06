@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -95,6 +96,92 @@ func TestFlushWriterTimerFailureTerminatesTunnel(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timer flush failure left the tunnel running")
 	}
+}
+
+func TestFlushWriterOverflowHasWriteDeadline(t *testing.T) {
+	response := &deadlineResponseWriter{}
+	writer := newFlushWriter(response, 8, time.Hour)
+	defer writer.Close()
+	if _, err := writer.Write([]byte("123456")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("789012")); err != nil {
+		t.Fatal(err)
+	}
+	if response.unboundedWrites != 0 {
+		t.Fatalf("buffer overflow performed %d response writes without a deadline", response.unboundedWrites)
+	}
+}
+
+func TestFlushWriterAbortCannotBeUndoneByDeadlineRefresh(t *testing.T) {
+	for _, delayReset := range []bool{false, true} {
+		t.Run(fmt.Sprint("reset=", delayReset), func(t *testing.T) {
+			response := &deadlineResponseWriter{
+				delayReset: delayReset,
+				entered:    make(chan struct{}),
+				release:    make(chan struct{}),
+				aborting:   make(chan struct{}),
+			}
+			writer := newFlushWriter(response, 8, time.Hour)
+			flushed := make(chan struct{})
+			go func() {
+				_, _ = writer.Write(nil)
+				close(flushed)
+			}()
+			<-response.entered
+			aborted := make(chan struct{})
+			go func() {
+				_ = writer.Abort()
+				close(aborted)
+			}()
+			select {
+			case <-response.aborting:
+			case <-time.After(20 * time.Millisecond):
+				// Serialized deadline updates hold stateMu until the delayed
+				// refresh returns; an unlocked mutex means Abort never ran.
+				if writer.stateMu.TryLock() {
+					writer.stateMu.Unlock()
+					t.Error("Abort neither set a deadline nor waited for a serialized refresh")
+				}
+			}
+			close(response.release)
+			<-flushed
+			<-aborted
+			if response.deadline.IsZero() || response.deadline.After(time.Now()) {
+				t.Fatalf("abort deadline was overwritten: %v", response.deadline)
+			}
+		})
+	}
+}
+
+type deadlineResponseWriter struct {
+	deadline        time.Time
+	unboundedWrites int
+	delayReset      bool
+	entered         chan struct{}
+	release         chan struct{}
+	aborting        chan struct{}
+}
+
+func (*deadlineResponseWriter) Header() http.Header { return make(http.Header) }
+func (*deadlineResponseWriter) WriteHeader(int)     {}
+func (*deadlineResponseWriter) Flush()              {}
+func (w *deadlineResponseWriter) Write(data []byte) (int, error) {
+	if w.deadline.IsZero() {
+		w.unboundedWrites++
+	}
+	return len(data), nil
+}
+func (w *deadlineResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	if w.entered != nil && (deadline.IsZero() && w.delayReset || deadline.After(time.Now()) && !w.delayReset) {
+		close(w.entered)
+		<-w.release
+	}
+	w.deadline = deadline
+	if w.aborting != nil && !deadline.IsZero() && !deadline.After(time.Now()) {
+		close(w.aborting)
+	}
+	return nil
 }
 
 func BenchmarkFlushWriterBufferedWrites(b *testing.B) {

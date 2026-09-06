@@ -30,7 +30,16 @@ func (r *Runner) protect(ctx context.Context) error {
 	}
 	add(`oifname "lo" accept`)
 	if r.state.Interface != "" {
-		add(fmt.Sprintf("oifname %q meta oif %d accept", r.state.Interface, r.state.Index))
+		link, err := r.actionLink(ctx, action{
+			Interface: r.state.Interface, Index: r.state.Index,
+			LinkAlias: "porta:" + r.state.Table, LinkKind: "tun",
+		})
+		if err != nil {
+			return err
+		}
+		if link != nil {
+			add(fmt.Sprintf("oifname %q meta oif %d accept", link.Name, link.Index))
+		}
 	}
 	// No established/related shortcut: pre-existing physical connections must
 	// also stop. DNS exceptions must not accidentally follow endpoint rules.

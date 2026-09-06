@@ -141,16 +141,31 @@ elif name == "sysctl":
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
 elif name == "ip":
-    if args[:4] == ["-4", "route", "show", "default"]:
+    if "show" in args and state.get("fail_ip_list"):
+        code = 2
+    elif args == ["-o", "link", "show"]:
+        print("1: lo: <LOOPBACK,UP> mtu 65536")
+        print("2: porta0: <POINTOPOINT,UP> mtu 1400")
+    elif args[:4] == ["-4", "route", "show", "default"]:
         print("default via 192.0.2.1 dev eth0")
 elif name == "nft":
-    if args[:2] == ["list", "table"]:
+    if args[0] == "list" and state.get("fail_nft_list"):
+        code = 2
+    elif args == ["list", "tables"]:
+        tables = state.get("nft_tables")
+        if tables is None:
+            tables = {"ip porta": state["nft_table"]} if state.get("nft_table") else {}
+        for table in tables:
+            print("table " + table)
+    elif args[:2] == ["list", "table"]:
         table = " ".join(args[2:4])
         tables = state.get("nft_tables")
         if tables is None:
             code = 0 if table == "ip porta" and state.get("nft_table") else 1
         else:
             code = 0 if tables.get(table) else 1
+            if code == 0:
+                print(tables[table])
     elif args == ["-f", "-"]:
         with unlocked_state():
             transaction = sys.stdin.read()
@@ -183,7 +198,14 @@ elif name == "iptables":
     args = [arg for arg in args if arg != "-w"]
     operation = args[0]
     if operation == "-S":
-        code = 0 if state.get("docker") else 1
+        if state.get("fail_iptables_list"):
+            code = 2
+        elif len(args) == 1:
+            print("-P FORWARD ACCEPT")
+            if state.get("docker"):
+                print("-N DOCKER-USER")
+        else:
+            code = 0 if state.get("docker") else 1
     else:
         rules = state.setdefault("iptables_rules", [])
         rule = args[2:] if operation != "-I" else args[3:]
@@ -297,6 +319,17 @@ elif name == "sleep":
     code = 1 if state.get("fail_sleep") else 0
 elif name == "uname":
     print("x86_64")
+elif name in ("sudo", "unshare"):
+    if name == "sudo":
+        if args[0] != "-n":
+            raise RuntimeError(f"unexpected sudo invocation: {args}")
+        command = args[1:]
+    else:
+        if args[:2] != ["--net", "--"]:
+            raise RuntimeError(f"unexpected unshare invocation: {args}")
+        command = args[2:]
+    with unlocked_state():
+        code = subprocess.run(command, check=False).returncode
 else:
     raise RuntimeError(f"unexpected mocked command: {name}")
 

@@ -322,8 +322,9 @@ func (q *http2UploadQueue) compactLocked() {
 	if q.head < 64 && q.head*2 < len(q.items) {
 		return
 	}
-	copy(q.items, q.items[q.head:])
-	q.items = q.items[:len(q.items)-q.head]
+	remaining := copy(q.items, q.items[q.head:])
+	clear(q.items[remaining:])
+	q.items = q.items[:remaining]
 	q.head = 0
 }
 

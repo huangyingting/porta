@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command in sudo unshare ip nft sysctl grep; do
+for command in sudo unshare ip nft sysctl grep mktemp; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 1
@@ -11,8 +11,15 @@ done
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sudo -n unshare --net -- bash -euo pipefail -c '
 repository_root=$1
+runtime_directory=$(mktemp -d)
+export PORTA_RUNTIME_DIRECTORY="$runtime_directory"
 cleanup() {
-  "$repository_root/scripts/server-down.sh" porta0 eth0 >/dev/null 2>&1 || true
+  status=$?
+  trap - EXIT
+  "$repository_root/scripts/server-down.sh" porta0 eth0 || status=1
+  rm -f "$runtime_directory/ip-forward-porta0" "$runtime_directory/docker-rules-porta0"
+  rmdir "$runtime_directory" || status=1
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -36,6 +43,7 @@ grep -Fq "limit rate over 500/second burst 1000 packets" <<<"$guard_rules"
 "$repository_root/scripts/server-up.sh" \
   porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443
 "$repository_root/scripts/server-down.sh" porta0 eth0
+rmdir "$runtime_directory"
 trap - EXIT
 
 if nft list table ip porta >/dev/null 2>&1 ||

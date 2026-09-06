@@ -194,6 +194,19 @@ func (p *Pool) Release(lease Lease) {
 	p.byClient[lease.clientID] = record
 }
 
+func (p *Pool) registerLease(lease Lease, register func()) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	record, ok := p.byClient[lease.clientID]
+	if !ok || !record.active || record.generation != lease.generation {
+		return false
+	}
+	// A reconnect must not supersede this generation between validation and
+	// router registration, or an older handler can replace the current owner.
+	register()
+	return true
+}
+
 func (p *Pool) activateGroup(clientID, groupID string, generation uint64) {
 	if groupID == "" {
 		delete(p.groups, clientID)

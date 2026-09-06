@@ -140,7 +140,7 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 	previousName, previousIndex := r.state.Interface, r.state.Index
 	if previousName == "" {
 		for _, a := range r.state.Undo {
-			if a.Kind == "link" {
+			if a.Kind == "link" || a.Kind == "alias" {
 				previousName, previousIndex = a.Interface, a.Index
 				break
 			}

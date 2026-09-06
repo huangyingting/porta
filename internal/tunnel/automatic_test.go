@@ -51,10 +51,10 @@ func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
 
 func TestInvalidPinnedEndpointIsPermanent(t *testing.T) {
 	for _, address := range []string{"vpn.example.com:443", "127.0.0.1:0", "0.0.0.0:443", "[ff02::1]:443"} {
-		_, err := tunnel.Dial(context.Background(), tunnel.Config{
+		_, err := tunnel.Dial(context.Background(), withTestDeviceProof(tunnel.Config{
 			URL: "https://vpn.example.invalid", Token: testToken,
 			Transport: tunnel.TransportAuto, DialAddress: address, Timeout: time.Second,
-		})
+		}))
 		if err == nil || tunnel.IsTransportUnavailable(err) || tunnel.IsRetryable(err) {
 			t.Fatalf("invalid pinned address %q classified as recoverable: %v", address, err)
 		}

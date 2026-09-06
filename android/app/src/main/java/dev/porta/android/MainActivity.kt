@@ -439,9 +439,15 @@ class MainActivity : Activity() {
     private fun renderProfiles() {
         if (!::profilesContainer.isInitialized) return
         profilesContainer.removeAllViews()
-        val profiles = profileStore.profiles()
+        val (snapshot, result) = profileStore.read()
+        val profiles = result.profiles
+        if (result.needsRecovery) {
+            profilesContainer.addView(profileRecovery(snapshot, result))
+        } else if (profileStore.archiveCount() > 0) {
+            profilesContainer.addView(profileArchives())
+        }
         if (profiles.isEmpty()) {
-            profilesContainer.addView(emptyProfiles())
+            if (!result.needsRecovery) profilesContainer.addView(emptyProfiles())
             return
         }
         val activeProfileId = TunnelService.currentProfileId()
@@ -452,6 +458,66 @@ class MainActivity : Activity() {
                 },
             )
         }
+    }
+
+    private fun profileRecovery(snapshot: ProfileSnapshot, result: ProfileReadResult): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(17), dp(16), dp(17), dp(16))
+            background = rounded(COLOR_CARD, 18f, COLOR_DELETE_DARK)
+            val message = TextView(this@MainActivity).apply {
+                text = getString(R.string.profile_recovery_warning, result.profiles.size)
+                setTextColor(COLOR_TEXT)
+                textSize = 13f
+            }
+            addView(message)
+            addView(Button(this@MainActivity).apply {
+                setText(R.string.profile_storage_retry)
+                isAllCaps = false
+                setOnClickListener { renderProfiles() }
+            })
+            val consent = CheckBox(this@MainActivity).apply {
+                setText(R.string.profile_recovery_consent)
+                setTextColor(COLOR_TEXT)
+            }
+            addView(consent)
+            addView(Button(this@MainActivity).apply {
+                setText(R.string.profile_recovery_action)
+                isAllCaps = false
+                isEnabled = false
+                consent.setOnCheckedChangeListener { _, checked -> isEnabled = checked }
+                setOnClickListener {
+                    if (profileStore.recover(snapshot)) {
+                        renderProfiles()
+                    } else {
+                        message.setText(R.string.profile_recovery_failed)
+                        consent.isChecked = false
+                    }
+                }
+            })
+            layoutParams = marginParams(top = 10).apply { bottomMargin = dp(10) }
+        }
+
+    private fun profileArchives(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        val message = TextView(this@MainActivity).apply {
+            setText(R.string.profile_archives_retained)
+            setTextColor(COLOR_MUTED)
+            textSize = 12f
+        }
+        addView(message)
+        addView(Button(this@MainActivity).apply {
+            setText(R.string.profile_archives_retry)
+            isAllCaps = false
+            setOnClickListener {
+                val restored = profileStore.restoreArchives()
+                if (restored > 0) renderProfiles()
+                else message.setText(
+                    if (restored == 0) R.string.profile_archives_unavailable
+                    else R.string.profile_recovery_failed,
+                )
+            }
+        })
     }
 
     private fun profileCard(profile: VpnProfile, activeProfileId: String?): View {

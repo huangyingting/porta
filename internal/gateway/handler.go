@@ -170,15 +170,20 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 
 	defer c.Pool.Release(lease)
 
-	session, sessionCtx, collapsed, err := c.Router.RegisterGroup(
-		r.Context(),
-		lease.Address,
-		lanes.sessionID,
-		lanes.index,
-		lanes.count,
-		r.RemoteAddr,
-	)
-	if err != nil {
+	var session *Session
+	var sessionCtx context.Context
+	var collapsed bool
+	registered := c.Pool.registerLease(lease, func() {
+		session, sessionCtx, collapsed, err = c.Router.RegisterGroup(
+			r.Context(),
+			lease.Address,
+			lanes.sessionID,
+			lanes.index,
+			lanes.count,
+			r.RemoteAddr,
+		)
+	})
+	if !registered || err != nil {
 		http.Error(w, "invalid tunnel lane group", http.StatusConflict)
 		return
 	}

@@ -176,3 +176,39 @@ func TestSessionCancellationInterruptsPendingDial(t *testing.T) {
 	}
 	<-done
 }
+
+func TestSessionCancellationInterruptsInitialConnectResponse(t *testing.T) {
+	handler := newTestHandler(t)
+	upstream, peer := net.Pipe()
+	defer peer.Close()
+	handler.dial = func(context.Context, string, string) (net.Conn, error) { return upstream, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body, requestWriter := io.Pipe()
+	defer requestWriter.Close()
+	request := httptest.NewRequest(http.MethodConnect, "http://example.com:443", body).WithContext(ctx)
+	request.URL.Host, request.Host = "example.com:443", "example.com:443"
+	request.ProtoMajor = 2
+	request.Header.Set("Proxy-Authorization", basicProxyAuth("phone", testToken))
+	response := &blockedConnectHeaderWriter{&blockedResponseWriter{
+		started: make(chan struct{}), unblocked: make(chan struct{}),
+	}}
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, request)
+		close(done)
+	}()
+	<-response.started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Error("session cancellation did not interrupt initial CONNECT response headers")
+		_ = response.SetWriteDeadline(time.Now())
+		<-done
+	}
+}
+
+type blockedConnectHeaderWriter struct{ *blockedResponseWriter }
+
+func (w *blockedConnectHeaderWriter) WriteHeader(int) { _, _ = w.Write(nil) }

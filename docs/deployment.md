@@ -82,12 +82,14 @@ sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --port 8443
 ```
 
-Certificate and key paths are canonicalized before installation and must not
-resolve under `/tmp` or `/var/tmp`, because the hardened synchronization unit
-uses a private temporary directory. Private-CA and self-managed certificates
-are supported; deployment verifies the key pair before installation and probes
-the loopback-bound public listener for availability without requiring the
-deployment host to trust that private issuer.
+Certificate and key paths and their resolved targets are validated before
+installation. Neither may reside under `/tmp` or `/var/tmp`, because the
+hardened synchronization unit uses a private temporary directory. The supplied
+live symlink paths are preserved so later synchronization follows certificate
+renewal. Private-CA and self-managed certificates are supported: deployment
+verifies the key pair before installation, then uses the installed certificate
+as explicit trust material to verify TLS and the hostname on the loopback-bound
+public listener. These local probes bypass HTTP proxy environment settings.
 
 Porta's authenticated HTTPS CONNECT proxy is enabled on the same TLS port by
 default. Add `--disable-forward-proxy` only when the deployment should provide
@@ -505,6 +507,9 @@ sudo /usr/local/libexec/porta/server-down.sh porta0 eth0
 
 The cleanup helper fails explicitly if required networking tools are missing,
 removes tracked Docker exceptions, and restores the saved host IPv4 forwarding
-state instead of leaving the machine configured as a router.
+state instead of leaving the machine configured as a router. Failed network
+inventory is not treated as successful cleanup. Docker recovery markers are
+retained on errors and retired only after the rules, or their chain, are
+confirmed absent.
 
 Credential and lease files are intentionally not removed automatically.

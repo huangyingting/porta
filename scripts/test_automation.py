@@ -4,12 +4,15 @@
 import base64
 import hashlib
 import fcntl
+import http.server
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import subprocess
+import threading
 import time
 import unittest
 import uuid
@@ -47,6 +50,7 @@ class AutomationTests(unittest.TestCase):
         for command in (
             "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "openssl",
             "curl", "ss", "make", "mv", "git", "gomobile", "adb", "sleep", "gh", "uname",
+            "sudo", "unshare",
         ):
             (self.bin / command).symlink_to(MOCK)
 
@@ -68,7 +72,8 @@ class AutomationTests(unittest.TestCase):
     def run_script(self, name, *args, success=True, cwd=None):
         result = subprocess.run(
             ["bash" if name.endswith(("deploy.sh", "server-up.sh", "server-down.sh",
-                                      "check-version.sh", "build-android-aar.sh")) else "sh",
+                                      "check-version.sh", "build-android-aar.sh",
+                                      "test-server-firewall.sh")) else "sh",
              str(ROOT / "scripts" / name), *map(str, args)],
             cwd=cwd or self.root, env=self.env, text=True, capture_output=True,
             timeout=30,
@@ -337,6 +342,60 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(self.state()["nft_tables"], old_tables)
         self.assertIn(["ip", "link", "set", "dev", "porta0", "down"], self.commands())
 
+    def test_down_reports_failed_network_inventory(self):
+        for failure in ("fail_nft_list", "fail_ip_list"):
+            with self.subTest(failure=failure):
+                self.update_state(
+                    nft_tables={"ip porta": "old", "inet porta_guard": "old guard"},
+                    **({"fail_nft_list": False, "fail_ip_list": False} | {failure: True}),
+                )
+                result = self.run_script("server-down.sh", "porta0", success=False)
+                self.assertIn("could not", result.stderr)
+
+    def test_up_rejects_failed_nft_inventory_before_changing_network(self):
+        old_tables = {"ip porta": "old", "inet porta_guard": "old guard"}
+        self.update_state(nft_tables=old_tables, fail_nft_list=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443", success=False)
+        self.assertEqual(self.state()["nft_tables"], old_tables)
+        self.assertFalse(any(call[0] in ("ip", "sysctl") for call in self.commands()))
+
+    def test_docker_inventory_failure_preserves_recovery_marker(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.update_state(fail_iptables_list=True)
+        self.run_script("server-down.sh", "porta0", success=False)
+        self.assertEqual((self.root / "runtime/docker-rules-porta0").read_text(), "eth0\n")
+        self.assertEqual(len(self.state()["iptables_rules"]), 2)
+
+    def test_down_retires_docker_marker_when_chain_is_confirmed_absent(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.update_state(docker=False, iptables_rules=[])
+        self.run_script("server-down.sh", "porta0")
+        self.assertFalse((self.root / "runtime/docker-rules-porta0").exists())
+
+    def test_invalid_docker_marker_is_retained_without_using_invalid_interfaces(self):
+        directory = self.root / "runtime"
+        directory.mkdir()
+        marker = directory / "docker-rules-porta0"
+        marker.write_text("invalid interface\n")
+        self.update_state(docker=True)
+        self.run_script("server-down.sh", "porta0", success=False)
+        self.assertTrue(marker.exists())
+        self.assertFalse(any("invalid interface" in call for call in self.commands()))
+
+    def test_native_firewall_runner_isolates_runtime_files(self):
+        sentinel = self.root / "runtime"
+        sentinel.mkdir()
+        marker = sentinel / "ip-forward-porta0"
+        marker.write_text("sentinel\n")
+        self.run_script("test-server-firewall.sh")
+        self.assertEqual(marker.read_text(), "sentinel\n")
+        self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
     def version_file(self, value):
         path = self.root / "internal/buildinfo/VERSION"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -600,6 +659,94 @@ class AutomationTests(unittest.TestCase):
         self.run_deploy(deploy, "--build-local", "--cert", certificate_link,
                         "--key", key_link, success=False)
         self.assertNotIn("stopped_helpers", self.state())
+
+    def test_deployed_certificate_sync_follows_renewal_symlinks(self):
+        deploy = self.prepare_deploy()
+        old_cert, old_key = self.certificate_pair("archive-old", "old")
+        renewed_cert, renewed_key = self.certificate_pair("archive-renewed", "renewed")
+        cert_link, key_link = self.root / "live.crt", self.root / "live.key"
+        cert_link.symlink_to(old_cert)
+        key_link.symlink_to(old_key)
+        self.run_deploy(deploy, "--build-local", "--cert", cert_link, "--key", key_link)
+        cert_link.unlink()
+        key_link.unlink()
+        cert_link.symlink_to(renewed_cert)
+        key_link.symlink_to(renewed_key)
+        result = subprocess.run(
+            [str(self.bin / "systemctl"), "start", "porta-cert-sync.service"],
+            cwd=self.root, env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        destination = self.root / "system/etc/porta/tls"
+        self.assertEqual((destination / "server.crt").read_text(), "certificate:renewed")
+        self.assertEqual((destination / "server.key").read_text(), "key:renewed")
+
+    def test_static_tls_probe_verifies_the_installed_certificate(self):
+        deploy = self.prepare_deploy()
+        cert, key = self.certificate_pair("source", "new")
+        self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key)
+        probe = next(call for call in self.commands()
+                     if call[0] == "curl" and "--resolve" in call)
+        self.assertNotIn("--insecure", probe)
+        self.assertEqual(probe[probe.index("--cacert") + 1],
+                         str(self.root / "system/etc/porta/tls/server.crt"))
+        self.assertEqual(probe[probe.index("--noproxy") + 1], "*")
+
+    def test_static_tls_probe_accepts_private_cert_and_rejects_wrong_peer(self):
+        real_openssl = shutil.which("openssl")
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_openssl)
+        self.assertIsNotNone(real_curl)
+        (self.bin / "openssl").unlink()
+        (self.bin / "openssl").symlink_to(real_openssl)
+        certificate, key = self.root / "source.crt", self.root / "source.key"
+        subprocess.run(
+            [real_openssl, "req", "-x509", "-newkey", "ec", "-pkeyopt",
+             "ec_paramgen_curve:P-256", "-nodes", "-sha256", "-days", "1",
+             "-subj", "/CN=vpn.example", "-addext", "subjectAltName=DNS:vpn.example",
+             "-keyout", str(key), "-out", str(certificate)],
+            check=True, capture_output=True, timeout=10,
+        )
+        deploy = self.prepare_deploy()
+        self.run_deploy(deploy, "--build-local", "--cert", certificate, "--key", key)
+        probe = next(call for call in self.commands()
+                     if call[0] == "curl" and "--resolve" in call)
+
+        class LandingHandler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certificate, key)
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), LandingHandler) as server:
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                port = server.server_port
+                for host, expected_status in (("vpn.example", 0), ("wrong.example", 60)):
+                    with self.subTest(host=host):
+                        command = [real_curl, *probe[1:]]
+                        command[command.index("--resolve") + 1] = f"{host}:{port}:127.0.0.1"
+                        command[-1] = f"https://{host}:{port}/"
+                        result = subprocess.run(
+                            command, env=self.env | {
+                                "HTTPS_PROXY": "http://127.0.0.1:1",
+                                "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "",
+                            }, capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, expected_status, result.stderr)
+                        if expected_status == 0:
+                            self.assertEqual(result.stdout, "200|text/html")
+            finally:
+                server.shutdown()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
 
     def release_assets(self, landing_templates=True, proxy_headers=True):
         release = self.root / "release"

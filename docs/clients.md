@@ -367,6 +367,14 @@ only one profile can be active. The app supports bounded reconnects, optional
 reconnect after device restart, live traffic statistics, and a local diagnostic
 log that excludes tokens and authorization headers.
 
+If saved profiles cannot be read, healthy profiles remain available while saves
+and deletions are paused. Use **Retry reading profiles** first. Explicit,
+inline consent is required to **Archive and repair storage**: readable profiles
+are retained, and the original ciphertext and encryption-key references are
+archived locally rather than deleted. **Retry archived profiles** can recover
+additional profiles after a temporary device-security failure without
+overwriting later edits or enabling auto-connect on restored profiles.
+
 Swipe an inactive profile at least halfway across its card, **right to edit**
 or **left to delete**. The action stays armed through a small retreat, gives
 haptic feedback, and then animates through; shorter swipes return to their

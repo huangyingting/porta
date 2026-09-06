@@ -57,6 +57,10 @@ func secureIdentityFile(path string) error {
 	return os.Chmod(path, 0o600)
 }
 
+func readIdentityFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
 func withFileLock(path string, action func() error) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err

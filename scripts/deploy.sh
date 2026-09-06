@@ -142,17 +142,17 @@ if $build_local; then
   fi
 fi
 if [[ $tls_mode == static ]]; then
-  certificate=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$certificate")
-  private_key=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$private_key")
-  [[ $certificate != *[$'\n\r\t ']* && $private_key != *[$'\n\r\t ']* &&
-     $certificate =~ ^/[A-Za-z0-9_./:@+-]+$ && $private_key =~ ^/[A-Za-z0-9_./:@+-]+$ ]] ||
+  resolved_certificate=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$certificate")
+  resolved_private_key=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$private_key")
+  [[ $resolved_certificate != *[$'\n\r\t ']* && $resolved_private_key != *[$'\n\r\t ']* &&
+     $resolved_certificate =~ ^/[A-Za-z0-9_./:@+-]+$ && $resolved_private_key =~ ^/[A-Za-z0-9_./:@+-]+$ ]] ||
     die "resolved certificate paths contain unsupported characters"
-  case "$certificate" in
-    /tmp/*|/var/tmp/*) die "--cert must not resolve inside a temporary directory" ;;
-  esac
-  case "$private_key" in
-    /tmp/*|/var/tmp/*) die "--key must not resolve inside a temporary directory" ;;
-  esac
+  # Keep the issuer's live symlink paths so renewal can replace their targets.
+  for path in "$certificate" "$private_key" "$resolved_certificate" "$resolved_private_key"; do
+    case "$path" in
+      /tmp/*|/var/tmp/*) die "certificate paths must not reside or resolve inside a temporary directory" ;;
+    esac
+  done
 fi
 
 if [[ -z $external_interface ]]; then
@@ -678,18 +678,18 @@ if [[ $tls_mode == static ]]; then
 fi
 
 for _ in $(seq 1 30); do
-  if curl --silent --show-error --fail --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null; then
+  if curl --silent --show-error --fail --noproxy '*' --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null; then
     break
   fi
   sleep 1
 done
-curl --silent --show-error --fail --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
+curl --silent --show-error --fail --noproxy '*' --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
 landing_tls_arguments=()
 if [[ $tls_mode == static ]]; then
-  landing_tls_arguments+=(--insecure)
+  landing_tls_arguments+=(--cacert /etc/porta/tls/server.crt)
 fi
-landing_probe=$(curl --silent --show-error --fail --head --output /dev/null \
+landing_probe=$(curl --silent --show-error --fail --noproxy '*' --head --output /dev/null \
   --write-out '%{http_code}|%{content_type}' --connect-timeout 5 --max-time 30 \
   "${landing_tls_arguments[@]}" \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||

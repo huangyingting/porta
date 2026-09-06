@@ -1,10 +1,112 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestPoolRejectsSupersededLeaseRegistration(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		pool, err := NewPool("10.66.0.0/30")
+		if err != nil {
+			t.Fatal(err)
+		}
+		router := NewRouter(testPacketDevice{}, nil)
+		acquire := func(group string) Lease {
+			t.Helper()
+			var lease Lease
+			if grouped {
+				lease, err = pool.AcquireGroup("client-a", group)
+			} else {
+				lease, err = pool.Acquire("client-a")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			return lease
+		}
+		first := acquire("first-session")
+		second := acquire("second-session")
+		var currentCtx context.Context
+		register := func(lease Lease, group string) bool {
+			return pool.registerLease(lease, func() {
+				var session *Session
+				var ctx context.Context
+				if grouped {
+					session, ctx, _, err = router.RegisterGroup(context.Background(), lease.Address, group, 0, 2, "")
+				} else {
+					session, ctx = router.Register(context.Background(), lease.Address)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if group == "second-session" {
+					currentCtx = ctx
+				}
+				t.Cleanup(session.Close)
+			})
+		}
+		if !register(second, "second-session") {
+			t.Fatal("current lease registration rejected")
+		}
+		if register(first, "first-session") {
+			t.Errorf("stale lease replaced current routed session (grouped=%t)", grouped)
+		}
+		pool.Release(first)
+		if currentCtx.Err() != nil {
+			pool.Release(second)
+		}
+		if _, err := pool.Acquire("client-b"); !errors.Is(err, ErrPoolExhausted) {
+			t.Errorf("replacement cleanup freed a still-routed address (grouped=%t): %v", grouped, err)
+		}
+	}
+}
+
+func TestPoolRegistrationSerializesReconnect(t *testing.T) {
+	pool, err := NewPool("10.66.0.0/30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := pool.Acquire("client-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	registered := make(chan bool, 1)
+	go func() {
+		registered <- pool.registerLease(lease, func() {
+			close(entered)
+			<-release
+		})
+	}()
+	<-entered
+	started, acquired := make(chan struct{}), make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := pool.Acquire("client-a")
+		acquired <- err
+	}()
+	<-started
+	completedEarly := false
+	select {
+	case err := <-acquired:
+		completedEarly = true
+		t.Errorf("reconnect superseded lease during router registration: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if !<-registered {
+		t.Fatal("current lease was rejected")
+	}
+	if !completedEarly {
+		if err := <-acquired; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestPoolReconnectKeepsAddressAndOldReleaseIsIgnored(t *testing.T) {
 	pool, err := NewPool("10.66.0.0/29")

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/huangyingting/porta/internal/abuse"
@@ -182,6 +183,12 @@ func TestStreamTunnelPreservesReverseHalfClose(t *testing.T) {
 	defer clientPeer.Close()
 	client := <-clientAccepted
 	defer client.Close()
+	_ = clientPeer.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = upstreamPeer.SetDeadline(time.Now().Add(3 * time.Second))
+	handler := newTestHandler(t)
+	usageSession := handler.usage.Begin("", "account", "device", "test", "", "")
+	defer usageSession.Close()
+	upstream = &meteredConn{Conn: &idleConn{Conn: upstream, timeout: time.Minute}, session: usageSession}
 
 	finished := make(chan struct{})
 	go func() {
@@ -242,6 +249,55 @@ func TestStreamTunnelTerminatesWhenWriterCannotHalfClose(t *testing.T) {
 		t.Fatal("terminal response writer was not closed")
 	}
 }
+
+func TestStreamTunnelUpstreamEOFInterruptsBlockedUpload(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		upstream := &halfClosedBlockingConn{writing: make(chan struct{}), closed: make(chan struct{})}
+		defer upstream.Close()
+		handler := newTestHandler(t)
+		session := handler.usage.Begin("", "account", "device", "test", "", "")
+		defer session.Close()
+		wrapped := &meteredConn{Conn: &idleConn{Conn: upstream, timeout: time.Minute}, session: session}
+		writer := newFlushWriter(httptest.NewRecorder(), 128, time.Hour)
+		defer writer.Close()
+		done := make(chan struct{})
+		go func() {
+			copyStreamTunnel(context.Background(), wrapped, io.NopCloser(strings.NewReader("upload")), writer)
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Error("upstream EOF left an in-flight upload blocked after closing the HTTP/2 body")
+		}
+	})
+}
+
+type halfClosedBlockingConn struct {
+	net.Conn
+	writing chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *halfClosedBlockingConn) Read([]byte) (int, error) {
+	<-c.writing
+	return 0, io.EOF
+}
+
+func (c *halfClosedBlockingConn) Write([]byte) (int, error) {
+	close(c.writing)
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *halfClosedBlockingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (*halfClosedBlockingConn) SetDeadline(time.Time) error { return nil }
 
 func TestCamouflagePassesInvalidProxyRequestsToWebsite(t *testing.T) {
 	handler, err := New(Config{

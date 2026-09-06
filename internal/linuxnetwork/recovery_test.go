@@ -203,6 +203,50 @@ func TestInvalidJournalIsRejectedWithoutCommands(t *testing.T) {
 	}
 }
 
+func TestV2JournalRequiresTunnelOwnershipForEveryUndoAction(t *testing.T) {
+	for _, kind := range []string{"alias", "link", "address", "route", "dns-route", "dns"} {
+		t.Run(kind, func(t *testing.T) {
+			runner, system := newFake(t)
+			if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+				t.Fatal(err)
+			}
+			for index := range runner.state.Undo {
+				if runner.state.Undo[index].Kind == kind {
+					runner.state.Undo[index].LinkAlias = ""
+					break
+				}
+			}
+			if err := runner.persist(); err != nil {
+				t.Fatal(err)
+			}
+			if err := runner.releaseLock(); err != nil {
+				t.Fatal(err)
+			}
+			if recovered, err := NewRunner(runner.statePath); err == nil {
+				_ = recovered.releaseLock()
+				t.Fatal("v2 journal missing tunnel ownership was accepted")
+			}
+			if len(system.tables) != 1 {
+				t.Fatal("invalid journal released protection")
+			}
+		})
+	}
+}
+
+func TestPrepareDoesNotExemptReusedTunnelNameAndIndex(t *testing.T) {
+	runner, system := newFake(t)
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	system.links["porta0"].Alias = ""
+	if err := runner.Prepare(context.Background(), testEndpoint()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(system.scripts[len(system.scripts)-1], `oifname "porta0" meta oif 10 accept`) {
+		t.Fatal("reused interface name and index received the old tunnel's firewall exemption")
+	}
+}
+
 func TestCanceledReconfigureKeepsProtection(t *testing.T) {
 	runner, system := newFake(t)
 	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {

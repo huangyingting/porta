@@ -356,9 +356,22 @@ func resolveQUICAddressesWithLookup(
 	if len(addresses) == 0 {
 		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 	}
+	first, second := make([]netip.Addr, 0, len(addresses)), make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		if address.Is4() == addresses[0].Is4() {
+			first = append(first, address)
+		} else {
+			second = append(second, address)
+		}
+	}
 	resolved := make([]string, 0, len(addresses))
-	for _, resolvedAddress := range addresses {
-		resolved = append(resolved, net.JoinHostPort(resolvedAddress.String(), port))
+	for index := 0; index < max(len(first), len(second)); index++ {
+		if index < len(first) {
+			resolved = append(resolved, net.JoinHostPort(first[index].String(), port))
+		}
+		if index < len(second) {
+			resolved = append(resolved, net.JoinHostPort(second[index].String(), port))
+		}
 	}
 	return resolved, nil
 }
@@ -369,8 +382,25 @@ func dialQUICAddresses(
 	tlsConfig *tls.Config,
 	quicConfig *quic.Config,
 ) (*quic.Conn, error) {
+	return dialQUICAddressesWithDial(ctx, addresses, func(ctx context.Context, address string) (*quic.Conn, error) {
+		return quic.DialAddr(ctx, address, tlsConfig, quicConfig)
+	}, 250*time.Millisecond)
+}
+
+func dialQUICAddressesWithDial(
+	ctx context.Context,
+	addresses []string,
+	dial func(context.Context, string) (*quic.Conn, error),
+	delay time.Duration,
+) (*quic.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("QUIC destination has no addresses")
+	}
 	if len(addresses) == 1 {
-		return quic.DialAddr(ctx, addresses[0], tlsConfig, quicConfig)
+		return dial(ctx, addresses[0])
 	}
 	type result struct {
 		connection *quic.Conn
@@ -380,20 +410,14 @@ func dialQUICAddresses(
 	finished := make(chan struct{})
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	for index, address := range addresses {
+	defer close(finished)
+	next, active := 0, 0
+	startNext := func() {
+		address := addresses[next]
+		next++
+		active++
 		go func() {
-			if delay := time.Duration(index) * 250 * time.Millisecond; delay > 0 {
-				timer := time.NewTimer(delay)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-				case <-finished:
-					return
-				case <-attemptCtx.Done():
-					return
-				}
-			}
-			connection, err := quic.DialAddr(attemptCtx, address, tlsConfig, quicConfig)
+			connection, err := dial(attemptCtx, address)
 			select {
 			case results <- result{connection: connection, err: err}:
 			case <-finished:
@@ -403,22 +427,48 @@ func dialQUICAddresses(
 			}
 		}()
 	}
+	startNext()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	var timerC <-chan time.Time
+	resetTimer := func() {
+		timer.Stop()
+		timerC = nil
+		if next < len(addresses) {
+			timer.Reset(delay)
+			timerC = timer.C
+		}
+	}
+	resetTimer()
 	var failures []error
-	for range addresses {
+	for active > 0 {
 		select {
 		case <-ctx.Done():
-			close(finished)
 			return nil, ctx.Err()
+		case <-timerC:
+			startNext()
+			resetTimer()
 		case result := <-results:
+			active--
+			if isPermanent(result.err) {
+				return nil, result.err
+			}
+			if err := ctx.Err(); err != nil {
+				if result.connection != nil {
+					_ = result.connection.CloseWithError(0, "")
+				}
+				return nil, err
+			}
 			if result.err == nil {
-				close(finished)
-				cancel()
 				return result.connection, nil
 			}
 			failures = append(failures, result.err)
+			if next < len(addresses) {
+				startNext()
+				resetTimer()
+			}
 		}
 	}
-	close(finished)
 	return nil, errors.Join(failures...)
 }
 

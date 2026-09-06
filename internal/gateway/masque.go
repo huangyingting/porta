@@ -69,7 +69,14 @@ func (config HandlerConfig) serveMasque(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer c.Pool.Release(lease)
-	session, sessionCtx := c.Router.Register(r.Context(), lease.Address)
+	var session *Session
+	var sessionCtx context.Context
+	if !c.Pool.registerLease(lease, func() {
+		session, sessionCtx = c.Router.Register(r.Context(), lease.Address)
+	}) {
+		http.Error(w, "tunnel lease superseded", http.StatusConflict)
+		return
+	}
 	defer session.Close()
 	stopResponseIO := stopStreamOnCancel(sessionCtx, w, r.Body)
 	defer stopResponseIO()

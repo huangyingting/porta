@@ -62,7 +62,7 @@ jobs:
       - name: Test Windows packages
         env:
           PORTA_WFP_NATIVE_TEST: "1"
-        run: go test -count=1 ./internal/clientapp ./internal/clientprofile ./internal/winnetwork ./cmd/porta-client ./cmd/porta-windows
+        run: go test -count=1 ./internal/clientapp ./internal/clientid ./internal/clientprofile ./internal/winnetwork ./cmd/porta-client ./cmd/porta-windows
       - name: Build Windows applications
         shell: pwsh
         run: |

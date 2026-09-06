@@ -74,6 +74,10 @@ ensure_docker_rule() {
   iptables -w -I DOCKER-USER "$position" "$@"
 }
 
+nft_tables=$(nft list tables) || {
+  echo "could not inspect existing nftables tables" >&2
+  exit 1
+}
 ip link show dev "$tun_interface" >/dev/null
 ip link show dev "$external_interface" >/dev/null
 ip address replace "$gateway_cidr" dev "$tun_interface"
@@ -104,10 +108,10 @@ if [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
 fi
 
 {
-  if nft list table ip porta >/dev/null 2>&1; then
+  if grep -Fxq 'table ip porta' <<<"$nft_tables"; then
     echo "delete table ip porta"
   fi
-  if nft list table inet porta_guard >/dev/null 2>&1; then
+  if grep -Fxq 'table inet porta_guard' <<<"$nft_tables"; then
     echo "delete table inet porta_guard"
   fi
   cat <<EOF
@@ -151,11 +155,11 @@ if [[ ${#tracked_external_interfaces[@]} -gt 0 ]] && ! command -v iptables >/dev
   exit 1
 fi
 if command -v iptables >/dev/null; then
-  if ! iptables -w -S DOCKER-USER >/dev/null 2>&1; then
-    [[ ${#tracked_external_interfaces[@]} -eq 0 ]] || {
-      echo "could not inspect previously installed Docker rules" >&2
-      exit 1
-    }
+  docker_rules=$(iptables -w -S) || {
+    echo "could not inspect existing Docker rules" >&2
+    exit 1
+  }
+  if ! grep -Fxq -- '-N DOCKER-USER' <<<"$docker_rules"; then
     rm -f "$docker_rules_state"
   else
     {

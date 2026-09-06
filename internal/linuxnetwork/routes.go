@@ -365,7 +365,8 @@ func (r *Runner) actionLink(ctx context.Context, a action) (*linkInfo, error) {
 	}
 	if a.LinkAlias != "" {
 		for index := range links {
-			if links[index].Alias == a.LinkAlias {
+			if links[index].Alias == a.LinkAlias && links[index].Index == a.Index &&
+				links[index].LinkInfo.Kind == a.LinkKind {
 				return &links[index], nil
 			}
 		}

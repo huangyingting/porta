@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="profile_recovery_warning">Some saved profiles cannot be read. %1$d readable profiles are still available. Saving and deleting are paused to protect your data. Retry first; this may be a temporary device security error.</string>
+    <string name="profile_storage_retry">Retry reading profiles</string>
+    <string name="profile_recovery_consent">Keep readable profiles and archive unreadable data on this device. Unreadable profiles will leave the active list; their encrypted originals and keys will be retained.</string>
+    <string name="profile_recovery_action">Archive and repair storage</string>
+    <string name="profile_recovery_failed">Recovery could not be completed or storage changed. Your original data is retained. Retry reading profiles before trying again.</string>
+    <string name="profile_archives_retained">Encrypted recovery archives are retained on this device. Retry them if device security becomes available again. Existing profiles will not be overwritten.</string>
+    <string name="profile_archives_retry">Retry archived profiles</string>
+    <string name="profile_archives_unavailable">No additional profiles could be read from the archives. The encrypted originals are still retained.</string>
     <string name="app_name">Porta</string>
     <string name="profile_tagline">Secure access to your networks</string>
     <string name="vpn_profiles">VPN PROFILES</string>

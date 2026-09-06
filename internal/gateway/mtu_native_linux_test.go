@@ -48,6 +48,7 @@ func TestNativeMTUFeedback(t *testing.T) {
 	if len(interfaces) != 1 || interfaces[0].Name != "lo" {
 		t.Fatal("refusing native network test outside a fresh, loopback-only network namespace")
 	}
+	t.Setenv("PORTA_RUNTIME_DIRECTORY", t.TempDir())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

@@ -58,10 +58,15 @@ Do not enable the environment variable directly against host networking.
 nftables parsing, atomic replacement, the IPv4/IPv6 TCP and UDP source meters,
 and complete cleanup without changing the host firewall or interfaces. It
 requires `ip`, `nft`, `sysctl`, `unshare`, and passwordless `sudo`.
+Both native targets set `PORTA_RUNTIME_DIRECTORY` to a private, per-test
+temporary directory and clean it afterward. Network namespaces alone do not
+isolate files, so the tests never use the installed service's `/run/porta`
+recovery journals or an inherited runtime-directory override.
 
 Windows networking script regressions use isolated PowerShell mocks. They run
 when `pwsh` is on `PATH`, or with Windows PowerShell on Windows; otherwise those
-tests are explicitly skipped. The Windows CI job runs the platform packages.
+tests are explicitly skipped. The Windows CI job runs the platform packages,
+including the identity-storage handle, link rejection, and protected ACL tests.
 It builds the Wails desktop with the `production` tag, smoke-tests WebView2
 startup, verifies the pinned Wintun archive, and uploads the complete Windows
 ZIP as a workflow artifact.

@@ -459,6 +459,79 @@ func TestEveryAmbiguousMutationIsJournaledAndRecoverable(t *testing.T) {
 	}
 }
 
+func TestAliasOnlySetupCanReconfigureAnotherInterface(t *testing.T) {
+	runner, system := newFake(t)
+	system.failMatch = "-j address show dev porta0"
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err == nil {
+		t.Fatal("expected failure after assigning the ownership alias")
+	}
+	if system.links["porta0"].Alias == "" || runner.hasAction("link", "porta0", "") {
+		t.Fatal("test did not stop between alias assignment and link journaling")
+	}
+	replacement := &linkInfo{Index: 11, Name: "porta1", MTU: 1600, Flags: []string{"POINTOPOINT"}}
+	replacement.LinkInfo.Kind = "tun"
+	system.links["porta1"] = replacement
+	system.failMatch = ""
+	if err := runner.Reconfigure(context.Background(), "porta1", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	if system.links["porta0"].Alias != "" {
+		t.Fatal("previous alias-only setup still owns the journal alias on a second interface")
+	}
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.MTU != 1600 || replacement.Alias != "" || len(system.addresses["porta1"]) != 0 {
+		t.Fatal("new interface was not restored")
+	}
+}
+
+func TestFailedAliasAssignmentCanBeRetriedWithoutGrowingJournal(t *testing.T) {
+	runner, system := newFake(t)
+	system.failMatch = "link set dev porta0 alias"
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err == nil {
+			t.Fatal("expected alias assignment failure")
+		}
+		aliases := 0
+		for _, a := range runner.state.Undo {
+			if a.Kind == "alias" {
+				aliases++
+			}
+		}
+		if aliases != 1 {
+			t.Fatalf("attempt %d left %d alias actions; want 1", attempt+1, aliases)
+		}
+	}
+	system.failMatch = ""
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAliasOnDifferentInterfaceDoesNotReceiveStaleRestoration(t *testing.T) {
+	runner, system := newFake(t)
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	alias := system.links["porta0"].Alias
+	delete(system.links, "porta0")
+	replacement := &linkInfo{Index: 11, Name: "other0", Alias: alias, MTU: 9000, Flags: []string{"UP"}}
+	system.links["other0"] = replacement
+	link, err := runner.actionLink(context.Background(), action{
+		Interface: "porta0", Index: 10, LinkKind: "tun", LinkAlias: alias,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if link != nil {
+		t.Fatal("an alias alone claimed an unrelated interface with a different index and kind")
+	}
+}
+
 func TestCleanupFailureKeepsFirewallAndJournalForRetry(t *testing.T) {
 	runner, system := newFake(t)
 	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
