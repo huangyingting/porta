@@ -1,0 +1,18 @@
+[package]
+name = "porta-rust-relay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytes = "=1.12.1"
+h2 = "=0.4.19"
+h3 = { git = "https://github.com/hyperium/h3.git", rev = "1f3d5295833ad454343f25d55633fb6bee1027b2" }
+h3-datagram = { git = "https://github.com/hyperium/h3.git", rev = "1f3d5295833ad454343f25d55633fb6bee1027b2" }
+h3-quinn = { git = "https://github.com/hyperium/h3.git", rev = "1f3d5295833ad454343f25d55633fb6bee1027b2", features = ["datagram"] }
+http = "=1.5.0"
+quinn = { version = "=0.11.11", default-features = false, features = ["bloom", "runtime-tokio", "rustls-aws-lc-rs"] }
+rustls = "=0.23.43"
+rustls-pemfile = "=2.2.0"
+tokio = { version = "=1.53.1", features = ["macros", "net", "rt-multi-thread"] }
+tokio-rustls = "=0.26.5"

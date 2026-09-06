@@ -1,5 +1,8 @@
 /bin/
 /dist/
+/.rust-benchmark/
+/experiments/server-benchmark/rust-server/target/
+__pycache__/
 /*.pem
 /*.key
 /*.crt
