@@ -94,34 +94,7 @@ func run() error {
 			controller.reportFrameworkError(err)
 		},
 	})
-	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name:                       "porta-main",
-		Title:                      "Porta " + buildinfo.Version,
-		URL:                        "/",
-		Width:                      680,
-		Height:                     600,
-		MinWidth:                   440,
-		MinHeight:                  520,
-		InitialPosition:            application.WindowCentered,
-		BackgroundType:             application.BackgroundTypeSolid,
-		BackgroundColour:           application.NewRGBA(8, 17, 31, 255),
-		DevToolsEnabled:            false,
-		DefaultContextMenuDisabled: true,
-		Windows: application.WindowsWindow{
-			Theme:                   application.Dark,
-			DisableMenu:             true,
-			GeneralAutofillEnabled:  false,
-			PasswordAutosaveEnabled: false,
-			Permissions: map[application.CoreWebView2PermissionKind]application.CoreWebView2PermissionState{
-				application.CoreWebView2PermissionKindMicrophone:    application.CoreWebView2PermissionStateDeny,
-				application.CoreWebView2PermissionKindCamera:        application.CoreWebView2PermissionStateDeny,
-				application.CoreWebView2PermissionKindGeolocation:   application.CoreWebView2PermissionStateDeny,
-				application.CoreWebView2PermissionKindNotifications: application.CoreWebView2PermissionStateDeny,
-				application.CoreWebView2PermissionKindOtherSensors:  application.CoreWebView2PermissionStateDeny,
-				application.CoreWebView2PermissionKindClipboardRead: application.CoreWebView2PermissionStateDeny,
-			},
-		},
-	})
+	window := app.Window.NewWithOptions(mainWindowOptions())
 
 	tray := app.SystemTray.New()
 	tray.SetIcon(portaIcon)
@@ -153,6 +126,40 @@ func run() error {
 		controller.publish()
 	})
 	return app.Run()
+}
+
+func mainWindowOptions() application.WebviewWindowOptions {
+	return application.WebviewWindowOptions{
+		Name:                       "porta-main",
+		Title:                      "Porta " + buildinfo.Version,
+		URL:                        "/",
+		Width:                      440,
+		Height:                     600,
+		MinWidth:                   440,
+		MinHeight:                  520,
+		DisableResize:              true,
+		InitialPosition:            application.WindowCentered,
+		BackgroundType:             application.BackgroundTypeSolid,
+		BackgroundColour:           application.NewRGBA(8, 17, 31, 255),
+		DevToolsEnabled:            false,
+		DefaultContextMenuDisabled: true,
+		MinimiseButtonState:        application.ButtonHidden,
+		MaximiseButtonState:        application.ButtonHidden,
+		Windows: application.WindowsWindow{
+			Theme:                   application.Dark,
+			DisableMenu:             true,
+			GeneralAutofillEnabled:  false,
+			PasswordAutosaveEnabled: false,
+			Permissions: map[application.CoreWebView2PermissionKind]application.CoreWebView2PermissionState{
+				application.CoreWebView2PermissionKindMicrophone:    application.CoreWebView2PermissionStateDeny,
+				application.CoreWebView2PermissionKindCamera:        application.CoreWebView2PermissionStateDeny,
+				application.CoreWebView2PermissionKindGeolocation:   application.CoreWebView2PermissionStateDeny,
+				application.CoreWebView2PermissionKindNotifications: application.CoreWebView2PermissionStateDeny,
+				application.CoreWebView2PermissionKindOtherSensors:  application.CoreWebView2PermissionStateDeny,
+				application.CoreWebView2PermissionKindClipboardRead: application.CoreWebView2PermissionStateDeny,
+			},
+		},
+	}
 }
 
 func restartAfter(value string) error {

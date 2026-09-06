@@ -124,9 +124,10 @@ connection state, tunnel traffic and an on-device activity timeline. Profile
 editing stays within the main window rather than opening another dialog.
 The compact Activity view can clear its local history, export the visible log
 through the native Windows save dialog, or open the log directory in Explorer.
-Closing or minimizing hides Porta in the notification area. Its native tray
-menu can open the window, connect or disconnect, show Activity, restore retained
-network state, or quit safely. Porta snapshots,
+The desktop stays at a fixed compact width without minimize or maximize
+controls. Closing it hides Porta in the notification area instead of ending the
+tunnel. Its native tray menu can open the window, connect or disconnect, show
+Activity, restore retained network state, or quit safely. Porta snapshots,
 applies, and restores the Wintun IPv4 MTU through the native Windows IP Helper
 API. This avoids depending on PowerShell's `NlMtuBytes` projection, which can be
 empty for otherwise usable Wintun adapters.

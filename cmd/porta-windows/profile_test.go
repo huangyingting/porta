@@ -16,6 +16,7 @@ import (
 	"github.com/huangyingting/porta/internal/clientprofile"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/huangyingting/porta/internal/winnetwork"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 func TestProfileWithFieldsPreservesHiddenSettings(t *testing.T) {
@@ -177,6 +178,19 @@ func TestWindowCloseRequiresCompletedSafeExit(t *testing.T) {
 	controller.allowClose.Store(true)
 	if !controller.CanClose() {
 		t.Fatal("window close was blocked after safe exit was authorized")
+	}
+}
+
+func TestMainWindowIsFixedCompactUtility(t *testing.T) {
+	options := mainWindowOptions()
+	if options.Width != 440 || options.Height != 600 || !options.DisableResize {
+		t.Fatalf("main window geometry = %+v", options)
+	}
+	if options.MinimiseButtonState != application.ButtonHidden ||
+		options.MaximiseButtonState != application.ButtonHidden ||
+		options.CloseButtonState != application.ButtonEnabled {
+		t.Fatalf("main window controls = minimise %d, maximise %d, close %d",
+			options.MinimiseButtonState, options.MaximiseButtonState, options.CloseButtonState)
 	}
 }
 
