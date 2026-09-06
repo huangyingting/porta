@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -70,16 +71,32 @@ func TestStartupPreservesFailureAndCancelsLifetime(t *testing.T) {
 func TestQUICResolutionRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := resolveQUICAddress(ctx, "vpn.example.com:443"); !errors.Is(err, context.Canceled) {
+	if _, err := resolveQUICAddresses(ctx, "vpn.example.com:443"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled resolution = %v", err)
 	}
 	for _, address := range []string{"127.0.0.1:443", "[::1]:8443", "[fe80::1%lo]:443"} {
-		resolved, err := resolveQUICAddress(context.Background(), address)
-		if err != nil || resolved != address {
-			t.Fatalf("numeric resolution = %s, %v; want %s", resolved, err, address)
+		resolved, err := resolveQUICAddresses(context.Background(), address)
+		if err != nil || len(resolved) != 1 || resolved[0] != address {
+			t.Fatalf("numeric resolution = %v, %v; want %s", resolved, err, address)
 		}
 	}
-
+	resolved, err := resolveQUICAddressesWithLookup(
+		context.Background(),
+		"vpn.example.com:443",
+		func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{
+				netip.MustParseAddr("2001:db8::1"),
+				netip.MustParseAddr("192.0.2.10"),
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"[2001:db8::1]:443", "192.0.2.10:443"}
+	if len(resolved) != len(want) || resolved[0] != want[0] || resolved[1] != want[1] {
+		t.Fatalf("resolved addresses = %v, want %v", resolved, want)
+	}
 }
 
 func TestStartupDeadlinePreservesRecoveryCategory(t *testing.T) {

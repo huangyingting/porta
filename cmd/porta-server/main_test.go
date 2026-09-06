@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/huangyingting/porta/internal/certutil"
@@ -123,6 +124,12 @@ func TestServerTLSConfigRejectsInvalidACMEOptions(t *testing.T) {
 		{name: "empty domain", cache: "cache"},
 		{name: "non-qualified domain", domain: "localhost", cache: "cache"},
 		{name: "URL", domain: "https://vpn.example.com", cache: "cache"},
+		{name: "IP address", domain: "192.0.2.1", cache: "cache"},
+		{name: "empty label", domain: "vpn..example.com", cache: "cache"},
+		{name: "leading hyphen", domain: "-vpn.example.com", cache: "cache"},
+		{name: "trailing hyphen", domain: "vpn-.example.com", cache: "cache"},
+		{name: "underscore", domain: "vpn_test.example.com", cache: "cache"},
+		{name: "long label", domain: strings.Repeat("a", 64) + ".example.com", cache: "cache"},
 		{name: "empty cache", domain: "vpn.example.com"},
 	}
 	for _, test := range tests {

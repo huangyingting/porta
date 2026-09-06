@@ -81,7 +81,7 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		client, token, err := a.registry.Create(input.Name, input.MaxDevices)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			a.writeError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"client": client, "token": token})
@@ -175,7 +175,13 @@ func (a *adminAPI) writeError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Client or device not found"})
 		return
 	}
-	writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	var inputError clientInputError
+	if errors.As(err, &inputError) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": inputError.Error()})
+		return
+	}
+	a.registry.logger.Error("admin registry mutation failed", "error", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal server error"})
 }
 
 func decodeJSON(r *http.Request, target any) error {

@@ -433,15 +433,25 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 		<-done
 		<-done
 	case completed := <-done:
-		if completed.direction == 1 && completed.err == nil {
-			closeTunnelInput(upstream, clientReader)
-			<-done
-			return
-		}
 		if completed.err != nil {
 			closeTunnelEndpoints(upstream, clientReader, clientWriter)
 			<-done
 			return
+		}
+		if completed.direction == 1 {
+			halfClosed, err := closeTunnelOutput(clientWriter)
+			if err != nil {
+				closeTunnelEndpoints(upstream, clientReader, clientWriter)
+				<-done
+				return
+			}
+			if !halfClosed {
+				if closer, ok := clientReader.(io.Closer); ok {
+					_ = closer.Close()
+				}
+				<-done
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -456,11 +466,14 @@ func copyStreamTunnel(ctx context.Context, upstream net.Conn, clientReader io.Re
 	}
 }
 
-func closeTunnelInput(upstream net.Conn, clientReader io.Reader) {
-	_ = upstream.Close()
-	if closer, ok := clientReader.(io.Closer); ok {
-		_ = closer.Close()
+func closeTunnelOutput(clientWriter io.Writer) (bool, error) {
+	if closer, ok := clientWriter.(interface{ CloseWrite() error }); ok {
+		return true, closer.CloseWrite()
 	}
+	if closer, ok := clientWriter.(io.Closer); ok {
+		return false, closer.Close()
+	}
+	return false, nil
 }
 
 func copyTunnelStream(destination io.Writer, source io.Reader) error {
@@ -517,6 +530,13 @@ type writeTimeoutConn struct {
 func (c *writeTimeoutConn) Write(data []byte) (int, error) {
 	_ = c.Conn.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
 	return c.Conn.Write(data)
+}
+
+func (c *writeTimeoutConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return net.ErrClosed
 }
 
 type meteredConn struct {

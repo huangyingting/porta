@@ -77,6 +77,9 @@ func loadOrCreate(path string, protect, unprotect func([]byte) ([]byte, error)) 
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("device identity path is required")
 	}
+	if err := prepareIdentityStorage(path); err != nil {
+		return nil, err
+	}
 	var key *ecdsa.PrivateKey
 	err := withFileLock(path+".lock", func() error {
 		data, err := os.ReadFile(path)
@@ -169,6 +172,9 @@ func persist(path string, key *ecdsa.PrivateKey, protect func([]byte) ([]byte, e
 	}
 	if err := os.Rename(tempName, path); err != nil {
 		return fmt.Errorf("replace device identity: %w", err)
+	}
+	if err := secureIdentityFile(path); err != nil {
+		return fmt.Errorf("secure device identity: %w", err)
 	}
 	if directory, err := os.Open(filepath.Dir(path)); err == nil {
 		_ = directory.Sync()

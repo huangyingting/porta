@@ -45,15 +45,19 @@ type networkState struct {
 // checks current kernel state, so an interrupted command can be retried without
 // guessing whether it reached the kernel.
 type action struct {
-	Kind        string `json:"kind"`
-	Interface   string `json:"interface"`
-	Index       int    `json:"index"`
-	Family      int    `json:"family,omitempty"`
-	Destination string `json:"destination,omitempty"`
-	Gateway     string `json:"gateway,omitempty"`
-	Address     string `json:"address,omitempty"`
-	MTU         int    `json:"mtu,omitempty"`
-	WasUp       bool   `json:"was_up,omitempty"`
+	Kind          string `json:"kind"`
+	Interface     string `json:"interface"`
+	Index         int    `json:"index"`
+	LinkKind      string `json:"link_kind,omitempty"`
+	LinkAddress   string `json:"link_address,omitempty"`
+	LinkAlias     string `json:"link_alias,omitempty"`
+	PreviousAlias string `json:"previous_alias,omitempty"`
+	Family        int    `json:"family,omitempty"`
+	Destination   string `json:"destination,omitempty"`
+	Gateway       string `json:"gateway,omitempty"`
+	Address       string `json:"address,omitempty"`
+	MTU           int    `json:"mtu,omitempty"`
+	WasUp         bool   `json:"was_up,omitempty"`
 }
 
 func (r *Runner) openState() error {
@@ -168,7 +172,7 @@ func (r *Runner) initializeState() error {
 	if _, err := rand.Read(id[:]); err != nil {
 		return err
 	}
-	r.state = networkState{Version: 1, Table: "porta_" + hex.EncodeToString(id[:]), Metric: 40000 + (int(id[0]) << 4) + int(id[1])}
+	r.state = networkState{Version: 2, Table: "porta_" + hex.EncodeToString(id[:]), Metric: 40000 + (int(id[0]) << 4) + int(id[1])}
 	if err := r.persist(); err != nil {
 		r.state = networkState{}
 		return err
@@ -241,7 +245,7 @@ func (r *Runner) hasAction(kind, iface, address string) bool {
 }
 
 func (s networkState) validate() error {
-	if s.Version != 1 || len(s.Table) != len("porta_")+16 || !strings.HasPrefix(s.Table, "porta_") {
+	if s.Version != 2 || len(s.Table) != len("porta_")+16 || !strings.HasPrefix(s.Table, "porta_") {
 		return errors.New("invalid network journal version or nftables table")
 	}
 	if _, err := hex.DecodeString(strings.TrimPrefix(s.Table, "porta_")); err != nil {
@@ -268,7 +272,20 @@ func (s networkState) validate() error {
 		if !validInterface(a.Interface) || a.Index <= 0 {
 			return errors.New("invalid network journal action interface")
 		}
+		if len(a.LinkKind) > 64 || len(a.LinkAddress) > 64 ||
+			len(a.LinkAlias) > 128 || len(a.PreviousAlias) > 128 {
+			return errors.New("invalid network journal link identity")
+		}
+		if a.LinkAddress != "" {
+			if _, err := net.ParseMAC(a.LinkAddress); err != nil {
+				return errors.New("invalid network journal link address")
+			}
+		}
 		switch a.Kind {
+		case "alias":
+			if a.LinkAlias == "" {
+				return errors.New("invalid network journal link alias")
+			}
 		case "link":
 			if a.MTU < 68 || a.MTU > 65535 {
 				return errors.New("invalid network journal MTU")

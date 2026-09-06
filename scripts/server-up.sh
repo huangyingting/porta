@@ -34,10 +34,64 @@ public_port=$((10#$public_port))
   exit 2
 }
 
+state_directory=${PORTA_RUNTIME_DIRECTORY:-/run/porta}
+[[ $state_directory == /* && $state_directory != *[$'\n\r\t ']* ]] || {
+  echo "invalid Porta runtime directory" >&2
+  exit 2
+}
+umask 077
+mkdir -p "$state_directory"
+[[ -d $state_directory && ! -L $state_directory ]] || {
+  echo "Porta runtime path is not a directory" >&2
+  exit 1
+}
+chmod 0700 "$state_directory"
+ip_forward_state="$state_directory/ip-forward-$tun_interface"
+docker_rules_state="$state_directory/docker-rules-$tun_interface"
+
+remove_docker_rule() {
+  while true; do
+    if iptables -w -C DOCKER-USER "$@" 2>/dev/null; then
+      iptables -w -D DOCKER-USER "$@" || return
+      continue
+    else
+      check_status=$?
+    fi
+    [[ $check_status -eq 1 ]] && return 0
+    return "$check_status"
+  done
+}
+
+ensure_docker_rule() {
+  position=$1
+  shift
+  if iptables -w -C DOCKER-USER "$@" 2>/dev/null; then
+    return 0
+  else
+    check_status=$?
+  fi
+  [[ $check_status -eq 1 ]] || return "$check_status"
+  iptables -w -I DOCKER-USER "$position" "$@"
+}
+
 ip link show dev "$tun_interface" >/dev/null
 ip link show dev "$external_interface" >/dev/null
 ip address replace "$gateway_cidr" dev "$tun_interface"
 ip link set dev "$tun_interface" up
+if [[ -e $ip_forward_state ]]; then
+  original_ip_forward=$(<"$ip_forward_state")
+else
+  original_ip_forward=$(sysctl -n net.ipv4.ip_forward)
+  [[ $original_ip_forward == 0 || $original_ip_forward == 1 ]] || {
+    echo "could not read the original IPv4 forwarding state" >&2
+    exit 1
+  }
+  printf '%s\n' "$original_ip_forward" >"$ip_forward_state"
+fi
+[[ $original_ip_forward == 0 || $original_ip_forward == 1 ]] || {
+  echo "invalid saved IPv4 forwarding state" >&2
+  exit 1
+}
 sysctl -w net.ipv4.ip_forward=1
 if $auto_mtu; then
   # Gateway-sourced ICMP enters through TUN; allow it without weakening
@@ -82,11 +136,47 @@ table inet porta_guard {
 EOF
 } | nft -f -
 
-if command -v iptables >/dev/null && iptables -w -S DOCKER-USER >/dev/null 2>&1; then
-  iptables -w -C DOCKER-USER -i "$tun_interface" -o "$external_interface" -m comment --comment porta -j ACCEPT 2>/dev/null ||
-    iptables -w -I DOCKER-USER 1 -i "$tun_interface" -o "$external_interface" -m comment --comment porta -j ACCEPT
-  iptables -w -C DOCKER-USER -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT 2>/dev/null ||
-    iptables -w -I DOCKER-USER 2 -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT
+tracked_external_interfaces=()
+if [[ -e $docker_rules_state ]]; then
+  mapfile -t tracked_external_interfaces <"$docker_rules_state"
+fi
+for tracked_external_interface in "${tracked_external_interfaces[@]}"; do
+  [[ $tracked_external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || {
+    echo "saved Docker rule interface is invalid" >&2
+    exit 1
+  }
+done
+if [[ ${#tracked_external_interfaces[@]} -gt 0 ]] && ! command -v iptables >/dev/null; then
+  echo "iptables is required to reconcile previously installed Docker rules" >&2
+  exit 1
+fi
+if command -v iptables >/dev/null; then
+  if ! iptables -w -S DOCKER-USER >/dev/null 2>&1; then
+    [[ ${#tracked_external_interfaces[@]} -eq 0 ]] || {
+      echo "could not inspect previously installed Docker rules" >&2
+      exit 1
+    }
+    rm -f "$docker_rules_state"
+  else
+    {
+      printf '%s\n' "${tracked_external_interfaces[@]}"
+      printf '%s\n' "$external_interface"
+    } | awk 'NF && !seen[$0]++' >"$docker_rules_state"
+    for tracked_external_interface in "${tracked_external_interfaces[@]}"; do
+      [[ $tracked_external_interface == "$external_interface" ]] && continue
+      remove_docker_rule -i "$tun_interface" -o "$tracked_external_interface" -m comment --comment porta -j ACCEPT ||
+        { echo "could not remove previous Porta Docker rule" >&2; exit 1; }
+      remove_docker_rule -i "$tracked_external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
+        { echo "could not remove previous Porta Docker rule" >&2; exit 1; }
+    done
+    ensure_docker_rule 1 -i "$tun_interface" -o "$external_interface" -m comment --comment porta -j ACCEPT ||
+      { echo "could not install Porta Docker rule" >&2; exit 1; }
+    ensure_docker_rule 2 -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
+      { echo "could not install Porta Docker rule" >&2; exit 1; }
+    printf '%s\n' "$external_interface" >"$docker_rules_state"
+  fi
+else
+  rm -f "$docker_rules_state"
 fi
 
 echo "configured $tun_interface; Porta nftables forwarding and public-input guards are active"

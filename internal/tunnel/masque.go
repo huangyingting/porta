@@ -207,14 +207,14 @@ func dialMasqueHTTP3(
 	if config.PacketConn != nil {
 		connection, err = quic.Dial(handshakeCtx, config.PacketConn, config.RemoteAddr, tlsConfig, quicConfig)
 	} else {
-		var address string
+		var addresses []string
 		target := endpoint.Host
 		if config.DialAddress != "" {
 			target = config.DialAddress
 		}
-		address, err = resolveQUICAddress(handshakeCtx, target)
+		addresses, err = resolveQUICAddresses(handshakeCtx, target)
 		if err == nil {
-			connection, err = quic.DialAddr(handshakeCtx, address, tlsConfig, quicConfig)
+			connection, err = dialQUICAddresses(handshakeCtx, addresses, tlsConfig, quicConfig)
 		}
 	}
 	stopHandshake()
@@ -329,26 +329,97 @@ func dialMasqueHTTP3(
 	return client, nil
 }
 
-func resolveQUICAddress(ctx context.Context, address string) (string, error) {
+func resolveQUICAddresses(ctx context.Context, address string) ([]string, error) {
+	return resolveQUICAddressesWithLookup(ctx, address, net.DefaultResolver.LookupNetIP)
+}
+
+func resolveQUICAddressesWithLookup(
+	ctx context.Context,
+	address string,
+	lookup func(context.Context, string, string) ([]netip.Addr, error),
+) ([]string, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return nil, err
 	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if _, err := netip.ParseAddr(host); err == nil {
-		return address, nil
+		return []string{address}, nil
 	}
 	// quic.DialAddr's own DNS lookup has no context, so pass it a numeric address.
-	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	addresses, err := lookup(ctx, "ip", host)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(addresses) == 0 {
-		return "", &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
+		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 	}
-	return net.JoinHostPort(addresses[0].String(), port), nil
+	resolved := make([]string, 0, len(addresses))
+	for _, resolvedAddress := range addresses {
+		resolved = append(resolved, net.JoinHostPort(resolvedAddress.String(), port))
+	}
+	return resolved, nil
+}
+
+func dialQUICAddresses(
+	ctx context.Context,
+	addresses []string,
+	tlsConfig *tls.Config,
+	quicConfig *quic.Config,
+) (*quic.Conn, error) {
+	if len(addresses) == 1 {
+		return quic.DialAddr(ctx, addresses[0], tlsConfig, quicConfig)
+	}
+	type result struct {
+		connection *quic.Conn
+		err        error
+	}
+	results := make(chan result)
+	finished := make(chan struct{})
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for index, address := range addresses {
+		go func() {
+			if delay := time.Duration(index) * 250 * time.Millisecond; delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-finished:
+					return
+				case <-attemptCtx.Done():
+					return
+				}
+			}
+			connection, err := quic.DialAddr(attemptCtx, address, tlsConfig, quicConfig)
+			select {
+			case results <- result{connection: connection, err: err}:
+			case <-finished:
+				if connection != nil {
+					_ = connection.CloseWithError(0, "")
+				}
+			}
+		}()
+	}
+	var failures []error
+	for range addresses {
+		select {
+		case <-ctx.Done():
+			close(finished)
+			return nil, ctx.Err()
+		case result := <-results:
+			if result.err == nil {
+				close(finished)
+				cancel()
+				return result.connection, nil
+			}
+			failures = append(failures, result.err)
+		}
+	}
+	close(finished)
+	return nil, errors.Join(failures...)
 }
 
 func preSessionFailure(err error) error {

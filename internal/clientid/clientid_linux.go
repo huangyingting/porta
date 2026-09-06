@@ -45,6 +45,18 @@ func passthrough(value []byte) ([]byte, error) {
 	return append([]byte(nil), value...), nil
 }
 
+func prepareIdentityStorage(path string) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("create device identity directory: %w", err)
+	}
+	return nil
+}
+
+func secureIdentityFile(path string) error {
+	return os.Chmod(path, 0o600)
+}
+
 func withFileLock(path string, action func() error) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err

@@ -46,7 +46,7 @@ build-windows:
 	$(GO) run ./scripts/package-windows.go bin/porta-client-windows-amd64.zip bin/windows-amd64
 
 android:
-	cd android && ANDROID_HOME=$${ANDROID_HOME:-/home/azadmin/Android/Sdk} ./gradlew testDebugUnitTest assembleRelease
+	cd android && ANDROID_HOME=$${ANDROID_HOME:-$$HOME/Android/Sdk} ./gradlew testDebugUnitTest assembleRelease
 
 clean:
 	$(GO) clean

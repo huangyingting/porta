@@ -365,10 +365,10 @@ func (c HandlerConfig) authorizeSession(parent context.Context, header string, p
 
 func bearerToken(header string) (string, error) {
 	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
 		return "", errors.New("missing bearer token")
 	}
-	token := strings.TrimPrefix(header, prefix)
+	token := header[len(prefix):]
 	if len(token) < 16 || len(token) > 512 {
 		return "", errors.New("invalid bearer token")
 	}
@@ -409,10 +409,10 @@ func onSessionCancel(ctx context.Context, interrupt func()) func() {
 
 func authorized(header, expected string) bool {
 	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
 		return false
 	}
-	provided := strings.TrimPrefix(header, prefix)
+	provided := header[len(prefix):]
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 

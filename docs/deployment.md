@@ -82,6 +82,13 @@ sudo --preserve-env=GH_TOKEN ./scripts/deploy.sh \
   --port 8443
 ```
 
+Certificate and key paths are canonicalized before installation and must not
+resolve under `/tmp` or `/var/tmp`, because the hardened synchronization unit
+uses a private temporary directory. Private-CA and self-managed certificates
+are supported; deployment verifies the key pair before installation and probes
+the loopback-bound public listener for availability without requiring the
+deployment host to trust that private issuer.
+
 Porta's authenticated HTTPS CONNECT proxy is enabled on the same TLS port by
 default. Add `--disable-forward-proxy` only when the deployment should provide
 VPN service without the proxy.
@@ -132,7 +139,10 @@ through TUN. Deployment passes the chosen `--auto-mtu=true` or
 `--auto-mtu=false` mode to both the daemon and
 `server-up.sh`; the helper sets `accept_local=1` and loose `rp_filter=2` only
 on the owned TUN. It does not change global or physical-interface reverse-path
-filtering. These interface-local settings disappear with the TUN.
+filtering. These interface-local settings disappear with the TUN. The helper
+records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
+restores it during normal cleanup when no administrator or other service has
+changed the setting in the meantime.
 
 The network helper also defaults to automatic mode:
 
@@ -492,5 +502,9 @@ sudo systemctl disable --now porta.service
 sudo systemctl disable --now porta-cert-sync.timer 2>/dev/null || true
 sudo /usr/local/libexec/porta/server-down.sh porta0 eth0
 ```
+
+The cleanup helper fails explicitly if required networking tools are missing,
+removes tracked Docker exceptions, and restores the saved host IPv4 forwarding
+state instead of leaving the machine configured as a router.
 
 Credential and lease files are intentionally not removed automatically.

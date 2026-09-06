@@ -96,7 +96,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
-[[ $domain =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $domain == *.* ]] ||
+[[ ${#domain} -le 253 &&
+   ! $domain =~ ^[0-9.]+$ &&
+   $domain =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] ||
   die "--domain must be a DNS hostname"
 if [[ -n $certificate || -n $private_key ]]; then
   [[ $certificate == /* && -f $certificate ]] || die "--cert must name an existing absolute path"
@@ -132,9 +134,25 @@ for command in install systemctl ip nft openssl curl sed awk sysctl python3 ss g
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 if $build_local; then
-  for command in make getent sudo; do
+  for command in make getent; do
     command -v "$command" >/dev/null || die "required command not found: $command"
   done
+  if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    command -v sudo >/dev/null || die "required command not found: sudo"
+  fi
+fi
+if [[ $tls_mode == static ]]; then
+  certificate=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$certificate")
+  private_key=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$private_key")
+  [[ $certificate != *[$'\n\r\t ']* && $private_key != *[$'\n\r\t ']* &&
+     $certificate =~ ^/[A-Za-z0-9_./:@+-]+$ && $private_key =~ ^/[A-Za-z0-9_./:@+-]+$ ]] ||
+    die "resolved certificate paths contain unsupported characters"
+  case "$certificate" in
+    /tmp/*|/var/tmp/*) die "--cert must not resolve inside a temporary directory" ;;
+  esac
+  case "$private_key" in
+    /tmp/*|/var/tmp/*) die "--key must not resolve inside a temporary directory" ;;
+  esac
 fi
 
 if [[ -z $external_interface ]]; then
@@ -245,7 +263,7 @@ else
   release_download_directory=$(mktemp -d)
   cleanup_release_download() {
     local artifact
-    for artifact in "${release_artifacts[@]}" release.json; do
+    for artifact in "${release_artifacts[@]}" release.json github-auth-header; do
       rm -f "$release_download_directory/$artifact"
     done
     rmdir "$release_download_directory"
@@ -258,7 +276,11 @@ else
   )
   github_token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
   if [[ -n $github_token ]]; then
-    github_api_headers+=(--header "Authorization: Bearer $github_token")
+    [[ $github_token != *[$'\r\n']* ]] || die "GitHub token contains invalid characters"
+    github_auth_header="$release_download_directory/github-auth-header"
+    printf 'Authorization: Bearer %s\n' "$github_token" >"$github_auth_header"
+    chmod 0600 "$github_auth_header"
+    github_api_headers+=(--header "@$github_auth_header")
   fi
   if [[ $release == latest ]]; then
     release_api_url=https://api.github.com/repos/huangyingting/porta/releases/latest
@@ -599,6 +621,9 @@ TimeoutStopSec=15
 LimitNOFILE=65536
 UMask=0077
 StateDirectory=porta
+RuntimeDirectory=porta
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -660,8 +685,13 @@ for _ in $(seq 1 30); do
 done
 curl --silent --show-error --fail --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
   die "gateway started but did not become ready"
+landing_tls_arguments=()
+if [[ $tls_mode == static ]]; then
+  landing_tls_arguments+=(--insecure)
+fi
 landing_probe=$(curl --silent --show-error --fail --head --output /dev/null \
   --write-out '%{http_code}|%{content_type}' --connect-timeout 5 --max-time 30 \
+  "${landing_tls_arguments[@]}" \
   --resolve "$domain:$port:127.0.0.1" "https://$domain:$port/") ||
   die "gateway admin endpoint is ready but public TLS is unavailable"
 landing_status=${landing_probe%%|*}

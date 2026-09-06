@@ -188,9 +188,12 @@ elif name == "iptables":
         rules = state.setdefault("iptables_rules", [])
         rule = args[2:] if operation != "-I" else args[3:]
         if operation == "-C":
-            code = 0 if rule in rules else 1
+            code = 2 if state.get("fail_iptables_check") else (0 if rule in rules else 1)
         elif operation == "-I":
-            rules.append(rule)
+            if state.get("fail_iptables_insert") == args[2]:
+                code = 2
+            else:
+                rules.append(rule)
         elif operation == "-D":
             rules.remove(rule)
         else:
@@ -286,6 +289,10 @@ elif name == "gomobile":
 elif name == "adb":
     if args == ["shell", "dumpsys", "connectivity"]:
         print("TRANSPORT_VPN")
+    elif args == ["shell", "dumpsys", "activity", "services",
+                  "dev.porta.android/.TunnelService"]:
+        if state.get("porta_service", True):
+            print("ServiceRecord{porta dev.porta.android/.TunnelService}")
 elif name == "sleep":
     code = 1 if state.get("fail_sleep") else 0
 elif name == "uname":

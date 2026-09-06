@@ -136,6 +136,7 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 	if link == nil || link.LinkInfo.Kind != "tun" || !contains(link.Flags, "POINTOPOINT") {
 		return errors.New("automatic networking requires a point-to-point TUN interface")
 	}
+	linkAlias := "porta:" + r.state.Table
 	previousName, previousIndex := r.state.Interface, r.state.Index
 	if previousName == "" {
 		for _, a := range r.state.Undo {
@@ -145,7 +146,8 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 			}
 		}
 	}
-	if previousName != "" && (previousName != interfaceName || previousIndex != link.Index) {
+	if previousName != "" &&
+		(previousName != interfaceName || previousIndex != link.Index || link.Alias != linkAlias) {
 		// Stale/recreated devices are cleaned while the existing OUTPUT guard
 		// remains installed. Escape routes stay available for reconnect.
 		if err := r.cleanupMatching(ctx, func(a action) bool { return a.Kind != "escape" }); err != nil {
@@ -155,6 +157,29 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 		if err := r.persist(); err != nil {
 			return err
 		}
+		link, err = r.link(ctx, interfaceName)
+		if err != nil {
+			return err
+		}
+		if link == nil || link.LinkInfo.Kind != "tun" || !contains(link.Flags, "POINTOPOINT") {
+			return errors.New("automatic networking requires a point-to-point TUN interface")
+		}
+	}
+	if link.Alias != linkAlias {
+		if link.Alias != "" {
+			return errors.New("automatic networking refuses to overwrite a pre-existing interface alias")
+		}
+		if err := r.record(action{
+			Kind: "alias", Interface: interfaceName, Index: link.Index,
+			LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address,
+			LinkAlias: linkAlias, PreviousAlias: link.Alias,
+		}); err != nil {
+			return err
+		}
+		if _, err := r.invoke(ctx, "ip", []string{"link", "set", "dev", interfaceName, "alias", linkAlias}, ""); err != nil {
+			return err
+		}
+		link.Alias = linkAlias
 	}
 	if !r.hasAction("link", interfaceName, "") {
 		addresses, err := r.addresses(ctx, interfaceName)
@@ -164,7 +189,11 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 		if len(addresses) != 0 {
 			return errors.New("refusing to configure a TUN interface with pre-existing addresses")
 		}
-		if err := r.record(action{Kind: "link", Interface: interfaceName, Index: link.Index, MTU: link.MTU, WasUp: contains(link.Flags, "UP")}); err != nil {
+		if err := r.record(action{
+			Kind: "link", Interface: interfaceName, Index: link.Index,
+			LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address,
+			LinkAlias: link.Alias, MTU: link.MTU, WasUp: contains(link.Flags, "UP"),
+		}); err != nil {
 			return err
 		}
 	}
@@ -179,7 +208,11 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 	}
 	address := lease.Address.String()
 	if !r.hasAction("address", interfaceName, address) {
-		if err := r.record(action{Kind: "address", Interface: interfaceName, Index: link.Index, Address: address}); err != nil {
+		if err := r.record(action{
+			Kind: "address", Interface: interfaceName, Index: link.Index,
+			LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address,
+			LinkAlias: link.Alias, Address: address,
+		}); err != nil {
 			return err
 		}
 	}
@@ -193,12 +226,18 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 		}
 	}
 	for _, destination := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
-		if err := r.ensureRoute(ctx, action{Kind: "route", Family: 4, Destination: destination, Interface: interfaceName, Index: link.Index}); err != nil {
+		if err := r.ensureRoute(ctx, action{
+			Kind: "route", Family: 4, Destination: destination, Interface: interfaceName, Index: link.Index,
+			LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address, LinkAlias: link.Alias,
+		}); err != nil {
 			return err
 		}
 	}
 	dnsDestination := netip.PrefixFrom(lease.DNS, 32).String()
-	if err := r.ensureRoute(ctx, action{Kind: "dns-route", Family: 4, Destination: dnsDestination, Interface: interfaceName, Index: link.Index}); err != nil {
+	if err := r.ensureRoute(ctx, action{
+		Kind: "dns-route", Family: 4, Destination: dnsDestination, Interface: interfaceName, Index: link.Index,
+		LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address, LinkAlias: link.Alias,
+	}); err != nil {
 		return fmt.Errorf("route tunnel DNS: %w", err)
 	}
 	if !r.hasAction("dns", interfaceName, "") {
@@ -212,7 +251,10 @@ func (r *Runner) Reconfigure(ctx context.Context, interfaceName string, remoteAd
 				return errors.New("refusing to overwrite pre-existing TUN resolver configuration")
 			}
 		}
-		if err := r.record(action{Kind: "dns", Interface: interfaceName, Index: link.Index}); err != nil {
+		if err := r.record(action{
+			Kind: "dns", Interface: interfaceName, Index: link.Index,
+			LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address, LinkAlias: link.Alias,
+		}); err != nil {
 			return err
 		}
 	}

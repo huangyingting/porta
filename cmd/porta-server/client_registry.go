@@ -40,6 +40,12 @@ var (
 	dummyTokenDigest      = sha256.Sum256(nil)
 )
 
+type clientInputError string
+
+func (e clientInputError) Error() string {
+	return string(e)
+}
+
 type tokenIndexEntry struct {
 	clientIndex int
 	digest      [sha256.Size]byte
@@ -520,7 +526,9 @@ func (r *clientRegistry) Update(id, name string, maxDevices int, enabled bool) (
 		return clientSummary{}, os.ErrNotExist
 	}
 	if maxDevices < len(client.Devices) {
-		return clientSummary{}, fmt.Errorf("device limit cannot be below the %d enrolled devices", len(client.Devices))
+		return clientSummary{}, clientInputError(fmt.Sprintf(
+			"device limit cannot be below the %d enrolled devices", len(client.Devices),
+		))
 	}
 	previous := *client
 	client.Name = name
@@ -1039,10 +1047,10 @@ func validateStoredClient(client clientRecord) error {
 func validateClientInput(name string, maxDevices int) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 80 {
-		return "", errors.New("client name must contain 1 to 80 characters")
+		return "", clientInputError("client name must contain 1 to 80 characters")
 	}
 	if maxDevices < 1 || maxDevices > 100 {
-		return "", errors.New("device limit must be between 1 and 100")
+		return "", clientInputError("device limit must be between 1 and 100")
 	}
 	return name, nil
 }

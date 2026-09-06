@@ -98,6 +98,9 @@ func (p *Pool) AcquireGroup(clientID, groupID string) (Lease, error) {
 }
 
 func (p *Pool) acquire(clientID, groupID string) (Lease, error) {
+	if !ValidClientID(clientID) {
+		return Lease{}, errors.New("invalid client ID")
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

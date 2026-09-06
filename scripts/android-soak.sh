@@ -22,12 +22,14 @@ command -v adb >/dev/null 2>&1 || {
 }
 adb get-state >/dev/null
 
-vpn_is_active() {
+porta_vpn_is_active() {
 	adb shell dumpsys connectivity |
-		grep -E 'TRANSPORT_VPN|type: VPN' >/dev/null
+		grep -E 'TRANSPORT_VPN|type: VPN' >/dev/null &&
+		adb shell dumpsys activity services dev.porta.android/.TunnelService |
+		grep -q 'ServiceRecord'
 }
 
-if ! vpn_is_active; then
+if ! porta_vpn_is_active; then
 	echo "connect Porta on the attached device before starting the soak test" >&2
 	exit 1
 fi
@@ -55,8 +57,8 @@ while [ "$cycle" -le "$cycles" ]; do
 	adb shell svc wifi enable
 	wifi_disabled=false
 	sleep "$recovery_seconds"
-	if ! vpn_is_active; then
-		echo "VPN was not active after reconnect cycle $cycle" >&2
+	if ! porta_vpn_is_active; then
+		echo "Porta VPN was not active after reconnect cycle $cycle" >&2
 		exit 1
 	fi
 	cycle=$((cycle + 1))

@@ -142,6 +142,107 @@ func TestHTTP2ConnectForwardsBidirectionalTraffic(t *testing.T) {
 	}
 }
 
+func TestStreamTunnelPreservesReverseHalfClose(t *testing.T) {
+	upstreamListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstreamListener.Close()
+	upstreamAccepted := make(chan *net.TCPConn, 1)
+	go func() {
+		connection, acceptErr := upstreamListener.Accept()
+		if acceptErr == nil {
+			upstreamAccepted <- connection.(*net.TCPConn)
+		}
+	}()
+	upstream, err := net.DialTimeout("tcp", upstreamListener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	upstreamPeer := <-upstreamAccepted
+	defer upstreamPeer.Close()
+
+	clientListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientListener.Close()
+	clientAccepted := make(chan *net.TCPConn, 1)
+	go func() {
+		connection, acceptErr := clientListener.Accept()
+		if acceptErr == nil {
+			clientAccepted <- connection.(*net.TCPConn)
+		}
+	}()
+	clientPeer, err := net.DialTimeout("tcp", clientListener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientPeer.Close()
+	client := <-clientAccepted
+	defer client.Close()
+
+	finished := make(chan struct{})
+	go func() {
+		copyStreamTunnel(context.Background(), upstream, client, &writeTimeoutConn{Conn: client})
+		close(finished)
+	}()
+
+	if _, err := io.WriteString(upstreamPeer, "response"); err != nil {
+		t.Fatal(err)
+	}
+	if err := upstreamPeer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, len("response"))
+	if _, err := io.ReadFull(clientPeer, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(clientPeer, "request-after-half-close"); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientPeer.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := io.ReadAll(upstreamPeer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(request) != "request-after-half-close" {
+		t.Fatalf("upstream request = %q", request)
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("stream tunnel did not finish after both halves closed")
+	}
+}
+
+func TestStreamTunnelTerminatesWhenWriterCannotHalfClose(t *testing.T) {
+	upstream, upstreamPeer := net.Pipe()
+	defer upstream.Close()
+	body, bodyWriter := io.Pipe()
+	defer bodyWriter.Close()
+	writer := newFlushWriter(httptest.NewRecorder(), 128, time.Millisecond)
+	finished := make(chan struct{})
+	go func() {
+		copyStreamTunnel(context.Background(), upstream, body, writer)
+		close(finished)
+	}()
+	if err := upstreamPeer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("writer without CloseWrite left the upload direction blocked")
+	}
+	if !writer.isClosed() {
+		t.Fatal("terminal response writer was not closed")
+	}
+}
+
 func TestCamouflagePassesInvalidProxyRequestsToWebsite(t *testing.T) {
 	handler, err := New(Config{
 		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

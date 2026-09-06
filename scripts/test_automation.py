@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -34,6 +35,7 @@ class AutomationTests(unittest.TestCase):
             "SUDO_USER": "",
             "GH_TOKEN": "",
             "GITHUB_TOKEN": "",
+            "PORTA_RUNTIME_DIRECTORY": str(self.root / "runtime"),
         }
         self.write_state(
             sysctl={
@@ -272,6 +274,61 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(self.state()["nft_table"], "")
         self.assertEqual(self.state()["nft_tables"], {})
 
+    def test_down_uses_tracked_external_interface_for_docker_cleanup(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.run_script("server-down.sh", "porta0")
+        self.assertEqual(self.state()["iptables_rules"], [])
+        self.assertFalse((self.root / "runtime/docker-rules-porta0").exists())
+
+    def test_docker_marker_survives_indeterminate_rule_check(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.update_state(fail_iptables_check=True)
+        self.run_script("server-down.sh", "porta0", success=False)
+        self.assertTrue((self.root / "runtime/docker-rules-porta0").exists())
+        self.assertEqual(len(self.state()["iptables_rules"]), 2)
+
+    def test_server_up_reconciles_previous_docker_interface(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "wan0", "8443")
+        rules = self.state()["iptables_rules"]
+        self.assertEqual(len(rules), 2)
+        self.assertTrue(all("wan0" in rule and "eth0" not in rule for rule in rules))
+        self.assertEqual((self.root / "runtime/docker-rules-porta0").read_text(), "wan0\n")
+
+    def test_partial_docker_reconciliation_keeps_all_interfaces_tracked(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.update_state(fail_iptables_insert="2")
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "wan0", "8443", success=False)
+        marker = (self.root / "runtime/docker-rules-porta0").read_text().splitlines()
+        self.assertCountEqual(marker, ["eth0", "wan0"])
+        self.update_state(fail_iptables_insert="")
+        self.run_script("server-down.sh", "porta0")
+        self.assertEqual(self.state()["iptables_rules"], [])
+
+    def test_down_restores_original_forwarding_state(self):
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.assertEqual(self.state()["sysctl"]["net.ipv4.ip_forward"], "1")
+        self.run_script("server-down.sh", "porta0", "eth0")
+        self.assertEqual(self.state()["sysctl"]["net.ipv4.ip_forward"], "0")
+        self.assertFalse((self.root / "runtime/ip-forward-porta0").exists())
+
+        self.update_state(sysctl=self.state()["sysctl"] | {"net.ipv4.ip_forward": "1"})
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443")
+        self.run_script("server-down.sh", "porta0", "eth0")
+        self.assertEqual(self.state()["sysctl"]["net.ipv4.ip_forward"], "1")
+
     def test_down_reports_failed_table_deletion(self):
         old_tables = {"ip porta": "old", "inet porta_guard": "old guard"}
         self.update_state(nft_table="old", nft_tables=old_tables, fail_nft=True)
@@ -326,6 +383,10 @@ class AutomationTests(unittest.TestCase):
         for value in ("bad", "-1", "0"):
             self.run_script("android-soak.sh", value, success=False)
         self.assertFalse((self.root / "commands.jsonl").exists())
+
+    def test_android_soak_rejects_another_apps_vpn(self):
+        self.update_state(porta_service=False)
+        self.run_script("android-soak.sh", "1", success=False)
 
     def prepare_deploy(self, existing=True, timer=True):
         checkout = self.root / "checkout"
@@ -512,10 +573,32 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
         self.assertIn("--auto-mtu=true", setup)
         self.assertIn("eth0 8443 --auto-mtu=true", setup)
+        self.assertIn("RuntimeDirectoryPreserve=yes", unit)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
         deploy = self.prepare_deploy()
         self.run_deploy(deploy, "--build-local", "--admin-port", "80", success=False)
+        self.assertNotIn("stopped_helpers", self.state())
+
+    def test_deploy_rejects_invalid_dns_names_before_stopping_service(self):
+        deploy = self.prepare_deploy()
+        for domain in ("vpn..example.com", "-vpn.example.com", "vpn-.example.com",
+                       "vpn_test.example.com", "192.0.2.1"):
+            with self.subTest(domain=domain):
+                self.run_deploy(deploy, "--build-local", "--domain", domain, success=False)
+        self.assertNotIn("stopped_helpers", self.state())
+
+    def test_deploy_rejects_unsafe_canonical_certificate_paths(self):
+        deploy = self.prepare_deploy()
+        unsafe_directory = self.root / "certificate directory"
+        unsafe_directory.mkdir()
+        certificate, key = self.certificate_pair("certificate directory/server", "new")
+        certificate_link = self.root / "server.crt"
+        key_link = self.root / "server.key"
+        certificate_link.symlink_to(certificate)
+        key_link.symlink_to(key)
+        self.run_deploy(deploy, "--build-local", "--cert", certificate_link,
+                        "--key", key_link, success=False)
         self.assertNotIn("stopped_helpers", self.state())
 
     def release_assets(self, landing_templates=True, proxy_headers=True):
@@ -557,6 +640,15 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue((downloads / "porta-client-windows-amd64.zip").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_release_token_is_not_exposed_in_curl_arguments(self):
+        deploy = self.prepare_deploy()
+        self.release_assets()
+        self.env["GH_TOKEN"] = "secret-test-token"
+        self.run_deploy(deploy)
+        curl_calls = [call for call in self.commands() if call[0] == "curl"]
+        self.assertTrue(curl_calls)
+        self.assertNotIn("secret-test-token", json.dumps(curl_calls))
 
     def test_release_without_landing_templates_fails_before_stopping_service(self):
         deploy = self.prepare_deploy()
@@ -602,6 +694,17 @@ class AutomationTests(unittest.TestCase):
         if script.startswith("|\n"):
             return "\n".join(line[10:] for line in script[2:].splitlines())
         return script.strip()
+
+    def test_workflows_pin_actions_and_gradle_distribution(self):
+        action_reference = re.compile(r"^[^@\s]+@[0-9a-f]{40}(?:\s+#\s+v\S+)?$")
+        for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+            for line in workflow.read_text().splitlines():
+                if "uses:" not in line:
+                    continue
+                reference = line.split("uses:", 1)[1].strip()
+                self.assertRegex(reference, action_reference, f"mutable action in {workflow}")
+        wrapper = (ROOT / "android/gradle/wrapper/gradle-wrapper.properties").read_text()
+        self.assertRegex(wrapper, r"(?m)^distributionSha256Sum=[0-9a-f]{64}$")
 
     def signing_environment(self):
         return self.env | {

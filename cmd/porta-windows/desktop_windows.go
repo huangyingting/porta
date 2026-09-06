@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -419,7 +418,7 @@ func (d *DesktopController) OpenLogFolder() (string, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", fmt.Errorf("create activity log directory: %w", err)
 	}
-	if err := exec.Command("explorer.exe", directory).Start(); err != nil {
+	if err := startDetachedProcess("explorer.exe", directory); err != nil {
 		return "", fmt.Errorf("open activity log directory: %w", err)
 	}
 	return directory, nil
@@ -467,7 +466,7 @@ func (d *DesktopController) startRestartHelper() {
 		fmt.Fprintln(os.Stderr, "porta: locate restart helper:", err)
 		return
 	}
-	if err := exec.Command(executable, "--restart-after", fmt.Sprint(os.Getpid())).Start(); err != nil {
+	if err := startDetachedProcess(executable, "--restart-after", fmt.Sprint(os.Getpid())); err != nil {
 		fmt.Fprintln(os.Stderr, "porta: start restart helper:", err)
 	}
 }

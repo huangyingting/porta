@@ -131,6 +131,26 @@ func TestPersistentPoolRestoresLeaseAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestPersistentPoolRejectsInvalidClientBeforeMutation(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "leases.json")
+	pool, err := NewPersistentPool("10.66.0.0/29", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Acquire(""); err == nil {
+		t.Fatal("empty client ID was accepted")
+	}
+	if _, err := pool.AcquireGroup("invalid client", "session-12345678"); err == nil {
+		t.Fatal("invalid grouped client ID was accepted")
+	}
+	if _, err := pool.Acquire("client-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewPersistentPool("10.66.0.0/29", statePath); err != nil {
+		t.Fatalf("invalid acquisition corrupted persistent state: %v", err)
+	}
+}
+
 func TestPersistentPoolPreservesReclamationOrder(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "leases.json")
 	firstPool, err := NewPersistentPool("10.66.0.0/29", statePath)

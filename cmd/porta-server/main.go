@@ -440,7 +440,7 @@ func run() (returnErr error) {
 
 func serverTLSConfig(acmeDomain, acmeEmail, acmeCache string) (*tls.Config, *autocert.Manager, error) {
 	domain := normalizeDomain(acmeDomain)
-	if domain == "" || !strings.Contains(domain, ".") || strings.ContainsAny(domain, "/:") {
+	if !validDNSName(domain) {
 		return nil, nil, errors.New("--acme-domain is required and must be a fully qualified DNS name without a scheme or port")
 	}
 	if acmeCache == "" {
@@ -465,6 +465,31 @@ func http3TLSConfig(config *tls.Config) *tls.Config {
 
 func normalizeDomain(domain string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+}
+
+func validDNSName(domain string) bool {
+	if len(domain) == 0 || len(domain) > 253 || !strings.Contains(domain, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(domain); err == nil {
+		return false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) == 0 || len(label) > 63 || !asciiAlphaNumeric(label[0]) ||
+			!asciiAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+		for index := 1; index < len(label)-1; index++ {
+			if !asciiAlphaNumeric(label[index]) && label[index] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func asciiAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
 }
 
 func proxyBackendHandler(handler http.Handler) http.Handler {

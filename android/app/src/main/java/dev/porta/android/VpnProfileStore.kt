@@ -64,7 +64,7 @@ internal class VpnProfileStore(private val context: Context) {
     }
 
     fun save(profile: VpnProfile): Boolean {
-        val stored = readProfiles() ?: return false
+        val stored = readProfiles() ?: if (resetCorruptStorage()) emptyList() else return false
         val updated = stored.filterNot { it.id == profile.id }.toMutableList()
         if (profile.autoConnect) {
             for (index in updated.indices) {
@@ -78,6 +78,29 @@ internal class VpnProfileStore(private val context: Context) {
     fun delete(profileId: String): Boolean {
         val stored = readProfiles() ?: return false
         return write(stored.filterNot { it.id == profileId })
+    }
+
+    @SuppressLint("ApplySharedPref")
+    private fun resetCorruptStorage(): Boolean {
+        Log.w(TAG, "Resetting unreadable VPN profile storage")
+        return try {
+            KeyStore.getInstance(KEYSTORE).apply {
+                load(null)
+                if (containsAlias(KEY_ALIAS)) {
+                    deleteEntry(KEY_ALIAS)
+                }
+            }
+            preferences.edit()
+                .remove(KEY_PROFILES)
+                .remove(KEY_SELECTED_PROFILE)
+                .commit()
+        } catch (error: GeneralSecurityException) {
+            Log.e(TAG, "Could not reset VPN profile storage", error)
+            false
+        } catch (error: IOException) {
+            Log.e(TAG, "Could not reset VPN profile storage", error)
+            false
+        }
     }
 
     fun selectedProfileId(): String? = preferences.getString(KEY_SELECTED_PROFILE, null)

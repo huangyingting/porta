@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -50,6 +52,35 @@ func TestAdminAPIRequiresTokenAndManagesClients(t *testing.T) {
 	deleted := adminRequest(t, handler, http.MethodDelete, "/api/clients/"+createResponse.Client.ID, "")
 	if deleted.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d: %s", deleted.Code, deleted.Body.String())
+	}
+}
+
+func TestAdminAPIDoesNotExposePersistenceFailuresAsClientErrors(t *testing.T) {
+	registry, err := openClientRegistry(filepath.Join(t.TempDir(), "clients.json"), "bootstrap-token-0123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	registry.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	registry.writeState = func([]byte) error {
+		return errors.New("injected private filesystem path")
+	}
+	handler := adminHandler(http.NotFoundHandler(), registry, testAdminToken)
+
+	response := adminRequest(t, handler, http.MethodPost, "/api/clients", `{"name":"Operations","max_devices":4}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("create status = %d: %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "filesystem") || !strings.Contains(response.Body.String(), "Internal server error") {
+		t.Fatalf("internal error was exposed: %s", response.Body.String())
+	}
+	if !strings.Contains(logs.String(), "injected private filesystem path") {
+		t.Fatalf("internal failure was not logged: %s", logs.String())
+	}
+
+	response = adminRequest(t, handler, http.MethodPost, "/api/clients", `{"name":"","max_devices":4}`)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "client name") {
+		t.Fatalf("validation status = %d: %s", response.Code, response.Body.String())
 	}
 }
 

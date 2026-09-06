@@ -48,6 +48,10 @@ func TestAuthorizedClientPrefersBoundCredential(t *testing.T) {
 	if err != nil || identity != want {
 		t.Fatalf("authorized identity = %#v, %v", identity, err)
 	}
+	identity, err = config.authorizeTestClient("bEaReR device-token-0123456789", "android-phone")
+	if err != nil || identity != want {
+		t.Fatalf("mixed-case authorization identity = %#v, %v", identity, err)
+	}
 	if _, err := config.authorizeTestClient("Bearer wrong-token-0123456789", "android-phone"); err == nil {
 		t.Fatal("invalid token was accepted")
 	}
@@ -163,6 +167,14 @@ func TestMetricsRequireSeparateCredential(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("metrics credential status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.Header.Set("Authorization", "BEARER metrics-token-0123456789")
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("mixed-case metrics credential status = %d, want %d", recorder.Code, http.StatusOK)
 	}
 }
 

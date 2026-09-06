@@ -61,8 +61,8 @@ func newFake(t *testing.T) (*Runner, *fakeSystem) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	physical := &linkInfo{Index: 2, Name: "eth0", MTU: 1500, Flags: []string{"UP"}}
-	tun := &linkInfo{Index: 10, Name: "porta0", MTU: 1500, Flags: []string{"POINTOPOINT"}}
+	physical := &linkInfo{Index: 2, Name: "eth0", Address: "02:00:00:00:00:02", MTU: 1500, Flags: []string{"UP"}}
+	tun := &linkInfo{Index: 10, Name: "porta0", Address: "00:00:00:00:00:00", MTU: 1500, Flags: []string{"POINTOPOINT"}}
 	tun.LinkInfo.Kind = "tun"
 	system := &fakeSystem{
 		t: t, path: runner.statePath,
@@ -120,11 +120,16 @@ func (s *fakeSystem) run(ctx context.Context, name string, args []string, input 
 		for _, a := range state.Undo {
 			switch {
 			case name == "resolvectl":
-				journaled = journaled || a.Kind == "dns" && a.Interface == args[1]
+				journaled = journaled || a.Kind == "dns" && s.actionOwnsInterface(a, args[1])
 			case name == "ip" && args[0] == "link":
-				journaled = journaled || a.Kind == "link" && a.Interface == args[3]
+				kind := "link"
+				if len(args) > 4 && args[4] == "alias" {
+					kind = "alias"
+				}
+				journaled = journaled || a.Kind == kind && s.actionOwnsInterface(a, args[3])
 			case name == "ip" && args[1] == "address":
-				journaled = journaled || a.Kind == "address" && a.Address == args[3] && a.Interface == args[5]
+				journaled = journaled || a.Kind == "address" && a.Address == args[3] &&
+					s.actionOwnsInterface(a, args[5])
 			case name == "ip" && args[1] == "route":
 				journaled = journaled || a.Destination == args[3] && (a.Kind == "route" || a.Kind == "escape" || a.Kind == "dns-route")
 			}
@@ -141,6 +146,14 @@ func (s *fakeSystem) run(ctx context.Context, name string, args []string, input 
 		return "", errors.New("injected ambiguous post-apply failure")
 	}
 	return output, err
+}
+
+func (s *fakeSystem) actionOwnsInterface(a action, name string) bool {
+	if a.Interface == name {
+		return true
+	}
+	link := s.links[name]
+	return link != nil && link.Index == a.Index
 }
 
 func jsonOutput(value any) (string, error) {
@@ -211,6 +224,10 @@ func (s *fakeSystem) apply(name string, args []string, input string) (string, er
 		}
 		if strings.HasPrefix(command, "link set dev ") {
 			link := s.links[args[3]]
+			if args[4] == "alias" {
+				link.Alias = args[5]
+				return "", nil
+			}
 			link.MTU, _ = strconv.Atoi(args[5])
 			link.Flags = []string{"POINTOPOINT"}
 			if args[6] == "up" {
@@ -546,6 +563,7 @@ func TestRecreatedInterfaceDoesNotReceiveStaleRestoration(t *testing.T) {
 		t.Fatal(err)
 	}
 	system.links["porta0"].Index = 11
+	system.links["porta0"].Alias = ""
 	system.links["porta0"].MTU = 1600
 	system.links["porta0"].Flags = []string{"POINTOPOINT"}
 	system.addresses["porta0"] = nil
@@ -565,6 +583,103 @@ func TestRecreatedInterfaceDoesNotReceiveStaleRestoration(t *testing.T) {
 	}
 	if system.links["porta0"].MTU != 1600 {
 		t.Fatal("stale original interface MTU applied to replacement")
+	}
+}
+
+func TestRenamedInterfacesRetainCleanupOwnership(t *testing.T) {
+	runner, system := newFake(t)
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+
+	physical := system.links["eth0"]
+	delete(system.links, "eth0")
+	physical.Name = "wan0"
+	system.links["wan0"] = physical
+	for key, routes := range system.routes {
+		for index := range routes {
+			if routes[index].Device == "eth0" {
+				routes[index].Device = "wan0"
+			}
+		}
+		system.routes[key] = routes
+	}
+
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(system.routes) != 0 || len(system.addresses["porta0"]) != 0 ||
+		len(system.dns) != 0 || len(system.domains) != 0 {
+		t.Fatalf("renamed interface cleanup was incomplete: %+v", system)
+	}
+	if system.links["porta0"].MTU != 1500 || contains(system.links["porta0"].Flags, "UP") {
+		t.Fatal("TUN settings were not restored")
+	}
+	if system.links["porta0"].Alias != "" {
+		t.Fatal("TUN ownership alias was not restored")
+	}
+}
+
+func TestReusedInterfaceIndexDoesNotReceiveStaleRestoration(t *testing.T) {
+	runner, system := newFake(t)
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	delete(system.links, "eth0")
+	replacement := &linkInfo{
+		Index: 2, Name: "other0", Address: "02:00:00:00:00:99",
+		MTU: 9000, Flags: []string{"UP"},
+	}
+	system.links["other0"] = replacement
+	system.routes["-4 198.51.100.10/32"][0].Device = "other0"
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(system.routes["-4 198.51.100.10/32"]) != 1 {
+		t.Fatal("route on reused interface index was removed")
+	}
+	if system.links["other0"].MTU != 9000 || !contains(system.links["other0"].Flags, "UP") {
+		t.Fatal("replacement interface was modified")
+	}
+}
+
+func TestReusedInterfaceNameAndIndexDoesNotReceiveStaleRestoration(t *testing.T) {
+	runner, system := newFake(t)
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	replacement := &linkInfo{
+		Index: 10, Name: "porta0", Address: "00:00:00:00:00:00",
+		MTU: 9000, Flags: []string{"POINTOPOINT", "UP"},
+	}
+	replacement.LinkInfo.Kind = "tun"
+	system.links["porta0"] = replacement
+	system.addresses["porta0"] = nil
+	delete(system.routes, "-4 0.0.0.0/1")
+	delete(system.routes, "-4 128.0.0.0/1")
+	delete(system.routes, "-4 1.1.1.1/32")
+	delete(system.dns, "porta0")
+	delete(system.domains, "porta0")
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if system.links["porta0"].MTU != 9000 || !contains(system.links["porta0"].Flags, "UP") ||
+		system.links["porta0"].Alias != "" {
+		t.Fatal("same-name replacement interface was modified")
+	}
+}
+
+func TestMACLessEscapeRouteUsesExactInterfaceAndOwnedRoute(t *testing.T) {
+	runner, system := newFake(t)
+	system.links["eth0"].Address = ""
+	if err := runner.Up(context.Background(), "porta0", testEndpoint(), testLease()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Down(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(system.routes) != 0 {
+		t.Fatalf("MAC-less escape route was not removed: %v", system.routes)
 	}
 }
 
@@ -604,6 +719,28 @@ func TestJournalLockAndOwnership(t *testing.T) {
 	}
 	if len(system.tables) != 1 {
 		t.Fatal("foreign nftables table deleted")
+	}
+}
+
+func TestLegacyJournalIsRejectedWithoutBeingRemoved(t *testing.T) {
+	path := filepath.Join(testDirectory(t), "network.json")
+	state := networkState{
+		Version: 1,
+		Table:   "porta_0011223344556677",
+		Metric:  40000,
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRunner(path); err == nil {
+		t.Fatal("legacy network journal was silently accepted")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("legacy network journal was removed: %v", err)
 	}
 }
 

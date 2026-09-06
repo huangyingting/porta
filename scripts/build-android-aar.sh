@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ANDROID_HOME="${ANDROID_HOME:-/home/azadmin/Android/Sdk}"
+ANDROID_HOME="${ANDROID_HOME:-${HOME}/Android/Sdk}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_HOME}/ndk/27.2.12479018}"
 GOMOBILE="${GOMOBILE:-$(command -v gomobile || true)}"
 OUTPUT="${1:-${ROOT}/android/app/build/generated/aar/portamobile.aar}"

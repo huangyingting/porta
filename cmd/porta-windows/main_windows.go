@@ -184,10 +184,18 @@ func restartAfter(value string) error {
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
 	}
-	if err := exec.Command(executable).Start(); err != nil {
+	if err := startDetachedProcess(executable); err != nil {
 		return fmt.Errorf("start replacement instance: %w", err)
 	}
 	return nil
+}
+
+func startDetachedProcess(name string, arguments ...string) error {
+	command := exec.Command(name, arguments...)
+	if err := command.Start(); err != nil {
+		return err
+	}
+	return command.Process.Release()
 }
 
 var (

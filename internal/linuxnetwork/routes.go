@@ -15,6 +15,8 @@ import (
 type linkInfo struct {
 	Index    int      `json:"ifindex"`
 	Name     string   `json:"ifname"`
+	Address  string   `json:"address"`
+	Alias    string   `json:"ifalias"`
 	MTU      int      `json:"mtu"`
 	Flags    []string `json:"flags"`
 	LinkInfo struct {
@@ -40,6 +42,32 @@ func (route routeInfo) multipath() bool {
 }
 
 func (r *Runner) link(ctx context.Context, name string) (*linkInfo, error) {
+	links, err := r.links(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range links {
+		if links[index].Name == name {
+			return &links[index], nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *Runner) linkByIndex(ctx context.Context, index int) (*linkInfo, error) {
+	links, err := r.links(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for linkIndex := range links {
+		if links[linkIndex].Index == index {
+			return &links[linkIndex], nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *Runner) links(ctx context.Context) ([]linkInfo, error) {
 	output, err := r.invoke(ctx, "ip", []string{"-j", "-d", "link", "show"}, "")
 	if err != nil {
 		return nil, err
@@ -48,12 +76,7 @@ func (r *Runner) link(ctx context.Context, name string) (*linkInfo, error) {
 	if err := json.Unmarshal([]byte(output), &links); err != nil {
 		return nil, fmt.Errorf("decode interface state: %w", err)
 	}
-	for _, link := range links {
-		if link.Name == name {
-			return &link, nil
-		}
-	}
-	return nil, nil
+	return links, nil
 }
 
 func (r *Runner) addresses(ctx context.Context, name string) ([]string, error) {
@@ -202,7 +225,10 @@ func (r *Runner) ensureEscape(ctx context.Context, endpoint endpointState) error
 			return errors.New("invalid physical gateway")
 		}
 	}
-	return r.ensureRoute(ctx, action{Kind: "escape", Family: family, Destination: endpoint.prefix(), Interface: chosen.Device, Index: link.Index, Gateway: chosen.Gateway})
+	return r.ensureRoute(ctx, action{
+		Kind: "escape", Family: family, Destination: endpoint.prefix(), Interface: chosen.Device, Index: link.Index,
+		LinkKind: link.LinkInfo.Kind, LinkAddress: link.Address, Gateway: chosen.Gateway,
+	})
 }
 
 func (r *Runner) ensureRoute(ctx context.Context, a action) error {
@@ -265,16 +291,37 @@ func (r *Runner) cleanupMatching(ctx context.Context, wanted func(action) bool) 
 }
 
 func (r *Runner) undo(ctx context.Context, a action) error {
-	link, err := r.link(ctx, a.Interface)
+	link, err := r.actionLink(ctx, a)
 	if err != nil {
 		return err
 	}
+	if link == nil && a.Kind == "escape" && !stableLinkIdentity(a) {
+		namedLink, namedErr := r.link(ctx, a.Interface)
+		if namedErr != nil {
+			return namedErr
+		}
+		if namedLink != nil && namedLink.Index == a.Index {
+			link = namedLink
+		} else {
+			indexedLink, indexErr := r.linkByIndex(ctx, a.Index)
+			if indexErr != nil {
+				return indexErr
+			}
+			if indexedLink != nil {
+				return errors.New("cannot verify renamed MAC-less escape interface ownership")
+			}
+		}
+	}
 	// The kernel removes interface-bound addresses/routes/DNS when a TUN is
 	// destroyed. Never apply stale restoration to an unrelated reused name.
-	if link == nil || link.Index != a.Index {
+	if link == nil {
 		return nil
 	}
+	a.Interface = link.Name
 	switch a.Kind {
+	case "alias":
+		_, err := r.invoke(ctx, "ip", []string{"link", "set", "dev", a.Interface, "alias", a.PreviousAlias}, "")
+		return err
 	case "route", "escape", "dns-route":
 		routes, err := r.routes(ctx, a.Family, "exact", a.Destination)
 		if err != nil {
@@ -309,4 +356,41 @@ func (r *Runner) undo(ctx context.Context, a action) error {
 		return errors.New("unsupported journal action")
 	}
 	return nil
+}
+
+func (r *Runner) actionLink(ctx context.Context, a action) (*linkInfo, error) {
+	links, err := r.links(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if a.LinkAlias != "" {
+		for index := range links {
+			if links[index].Alias == a.LinkAlias {
+				return &links[index], nil
+			}
+		}
+		return nil, nil
+	}
+	for index := range links {
+		if links[index].Name == a.Interface && links[index].Index == a.Index &&
+			sameLinkIdentity(a, &links[index]) {
+			return &links[index], nil
+		}
+	}
+	for index := range links {
+		if links[index].Index == a.Index && sameLinkIdentity(a, &links[index]) {
+			return &links[index], nil
+		}
+	}
+	return nil, nil
+}
+
+func sameLinkIdentity(a action, link *linkInfo) bool {
+	return stableLinkIdentity(a) &&
+		strings.EqualFold(a.LinkAddress, link.Address) &&
+		a.LinkKind == link.LinkInfo.Kind
+}
+
+func stableLinkIdentity(a action) bool {
+	return a.LinkAddress != "" && a.LinkAddress != "00:00:00:00:00:00"
 }
