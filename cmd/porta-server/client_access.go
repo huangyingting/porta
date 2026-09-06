@@ -16,16 +16,13 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/huangyingting/porta/internal/abuse"
 	"github.com/huangyingting/porta/internal/clientip"
 	"github.com/skip2/go-qrcode"
 )
 
-const clientAccessTTL = 8 * time.Hour
-
-var errClientAccess = errors.New("This access link is invalid or expired. Ask your administrator for a new link.")
+var errClientAccess = errors.New("This access link is invalid or no longer authorized. Ask your administrator for a new link.")
 
 type clientAccessInput struct {
 	Origin string `json:"origin"`
@@ -35,7 +32,7 @@ type clientAccessInput struct {
 type clientAccessClaim struct {
 	ClientID  string `json:"client_id"`
 	Token     string `json:"token"`
-	ExpiresAt int64  `json:"expires_at"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
 func (a *adminAPI) serveClientAccess(w http.ResponseWriter, r *http.Request) {
@@ -62,9 +59,8 @@ func (a *adminAPI) serveClientAccess(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	expires := time.Unix(time.Now().Add(clientAccessTTL).Unix(), 0).UTC()
 	ticket, err := sealClientAccess(a.adminToken, origin, clientAccessClaim{
-		ClientID: identity.ID, Token: input.Token, ExpiresAt: expires.Unix(),
+		ClientID: identity.ID, Token: input.Token,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to create client access"})
@@ -82,7 +78,6 @@ func (a *adminAPI) serveClientAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"url": link, "image": "data:image/png;base64," + base64.StdEncoding.EncodeToString(image),
-		"expires_at": expires,
 	})
 }
 
@@ -159,7 +154,7 @@ func sealClientAccess(adminToken, origin string, claim clientAccessClaim) (strin
 	return sealPortalCredential(aead, value, "client-access-v1\n"+origin)
 }
 
-func openClientAccess(adminToken, origin, ticket string, now time.Time) (clientAccessClaim, error) {
+func openClientAccess(adminToken, origin, ticket string) (clientAccessClaim, error) {
 	if len(adminToken) < 16 {
 		return clientAccessClaim{}, errClientAccess
 	}
@@ -178,7 +173,7 @@ func openClientAccess(adminToken, origin, ticket string, now time.Time) (clientA
 		return clientAccessClaim{}, errClientAccess
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF || claim.ClientID == "" ||
-		len(claim.Token) < 16 || len(claim.Token) > 512 || claim.ExpiresAt <= now.Unix() {
+		len(claim.Token) < 16 || len(claim.Token) > 512 {
 		return clientAccessClaim{}, errClientAccess
 	}
 	return claim, nil
@@ -224,7 +219,7 @@ func (p *portalHandler) redeemClientAccess(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	claim, err := openClientAccess(p.adminToken, origin, r.PostForm.Get("ticket"), time.Now())
+	claim, err := openClientAccess(p.adminToken, origin, r.PostForm.Get("ticket"))
 	if err != nil {
 		p.serveJoin(w, r, errClientAccess.Error(), http.StatusUnauthorized)
 		return

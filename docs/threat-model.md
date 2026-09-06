@@ -17,9 +17,10 @@
   process-local, with client identity and token hash authenticated as binding
   data. A separate admin token protects the loopback management API.
 - Shared download invitations encrypt the client token and ID using
-  AES-256-GCM, a purpose-separated administrator-derived key, an eight-hour
-  expiry, and HTTPS-origin binding. They survive restart with the same admin
-  token, but are reusable bearer credentials, not public or single-use links.
+  AES-256-GCM, a purpose-separated administrator-derived key, and HTTPS-origin
+  binding. They survive restart with the same admin token and remain valid
+  until revoked, but are reusable bearer credentials, not public or single-use
+  links.
   Client rotation, disable, and deletion are checked on redemption and on
   subsequent authenticated page access. Changing the admin token invalidates
   outstanding invitations.

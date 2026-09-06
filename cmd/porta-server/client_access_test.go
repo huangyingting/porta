@@ -92,9 +92,8 @@ func TestClientAccessDownloadThenProfileQR(t *testing.T) {
 		t.Fatalf("access invitation status/headers = %d %v", issued.Code, issued.Header())
 	}
 	var invitation struct {
-		URL       string    `json:"url"`
-		Image     string    `json:"image"`
-		ExpiresAt time.Time `json:"expires_at"`
+		URL   string `json:"url"`
+		Image string `json:"image"`
 	}
 	if err := json.Unmarshal(issued.Body.Bytes(), &invitation); err != nil {
 		t.Fatal(err)
@@ -112,8 +111,8 @@ func TestClientAccessDownloadThenProfileQR(t *testing.T) {
 	if err != nil || invitation.Image != "data:image/png;base64,"+base64.StdEncoding.EncodeToString(png) {
 		t.Fatal("first QR does not encode the HTTPS download access link")
 	}
-	if remaining := time.Until(invitation.ExpiresAt); remaining <= clientAccessTTL-time.Minute || remaining > clientAccessTTL {
-		t.Fatalf("invitation lifetime = %s", remaining)
+	if bytes.Contains(issued.Body.Bytes(), []byte(`"expires_at"`)) {
+		t.Fatal("access invitation unexpectedly contains a fixed expiry")
 	}
 	landing := httptest.NewRecorder()
 	portal.ServeHTTP(landing, httptest.NewRequest(http.MethodGet, accessTestOrigin+"/join", nil))
@@ -162,7 +161,7 @@ func TestClientAccessDownloadThenProfileQR(t *testing.T) {
 
 func TestClientAccessCryptographicBoundaries(t *testing.T) {
 	now := time.Now()
-	claim := clientAccessClaim{ClientID: "client", Token: accessTestToken, ExpiresAt: now.Add(time.Hour).Unix()}
+	claim := clientAccessClaim{ClientID: "client", Token: accessTestToken}
 	ticket, err := sealClientAccess(testAdminToken, accessTestOrigin, claim)
 	if err != nil {
 		t.Fatal(err)
@@ -171,9 +170,17 @@ func TestClientAccessCryptographicBoundaries(t *testing.T) {
 	if err != nil || ticket == second {
 		t.Fatal("invitation encryption reused its nonce")
 	}
-	opened, err := openClientAccess(testAdminToken, accessTestOrigin, ticket, now)
+	opened, err := openClientAccess(testAdminToken, accessTestOrigin, ticket)
 	if err != nil || opened != claim {
 		t.Fatalf("valid invitation did not decrypt: %v", err)
+	}
+	legacy := clientAccessClaim{ClientID: "client", Token: accessTestToken, ExpiresAt: now.Add(-time.Hour).Unix()}
+	legacyTicket, err := sealClientAccess(testAdminToken, accessTestOrigin, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := openClientAccess(testAdminToken, accessTestOrigin, legacyTicket); err != nil || opened != legacy {
+		t.Fatalf("previously expired invitation was not restored: %#v, %v", opened, err)
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(ticket)
 	if err != nil {
@@ -182,18 +189,16 @@ func TestClientAccessCryptographicBoundaries(t *testing.T) {
 	raw[len(raw)-1] ^= 1
 	for _, test := range []struct {
 		name, secret, origin, ticket string
-		now                          time.Time
 	}{
-		{"tampered", testAdminToken, accessTestOrigin, base64.RawURLEncoding.EncodeToString(raw), now},
-		{"wrong origin", testAdminToken, "https://other.example.com", ticket, now},
-		{"wrong port", testAdminToken, "https://porta.example.com", ticket, now},
-		{"rotated admin", testAdminToken + "-new", accessTestOrigin, ticket, now},
-		{"expired", testAdminToken, accessTestOrigin, ticket, time.Unix(claim.ExpiresAt, 0)},
-		{"oversized", testAdminToken, accessTestOrigin, strings.Repeat("a", 4097), now},
-		{"malformed", testAdminToken, accessTestOrigin, "not!an!invitation", now},
+		{"tampered", testAdminToken, accessTestOrigin, base64.RawURLEncoding.EncodeToString(raw)},
+		{"wrong origin", testAdminToken, "https://other.example.com", ticket},
+		{"wrong port", testAdminToken, "https://porta.example.com", ticket},
+		{"rotated admin", testAdminToken + "-new", accessTestOrigin, ticket},
+		{"oversized", testAdminToken, accessTestOrigin, strings.Repeat("a", 4097)},
+		{"malformed", testAdminToken, accessTestOrigin, "not!an!invitation"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := openClientAccess(test.secret, test.origin, test.ticket, test.now); err != errClientAccess {
+			if _, err := openClientAccess(test.secret, test.origin, test.ticket); err != errClientAccess {
 				t.Fatalf("invalid invitation accepted or detailed error exposed: %v", err)
 			}
 		})
@@ -205,7 +210,7 @@ func TestClientAccessRevocationAndRoleBinding(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			portal, registry := accessTestPortal(t)
 			client := registry.List()[0]
-			claim := clientAccessClaim{ClientID: client.ID, Token: accessTestToken, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+			claim := clientAccessClaim{ClientID: client.ID, Token: accessTestToken}
 			var mutationErr error
 			switch action {
 			case "disable":
@@ -239,7 +244,7 @@ func TestClientAccessSurvivesRestartButPortalCredentialsDoNotTransfer(t *testing
 	first, registry := accessTestPortal(t)
 	client := registry.List()[0]
 	ticket, err := sealClientAccess(testAdminToken, accessTestOrigin, clientAccessClaim{
-		ClientID: client.ID, Token: accessTestToken, ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		ClientID: client.ID, Token: accessTestToken,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +262,7 @@ func TestClientAccessSurvivesRestartButPortalCredentialsDoNotTransfer(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openClientAccess(testAdminToken, accessTestOrigin, session.EncryptedToken, time.Now()); err == nil {
+	if _, err := openClientAccess(testAdminToken, accessTestOrigin, session.EncryptedToken); err == nil {
 		t.Fatal("encrypted in-memory profile token was accepted as a public invitation")
 	}
 	if _, err := openPortalCredential(first.tokenCipher, session.EncryptedToken, "another-client\n"+session.TokenHash); err == nil {
@@ -301,7 +306,7 @@ func TestClientAccessRejectsUnsafeOriginAndNeverForwardsCredentials(t *testing.T
 func TestClientAccessStrictRedemptionForm(t *testing.T) {
 	portal, registry := accessTestPortal(t)
 	ticket, err := sealClientAccess(testAdminToken, accessTestOrigin, clientAccessClaim{
-		ClientID: registry.List()[0].ID, Token: accessTestToken, ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		ClientID: registry.List()[0].ID, Token: accessTestToken,
 	})
 	if err != nil {
 		t.Fatal(err)

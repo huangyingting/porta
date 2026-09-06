@@ -51,7 +51,6 @@ const dispatchClose = () => { while (closeEvents.length) closeEvents.shift()(); 
 const ready = ticket => ({
   url: context.location.origin + '/join#invite=' + ticket,
   image: 'data:image/png;base64,aW1hZ2U=',
-  expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(),
 });
 const assertCleared = () => {
   assert.equal(run('rawClientToken'), '');
@@ -139,7 +138,6 @@ const assertCleared = () => {
     {...ready('x'), image: 'https://other.example.test/qr.png'},
     {...ready('x'), image: 'data:image/svg+xml;base64,aW1hZ2U='},
     {...ready('x'), image: 'data:image/png;base64,'},
-    {...ready('x'), expires_at: 'not a date'},
   ];
   for (const body of invalid) {
     run('generateClientAccess()');

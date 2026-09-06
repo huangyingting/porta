@@ -299,13 +299,13 @@ start a tunnel without your approval. Manual server/token copy controls on the
 download page and **Enter manually** in the app remain available.
 
 **Treat both QR codes and their copied links like credentials.** The first
-access link is encrypted, valid for eight hours, and reusable during that
-period; encryption does not make public sharing safe. It works only on the
-HTTPS origin for which it was issued and survives a server restart if the
-administrator token is unchanged. Redemption creates an eight-hour client
-browser session. The second profile QR contains the actual client token and
-has no independent expiry. Anyone who obtains either can access the account,
-subject to its device limit.
+access link is encrypted and reusable until the client token is rotated or the
+account is disabled or deleted; encryption does not make public sharing safe.
+It works only on the HTTPS origin for which it was issued and survives a server
+restart if the administrator token is unchanged. Redemption creates an
+eight-hour client browser session. The second profile QR contains the actual
+client token and has no independent expiry. Anyone who obtains either can
+access the account, subject to its device limit.
 
 Rotating the client token, disabling the account, or deleting it revokes access
 through existing invitations and browser sessions. Changing the administrator

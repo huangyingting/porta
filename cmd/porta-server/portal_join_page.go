@@ -20,7 +20,7 @@ const portalJoinScript = `(()=>{
   function invalid(){
     root.dataset.joinState='error';
     document.getElementById('join-heading').textContent='Link unavailable';
-    document.getElementById('join-detail').textContent='This access link is invalid or expired. Ask your administrator for a new link.';
+    document.getElementById('join-detail').textContent='This access link is invalid or no longer authorized. Ask your administrator for a new link.';
   }
   const params=new URLSearchParams(fragment.slice(1));
   fragment='';

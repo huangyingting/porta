@@ -56,7 +56,7 @@ module.exports = async function testOnboarding(directory) {
     assert.deepEqual(result.order, ['clear']);
     assert.equal(result.forms.length, 0);
     assert.equal(result.nodes.get('portal-join').dataset.joinState, 'error');
-    assert.match(result.nodes.get('join-detail').textContent, /invalid or expired/);
+    assert.match(result.nodes.get('join-detail').textContent, /invalid or no longer authorized/);
     assert.doesNotMatch(result.nodes.get('join-detail').textContent, /secret/);
   }
   const serverError = join('#invite=must-not-submit', 'error');

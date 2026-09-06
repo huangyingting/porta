@@ -79,15 +79,15 @@ the main Porta listener.
 `POST /api/client-access` requires an administrator browser session (with the
 existing same-origin checks) or a loopback API administrator bearer token.
 Send `{"origin":"https://porta.example.com:8443","token":"CLIENT_TOKEN"}`.
-The token must identify an active client. The response contains `url`, a PNG
-data URI in `image`, and an RFC3339 `expires_at`, with `Cache-Control: no-store`.
+The token must identify an active client. The response contains `url` and a PNG
+data URI in `image`, with `Cache-Control: no-store`.
 The image encodes the HTTPS access URL, not an Android profile.
 
-Invitations contain an AES-256-GCM encrypted client account ID, token, and eight-hour
-expiry. They are bound to the normalized HTTPS origin (including non-default
-ports) and a purpose-separated key derived from the administrator token.
-Unexpired invitations survive restarts with the same key and can be shared
-with multiple intended devices. Rotation, disabling, or deletion is checked
+Invitations contain an AES-256-GCM encrypted client account ID and token. They
+are bound to the normalized HTTPS origin (including non-default ports) and a
+purpose-separated key derived from the administrator token. Invitations
+survive restarts with the same key and can be shared with multiple intended
+devices. Rotation, disabling, or deletion is checked
 against the current client registry at redemption; administrator-key changes
 also invalidate invitations. Invitations never grant administrator access.
 

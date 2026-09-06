@@ -126,7 +126,8 @@ Imports create a local profile and do not connect automatically. Android keeps
 one app-wide signing key in Android Keystore and uses the device name, or model
 fallback, only as the readable name. Identity is not imported or editable.
 **Enter manually** remains available. Keep both codes private; access links
-expire after eight hours, while profile codes contain the client token.
+remain valid until the client token is rotated, disabled, or deleted, while
+profile codes contain the client token.
 Android uses HTTP/3 when available and falls back to HTTP/2 automatically.
 
 ### Forward proxy
