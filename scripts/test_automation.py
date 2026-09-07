@@ -49,7 +49,7 @@ class AutomationTests(unittest.TestCase):
         )
         for command in (
             "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "openssl",
-            "curl", "ss", "make", "mv", "git", "gomobile", "adb", "sleep", "gh", "uname",
+            "curl", "ss", "make", "mv", "git", "adb", "sleep", "gh", "uname",
             "sudo", "unshare",
         ):
             (self.bin / command).symlink_to(MOCK)
@@ -72,7 +72,7 @@ class AutomationTests(unittest.TestCase):
     def run_script(self, name, *args, success=True, cwd=None):
         result = subprocess.run(
             ["bash" if name.endswith(("deploy.sh", "server-up.sh", "server-down.sh",
-                                      "check-version.sh", "build-android-aar.sh",
+                                      "check-version.sh", "build-android-rust.sh",
                                       "test-server-firewall.sh")) else "sh",
              str(ROOT / "scripts" / name), *map(str, args)],
             cwd=cwd or self.root, env=self.env, text=True, capture_output=True,
@@ -425,12 +425,62 @@ class AutomationTests(unittest.TestCase):
         self.update_state(missing_previous_file=True)
         self.run_script("check-version.sh", "base")
 
-    def test_android_relative_output_uses_callers_directory(self):
+    def test_rust_package_versions_match_application_version(self):
+        version = (ROOT / "internal/buildinfo/VERSION").read_text().strip()
+        for manifest in (ROOT / "rust").glob("*/Cargo.toml"):
+            package = manifest.read_text().split("[package]", 1)
+            if len(package) != 2:
+                continue
+            match = re.search(r'(?m)^version = "([^"]+)"$', package[1])
+            self.assertIsNotNone(match, manifest)
+            self.assertEqual(match.group(1), version, manifest)
+
+    def test_android_rust_libraries_use_requested_output_directory(self):
         ndk = self.root / "ndk"
-        ndk.mkdir()
-        self.env.update(ANDROID_NDK_HOME=str(ndk), GOMOBILE=str(self.bin / "gomobile"))
-        self.run_script("build-android-aar.sh", "nested/output.aar")
-        self.assertEqual((self.root / "nested/output.aar").read_text(), "aar")
+        tools = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+        tools.mkdir(parents=True)
+        for name in (
+            "aarch64-linux-android26-clang",
+            "armv7a-linux-androideabi26-clang",
+            "x86_64-linux-android26-clang",
+        ):
+            (tools / name).write_text("#!/bin/sh\n")
+            (tools / name).chmod(0o755)
+
+        rustup = self.root / "rustup"
+        rustup.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' aarch64-linux-android armv7-linux-androideabi "
+            "x86_64-linux-android\n"
+        )
+        rustup.chmod(0o755)
+        cargo = self.root / "cargo"
+        cargo.write_text(
+            "#!/bin/sh\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$1\" = --target ]; then target=$2; shift 2; else shift; fi\n"
+            "done\n"
+            "mkdir -p \"$CARGO_TARGET_DIR/$target/release\"\n"
+            "printf '%s' \"$target\" > "
+            "\"$CARGO_TARGET_DIR/$target/release/libporta_android.so\"\n"
+        )
+        cargo.chmod(0o755)
+        target_dir = self.root / "target"
+        self.env.update(
+            ANDROID_NDK_HOME=str(ndk),
+            CARGO=str(cargo),
+            RUSTUP=str(rustup),
+            CARGO_TARGET_DIR=str(target_dir),
+        )
+        self.run_script("build-android-rust.sh", "nested/jni")
+        expected = {
+            "arm64-v8a": "aarch64-linux-android",
+            "armeabi-v7a": "armv7-linux-androideabi",
+            "x86_64": "x86_64-linux-android",
+        }
+        for abi, target in expected.items():
+            self.assertEqual((self.root / f"nested/jni/{abi}/libporta_android.so").read_text(),
+                             target)
 
     def test_android_soak_restores_wifi_after_failure(self):
         self.update_state(fail_sleep=True)
@@ -771,7 +821,9 @@ class AutomationTests(unittest.TestCase):
             (release / name).write_bytes(data)
             checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
         (release / "SHA256SUMS").write_text("".join(checksums))
-        assets.append("SHA256SUMS")
+        (release / "SHA256SUMS.sig").write_bytes(b"signed manifest")
+        (release / "release-signing-cert.der").write_bytes(b"release certificate")
+        assets.extend(["SHA256SUMS", "SHA256SUMS.sig", "release-signing-cert.der"])
         (release / "release.json").write_text(json.dumps({
             "tag_name": "v0.1.4",
             "assets": [{"name": name, "url": f"https://api.github.com/mock-assets/{name}"}
@@ -785,6 +837,8 @@ class AutomationTests(unittest.TestCase):
         downloads = self.root / "system/var/lib/porta/downloads"
         self.assertEqual((downloads / "CLIENT_VERSION").read_text(), "v0.1.4\n")
         self.assertTrue((downloads / "porta-client-windows-amd64.zip").is_file())
+        self.assertTrue((downloads / "SHA256SUMS.sig").is_file())
+        self.assertTrue((downloads / "release-signing-cert.der").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
@@ -823,6 +877,16 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("stopped_helpers", self.state())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
+    def test_release_signature_failure_leaves_installation_untouched(self):
+        deploy = self.prepare_deploy()
+        before = self.snapshot()
+        self.release_assets()
+        self.update_state(fail_release_signature=True)
+        self.run_deploy(deploy, success=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("stopped_helpers", self.state())
+        self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
     def test_failed_release_upgrade_restores_previous_downloads(self):
         deploy = self.prepare_deploy()
         before = self.snapshot()
@@ -852,6 +916,92 @@ class AutomationTests(unittest.TestCase):
                 self.assertRegex(reference, action_reference, f"mutable action in {workflow}")
         wrapper = (ROOT / "android/gradle/wrapper/gradle-wrapper.properties").read_text()
         self.assertRegex(wrapper, r"(?m)^distributionSha256Sum=[0-9a-f]{64}$")
+
+    def test_client_builds_use_rust_without_go_tooling(self):
+        build_sources = "\n".join(
+            (ROOT / path).read_text()
+            for path in ("Makefile", ".github/workflows/ci.yml",
+                         ".github/workflows/release.yml")
+        )
+        for obsolete in ("setup-go", "gomobile", "gobind"):
+            self.assertNotIn(obsolete, build_sources)
+        self.assertIsNone(re.search(r"(?<![A-Za-z])go (?:build|test|run)\b", build_sources))
+        go_sources = sorted(
+            path.relative_to(ROOT)
+            for directory in ("cmd", "internal", "mobile", "scripts", "experiments")
+            for path in (ROOT / directory).rglob("*.go")
+        )
+        self.assertEqual(go_sources, [])
+        for obsolete in ("go.mod", "go.sum", "scripts/build-android-aar.sh"):
+            self.assertFalse((ROOT / obsolete).exists(), obsolete)
+
+    def test_android_jni_entrypoints_are_not_obfuscated(self):
+        rules = (ROOT / "android/app/proguard-rules.pro").read_text()
+        for symbol in ("portamobile.Portamobile", "portamobile.ProofProvider",
+                       "portamobile.Protector", "native <methods>"):
+            self.assertIn(symbol, rules)
+
+    def test_windows_release_uses_native_msvc_package(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertRegex(workflow, r"(?ms)^  windows:\n.*?runs-on: windows-latest")
+        self.assertIn("--target x86_64-pc-windows-msvc", workflow)
+        self.assertIn("name: porta-windows-release", workflow)
+        self.assertIn("path: porta-client-windows-amd64.zip", workflow)
+        self.assertIn("actions/download-artifact@", workflow)
+        self.assertNotIn("WebView2Loader.dll", workflow)
+        package = (ROOT / "rust/porta-windows-package/src/lib.rs").read_text()
+        for name in ("porta.exe", "porta-cli.exe", "wintun.dll"):
+            self.assertIn(f'"{name}"', package)
+
+    def test_native_client_security_failures_remain_fail_closed(self):
+        windows_network = (
+            ROOT / "rust/porta-client/src/windows/network.rs"
+        ).read_text()
+        helper = windows_network.split("let mut command = Command::new(powershell);", 1)[1]
+        self.assertLess(helper.index(".env_clear()"), helper.index('.env("SystemRoot"'))
+
+        android_service = (
+            ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt"
+        ).read_text()
+        permanent_failure = android_service.split(
+            "} catch (error: PermanentTunnelException) {", 1
+        )[1].split("} catch (error: Exception) {", 1)[0]
+        self.assertIn("retainVpn = descriptor.get() != null", permanent_failure)
+        self.assertIn(
+            "if (!retainVpn || !holdVpnAfterTerminalFailure(runGeneration, finalStatus))",
+            android_service,
+        )
+        blocked = android_service.split(
+            "private fun holdVpnAfterTerminalFailure", 1
+        )[1].split("private fun finishTunnel", 1)[0]
+        self.assertIn("failClosed.set(true)", blocked)
+        self.assertIn("outboundPackets.clear()", blocked)
+
+        android_ui = (
+            ROOT / "android/app/src/main/java/dev/porta/android/MainActivity.kt"
+        ).read_text()
+        self.assertIn(
+            'value.startsWith("Waiting") || value.startsWith("Connection blocked")',
+            android_ui,
+        )
+
+    def test_wintun_checksum_is_consistent(self):
+        expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+        makefile = (ROOT / "Makefile").read_text().lower()
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text().lower()
+        self.assertIn(f"wintun_sha256 := {expected}", makefile)
+        self.assertIn(expected, workflow)
+        dll_expected = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+        tunnel = (ROOT / "rust/porta-client/src/windows/tun.rs").read_text().lower()
+        self.assertIn(dll_expected, tunnel)
+
+    def test_release_manifest_uses_pinned_signing_certificate(self):
+        expected = (ROOT / "android/signing-certificate.sha256").read_text().strip()
+        deploy = (ROOT / "scripts/deploy.sh").read_text().lower()
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn(f"release_signing_fingerprint={expected}", deploy)
+        self.assertIn("SignReleaseManifest.java", workflow)
+        self.assertIn("SHA256SUMS.sig", workflow)
 
     def test_rust_release_uses_compatible_glibc_baseline_and_guard(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

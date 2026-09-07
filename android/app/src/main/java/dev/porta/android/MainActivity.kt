@@ -385,10 +385,12 @@ class MainActivity : Activity() {
     private fun render(value: String) {
         if (!::status.isInitialized) return
         val connected = value.startsWith("Connected")
+        val blocked = value.startsWith("Connection blocked")
         val waiting = value.startsWith("Waiting")
         val active = isActiveStatus(value)
         status.text = when {
             connected -> getString(R.string.connected)
+            blocked -> getString(R.string.connection_blocked)
             waiting -> getString(R.string.waiting_for_network)
             active -> getString(R.string.connecting)
             else -> getString(R.string.disconnected)
@@ -396,6 +398,7 @@ class MainActivity : Activity() {
         statusDetail.text = when {
             value.contains("HTTP/3") -> getString(R.string.transport_http3)
             value.contains("HTTP/2") -> getString(R.string.transport_http2)
+            blocked -> value.substringAfter(": ", getString(R.string.connection_blocked))
             value.startsWith("Reconnecting") || value.startsWith("Connection lost") || waiting -> value
             active -> getString(R.string.establishing_secure_tunnel)
             else -> getString(R.string.choose_profile)
@@ -411,10 +414,15 @@ class MainActivity : Activity() {
             }
         }
         statusDot.background = circle(
-            if (connected) COLOR_CONNECTED else if (active) COLOR_CONNECTING else COLOR_OFFLINE,
+            when {
+                connected -> COLOR_CONNECTED
+                blocked -> COLOR_DELETE
+                active -> COLOR_CONNECTING
+                else -> COLOR_OFFLINE
+            },
         )
-        trafficState.setText(if (active) R.string.live else R.string.idle)
-        trafficState.setTextColor(if (active) COLOR_ACCENT else COLOR_MUTED)
+        trafficState.setText(if (active && !blocked) R.string.live else R.string.idle)
+        trafficState.setTextColor(if (active && !blocked) COLOR_ACCENT else COLOR_MUTED)
         updateBandwidth(TunnelService.currentTrafficSnapshot(), addSample = false)
         renderProfiles()
     }
@@ -925,6 +933,7 @@ class MainActivity : Activity() {
 
     private fun profileStatus(value: String): String = when {
         value.startsWith("Connected") -> getString(R.string.profile_connected)
+        value.startsWith("Connection blocked") -> getString(R.string.connection_blocked)
         value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
             getString(R.string.profile_reconnecting)
         value.startsWith("Waiting") -> getString(R.string.waiting_for_network)
@@ -995,7 +1004,7 @@ class MainActivity : Activity() {
     private fun isActiveStatus(value: String): Boolean =
         value.startsWith("Connected") || value.startsWith("Connecting") ||
             value.startsWith("Reconnecting") || value.startsWith("Connection lost") ||
-            value.startsWith("Waiting")
+            value.startsWith("Waiting") || value.startsWith("Connection blocked")
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 

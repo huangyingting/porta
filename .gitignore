@@ -2,7 +2,9 @@
 /dist/
 /.server-benchmark/
 /.server-interop/
-/rust/porta-server/target/
+/rust/target/
+/rust/*/target/
+/rust/porta-windows/gen/
 __pycache__/
 /*.pem
 /*.key

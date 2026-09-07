@@ -1,7 +1,6 @@
 package dev.porta.android
 
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -18,39 +17,6 @@ class PacketFilterTest {
         assertTrue(formatDataRate(0) == "0 B/s")
         assertTrue(formatDataRate(1536) == "1.5 KB/s")
         assertTrue(formatDataSize(2 * 1024 * 1024) == "2.0 MB")
-    }
-
-    @Test
-    fun reservesHttp2LaneZeroForDns() {
-        val packet = ByteArray(28)
-        packet[0] = 0x45
-        packet[3] = packet.size.toByte()
-        packet[9] = 17
-        packet[12] = 10
-        packet[13] = 66
-        packet[15] = 2
-        packet[16] = 1
-        packet[17] = 1
-        packet[18] = 1
-        packet[19] = 1
-        packet[20] = 0x9c.toByte()
-        packet[21] = 0x40
-        packet[22] = 0
-        packet[23] = 53
-        assertTrue(http2PacketLane(packet, 4) == 0)
-
-        val dataPacket = packet.copyOf(300)
-        dataPacket[2] = 1
-        dataPacket[3] = 44
-        dataPacket[22] = 1
-        dataPacket[23] = 187.toByte()
-        val lane = http2PacketLane(dataPacket, 4)
-        assertTrue(lane in 1..3)
-        dataPacket[4] = 0x12
-        dataPacket[5] = 0x34
-        dataPacket[10] = 0x56
-        dataPacket[11] = 0x78
-        assertTrue(http2PacketLane(dataPacket, 4) == lane)
     }
 
     @Test
@@ -79,32 +45,6 @@ class PacketFilterTest {
         packet[0] = 0x60
         assertFalse(isAssignedIPv4Packet(packet, packet.size, assigned))
         assertFalse(isAssignedIPv4Packet(packet, 19, assigned))
-    }
-
-    @Test
-    fun keepsEveryFragmentOfADatagramOnTheSameLane() {
-        val packet = ByteArray(28)
-        packet[0] = 0x45
-        packet[3] = packet.size.toByte()
-        packet[4] = 0x12
-        packet[5] = 0x34
-        packet[6] = 0x20
-        packet[9] = 17
-        packet[12] = 10
-        packet[15] = 2
-        packet[16] = 1
-        packet[19] = 1
-        packet[23] = 53
-        val firstLane = http2PacketLane(packet, 4)
-        assertTrue(firstLane in 1..3)
-
-        packet[6] = 0
-        for (offset in 1..255) {
-            packet[7] = offset.toByte()
-            packet[20] = offset.toByte()
-            packet[23] = (255 - offset).toByte()
-            assertEquals(firstLane, http2PacketLane(packet, 4))
-        }
     }
 
     @Test

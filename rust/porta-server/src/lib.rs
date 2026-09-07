@@ -9,7 +9,7 @@ pub mod server;
 pub mod state;
 pub mod transport;
 pub mod web;
-pub mod wire;
+pub use porta_wire as wire;
 
 pub const VERSION: &str = include_str!("../../../internal/buildinfo/VERSION");
 

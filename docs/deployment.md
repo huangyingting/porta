@@ -33,7 +33,15 @@ and client binaries. Download and verify the latest bundle:
 
 ```sh
 gh release download --repo huangyingting/porta \
-  --pattern porta-deploy.tar.gz --pattern SHA256SUMS
+  --pattern porta-deploy.tar.gz --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sig --pattern release-signing-cert.der
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8
+actual=$(openssl x509 -inform DER -in release-signing-cert.der \
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
+test "$actual" = "$expected"
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout > release-public-key.pem
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS
 grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf porta-deploy.tar.gz
 cd porta
@@ -45,11 +53,14 @@ can read it. Preserve `GH_TOKEN` through `sudo` when using release deployment;
 the token is not written to Porta's configuration.
 
 By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
-`porta-server` from that release and verifies it with `SHA256SUMS`. Pass
+`porta-server` from that release, verifies it with `SHA256SUMS`, and requires
+a detached signature from Porta's pinned release certificate before executing it.
+The signing key is isolated in GitHub Actions and is also the persistent key
+whose certificate pins official Android builds. Pass
 `--release vX.Y.Z` to pin a release that includes the client download portal.
 Developers working from a full source checkout can pass `--build-local`
-instead. Local builds require Go plus a stable Rust toolchain with Cargo; the
-deployed server binary is built from `rust/porta-server`.
+instead. Local builds require a stable Rust toolchain with Cargo; the deployed
+server binary is built from the Rust workspace.
 
 ## One-command installation with Let's Encrypt
 
@@ -212,6 +223,18 @@ curl -fsSLO -b porta.cookies \
   https://vpn.example.com:8443/download/porta-android-arm64-v8a.apk
 curl -fsSLO -b porta.cookies \
   https://vpn.example.com:8443/download/SHA256SUMS
+curl -fsSLO -b porta.cookies \
+  https://vpn.example.com:8443/download/SHA256SUMS.sig
+curl -fsSLO -b porta.cookies \
+  https://vpn.example.com:8443/download/release-signing-cert.der
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8
+actual=$(openssl x509 -inform DER -in release-signing-cert.der \
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
+test "$actual" = "$expected"
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout \
+  > release-public-key.pem
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS
 grep ' porta-android-arm64-v8a.apk$' SHA256SUMS | sha256sum -c -
 ```
 
@@ -495,7 +518,7 @@ Gateway: https://porta-dev.i-csu.org:8443
 The default APK is the optimized ARM64 build used by most current phones. Use
 `porta-android-armeabi-v7a.apk` for older 32-bit ARM devices or
 `porta-android-x86_64.apk` for an emulator. Each APK contains only its
-required native Go runtime instead of bundling every Android CPU architecture.
+required native Rust library instead of bundling every Android CPU architecture.
 
 ## Removal
 

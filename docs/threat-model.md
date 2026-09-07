@@ -36,8 +36,18 @@
   limiter. Successful authentication refunds its reservation, so established
   sessions do not consume failure budget. Overflow uses fixed shards rather
   than allocating unbounded attacker-controlled state.
-- Tokens are accepted through environment variables or the admin UI and are
-  never intentionally logged.
+- Tokens are accepted through environment variables or the admin UI, never
+  through client process arguments, and are never intentionally logged.
+- Release hashes are covered by a detached signature. Deployment first verifies
+  the signing certificate against the repository pin, then verifies the
+  manifest signature, and only then trusts artifact hashes. The same pinned
+  certificate identifies official Android release APKs.
+- Windows verifies the exact Wintun DLL hash while retaining a non-writable
+  handle through library loading. Its privileged recovery state lives in
+  administrator-only, high-integrity ProgramData storage that rejects reparse
+  points and hard links. The embedded PowerShell helper is delivered over
+  standard input instead of a replaceable user-writable script and runs with a
+  reconstructed system-only environment.
 - The access invitation travels in a URL fragment, which is removed before
   same-origin POST redemption. Pages use no-store, restrictive CSP, and secure
   HttpOnly session cookies. The join page uses `Referrer-Policy: same-origin`
@@ -121,16 +131,18 @@ not conceal transport fingerprints from network inspection.
   flow-pinned data lanes. Loss can still stall every flow assigned to the
   affected lane, and a reverse proxy can accidentally collapse the lanes onto
   one backend TCP connection.
-- Android prefers native HTTP/3 Extended CONNECT through the bundled Go
-  MASQUE bridge. It falls back to the private adaptive multi-lane HTTP/2
+- Android prefers native HTTP/3 Extended CONNECT through the bundled Rust
+  transport. It falls back to the private adaptive multi-lane HTTP/2
   transport when UDP or HTTP/3 is unavailable.
 - Android relies on the system trust store and does not offer an insecure TLS
   switch.
 - Linux automatic networking uses an owned nftables OUTPUT guard. Windows
-  desktop and opt-in automatic CLI networking use persistent native WFP filters;
-  the explicit Windows helpers use the same implementation. Protection starts
-  after the initial DNS/authenticated handshake, before route installation.
+  desktop and CLI automatic networking use persistent native WFP filters.
+  Protection starts after the initial DNS/authenticated handshake, before route
+  installation.
 - Guards remain active on reconnect, process crash, and terminal failure.
+  Android retains an established VPN in a packet-dropping blocked state after
+  a terminal reconnect failure.
   Intentional disconnect/cleanup restores owned networking and removes the
   guard last. A recovery journal is essential; deleting it is not cleanup.
 - Linux protection covers the host's network namespace, not forwarded/container
@@ -145,3 +157,7 @@ not conceal transport fingerprints from network inspection.
   Linux reboot/external nftables removal and Windows early boot/BFE shutdown
   are outside the guarantee, as is administrator tampering. Mocked policy and
   cross-platform builds are not native packet-level leak certification.
+- The release signing private key is an offline-sensitive trust root shared
+  with Android release signing. Compromise requires rotating the pinned
+  certificate and deliberately migrating installed Android applications;
+  ordinary release assets and checksums cannot authorize that rotation.

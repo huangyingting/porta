@@ -24,7 +24,16 @@ Do not copy `deploy.sh` by itself. It also requires the helper scripts in
 
 ```sh
 gh release download --repo huangyingting/porta \
-  --pattern porta-deploy.tar.gz --pattern SHA256SUMS
+  --pattern porta-deploy.tar.gz --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sig --pattern release-signing-cert.der
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8
+actual=$(openssl x509 -inform DER -in release-signing-cert.der \
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
+test "$actual" = "$expected"
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout \
+  > release-public-key.pem
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS
 grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf porta-deploy.tar.gz
 cd porta

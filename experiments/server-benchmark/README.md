@@ -1,9 +1,10 @@
 # Server performance regression benchmark
 
-The live benchmark exercises Porta's production Rust server with the production
-Go client over both HTTP/2 and HTTP/3. It uses a real Linux TUN, registry, usage
-store, TLS stack, router, and kernel UDP echo path, then reports throughput,
-p95 latency, server CPU, and peak RSS.
+The live benchmark exercises Porta's production Rust server and Rust load
+generator over HTTP/2, HTTP/3, and automatic transport selection. It uses a
+real Linux TUN, registry, usage store, TLS stack, router, and kernel UDP echo
+path, then reports throughput, latency, CPU, and peak RSS for both the client
+and server processes.
 
 Run the repeatable, CPU-pinned benchmark:
 
@@ -12,7 +13,7 @@ PORTA_SERVER_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
 ```
 
 The benchmark requires passwordless `sudo`, `unshare`, `ip`, `nft`, OpenSSL,
-taskset, Python 3, Go, and stable Rust. It runs in a disposable network
+GNU time, taskset, Python 3, and stable Rust. It runs in a disposable network
 namespace and does not alter host networking.
 
 Defaults are three runs at 1 and 16 concurrent clients, with a 500-millisecond
@@ -24,6 +25,41 @@ CPU scaling can be measured with `PORTA_SERVER_BENCH_SERVER_CPUS`,
 `PORTA_SERVER_BENCH_CLIENT_THREADS`. `PORTA_SERVER_BENCH_TRANSPORTS` selects
 `h2`, `h3`, and/or `auto`; setting `PORTA_SERVER_BENCH_AUTO_MTU=true` also
 requires every HTTP/3 connection to complete automatic MTU negotiation.
+`PORTA_SERVER_BENCH_INFLIGHT` controls outstanding packets per tunnel.
+
+For migration comparisons, provide space-separated `label=executable` entries.
+The same Rust server and benchmark sequence are used for every load generator:
+
+```sh
+PORTA_SERVER_BENCH_LOADGENS="rust=/path/porta-loadgen go=/path/go-loadgen" \
+  ./experiments/server-benchmark/run.sh
+```
+
+Paths must not contain spaces. `PORTA_SERVER_BENCH_LOADGEN` and
+`PORTA_SERVER_BENCH_LOADGEN_IMPLEMENTATION` select one external implementation.
+Without overrides, the runner builds and measures `porta-loadgen` from the Rust
+workspace.
+
+## 2026-09-07 Rust client migration result
+
+The final client comparison used the production Rust server, identical
+two-thread CPU pinning, one outstanding 1,200-byte packet per tunnel, a
+one-second warmup, and a one-second measurement. Each value is the median of
+five completed runs. Transient packet loss from the saturating local UDP echo
+path was excluded and rerun in a fresh network namespace.
+
+| Transport | Clients | Rust throughput | Rust p95 | Rust client CPU/op | Rust client RSS | Rust server CPU/op | Rust server RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HTTP/2 | 1 | +98.3% | -49.1% | -69.2% | -53.0% | -26.3% | +0.4% |
+| HTTP/3 | 1 | +21.0% | -21.0% | -44.5% | -53.4% | -12.6% | -0.3% |
+| HTTP/2 | 16 | +76.1% | -74.0% | -51.8% | -64.1% | -31.5% | +0.0% |
+| HTTP/3 | 16 | +55.5% | -63.7% | -46.4% | -53.7% | -16.3% | +2.8% |
+
+The initial Rust HTTP/2 client still used a linear scan when its 4,096-entry
+flow-affinity table filled. The benchmark crossed that boundary at 16 clients,
+causing queue expiry and packet loss. Replacing it with an index-linked,
+constant-time LRU removed the cliff: five consecutive three-second stress runs
+completed without packet loss at a median 46,972 operations per second.
 
 The historical Go-versus-Rust results below are retained as migration evidence.
 The obsolete prototype and Go server implementations were removed after the

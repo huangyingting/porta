@@ -1,0 +1,15 @@
+[package]
+name = "porta-windows-package"
+version = "0.1.35"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "porta-package-windows"
+path = "src/main.rs"
+
+[dependencies]
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"

@@ -2,13 +2,13 @@
 
 ## Requirements
 
-Go builds require Go 1.26 or newer. The Rust server additionally requires the
-stable Rust toolchain with Cargo, Clippy, and rustfmt. Android builds require
-JDK 17, Android SDK 35, Android NDK 27.2.12479018, and matching `gomobile` and
-`gobind` binaries on `PATH`. The Windows desktop uses the pinned Wails v3
-module and Microsoft Edge WebView2. Production builds must include the
-`production` build tag; the frontend is embedded HTML, CSS, and JavaScript and
-does not require Node.js or an npm build.
+All shipped binaries use the stable Rust toolchain with Cargo, Clippy, and
+rustfmt. Android builds additionally require JDK 17, Android SDK 35, and Android
+NDK 27.2.12479018. Distributable Windows builds use the MSVC Rust target on
+Windows; Linux cross-build checks use `x86_64-pc-windows-gnu` and MinGW-w64.
+The Tauri 2 desktop
+uses Microsoft Edge WebView2. Its embedded HTML, CSS, and JavaScript require no
+Node.js or npm build.
 
 ## Local validation
 
@@ -16,28 +16,29 @@ does not require Node.js or an npm build.
 make check-version
 make test-automation
 make test
-make test-race
 make test-rust-server
+make test-rust-client
 make test-rust-interop
+make test-windows-cross
 make test-native-firewall
 make vet
 make build
-make build-rust-server
 make build-windows
+make android-debug
 make android
 ```
 
-`make build` builds the production Rust server as `bin/porta-server` together
-with the Go clients. Rust is the only supported server implementation.
+`make build` builds the production Rust server, Linux client, and key generator
+under `bin/`. Rust is the only supported implementation for shipped server and
+client components.
 
-`make test-automation` uses Python 3's standard library and Go tests to exercise
+`make test-automation` uses Python 3's standard library to exercise
 deployment, certificate sync, firewall cleanup and packaging with isolated
 fixtures and mocked system commands. It does not change host services or
 network settings.
 
-The Rust server suite also invokes the focused Node.js browser regressions when
-Node.js is available. They cover invitation generation, dialog cleanup,
-fragment redemption, profile-copy controls, and compact admin layouts:
+The server and desktop suites also use Node.js, when available, to syntax-check
+the embedded browser JavaScript:
 
 ```sh
 make test-server-web
@@ -61,19 +62,18 @@ uses the installed service's `/run/porta` recovery journals or an inherited
 runtime-directory override. Rust unit tests separately verify fragmentation and
 ICMP generation.
 
-Windows networking script regressions use isolated PowerShell mocks. They run
-when `pwsh` is on `PATH`, or with Windows PowerShell on Windows; otherwise those
-tests are explicitly skipped. The Windows CI job runs the platform packages,
-including the identity-storage handle, link rejection, and protected ACL tests.
-It builds the Wails desktop with the `production` tag, smoke-tests WebView2
+The Windows CI job runs the Rust platform tests, including identity/profile
+DPAPI compatibility, private-file validation, journal recovery, and native WFP
+transaction acceptance. It builds the Tauri desktop, smoke-tests WebView2
 startup, verifies the pinned Wintun archive, and uploads the complete Windows
-ZIP as a workflow artifact.
-It also requires live BFE acceptance with `PORTA_WFP_NATIVE_TEST=1`, bypassing
-the Go test result cache. Run the same acceptance locally from elevated Windows:
+ZIP as a workflow artifact. Run the same acceptance locally from elevated
+Windows:
 
 ```powershell
 $env:PORTA_WFP_NATIVE_TEST = "1"
-go test ./internal/winnetwork -run '^TestNativeWFP' -count=1 -v
+cargo test --manifest-path rust/Cargo.toml --locked `
+  --target x86_64-pc-windows-msvc `
+  --package porta-client-rust -- --nocapture
 ```
 
 The native acceptance path stages the production IPv4/IPv6 filters, reads back
@@ -83,28 +83,21 @@ changes routes. It requires Windows/BFE and administrator access; Linux
 cross-compilation cannot execute it. This is native API acceptance, not an
 end-to-end packet-leak or reboot-persistence certification.
 
-Linux binaries are written to `bin/`. The Windows target creates
-`bin/porta-client-windows-amd64.zip`. Optimized per-architecture Android APKs
-are written under `android/app/build/outputs/apk/release/`.
+Linux binaries are written to `bin/`. `make build-windows` cross-compiles the
+Windows applications for validation; the distributable ZIP is built with MSVC
+by Windows CI and the release workflow so WebView2Loader is statically linked.
+Optimized per-architecture Android APKs are written under
+`android/app/build/outputs/apk/release/`.
 
 ## Performance measurements
 
-Use the existing Go benchmark runner to measure framing, packet delivery and
-allocation costs:
-
-```sh
-go test ./internal/masque ./internal/protocol ./internal/tunnel \
-  -run '^$' -bench . -benchmem -count=3
-```
-
 Keep payload sizes and concurrency identical for before/after comparisons.
-These in-process microbenchmarks isolate hot-path overhead; their throughput
-is not a prediction of end-to-end VPN speed. Network tests should compare
-HTTP/3, HTTP/2 fallback and CONNECT separately under the same latency, loss,
-client count and server load.
+Network tests should compare HTTP/3, HTTP/2 fallback, and automatic transport
+selection separately under the same latency, loss, client count, and server
+load.
 
 For complete HTTP/2 and HTTP/3 measurements through the production Rust
-server, real TUN, kernel UDP echo path, and production Go client, run:
+server, real TUN, kernel UDP echo path, and production Rust client stack, run:
 
 ```sh
 PORTA_SERVER_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
@@ -112,8 +105,10 @@ PORTA_SERVER_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
 
 `make test-rust-interop` runs a short form of this benchmark across HTTP/2,
 HTTP/3, and automatic transport with automatic MTU enabled. The benchmark
-requires `ip`, `nft`, `unshare`, and passwordless `sudo`, and runs entirely in
-a disposable network namespace.
+requires `ip`, `nft`, `unshare`, GNU time, and passwordless `sudo`, and runs
+entirely in a disposable network namespace. Set
+`PORTA_SERVER_BENCH_LOADGENS` to compare labeled Rust and preserved baseline
+executables in one interleaved run.
 
 ## Android signing
 
@@ -181,7 +176,7 @@ the persistent key and are the distributable update artifacts.
 
 The application version is stored in `internal/buildinfo/VERSION` and currently
 starts at `0.1.0`. The server, command-line clients, Windows desktop client,
-Android application, mobile bridge, release metadata, and download portal all
+Android application, native Rust libraries, release metadata, and download portal all
 use this application version.
 
 During the current development series, every merged change increments exactly
@@ -205,12 +200,17 @@ workflow and publishes:
 - the Windows desktop and CLI ZIP;
 - per-architecture Android APKs;
 - the deployment bundle;
-- `SHA256SUMS`.
+- `SHA256SUMS`, `SHA256SUMS.sig`, and `release-signing-cert.der`.
 
 Artifacts are uploaded to a draft release before it becomes visible as a
 published release. A failed upload leaves the draft unpublished and can be
 retried. Published artifacts are not overwritten on workflow reruns; changes
 require a new version and tag.
+
+Each release also publishes `SHA256SUMS`, its detached `SHA256SUMS.sig`, and
+`release-signing-cert.der`. The workflow verifies that the certificate matches
+the repository pin before signing, and deployment verifies the pin and
+signature before trusting any downloaded artifact hash.
 
 The release version supplies the Android application version name and a
 monotonic Android version code. These repository Actions secrets must contain

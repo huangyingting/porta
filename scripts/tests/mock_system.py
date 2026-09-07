@@ -226,6 +226,12 @@ elif name == "openssl":
         print("a" * 64)
     elif "-checkhost" in args:
         pass
+    elif args and args[0] == "x509" and "-fingerprint" in args:
+        print("sha256 Fingerprint=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8")
+    elif args and args[0] == "x509" and "-pubkey" in args and "-inform" in args:
+        print("mock release public key")
+    elif args and args[0] == "dgst":
+        code = 1 if state.get("fail_release_signature") else 0
     else:
         path = safe(args[args.index("-in") + 1])
         if state.get("slow_openssl"):
@@ -306,9 +312,6 @@ elif name == "git":
         print(state.get("previous_version", "0.1.3"))
     else:
         raise RuntimeError(f"unexpected git invocation: {args}")
-elif name == "gomobile":
-    output = safe(args[args.index("-o") + 1])
-    output.write_text("aar")
 elif name == "adb":
     if args == ["shell", "dumpsys", "connectivity"]:
         print("TRANSPORT_VPN")

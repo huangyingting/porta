@@ -217,21 +217,24 @@ tunnel.
   systemd-resolved per-link DNS through an exclusively locked recovery journal.
   An owned nftables OUTPUT guard remains installed during reconnect and cleanup
   removes it last. This covers host traffic, not containers or forwarded traffic.
-- Windows uses the WireGuard project's Wintun bindings. The desktop client
-  configures addresses, DNS and routes through a journaled PowerShell helper.
+- Windows calls the official Wintun API through a pinned DLL whose SHA-256 is
+  verified before loading. The desktop client configures addresses, DNS and
+  routes through an embedded PowerShell helper delivered over standard input,
+  not a user-writable script file.
   Persistent native WFP filters provide atomic fail-closed protection in an
   owned sublayer without overriding unrelated firewall blocks. The CLI retains
-  manual networking by default; `--manual-network=false` enables the same
-  automatic lifecycle. Separate up/down scripts invoke the same executable's
-  native helper rather than duplicating protection logic. The helper explicitly
-  sets the Windows IP-interface MTU: Wintun's buffer MTU does not configure the
-  OS network stack. MTU/DNS/routes are journaled for retryable recovery, and
-  guarded reconnects revalidate the adapter before restoring its exemption.
-- Android uses `VpnService` with a native Go HTTP/3 MASQUE bridge. The UDP
+  the same automatic lifecycle by default; `--manual-network` delegates all
+  network configuration and leak protection to the operator. The helper
+  explicitly sets the Windows IP-interface MTU: Wintun's buffer MTU does not
+  configure the OS network stack. MTU/DNS/routes are journaled for retryable
+  recovery under administrator-only, high-integrity ProgramData storage that
+  rejects reparse points and hard links. Guarded reconnects revalidate the
+  adapter before restoring its exemption.
+- Android uses `VpnService` with the shared native Rust transport. The UDP
   socket is protected from the VPN routing loop and bound to Android's selected
   underlying network. Four-lane HTTP/2 remains an automatic fallback.
-  Distribution uses stripped per-ABI APKs so each device downloads only one Go
-  runtime while retaining the complete HTTP/3 implementation.
+  Distribution uses stripped per-ABI APKs so each device downloads only one
+  Rust library while retaining the complete HTTP/3 implementation.
   Named server profiles and their tokens are stored locally, with tokens
   encrypted by Android Keystore.
 
@@ -240,7 +243,7 @@ for transport unavailability, never authentication, certificate, or protocol
 rejection. Protected reconnects prepare a cached numeric endpoint before dialing
 while preserving URL authority and TLS identity. Lease/address/MTU changes
 reconfigure networking under the guard; native TUN replacement joins workers
-and discards stale queued packets. Initial DNS and authenticated bootstrap are
+and discards stale queued packets when replacement is required. Initial DNS and authenticated bootstrap are
 outside the guard. Recovery journals allow crash restart without physical DNS,
 but cannot discover previously unknown hostname addresses while protected.
 

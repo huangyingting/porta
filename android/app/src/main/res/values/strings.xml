@@ -54,6 +54,7 @@
     <string name="disconnect_before_deleting">Disconnect this profile before deleting it.</string>
     <string name="disconnect_active_profile">Disconnect the active profile before connecting another one.</string>
     <string name="connected">Connected</string>
+    <string name="connection_blocked">Connection blocked</string>
     <string name="disconnected">Disconnected</string>
     <string name="connecting">Connecting</string>
     <string name="waiting_for_network">Waiting for network</string>

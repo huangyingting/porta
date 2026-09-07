@@ -18,30 +18,19 @@ import android.util.Log
 import portamobile.Portamobile
 import portamobile.Dialer
 import portamobile.Protector
+import portamobile.ProofProvider
 import portamobile.Session
-import okhttp3.Call
-import okhttp3.ConnectionPool
-import okhttp3.Dns
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Protocol
-import okhttp3.Request
-import okhttp3.RequestBody
-import okio.BufferedSink
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.EOFException
 import java.io.IOException
 import java.net.URI
 import java.net.UnknownHostException
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import java.util.UUID
+import org.json.JSONObject
 
 class TunnelService : VpnService() {
     private val running = AtomicBoolean(false)
@@ -50,6 +39,7 @@ class TunnelService : VpnService() {
     private val downloadedBytes = AtomicLong(0)
     private val descriptor = AtomicReference<ParcelFileDescriptor?>()
     private val vpnReaderFailure = AtomicReference<Exception?>()
+    private val failClosed = AtomicBoolean(false)
     private val selectedNetwork = AtomicReference<Network?>()
     private val preferredNetwork = AtomicReference<Network?>()
     private val uplinkPacketPool = PacketBufferPool(
@@ -66,9 +56,6 @@ class TunnelService : VpnService() {
             replacementPolicy = PacketQueueReplacementPolicy.DROP_OLDEST,
         ),
     )
-    private val http2Calls = ConcurrentHashMap.newKeySet<Call>()
-    private val http2PacketDispatcher = AtomicReference<Http2PacketDispatcher?>()
-    private val queueRoutingLock = Any()
     private val nativeSession = AtomicReference<Session?>()
     private val nativeDialer = AtomicReference<Dialer?>()
     private var input: FileInputStream? = null
@@ -80,6 +67,7 @@ class TunnelService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        Portamobile.initialize(this)
         createNotificationChannel()
     }
 
@@ -120,6 +108,7 @@ class TunnelService : VpnService() {
         val clientId = deviceIdentity.id
         uploadedBytes.set(0)
         downloadedBytes.set(0)
+        failClosed.set(false)
         currentSnapshot = TrafficSnapshot()
         resetConnectionDetailsState()
         logEvent("Porta ${Portamobile.version()}; protocol ${PacketFraming.VERSION}")
@@ -157,28 +146,9 @@ class TunnelService : VpnService() {
         startId: Int,
     ) {
         val clientId = deviceIdentity.id
-        val client = OkHttpClient.Builder()
-            .dns(object : Dns {
-                override fun lookup(hostname: String) = selectedNetwork.get()
-                    ?.getAllByName(hostname)
-                    ?.toList()
-                    ?: underlyingNetwork()
-                    ?.getAllByName(hostname)
-                    ?.toList()
-                    ?: throw UnknownHostException("No underlying network is available")
-            })
-            .socketFactory(ProtectedSocketFactory(this) {
-                selectedNetwork.get() ?: underlyingNetwork()
-            })
-            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .writeTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(20, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false)
-            .build()
         val backoff = ReconnectBackoff(clientId)
         var finalStatus = "Disconnected"
+        var retainVpn = false
         try {
             while (isRunActive(runGeneration)) {
                 val network = underlyingNetwork()
@@ -211,47 +181,29 @@ class TunnelService : VpnService() {
                     }
                     val reconnecting = descriptor.get() != null
                     updateConnectionStatus(if (reconnecting) "Reconnecting" else "Connecting", runGeneration)
-                    try {
-                        logEvent(formatAttemptEvent("HTTP/3 MASQUE", selectedNetworkType))
-                        connectNativeOnce(
-                            server,
-                            token,
-                            deviceIdentity,
-                            network,
-                            attemptActive,
-                            attemptToken,
-                            selectedNetworkType,
-                            runGeneration,
-                        ) {
-                            attemptConnectedAt = System.currentTimeMillis()
-                        }
-                    } catch (error: NativeTransportUnavailableException) {
-                        if (!isRunActive(runGeneration)) break
-                        if (!attemptActive.get()) {
-                            throw IOException("Underlying network changed during connection", error)
-                        }
-                        Log.i(TAG, "HTTP/3 MASQUE unavailable; falling back to HTTP/2")
-                        logEvent(
-                            "HTTP/3 unavailable: ${safeErrorMessage(error, token)}; " +
-                                "trying encrypted HTTP/2 fallback",
-                        )
-                        connectHttp2Once(
-                            client,
-                            server,
-                            token,
-                            deviceIdentity,
-                            attemptActive,
-                            attemptToken,
-                            selectedNetworkType,
-                            runGeneration,
-                        ) {
-                            attemptConnectedAt = System.currentTimeMillis()
-                        }
+                    logEvent(formatAttemptEvent("Automatic HTTP/3 or HTTP/2", selectedNetworkType))
+                    connectNativeOnce(
+                        server,
+                        token,
+                        deviceIdentity,
+                        network,
+                        attemptActive,
+                        attemptToken,
+                        selectedNetworkType,
+                        runGeneration,
+                    ) {
+                        attemptConnectedAt = System.currentTimeMillis()
                     }
                     networkChange.get()?.let { throw it }
                 } catch (error: PermanentTunnelException) {
                     if (!isRunActive(runGeneration)) break
-                    finalStatus = "Connection rejected: ${safeErrorMessage(error, token)}"
+                    val detail = safeErrorMessage(error, token)
+                    retainVpn = descriptor.get() != null
+                    finalStatus = if (retainVpn) {
+                        "Connection blocked: $detail"
+                    } else {
+                        "Connection rejected: $detail"
+                    }
                     clearConnectionDetails(attemptToken)
                     logEvent(finalStatus)
                     break
@@ -264,7 +216,6 @@ class TunnelService : VpnService() {
                     ) {
                         backoff.reset()
                     }
-                    client.connectionPool.evictAll()
                     synchronized(this) {
                         if (isRunActive(runGeneration)) selectedNetwork.set(null)
                     }
@@ -275,9 +226,9 @@ class TunnelService : VpnService() {
                 }
             }
         } finally {
-            client.dispatcher.executorService.shutdown()
-            client.connectionPool.evictAll()
-            finishTunnel(runGeneration, startId, finalStatus)
+            if (!retainVpn || !holdVpnAfterTerminalFailure(runGeneration, finalStatus)) {
+                finishTunnel(runGeneration, startId, finalStatus)
+            }
         }
     }
 
@@ -308,7 +259,7 @@ class TunnelService : VpnService() {
         val protector = object : Protector {
             override fun prepare(fd: Int): String {
                 if (!this@TunnelService.protect(fd)) {
-                    return "configuration: Android refused to protect the UDP socket"
+                    return "configuration: Android refused to protect the transport socket"
                 }
                 return try {
                     ParcelFileDescriptor.fromFd(fd).use { socket ->
@@ -316,18 +267,28 @@ class TunnelService : VpnService() {
                     }
                     ""
                 } catch (error: IOException) {
-                    "transport unavailable: could not bind UDP socket to the selected network"
+                    "transport unavailable: could not bind the transport socket to the selected network"
                 }
             }
+        }
+        val proofProvider = ProofProvider { method, path ->
+            val proof = deviceIdentity.proof(token, method, path)
+            JSONObject()
+                .put("publicKey", proof.publicKey)
+                .put("timestamp", proof.timestamp)
+                .put("nonce", proof.nonce)
+                .put("signature", proof.signature)
+                .put("deviceName", deviceIdentity.name)
+                .toString()
         }
         val dialer = Portamobile.newDialer()
         val readerFailureBeforeDial = synchronized(this) {
             if (!isRunActive(runGeneration)) {
-                dialer.close()
+                closeDialer(dialer)
                 throw InterruptedException("Tunnel generation was replaced")
             }
             if (!nativeDialer.compareAndSet(null, dialer)) {
-                dialer.close()
+                closeDialer(dialer)
                 throw IOException("Another native connection attempt is active")
             }
             vpnReaderFailure.get()
@@ -342,16 +303,11 @@ class TunnelService : VpnService() {
                     if (!attemptActive.get()) {
                         throw IOException("Underlying network changed during connection")
                     }
-                    val proof = deviceIdentity.proof(token, "CONNECT", MASQUE_PATH)
                     session = dialer.dial(
                         server,
                         token,
-                        deviceIdentity.name,
-                        proof.publicKey,
-                        proof.timestamp,
-                        proof.nonce,
-                        proof.signature,
                         remoteAddress,
+                        proofProvider,
                         protector,
                     )
                     connected = true
@@ -375,17 +331,15 @@ class TunnelService : VpnService() {
         } finally {
             if (!connected) {
                 nativeDialer.compareAndSet(dialer, null)
-                dialer.close()
+                closeDialer(dialer)
             }
         }
         val activeSession = session
-            ?: throw NativeTransportUnavailableException(
-                unavailable?.message ?: "HTTP/3 MASQUE is unavailable",
-            )
+            ?: throw IOException(unavailable?.message ?: "No supported tunnel transport is available")
         synchronized(this) {
             if (!isRunActive(runGeneration) || !nativeSession.compareAndSet(null, activeSession)) {
                 nativeDialer.compareAndSet(dialer, null)
-                dialer.close()
+                closeDialer(dialer)
                 activeSession.close()
                 throw IOException("Native tunnel was stopped or replaced")
             }
@@ -418,25 +372,34 @@ class TunnelService : VpnService() {
                     }
                 }
             }
-        }, "porta-http3-upload")
+        }, "porta-native-upload")
 
         try {
+            val address = "${activeSession.address()}/${activeSession.prefixLength()}"
+            val dns = activeSession.dns()
+            val mtu = activeSession.mtu()
             configureVpn(
-                activeSession.address(),
-                activeSession.dns(),
-                activeSession.mtu().toString(),
+                address,
+                dns,
+                mtu.toString(),
                 runGeneration,
             )
+            val transport = when (val selected = activeSession.transport()) {
+                "h2" -> "multi-lane HTTP/2"
+                "h3" -> "HTTP/3 MASQUE"
+                else -> throw IOException("Native tunnel selected unknown transport: $selected")
+            }
             val details = ConnectionTelemetry(
-                transport = "HTTP/3 MASQUE",
-                mtu = activeSession.mtu().toInt(),
+                transport = transport,
+                mtu = mtu,
                 automaticMtu = activeSession.automaticMTU(),
-                mtuCeiling = activeSession.maximumMTU().toInt().takeIf { it > 0 },
-                address = activeSession.address(),
-                dns = activeSession.dns(),
+                mtuCeiling = activeSession.maximumMTU().takeIf { it > 0 },
+                address = address,
+                dns = dns,
                 deliveryMode = when (activeSession.packetDeliveryMode()) {
                     "datagram" -> "datagrams"
                     "capsule" -> "capsules"
+                    "framed" -> "framed packets"
                     else -> null
                 },
                 networkType = selectedNetworkType,
@@ -450,7 +413,7 @@ class TunnelService : VpnService() {
             val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
             onConnected()
             formatConnectedEvents(details).forEach(::logEvent)
-            updateConnectionStatus("Connected over HTTP/3 MASQUE", runGeneration)
+            updateConnectionStatus("Connected over $transport", runGeneration)
             sender.start()
             while (isRunActive(runGeneration) && attemptActive.get()) {
                 val packet = activeSession.receive()
@@ -468,7 +431,7 @@ class TunnelService : VpnService() {
         } finally {
             attemptActive.set(false)
             nativeDialer.compareAndSet(dialer, null)
-            dialer.close()
+            closeDialer(dialer)
             nativeSession.compareAndSet(activeSession, null)
             try {
                 activeSession.close()
@@ -477,499 +440,10 @@ class TunnelService : VpnService() {
             sender.interrupt()
             if (sender.isAlive && sender !== Thread.currentThread()) {
                 try {
-                    sender.join(REQUEST_WRITER_STOP_TIMEOUT_MILLIS)
+                    sender.join(NATIVE_SENDER_STOP_TIMEOUT_MILLIS)
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
-            }
-        }
-    }
-
-    private fun connectHttp2Once(
-        client: OkHttpClient,
-        server: String,
-        token: String,
-        deviceIdentity: AndroidDeviceIdentity,
-        attemptActive: AtomicBoolean,
-        attemptToken: ConnectionAttemptToken,
-        selectedNetworkType: String?,
-        runGeneration: Long,
-        onConnected: () -> Unit,
-    ) {
-        val attemptStartedAt = System.nanoTime()
-        val sessionId = UUID.randomUUID().toString().replace("-", "")
-        val laneQueues = List(HTTP2_LANE_COUNT) {
-            BoundedPacketQueue(HTTP2_UPLINK_QUEUE_CONFIG)
-        }
-        val pendingPackets = BoundedPacketQueue(HTTP2_UPLINK_QUEUE_CONFIG)
-        val downstreamSignal = PacketQueueSignal()
-        val downstreamQueues = List(HTTP2_LANE_COUNT) {
-            BoundedPacketQueue(HTTP2_DOWNLINK_QUEUE_CONFIG, downstreamSignal)
-        }
-        val downstreamScheduler = FairLanePacketScheduler(downstreamQueues, downstreamSignal)
-        val downstreamPool = PacketBufferPool(
-            bufferSize = MAX_VPN_PACKET_SIZE,
-            maxCachedBuffers = HTTP2_DOWNSTREAM_POOL_SIZE,
-        )
-        val laneClients = List(HTTP2_LANE_COUNT) {
-            client.newBuilder().connectionPool(ConnectionPool()).build()
-        }
-        val lanesActive = AtomicBoolean(true)
-        val expectedConfiguration = AtomicReference<VpnConfiguration?>()
-        val configurationLock = Any()
-        val recovery = Http2LaneRecoveryState<VpnConfiguration>(
-            laneCount = HTTP2_LANE_COUNT,
-            requiredUnavailableTimeoutMillis = TimeUnit.SECONDS.toMillis(
-                HTTP2_LANE_CONNECT_TIMEOUT_SECONDS,
-            ),
-        )
-        val adaptiveLanes = AdaptiveLaneController(HTTP2_LANE_COUNT)
-        val activationRequests = LinkedBlockingQueue<Int>()
-        val errors = LinkedBlockingQueue<Exception>()
-        val sessionCalls = ConcurrentHashMap.newKeySet<Call>()
-        val dispatcher = Http2PacketDispatcher(
-            laneQueues = laneQueues,
-            pendingQueue = pendingPackets,
-            isLaneReady = recovery::isReady,
-            adaptiveLanes = adaptiveLanes,
-            requestLaneActivation = activationRequests::offer,
-        )
-        val laneThreads = arrayOfNulls<Thread>(HTTP2_LANE_COUNT)
-        val laneThreadLock = Any()
-        val startLane: (Int) -> Unit = { laneIndex ->
-            synchronized(laneThreadLock) {
-                if (laneThreads[laneIndex] == null) {
-                    laneThreads[laneIndex] = Thread({
-                        runHttp2LaneWorker(
-                            client = laneClients[laneIndex],
-                            server = server,
-                            token = token,
-                            deviceIdentity = deviceIdentity,
-                            sessionId = sessionId,
-                            laneIndex = laneIndex,
-                            outboundQueue = laneQueues[laneIndex],
-                            downstreamQueue = downstreamQueues[laneIndex],
-                            downstreamPool = downstreamPool,
-                            active = lanesActive,
-                            attemptActive = attemptActive,
-                            expectedConfiguration = expectedConfiguration,
-                            configurationLock = configurationLock,
-                            recovery = recovery,
-                            dispatcher = dispatcher,
-                            adaptiveLanes = adaptiveLanes,
-                            activationRequests = activationRequests,
-                            errors = errors,
-                            sessionCalls = sessionCalls,
-                            runGeneration = runGeneration,
-                        )
-                    }, "porta-http2-lane-$laneIndex").also { it.start() }
-                }
-            }
-        }
-        startLane(0)
-        startLane(1)
-        var downstreamWriter: Thread? = null
-        try {
-            val deadline = System.nanoTime() +
-                TimeUnit.SECONDS.toNanos(HTTP2_LANE_CONNECT_TIMEOUT_SECONDS)
-            var nextStartupScale = System.nanoTime() +
-                TimeUnit.MILLISECONDS.toNanos(HTTP2_STARTUP_SCALE_INTERVAL_MILLIS)
-            while (!recovery.isPartiallyReady() && isRunActive(runGeneration) &&
-                lanesActive.get() && attemptActive.get()
-            ) {
-                while (true) {
-                    val lane = activationRequests.poll() ?: break
-                    startLane(lane)
-                }
-                errors.poll(100, TimeUnit.MILLISECONDS)?.let { throw it }
-                if (System.nanoTime() >= nextStartupScale) {
-                    adaptiveLanes.observePressure(1.0)?.let(startLane)
-                    nextStartupScale +=
-                        TimeUnit.MILLISECONDS.toNanos(HTTP2_STARTUP_SCALE_INTERVAL_MILLIS)
-                }
-                if (System.nanoTime() >= deadline) {
-                    throw IOException("Timed out establishing the required HTTP/2 fallback lanes")
-                }
-            }
-            errors.poll()?.let { throw it }
-            if (!isRunActive(runGeneration)) return
-            if (!lanesActive.get() || !attemptActive.get()) {
-                throw IOException("HTTP/2 fallback stopped during setup")
-            }
-            val tunnelOutput = output ?: throw IOException("VPN output is unavailable")
-            synchronized(queueRoutingLock) {
-                if (http2PacketDispatcher.get() != null) {
-                    throw IOException("Another HTTP/2 fallback session is active")
-                }
-                http2PacketDispatcher.set(dispatcher)
-                while (true) {
-                    val packet = outboundPackets.pollNow() ?: break
-                    dispatcher.offer(packet)
-                }
-            }
-            val configuration = expectedConfiguration.get()
-                ?: throw IOException("HTTP/2 fallback did not return a VPN lease")
-            val initialActiveLanes = recovery.snapshot().activeLaneCount
-            val details = ConnectionTelemetry(
-                transport = "multi-lane HTTP/2",
-                mtu = configuration.mtu,
-                automaticMtu = false,
-                address = "${configuration.address}/${configuration.prefix}",
-                dns = configuration.dns,
-                deliveryMode = "$initialActiveLanes active of $HTTP2_LANE_COUNT lanes",
-                networkType = selectedNetworkType,
-                setupDurationMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - attemptStartedAt),
-                appVersion = Portamobile.version(),
-                protocolVersion = PacketFraming.VERSION,
-            )
-            if (!publishConnectionDetails(attemptToken, details.toConnectionDetails())) {
-                throw InterruptedException("HTTP/2 fallback was replaced")
-            }
-            onConnected()
-            formatConnectedEvents(details).forEach(::logEvent)
-            updateConnectionStatus("Connected over multi-lane HTTP/2", runGeneration)
-            downstreamWriter = Thread({
-                try {
-                    while (isRunActive(runGeneration) && lanesActive.get() && attemptActive.get()) {
-                        val scheduled = downstreamScheduler.poll(1, TimeUnit.SECONDS) ?: continue
-                        if (!isRunActive(runGeneration) || !lanesActive.get() ||
-                            !attemptActive.get()
-                        ) {
-                            scheduled.packet.release()
-                            break
-                        }
-                        try {
-                            tunnelOutput.write(
-                                scheduled.packet.bytes,
-                                0,
-                                scheduled.packet.length,
-                            )
-                            downloadedBytes.addAndGet(scheduled.packet.length.toLong())
-                        } finally {
-                            scheduled.packet.release()
-                        }
-                    }
-                } catch (error: Exception) {
-                    if (isRunActive(runGeneration) && lanesActive.get() && attemptActive.get()) {
-                        errors.offer(error)
-                    }
-                }
-            }, "porta-http2-download").also { it.start() }
-            var lastActiveLaneCount = -1
-            while (isRunActive(runGeneration) && lanesActive.get() && attemptActive.get()) {
-                while (true) {
-                    val lane = activationRequests.poll() ?: break
-                    startLane(lane)
-                }
-                errors.poll(250, TimeUnit.MILLISECONDS)?.let { throw it }
-                val laneSnapshot = recovery.snapshot()
-                if (laneSnapshot.activeLaneCount != lastActiveLaneCount) {
-                    lastActiveLaneCount = laneSnapshot.activeLaneCount
-                    logEvent(
-                        "HTTP/2 active lanes: $lastActiveLaneCount/$HTTP2_LANE_COUNT",
-                    )
-                }
-                if (recovery.shouldTerminate()) {
-                    throw IOException("Required HTTP/2 lanes were unavailable too long")
-                }
-            }
-            errors.poll()?.let { throw it }
-        } finally {
-            synchronized(this) {
-                lanesActive.set(false)
-                sessionCalls.forEach(Call::cancel)
-            }
-            laneThreads.filterNotNull().forEach {
-                it.interrupt()
-                if (it.isAlive && it !== Thread.currentThread()) {
-                    try {
-                        it.join(REQUEST_WRITER_STOP_TIMEOUT_MILLIS)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                    }
-                }
-            }
-            downstreamWriter?.interrupt()
-            if (downstreamWriter?.isAlive == true && downstreamWriter !== Thread.currentThread()) {
-                try {
-                    downstreamWriter.join(REQUEST_WRITER_STOP_TIMEOUT_MILLIS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-            }
-            laneClients.forEach { it.connectionPool.evictAll() }
-            val recoverySnapshot = recovery.snapshot()
-            laneQueues.forEachIndexed { lane, queue ->
-                logEvent(
-                    formatHttp2LaneDiagnostic(
-                        lane = lane,
-                        queue = queue.snapshot(),
-                        reconnects = recoverySnapshot.reconnects[lane],
-                    ),
-                )
-            }
-            synchronized(queueRoutingLock) {
-                if (http2PacketDispatcher.get() === dispatcher) {
-                    http2PacketDispatcher.set(null)
-                }
-                laneQueues.forEach { it.clear() }
-                pendingPackets.clear()
-            }
-            downstreamQueues.forEach { it.clear() }
-        }
-    }
-
-    private fun runHttp2LaneWorker(
-        client: OkHttpClient,
-        server: String,
-        token: String,
-        deviceIdentity: AndroidDeviceIdentity,
-        sessionId: String,
-        laneIndex: Int,
-        outboundQueue: BoundedPacketQueue,
-        downstreamQueue: BoundedPacketQueue,
-        downstreamPool: PacketBufferPool,
-        active: AtomicBoolean,
-        attemptActive: AtomicBoolean,
-        expectedConfiguration: AtomicReference<VpnConfiguration?>,
-        configurationLock: Any,
-        recovery: Http2LaneRecoveryState<VpnConfiguration>,
-        dispatcher: Http2PacketDispatcher,
-        adaptiveLanes: AdaptiveLaneController,
-        activationRequests: LinkedBlockingQueue<Int>,
-        errors: LinkedBlockingQueue<Exception>,
-        sessionCalls: MutableSet<Call>,
-        runGeneration: Long,
-    ) {
-        while (isRunActive(runGeneration) && active.get() && attemptActive.get()) {
-            recovery.markConnecting(laneIndex)
-            try {
-                runHttp2LaneAttempt(
-                    client = client,
-                    server = server,
-                    token = token,
-                    deviceIdentity = deviceIdentity,
-                    sessionId = sessionId,
-                    laneIndex = laneIndex,
-                    outboundQueue = outboundQueue,
-                    downstreamQueue = downstreamQueue,
-                    downstreamPool = downstreamPool,
-                    active = active,
-                    attemptActive = attemptActive,
-                    expectedConfiguration = expectedConfiguration,
-                    configurationLock = configurationLock,
-                    recovery = recovery,
-                    dispatcher = dispatcher,
-                    onBlockedWrite = { durationMillis ->
-                        if (laneIndex > 0) {
-                            adaptiveLanes.observeBlockedWrite(durationMillis)
-                                ?.let(activationRequests::offer)
-                        }
-                    },
-                    sessionCalls = sessionCalls,
-                    runGeneration = runGeneration,
-                )
-                if (isRunActive(runGeneration) && active.get() && attemptActive.get()) {
-                    throw IOException("HTTP/2 lane $laneIndex closed")
-                }
-                return
-            } catch (error: Exception) {
-                if (!isRunActive(runGeneration) || !active.get() || !attemptActive.get()) return
-                val classified = if (error is DeviceIdentityUnavailableException) {
-                    PermanentTunnelException(error.message ?: "Could not sign the device request")
-                } else {
-                    error
-                }
-                if (classified is RetryableGroupTunnelException) {
-                    errors.offer(classified)
-                    return
-                }
-                val permanent = classified is PermanentTunnelException
-                val delayMillis = recovery.markFailure(laneIndex, permanent)
-                if (permanent) {
-                    errors.offer(classified)
-                    return
-                }
-                dispatcher.laneBecameUnavailable(outboundQueue)
-                if (laneIndex > 0) {
-                    adaptiveLanes.observeLaneFailure()?.let(activationRequests::offer)
-                }
-                val reconnects = recovery.snapshot().reconnects[laneIndex]
-                logEvent(
-                    "HTTP/2 lane $laneIndex reconnect $reconnects in " +
-                        "${(delayMillis + 999L) / 1_000L}s",
-                )
-                if (!sleepWhileActive(delayMillis, active, attemptActive, runGeneration)) return
-            }
-        }
-    }
-
-    private fun runHttp2LaneAttempt(
-        client: OkHttpClient,
-        server: String,
-        token: String,
-        deviceIdentity: AndroidDeviceIdentity,
-        sessionId: String,
-        laneIndex: Int,
-        outboundQueue: BoundedPacketQueue,
-        downstreamQueue: BoundedPacketQueue,
-        downstreamPool: PacketBufferPool,
-        active: AtomicBoolean,
-        attemptActive: AtomicBoolean,
-        expectedConfiguration: AtomicReference<VpnConfiguration?>,
-        configurationLock: Any,
-        recovery: Http2LaneRecoveryState<VpnConfiguration>,
-        dispatcher: Http2PacketDispatcher,
-        onBlockedWrite: (Long) -> Unit,
-        sessionCalls: MutableSet<Call>,
-        runGeneration: Long,
-    ) {
-        val attemptCall = AtomicReference<Call?>()
-        val laneAttemptActive = AtomicBoolean(true)
-        val uploadReady = CountDownLatch(1)
-        val requestBody = TunRequestBody(
-            active = active,
-            attemptActive = laneAttemptActive,
-            ready = uploadReady,
-            ownerCall = attemptCall,
-            outboundQueue = outboundQueue,
-            runGeneration = runGeneration,
-            onBlockedWrite = onBlockedWrite,
-        )
-        var activeCall: Call? = null
-        try {
-            val proof = deviceIdentity.proof(token, "POST", TUNNEL_PATH)
-            val request = Request.Builder()
-                .url(server.trimEnd('/') + TUNNEL_PATH)
-                .header("Authorization", "Bearer $token")
-                .header("X-Porta-Version", PacketFraming.VERSION)
-                .header("X-Porta-Client-ID", deviceIdentity.id)
-                .header("X-Porta-Device-Name", deviceIdentity.name)
-                .header("X-Porta-Device-Key", proof.publicKey)
-                .header("X-Porta-Device-Time", proof.timestamp)
-                .header("X-Porta-Device-Nonce", proof.nonce)
-                .header("X-Porta-Device-Signature", proof.signature)
-                .header(HEADER_LANE_SESSION, sessionId)
-                .header(HEADER_LANE_INDEX, laneIndex.toString())
-                .header(HEADER_LANE_COUNT, HTTP2_LANE_COUNT.toString())
-                .post(requestBody)
-                .build()
-            val call = client.newCall(request)
-            activeCall = call
-            attemptCall.set(call)
-            synchronized(this) {
-                if (!isRunActive(runGeneration) || !active.get() || !attemptActive.get()) {
-                    call.cancel()
-                    return
-                }
-                http2Calls.add(call)
-                sessionCalls.add(call)
-            }
-            call.execute().use { response ->
-                if (!response.isSuccessful) {
-                    if (response.code == 426) {
-                        val minimum = response.header(HEADER_PROTOCOL_MIN_VERSION).orEmpty()
-                        val maximum = response.header(HEADER_PROTOCOL_MAX_VERSION).orEmpty()
-                        val supported = if (maximum.isNotEmpty() && maximum != minimum) {
-                            "$minimum-$maximum"
-                        } else {
-                            minimum.ifEmpty { "an incompatible version" }
-                        }
-                        throw PermanentTunnelException(
-                            "Gateway requires Porta protocol $supported; client uses ${PacketFraming.VERSION}",
-                        )
-                    }
-                    val message = "Gateway returned HTTP ${response.code} for HTTP/2 lane $laneIndex"
-                    if (response.code in 400..499 && response.code !in RETRYABLE_HTTP_CODES) {
-                        throw PermanentTunnelException(message)
-                    }
-                    throw IOException(message)
-                }
-                if (response.protocol != Protocol.HTTP_2) {
-                    throw PermanentTunnelException("Gateway did not negotiate HTTP/2")
-                }
-                if (response.header(HEADER_PROTOCOL_VERSION) != PacketFraming.VERSION) {
-                    throw PermanentTunnelException("Gateway selected an incompatible Porta protocol")
-                }
-                if (response.header("Content-Type")?.substringBefore(';')?.trim() !=
-                    PacketFraming.CONTENT_TYPE
-                ) {
-                    throw PermanentTunnelException("Gateway returned an invalid tunnel content type")
-                }
-                if (response.header(HEADER_LANE_SESSION) != sessionId ||
-                    response.header(HEADER_LANE_INDEX) != laneIndex.toString() ||
-                    response.header(HEADER_LANE_COUNT) != HTTP2_LANE_COUNT.toString()
-                ) {
-                    throw PermanentTunnelException("Gateway rejected HTTP/2 lane negotiation")
-                }
-                if (!isRunActive(runGeneration) || !active.get() || !attemptActive.get()) return
-
-                val configuration = parseVpnConfiguration(
-                    response.header("X-Porta-Address"),
-                    response.header("X-Porta-DNS"),
-                    response.header("X-Porta-MTU"),
-                )
-                synchronized(configurationLock) {
-                    if (!isRunActive(runGeneration) || !active.get() || !attemptActive.get()) {
-                        throw InterruptedException("HTTP/2 fallback was stopped")
-                    }
-                    val expected = expectedConfiguration.get()
-                    if (expected == null) {
-                        configureVpn(configuration, runGeneration)
-                        expectedConfiguration.set(configuration)
-                    } else if (expected != configuration) {
-                        if (recovery.hasBeenPartiallyReady() &&
-                            recovery.snapshot().activeLaneCount == 0
-                        ) {
-                            throw RetryableGroupTunnelException(
-                                "HTTP/2 lease changed after all lanes disconnected",
-                            )
-                        }
-                        throw PermanentTunnelException("HTTP/2 lanes returned different VPN leases")
-                    } else {
-                        configureVpn(configuration, runGeneration)
-                    }
-                }
-                val responseBody = response.body ?: throw IOException("Gateway returned no response stream")
-                if (!recovery.markReady(laneIndex, configuration)) {
-                    throw PermanentTunnelException("HTTP/2 lanes returned different VPN leases")
-                }
-                uploadReady.countDown()
-                dispatcher.laneBecameReady()
-                val source = responseBody.source()
-                while (isRunActive(runGeneration) && active.get() && attemptActive.get() &&
-                    laneAttemptActive.get()
-                ) {
-                    val buffer = downstreamPool.acquire()
-                    val length = try {
-                        PacketFraming.readInto(source, buffer)
-                    } catch (error: Exception) {
-                        downstreamPool.recycle(buffer)
-                        throw error
-                    }
-                    if (length == null) {
-                        downstreamPool.recycle(buffer)
-                        continue
-                    }
-                    if (!isRunActive(runGeneration) || !active.get() || !attemptActive.get() ||
-                        !laneAttemptActive.get()
-                    ) {
-                        downstreamPool.recycle(buffer)
-                        break
-                    }
-                    val packet = PacketBuffer.pooled(buffer, length, downstreamPool)
-                    if (!downstreamQueue.offer(packet)) packet.release()
-                }
-                if (isRunActive(runGeneration) && active.get() && attemptActive.get()) {
-                    throw IOException("HTTP/2 lane $laneIndex closed")
-                }
-            }
-        } finally {
-            activeCall?.cancel()
-            requestBody.stop()
-            activeCall?.let {
-                http2Calls.remove(it)
-                sessionCalls.remove(it)
             }
         }
     }
@@ -1007,8 +481,9 @@ class TunnelService : VpnService() {
     private fun configureVpn(configuration: VpnConfiguration, runGeneration: Long) {
         if (!isRunActive(runGeneration)) throw InterruptedException("Tunnel generation was replaced")
         if (descriptor.get() != null && vpnConfiguration == configuration && vpnReaderFailure.get() == null) return
-        closeVpn()
 
+        val sourceAddress = parseIPv4Address(configuration.address)
+            ?: throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
         val builder = Builder()
             .setSession(currentProfileName ?: "Porta")
             .setMtu(configuration.mtu)
@@ -1017,13 +492,24 @@ class TunnelService : VpnService() {
             .setBlocking(true)
         if (configuration.dns.isNotBlank()) builder.addDnsServer(configuration.dns)
         val vpn = builder.establish() ?: throw PermanentTunnelException("Android refused to establish the VPN")
-        descriptor.set(vpn)
-        input = FileInputStream(vpn.fileDescriptor)
-        output = FileOutputStream(vpn.fileDescriptor)
+        val previousReader = vpnReader
+        vpnReader = null
+        val previousVpn = descriptor.getAndSet(vpn)
+        val nextInput = FileInputStream(vpn.fileDescriptor)
+        val nextOutput = FileOutputStream(vpn.fileDescriptor)
+        input = nextInput
+        output = nextOutput
         vpnConfiguration = configuration
+        vpnReaderFailure.set(null)
+        failClosed.set(false)
         selectedNetwork.get()?.let { setUnderlyingNetworks(arrayOf(it)) }
-        val sourceAddress = parseIPv4Address(configuration.address)
-            ?: throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
+        retireVpn(previousVpn, previousReader)
+        if (previousReader?.isAlive == true) {
+            val error = IOException("Previous VPN packet reader did not stop")
+            vpnReaderFailure.set(error)
+            throw error
+        }
+        if (previousVpn != null) outboundPackets.discardForRecovery()
         startVpnReader(sourceAddress)
     }
 
@@ -1052,19 +538,16 @@ class TunnelService : VpnService() {
                         uplinkPacketPool.recycle(buffer)
                         break
                     }
+                    if (failClosed.get()) {
+                        uplinkPacketPool.recycle(buffer)
+                        continue
+                    }
                     if (!isAssignedIPv4Packet(buffer, count, sourceAddress)) {
                         uplinkPacketPool.recycle(buffer)
                         continue
                     }
                     val packet = PacketBuffer.pooled(buffer, count, uplinkPacketPool)
-                    synchronized(queueRoutingLock) {
-                        val dispatcher = http2PacketDispatcher.get()
-                        if (dispatcher == null) {
-                            if (!outboundPackets.offer(packet)) packet.release()
-                        } else {
-                            dispatcher.offer(packet)
-                        }
-                    }
+                    if (!outboundPackets.offer(packet)) packet.release()
                 }
             } catch (error: Exception) {
                 if (!running.get() || descriptor.get() !== readerDescriptor) return@Thread
@@ -1072,7 +555,6 @@ class TunnelService : VpnService() {
                     if (!running.get() || descriptor.get() !== readerDescriptor) return@Thread
                     vpnReaderFailure.set(error)
                     Log.w(TAG, "VPN packet reader stopped")
-                    http2Calls.forEach(Call::cancel)
                     closeNativeDialer()
                     closeNativeSession()
                 }
@@ -1186,28 +668,8 @@ class TunnelService : VpnService() {
     }
 
     private fun cancelCurrentTransportAttempt() {
-        http2Calls.forEach(Call::cancel)
         closeNativeDialer()
         closeNativeSession()
-    }
-
-    private fun sleepWhileActive(
-        delayMillis: Long,
-        active: AtomicBoolean,
-        attemptActive: AtomicBoolean,
-        runGeneration: Long,
-    ): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMillis)
-        while (isRunActive(runGeneration) && active.get() && attemptActive.get()) {
-            val remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
-            if (remainingMillis <= 0L) return true
-            try {
-                Thread.sleep(remainingMillis.coerceAtMost(250L))
-            } catch (_: InterruptedException) {
-                return isRunActive(runGeneration) && active.get() && attemptActive.get()
-            }
-        }
-        return false
     }
 
     private fun waitForRetry(reason: String, delayMillis: Long, runGeneration: Long): Boolean {
@@ -1236,88 +698,10 @@ class TunnelService : VpnService() {
         updateNotification(value)
     }
 
-    private inner class TunRequestBody(
-        private val active: AtomicBoolean,
-        private val attemptActive: AtomicBoolean,
-        private val ready: CountDownLatch,
-        private val ownerCall: AtomicReference<Call?>,
-        private val outboundQueue: BoundedPacketQueue,
-        private val runGeneration: Long,
-        private val onBlockedWrite: (Long) -> Unit,
-    ) : RequestBody() {
-        private val writer = AtomicReference<Thread?>()
-
-        override fun contentType() = PacketFraming.CONTENT_TYPE.toMediaType()
-        override fun isDuplex() = true
-
-        override fun writeTo(sink: BufferedSink) {
-            PacketFraming.write(sink, byteArrayOf())
-            val thread = Thread({
-                try {
-                    ready.await()
-                    val batch = ArrayList<PacketBuffer>(HTTP2_UPLOAD_BATCH_SIZE)
-                    while (isRunActive(runGeneration) && active.get() && attemptActive.get()) {
-                        val packet = outboundQueue.poll(1, TimeUnit.SECONDS) ?: continue
-                        if (!isRunActive(runGeneration) || !active.get() || !attemptActive.get()) {
-                            packet.release()
-                            break
-                        }
-                        batch.clear()
-                        batch.add(packet)
-                        outboundQueue.drainTo(
-                            batch,
-                            HTTP2_UPLOAD_BATCH_SIZE - 1,
-                            HTTP2_UPLOAD_BATCH_BYTES,
-                        )
-                        val writeStartedAt = System.nanoTime()
-                        try {
-                            val bytes = PacketFraming.writePacketBatch(sink, batch)
-                            if (isRunActive(runGeneration)) {
-                                uploadedBytes.addAndGet(bytes)
-                            }
-                            onBlockedWrite(
-                                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - writeStartedAt),
-                            )
-                        } finally {
-                            batch.forEach(PacketBuffer::release)
-                        }
-                    }
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                } catch (_: Exception) {
-                    if (running.get() && active.get() && attemptActive.get()) {
-                        ownerCall.get()?.cancel()
-                    }
-                } finally {
-                    try {
-                        sink.close()
-                    } catch (_: IOException) {
-                    }
-                }
-            }, "porta-http2-upload")
-            check(writer.compareAndSet(null, thread)) { "duplex request body was written more than once" }
-            thread.start()
-        }
-
-        fun stop() {
-            attemptActive.set(false)
-            val thread = writer.getAndSet(null)
-            thread?.interrupt()
-            if (thread != null && thread !== Thread.currentThread()) {
-                try {
-                    thread.join(REQUEST_WRITER_STOP_TIMEOUT_MILLIS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-            }
-        }
-    }
-
     @Synchronized
     private fun stopTunnel(message: String) {
-        if (!running.getAndSet(false) && descriptor.get() == null && http2Calls.isEmpty()) return
+        if (!running.getAndSet(false) && descriptor.get() == null) return
         generation.incrementAndGet()
-        http2Calls.forEach(Call::cancel)
         closeNativeDialer()
         closeNativeSession()
         worker?.interrupt()
@@ -1340,10 +724,24 @@ class TunnelService : VpnService() {
     }
 
     @Synchronized
+    private fun holdVpnAfterTerminalFailure(runGeneration: Long, message: String): Boolean {
+        if (!isRunActive(runGeneration) || descriptor.get() == null) return false
+        closeNativeDialer()
+        closeNativeSession()
+        failClosed.set(true)
+        outboundPackets.clear()
+        selectedNetwork.set(null)
+        preferredNetwork.set(null)
+        worker = null
+        sendStatus(message)
+        updateNotification("Connection blocked")
+        return true
+    }
+
+    @Synchronized
     private fun finishTunnel(runGeneration: Long, startId: Int, message: String) {
         if (generation.get() != runGeneration) return
         running.set(false)
-        http2Calls.forEach(Call::cancel)
         closeNativeDialer()
         closeNativeSession()
         stopStatsWorker()
@@ -1369,6 +767,16 @@ class TunnelService : VpnService() {
         val reader = vpnReader
         vpnReader = null
         val vpn = descriptor.getAndSet(null)
+        retireVpn(vpn, reader)
+        input = null
+        output = null
+        vpnConfiguration = null
+        vpnReaderFailure.set(null)
+        failClosed.set(false)
+        outboundPackets.clear()
+    }
+
+    private fun retireVpn(vpn: ParcelFileDescriptor?, reader: Thread?) {
         try { vpn?.close() } catch (_: Exception) {}
         reader?.interrupt()
         if (reader != null && reader !== Thread.currentThread()) {
@@ -1378,11 +786,6 @@ class TunnelService : VpnService() {
                 Thread.currentThread().interrupt()
             }
         }
-        input = null
-        output = null
-        vpnConfiguration = null
-        vpnReaderFailure.set(null)
-        outboundPackets.clear()
     }
 
     private fun closeNativeSession() {
@@ -1394,7 +797,14 @@ class TunnelService : VpnService() {
     }
 
     private fun closeNativeDialer() {
-        nativeDialer.getAndSet(null)?.close()
+        nativeDialer.getAndSet(null)?.let(::closeDialer)
+    }
+
+    private fun closeDialer(dialer: Dialer) {
+        try {
+            dialer.close()
+        } catch (_: Exception) {
+        }
     }
 
     private fun sendStatus(value: String) {
@@ -1551,42 +961,13 @@ class TunnelService : VpnService() {
         private const val TAG = "Porta"
         private const val STABLE_CONNECTION_MILLIS = 30_000L
         private const val VPN_READER_STOP_TIMEOUT_MILLIS = 2_000L
-        private const val REQUEST_WRITER_STOP_TIMEOUT_MILLIS = 2_000L
+        private const val NATIVE_SENDER_STOP_TIMEOUT_MILLIS = 2_000L
         private const val STATS_INTERVAL_MILLIS = 1_000L
         private const val STATS_STOP_TIMEOUT_MILLIS = 2_000L
         private const val NANOS_PER_SECOND = 1_000_000_000L
         private const val NO_SESSION = 0L
         private const val MAX_VPN_PACKET_SIZE = 9_000
-        private const val HTTP2_LANE_COUNT = 4
-        private const val HTTP2_UPLOAD_BATCH_SIZE = 16
-        private const val HTTP2_UPLOAD_BATCH_BYTES = 16 * 1024
-        private const val HTTP2_DOWNSTREAM_POOL_SIZE = 64
-        private const val HTTP2_LANE_CONNECT_TIMEOUT_SECONDS = 20L
-        private const val HTTP2_STARTUP_SCALE_INTERVAL_MILLIS = 1_000L
-        private const val HEADER_PROTOCOL_VERSION = "X-Porta-Version"
-        private const val HEADER_PROTOCOL_MIN_VERSION = "X-Porta-Min-Version"
-        private const val HEADER_PROTOCOL_MAX_VERSION = "X-Porta-Max-Version"
-        private const val TUNNEL_PATH = "/v1/tunnel"
-        private const val MASQUE_PATH = "/.well-known/masque/ip/*/*/"
-        private const val HEADER_LANE_SESSION = "X-Porta-Lane-Session"
-        private const val HEADER_LANE_INDEX = "X-Porta-Lane"
-        private const val HEADER_LANE_COUNT = "X-Porta-Lanes"
         private const val STATUS_PERMISSION = "dev.porta.android.permission.STATUS"
-        private val RETRYABLE_HTTP_CODES = setOf(408, 425, 429)
-        private val HTTP2_UPLINK_QUEUE_CONFIG = PacketQueueConfig(
-            maxPackets = 128,
-            maxBytes = 192 * 1024,
-            tcpMaxAgeMillis = 500,
-            datagramMaxAgeMillis = 150,
-            controlMaxAgeMillis = 250,
-        )
-        private val HTTP2_DOWNLINK_QUEUE_CONFIG = PacketQueueConfig(
-            maxPackets = 128,
-            maxBytes = 192 * 1024,
-            tcpMaxAgeMillis = 500,
-            datagramMaxAgeMillis = 150,
-            controlMaxAgeMillis = 250,
-        )
 
         fun currentStatus(): String = currentStatus
         fun currentProfileId(): String? = currentProfileId
@@ -1607,8 +988,6 @@ class TunnelService : VpnService() {
     )
 
     private class PermanentTunnelException(message: String) : Exception(message)
-    private class RetryableGroupTunnelException(message: String) : IOException(message)
-    private class NativeTransportUnavailableException(message: String) : Exception(message)
 }
 
 internal data class TrafficSnapshot(

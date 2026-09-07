@@ -1,2 +1,7 @@
-# Porta does not use reflection. Keep rules are intentionally unnecessary.
-
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+-keep class portamobile.Portamobile { *; }
+-keep interface portamobile.ProofProvider { *; }
+-keep interface portamobile.Protector { *; }
+-keepclasseswithmembernames,includedescriptorclasses class * {
+    native <methods>;
+}

@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "porta-android",
+    "porta-client",
+    "porta-keygen",
+    "porta-loadgen",
+    "porta-server",
+    "porta-windows",
+    "porta-windows-package",
+    "porta-wire",
+]
+resolver = "2"
+
+[patch."https://github.com/hyperium/h3.git"]
+h3 = { path = "porta-server/vendor/h3" }
+
+[patch.crates-io]
+hyper = { path = "porta-server/vendor/hyper" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

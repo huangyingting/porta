@@ -377,14 +377,18 @@ impl Portal {
         } else {
             rows
         };
-        let checksum_ticket =
-            self.issue_download_ticket("SHA256SUMS", now + DOWNLOAD_TICKET_TTL_SECS);
+        let release_tickets = ReleaseDownloadTickets {
+            checksums: self.issue_download_ticket("SHA256SUMS", now + DOWNLOAD_TICKET_TTL_SECS),
+            signature: self.issue_download_ticket("SHA256SUMS.sig", now + DOWNLOAD_TICKET_TTL_SECS),
+            certificate: self
+                .issue_download_ticket("release-signing-cert.der", now + DOWNLOAD_TICKET_TTL_SECS),
+        };
         let body = downloads_page_html(
             &name,
             &portal_request_host(request, self.trust_proxy_headers),
             &read_download_version(&self.downloads_directory),
             &rows,
-            &checksum_ticket,
+            &release_tickets,
             profile.as_ref(),
         );
         let mut response = Response::html(200, body.into_bytes());
@@ -768,6 +772,12 @@ struct DownloadArtifact {
     recommended: bool,
 }
 
+struct ReleaseDownloadTickets {
+    checksums: String,
+    signature: String,
+    certificate: String,
+}
+
 const DOWNLOAD_CATALOG: &[(&str, &str, &str, &str, bool)] = &[
     (
         "porta-client-windows-amd64.zip",
@@ -979,16 +989,18 @@ fn downloads_page_html(
     host: &str,
     version: &str,
     rows: &str,
-    checksum_ticket: &str,
+    release_tickets: &ReleaseDownloadTickets,
     profile: Option<&DownloadProfile>,
 ) -> String {
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/assets/porta-mark.svg\" type=\"image/svg+xml\"><title>Porta downloads</title><style>@font-face{{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\")}}:root{{font-family:\"Mona Sans\",sans-serif;background:#f5f6fa}}.page{{width:min(900px,calc(100% - 28px));margin:auto}}.download-row{{display:grid;grid-template-columns:40px 1fr auto 118px;gap:13px;padding:13px;background:#fff;margin:8px;border-radius:13px}}@media(max-width:680px){{.download-row{{grid-template-columns:40px 1fr 104px}}}}@media(max-width:430px){{.download-row{{grid-template-columns:36px 1fr}}}}</style></head><body><main class=\"page\"><form method=\"post\" action=\"/portal/logout\"><button>Sign out</button></form><section><div>Client version <span>{}</span></div><h1>Downloads</h1><p>Welcome, {}. Choose the package for your device and use your existing Porta token to connect.</p><code>https://{}</code></section><section>{rows}{}</section><a href=\"/download/SHA256SUMS?ticket={}\" download>SHA256 checksums</a></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/assets/porta-mark.svg\" type=\"image/svg+xml\"><title>Porta downloads</title><style>@font-face{{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\")}}:root{{font-family:\"Mona Sans\",sans-serif;background:#f5f6fa}}.page{{width:min(900px,calc(100% - 28px));margin:auto}}.download-row{{display:grid;grid-template-columns:40px 1fr auto 118px;gap:13px;padding:13px;background:#fff;margin:8px;border-radius:13px}}@media(max-width:680px){{.download-row{{grid-template-columns:40px 1fr 104px}}}}@media(max-width:430px){{.download-row{{grid-template-columns:36px 1fr}}}}</style></head><body><main class=\"page\"><form method=\"post\" action=\"/portal/logout\"><button>Sign out</button></form><section><div>Client version <span>{}</span></div><h1>Downloads</h1><p>Welcome, {}. Choose the package for your device and use your existing Porta token to connect.</p><code>https://{}</code></section><section>{rows}{}</section><p><a href=\"/download/SHA256SUMS?ticket={}\" download>SHA256 checksums</a> · <a href=\"/download/SHA256SUMS.sig?ticket={}\" download>Manifest signature</a> · <a href=\"/download/release-signing-cert.der?ticket={}\" download>Signing certificate</a></p></main></body></html>",
         html_escape(version),
         html_escape(client_name),
         html_escape(host),
         client_setup_html(profile),
-        html_escape(checksum_ticket),
+        html_escape(&release_tickets.checksums),
+        html_escape(&release_tickets.signature),
+        html_escape(&release_tickets.certificate),
     )
 }
 

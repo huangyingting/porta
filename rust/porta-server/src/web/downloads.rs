@@ -23,6 +23,8 @@ pub const CLIENT_DOWNLOAD_TYPES: &[(&str, &str)] = &[
         "application/vnd.android.package-archive",
     ),
     ("SHA256SUMS", "text/plain; charset=utf-8"),
+    ("SHA256SUMS.sig", "application/octet-stream"),
+    ("release-signing-cert.der", "application/pkix-cert"),
 ];
 
 pub fn download_content_type(name: &str) -> Option<&'static str> {

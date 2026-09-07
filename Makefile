@@ -1,84 +1,114 @@
-GO ?= go
-CARGO ?= cargo
-RUST_SERVER_MANIFEST := rust/porta-server/Cargo.toml
+SHELL := /bin/bash
 
-.PHONY: check-version test test-automation test-race test-native-firewall test-rust-server test-rust-interop test-server-web vet build build-rust-server build-go-clients build-windows android clean
+CARGO ?= $(HOME)/.cargo/bin/cargo
+RUSTUP ?= $(HOME)/.cargo/bin/rustup
+RUST_MANIFEST := rust/Cargo.toml
+RUST_TARGET := rust/target
+WINDOWS_TARGET := x86_64-pc-windows-gnu
+WINTUN_VERSION := 0.14.1
+WINTUN_ZIP := bin/wintun-$(WINTUN_VERSION).zip
+WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+
+.PHONY: all build build-rust-server build-rust-clients build-windows android android-debug \
+	check-version clean test test-automation test-rust test-rust-server test-rust-client \
+	test-rust-interop test-windows-cross test-native-firewall test-server-web verify-wintun vet
+
+all: build
 
 check-version:
-	./scripts/check-version.sh
+	./scripts/check-version.sh HEAD
 
-test:
-	$(GO) test ./...
+test: test-rust test-automation test-server-web
+
+test-rust:
+	$(CARGO) fmt --manifest-path $(RUST_MANIFEST) --all -- --check
+	$(CARGO) test --manifest-path $(RUST_MANIFEST) --workspace --all-targets --locked
+	$(CARGO) clippy --manifest-path $(RUST_MANIFEST) --workspace --all-targets --locked -- -D warnings
+
+test-rust-server:
+	$(CARGO) test --manifest-path $(RUST_MANIFEST) --package porta-server-rust --all-targets --locked
+
+test-rust-client:
+	$(CARGO) test --manifest-path $(RUST_MANIFEST) \
+		--package porta-client-rust \
+		--package porta-keygen \
+		--package porta-windows-package \
+		--all-targets --locked
+
+test-windows-cross:
+	$(RUSTUP) target add $(WINDOWS_TARGET)
+	$(CARGO) check --manifest-path $(RUST_MANIFEST) \
+		--package porta-client-rust \
+		--package porta-windows \
+		--target $(WINDOWS_TARGET) \
+		--all-targets --locked
 
 test-automation:
 	python3 scripts/test_automation.py
-	$(GO) test ./scripts/package-windows.go ./scripts/package-windows_test.go
-
-test-race:
-	$(GO) test -race ./...
-
-test-native-firewall:
-	./scripts/test-server-firewall.sh
-
-test-rust-server:
-	$(CARGO) fmt --manifest-path $(RUST_SERVER_MANIFEST) --check
-	$(CARGO) test --manifest-path $(RUST_SERVER_MANIFEST) --locked
-	$(CARGO) clippy --manifest-path $(RUST_SERVER_MANIFEST) --locked --all-targets -- -D warnings
-	$(MAKE) test-server-web
-
-test-rust-interop:
-	PORTA_SERVER_BENCH_WORK="$(CURDIR)/.server-interop" \
-	PORTA_SERVER_BENCH_REPEATS=1 \
-	PORTA_SERVER_BENCH_DURATION=250ms \
-	PORTA_SERVER_BENCH_WARMUP=100ms \
-	PORTA_SERVER_BENCH_CLIENTS=1 \
-	PORTA_SERVER_BENCH_SERVER_CPUS=0 \
-	PORTA_SERVER_BENCH_CLIENT_CPUS=0 \
-	PORTA_SERVER_BENCH_SERVER_THREADS=1 \
-	PORTA_SERVER_BENCH_CLIENT_THREADS=1 \
-	PORTA_SERVER_BENCH_TRANSPORTS="h2 h3 auto" \
-	PORTA_SERVER_BENCH_AUTO_MTU=true \
-	CARGO="$(CARGO)" \
-	./experiments/server-benchmark/run.sh
 
 test-server-web:
 	@if command -v node >/dev/null 2>&1; then \
-		node scripts/tests/profile_qr_ui.cjs rust/porta-server/assets/admin.html; \
-		node scripts/tests/onboarding_layout.cjs; \
+		node --check rust/porta-server/assets/portal-client.js; \
+		node --check rust/porta-server/assets/portal-join.js; \
+		node --check rust/porta-windows/frontend/app.js; \
 	else \
-		echo "Node.js not found; skipping server browser regressions"; \
+		echo "node is not installed; skipping browser script checks"; \
 	fi
 
+test-rust-interop:
+	PORTA_BENCH_QUICK=1 ./experiments/server-benchmark/run.sh
+
+test-native-firewall:
+	./scripts/test-server-firewall.sh
+	./scripts/test-rust-client-network.sh
+
 vet:
-	$(GO) vet ./...
+	$(CARGO) clippy --manifest-path $(RUST_MANIFEST) --workspace --all-targets --locked -- -D warnings
 
-build: build-rust-server build-go-clients
-
-build-go-clients:
-	mkdir -p bin
-	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-client ./cmd/porta-client
-	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-keygen ./cmd/porta-keygen
+build: build-rust-server build-rust-clients
 
 build-rust-server:
-	$(CARGO) build --manifest-path $(RUST_SERVER_MANIFEST) --locked --release
 	mkdir -p bin
-	cp rust/porta-server/target/release/porta-server bin/porta-server
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) --package porta-server-rust --release --locked
+	cp $(RUST_TARGET)/release/porta-server bin/porta-server
+
+build-rust-clients:
+	mkdir -p bin
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-client-rust \
+		--package porta-keygen \
+		--release --locked
+	cp $(RUST_TARGET)/release/porta-client bin/porta-client
+	cp $(RUST_TARGET)/release/porta-keygen bin/porta-keygen
+
+$(WINTUN_ZIP):
+	mkdir -p bin
+	curl -fsSL --proto '=https' --tlsv1.2 \
+		-o $(WINTUN_ZIP).tmp \
+		https://www.wintun.net/builds/wintun-$(WINTUN_VERSION).zip
+	echo "$(WINTUN_SHA256)  $(WINTUN_ZIP).tmp" | sha256sum -c -
+	mv $(WINTUN_ZIP).tmp $(WINTUN_ZIP)
+
+verify-wintun: $(WINTUN_ZIP)
+	echo "$(WINTUN_SHA256)  $(WINTUN_ZIP)" | sha256sum -c -
 
 build-windows:
-	rm -rf bin/windows-amd64
-	mkdir -p bin/windows-amd64
-	curl --fail --silent --show-error --location -o bin/wintun-0.14.1.zip https://www.wintun.net/builds/wintun-0.14.1.zip
-	printf '%s  %s\n' 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51 bin/wintun-0.14.1.zip | sha256sum -c -
-	unzip -p bin/wintun-0.14.1.zip wintun/bin/amd64/wintun.dll > bin/windows-amd64/wintun.dll
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -tags production -trimpath -ldflags="-s -w -H=windowsgui" -o bin/windows-amd64/porta.exe ./cmd/porta-windows
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o bin/windows-amd64/porta-cli.exe ./cmd/porta-client
-	$(GO) run ./scripts/package-windows.go bin/porta-client-windows-amd64.zip bin/windows-amd64
+	command -v x86_64-w64-mingw32-gcc >/dev/null
+	$(RUSTUP) target add $(WINDOWS_TARGET)
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-client-rust \
+		--package porta-windows \
+		--target $(WINDOWS_TARGET) \
+		--release --locked
+
+android-debug:
+	cd android && ./gradlew testDebugUnitTest assembleDebug
 
 android:
-	cd android && ANDROID_HOME=$${ANDROID_HOME:-$$HOME/Android/Sdk} ./gradlew testDebugUnitTest assembleRelease
+	cd android && ./gradlew testReleaseUnitTest assembleRelease
 
 clean:
-	$(GO) clean
-	rm -rf rust/porta-server/target
-	rm -rf bin/windows-amd64 bin/porta-client-windows-amd64.zip bin/wintun-0.14.1.zip
+	$(CARGO) clean --manifest-path $(RUST_MANIFEST)
+	rm -f bin/porta-server bin/porta-client bin/porta-keygen
+	rm -f bin/porta-client-windows-amd64.zip $(WINTUN_ZIP) $(WINTUN_ZIP).tmp
 	cd android && ./gradlew clean

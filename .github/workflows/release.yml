@@ -13,7 +13,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  windows:
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build Windows applications
+        run: >
+          cargo build --manifest-path rust/Cargo.toml --locked --release
+          --target x86_64-pc-windows-msvc
+          --package porta-client-rust
+          --package porta-windows
+      - name: Package Windows applications
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package -Force | Out-Null
+          Copy-Item rust\target\x86_64-pc-windows-msvc\release\porta.exe package\porta.exe
+          Copy-Item rust\target\x86_64-pc-windows-msvc\release\porta-client.exe package\porta-cli.exe
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $expected = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+          if ((Get-FileHash wintun.zip -Algorithm SHA256).Hash -ne $expected) {
+            throw "Wintun archive checksum mismatch"
+          }
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll package\wintun.dll
+          cargo run --manifest-path rust/Cargo.toml --locked --release `
+            --package porta-windows-package -- porta-client-windows-amd64.zip package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: porta-windows-release
+          path: porta-client-windows-amd64.zip
+          if-no-files-found: error
+
   release:
+    needs: windows
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -28,10 +67,6 @@ jobs:
           patch=${version##*.}
           echo "PORTA_ANDROID_VERSION_NAME=$version" >> "$GITHUB_ENV"
           echo "PORTA_ANDROID_VERSION_CODE=$((1000 + 10#$patch))" >> "$GITHUB_ENV"
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: Install Rust toolchain and Linux targets
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -60,38 +95,40 @@ jobs:
           echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.p12" >> "$GITHUB_ENV"
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
-      - name: Install Go mobile tools
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
-          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       - name: Test release source
-        run: |
-          make test-automation
-          make test
-          make test-rust-server
-          make vet
+        run: make test
       - name: Build release binaries
         run: |
           mkdir -p dist
-          cargo build --manifest-path rust/porta-server/Cargo.toml --locked --release --target x86_64-unknown-linux-gnu
-          cp rust/porta-server/target/x86_64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-amd64
+          cargo build --manifest-path rust/Cargo.toml --locked --release \
+            --target x86_64-unknown-linux-gnu \
+            --package porta-server-rust \
+            --package porta-client-rust \
+            --package porta-keygen
+          cp rust/target/x86_64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-amd64
+          cp rust/target/x86_64-unknown-linux-gnu/release/porta-client dist/porta-client-linux-amd64
+          cp rust/target/x86_64-unknown-linux-gnu/release/porta-keygen dist/porta-keygen-linux-amd64
           CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-            cargo build --manifest-path rust/porta-server/Cargo.toml --locked --release --target aarch64-unknown-linux-gnu
-          cp rust/porta-server/target/aarch64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-arm64
-          for binary in dist/porta-server-linux-*; do
+            cargo build --manifest-path rust/Cargo.toml --locked --release \
+              --target aarch64-unknown-linux-gnu \
+              --package porta-server-rust \
+              --package porta-client-rust \
+              --package porta-keygen
+          cp rust/target/aarch64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-arm64
+          cp rust/target/aarch64-unknown-linux-gnu/release/porta-client dist/porta-client-linux-arm64
+          cp rust/target/aarch64-unknown-linux-gnu/release/porta-keygen dist/porta-keygen-linux-arm64
+          for binary in dist/porta-{server,client,keygen}-linux-*; do
             if readelf --version-info "$binary" | grep -Eq 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
               echo "$binary requires glibc newer than the Ubuntu 22.04 deployment baseline" >&2
               exit 1
             fi
           done
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-client-linux-$arch" ./cmd/porta-client
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-keygen-linux-$arch" ./cmd/porta-keygen
-          done
-          make build-windows
-          cp bin/porta-client-windows-amd64.zip dist/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: porta-windows-release
+          path: dist
       - name: Package deployment tools
         run: |
           mkdir -p dist/deploy-bundle/porta/scripts dist/deploy-bundle/porta/deploy
@@ -123,6 +160,18 @@ jobs:
           cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/porta-android-x86_64.apk
           cd dist
           sha256sum porta-server-* porta-client-* porta-keygen-* porta-android-* porta-deploy.tar.gz > SHA256SUMS
+      - name: Sign release manifest
+        env:
+          PORTA_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
+          PORTA_ANDROID_KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
+          PORTA_ANDROID_KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
+        run: |
+          java scripts/SignReleaseManifest.java \
+            "$PORTA_ANDROID_KEYSTORE" \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sig \
+            dist/release-signing-cert.der \
+            "$(tr -d '\r\n' < android/signing-certificate.sha256)"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -141,7 +190,9 @@ jobs:
             dist/porta-keygen-* \
             dist/porta-android-* \
             dist/porta-deploy.tar.gz \
-            dist/SHA256SUMS
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sig \
+            dist/release-signing-cert.der
           gh release edit "$GITHUB_REF_NAME" --draft=false
       - name: Remove temporary Android signing key
         if: always()

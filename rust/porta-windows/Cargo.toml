@@ -1,0 +1,35 @@
+[package]
+name = "porta-windows"
+version = "0.1.35"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "porta"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = "2.6.3"
+
+[target.'cfg(windows)'.dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+humantime = "2.3.0"
+porta-client = { package = "porta-client-rust", path = "../porta-client" }
+serde = { version = "1.0.228", features = ["derive"] }
+tauri = { version = "2.11.5", default-features = false, features = [
+  "common-controls-v6",
+  "compression",
+  "image-ico",
+  "tray-icon",
+  "wry",
+] }
+tauri-plugin-single-instance = "2.4.4"
+tokio = { version = "1.48.0", features = ["rt", "time"] }
+tokio-util = { version = "0.7.17", features = ["rt"] }
+url = "2.5.7"
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }

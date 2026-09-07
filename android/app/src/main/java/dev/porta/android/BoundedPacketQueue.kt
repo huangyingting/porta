@@ -141,7 +141,7 @@ internal class BoundedPacketQueue(
 
     fun offer(
         packet: PacketBuffer,
-        packetClass: PacketClass = classifyIPv4Packet(packet.bytes, packet.length).packetClass,
+        packetClass: PacketClass = classifyIPv4Packet(packet.bytes, packet.length),
         nowNanos: Long = clockNanos(),
         enqueuedNanos: Long = nowNanos,
     ): Boolean = lock.withLock {
