@@ -114,9 +114,41 @@ RSS changes favor Rust.
 | HTTP/2 | 16 | +29.5% | -26.7% | -0.9% | -55.9% |
 | HTTP/3 | 16 | +34.5% | -26.6% | -13.7% | -54.5% |
 
-The integrated Rust server has 3.1% lower single-client HTTP/2 throughput, but
-improves its latency by 8.5%, CPU by 38.0%, and RSS by 47.9%. It clears the
-throughput threshold for HTTP/3 and concurrent HTTP/2 while improving latency
-and memory in every measured case. It is now the production build; the Go
-server remains available only as an explicit rollback build during deployment
-acceptance.
+At this point the integrated Rust server had 3.1% lower single-client HTTP/2
+throughput, but improved its latency by 8.5%, CPU by 38.0%, and RSS by 47.9%.
+It cleared the throughput threshold for HTTP/3 and concurrent HTTP/2 while
+improving latency and memory in every measured case. It became the production
+build; the Go server remains available only as an explicit rollback build
+during deployment acceptance.
+
+## 2026-09-07 HTTP/2 flow-churn optimization
+
+Sampling the complete server under the changing-flow workload found that the
+HTTP/2 lane router scanned all 4,096 tracked flows for every new flow after the
+table reached capacity. A bounded index-linked LRU now performs constant-time
+lookup, recency updates, insertion, and eviction while preserving existing-flow
+lane affinity. The router hotspot fell from roughly 40% of sampled CPU to 1.6%.
+
+Comparing three baseline runs with three optimized runs produced these median
+changes:
+
+| Clients | Rust throughput | Rust p95 | Rust CPU | Rust user CPU | Rust RSS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | +16.0% | -13.1% | -20.2% | -43.6% | -2.6% |
+| 16 | +2.2% | -5.4% | -36.3% | -53.6% | -3.9% |
+
+The single-client runs used ten-second measurements; the 16-client runs used
+15-second measurements. HTTP/3 bypasses the multi-lane flow table, and its
+control runs remained within approximately 2%, as expected.
+
+A fresh production-path HTTP/2 comparison against the Go rollback server then
+measured:
+
+| Clients | Duration | Rust throughput | Rust p95 | Rust CPU | Rust RSS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 10 s | +46.0% | -31.2% | -50.2% | -51.2% |
+| 16 | 6 s | +12.6% | -14.4% | -39.3% | -59.8% |
+
+Each row is the median of three completed runs with identical CPU pinning and
+duration. Transient packet-loss failures from the local benchmark harness were
+discarded and rerun.

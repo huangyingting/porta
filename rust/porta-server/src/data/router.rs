@@ -11,14 +11,14 @@ use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 const MIN_TUNNEL_LANES: usize = 2;
 const MAX_TUNNEL_LANES: usize = 4;
 const MAX_TRACKED_FLOWS: usize = 4096;
-const FLOW_MAX_IDLE: Duration = Duration::from_secs(120);
+const NO_FLOW_INDEX: u16 = u16::MAX;
+const _: () = assert!(MAX_TRACKED_FLOWS < NO_FLOW_INDEX as usize);
 
 pub trait PacketDevice: Send + Sync + 'static {
     fn read_packet(&self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + '_>>;
@@ -130,14 +130,121 @@ struct SessionGroup {
     lane_count: usize,
     lanes: HashMap<usize, Weak<SessionInner>>,
     lane_connections: HashMap<usize, String>,
-    flows: Mutex<HashMap<FlowKey, FlowLane>>,
+    flows: Mutex<FlowTable>,
     collapse_warned: bool,
 }
 
+struct FlowTable {
+    assignments: HashMap<FlowKey, u16>,
+    entries: Vec<FlowEntry>,
+    free: Vec<u16>,
+    oldest: u16,
+    newest: u16,
+}
+
 #[derive(Clone, Copy)]
-struct FlowLane {
-    lane: usize,
-    last_seen: Instant,
+struct FlowEntry {
+    flow: FlowKey,
+    previous: u16,
+    next: u16,
+    lane: u8,
+}
+
+impl Default for FlowTable {
+    fn default() -> Self {
+        Self {
+            assignments: HashMap::new(),
+            entries: Vec::new(),
+            free: Vec::new(),
+            oldest: NO_FLOW_INDEX,
+            newest: NO_FLOW_INDEX,
+        }
+    }
+}
+
+impl FlowTable {
+    fn assignment(&self, flow: &FlowKey) -> Option<(u16, usize)> {
+        let index = *self.assignments.get(flow)?;
+        Some((index, usize::from(self.entries[usize::from(index)].lane)))
+    }
+
+    fn assign(&mut self, flow: FlowKey, lane: usize) {
+        if let Some(index) = self.assignments.get(&flow).copied() {
+            self.entries[usize::from(index)].lane = lane as u8;
+            self.touch(index);
+            return;
+        }
+        if self.assignments.len() >= MAX_TRACKED_FLOWS {
+            self.evict_oldest();
+        }
+        let entry = FlowEntry {
+            flow,
+            previous: NO_FLOW_INDEX,
+            next: NO_FLOW_INDEX,
+            lane: lane as u8,
+        };
+        let index = if let Some(index) = self.free.pop() {
+            self.entries[usize::from(index)] = entry;
+            index
+        } else {
+            let index = u16::try_from(self.entries.len()).expect("flow table index fits in u16");
+            self.entries.push(entry);
+            index
+        };
+        self.assignments.insert(flow, index);
+        self.link_newest(index);
+    }
+
+    fn remove(&mut self, flow: &FlowKey) {
+        if let Some(index) = self.assignments.remove(flow) {
+            self.unlink(index);
+            self.free.push(index);
+        }
+    }
+
+    fn touch(&mut self, index: u16) {
+        if index != self.newest {
+            self.unlink(index);
+            self.link_newest(index);
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        debug_assert_ne!(self.oldest, NO_FLOW_INDEX);
+        let index = self.oldest;
+        let flow = self.entries[usize::from(index)].flow;
+        let removed = self.assignments.remove(&flow);
+        debug_assert_eq!(removed, Some(index));
+        self.unlink(index);
+        self.free.push(index);
+    }
+
+    fn unlink(&mut self, index: u16) {
+        let entry = self.entries[usize::from(index)];
+        if entry.previous == NO_FLOW_INDEX {
+            self.oldest = entry.next;
+        } else {
+            self.entries[usize::from(entry.previous)].next = entry.next;
+        }
+        if entry.next == NO_FLOW_INDEX {
+            self.newest = entry.previous;
+        } else {
+            self.entries[usize::from(entry.next)].previous = entry.previous;
+        }
+    }
+
+    fn link_newest(&mut self, index: u16) {
+        let previous = self.newest;
+        let entry = &mut self.entries[usize::from(index)];
+        entry.previous = previous;
+        entry.next = NO_FLOW_INDEX;
+        if previous == NO_FLOW_INDEX {
+            self.oldest = index;
+        } else {
+            self.entries[usize::from(previous)].next = index;
+        }
+        self.newest = index;
+    }
 }
 
 struct RouterInner {
@@ -191,7 +298,7 @@ impl Router {
                 lane_count: 1,
                 lanes: HashMap::from([(0, Arc::downgrade(&session.inner))]),
                 lane_connections: HashMap::new(),
-                flows: Mutex::new(HashMap::new()),
+                flows: Mutex::new(FlowTable::default()),
                 collapse_warned: false,
             },
         );
@@ -236,7 +343,7 @@ impl Router {
                         lane_count,
                         lanes: HashMap::with_capacity(lane_count),
                         lane_connections: HashMap::with_capacity(lane_count),
-                        flows: Mutex::new(HashMap::new()),
+                        flows: Mutex::new(FlowTable::default()),
                         collapse_warned: false,
                     },
                 );
@@ -453,34 +560,14 @@ fn select_data_lane(group: &SessionGroup, flow: FlowKey, hash: u32) -> usize {
         return 0;
     }
     let mut flows = group.flows.lock();
-    let now = Instant::now();
-    if let Some(assignment) = flows.get_mut(&flow) {
+    if let Some((index, lane)) = flows.assignment(&flow) {
         if group
             .lanes
-            .get(&assignment.lane)
+            .get(&lane)
             .is_some_and(|session| session.strong_count() != 0)
         {
-            assignment.last_seen = now;
-            return assignment.lane;
-        }
-        flows.remove(&flow);
-    }
-    if flows.len() >= MAX_TRACKED_FLOWS {
-        let mut oldest = None;
-        flows.retain(|key, assignment| {
-            if now.saturating_duration_since(assignment.last_seen) >= FLOW_MAX_IDLE {
-                false
-            } else {
-                if oldest.is_none_or(|(_, seen)| assignment.last_seen < seen) {
-                    oldest = Some((*key, assignment.last_seen));
-                }
-                true
-            }
-        });
-        if flows.len() >= MAX_TRACKED_FLOWS {
-            if let Some((flow, _)) = oldest {
-                flows.remove(&flow);
-            }
+            flows.touch(index);
+            return lane;
         }
     }
     let data_lanes = group.lane_count - 1;
@@ -498,15 +585,10 @@ fn select_data_lane(group: &SessionGroup, flow: FlowKey, hash: u32) -> usize {
         }
     }
     let Some(selected) = selected else {
+        flows.remove(&flow);
         return 0;
     };
-    flows.insert(
-        flow,
-        FlowLane {
-            lane: selected,
-            last_seen: now,
-        },
-    );
+    flows.assign(flow, selected);
     selected
 }
 
@@ -565,8 +647,9 @@ fn parse_ipv4(packet: &[u8]) -> Result<(Ipv4Addr, Ipv4Addr), RouterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     #[derive(Default)]
@@ -645,6 +728,102 @@ mod tests {
         packet[20..22].copy_from_slice(&40000_u16.to_be_bytes());
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         packet
+    }
+
+    fn flow(marker: u16) -> FlowKey {
+        let mut packet = udp([1, 1, 1, 1], [10, 66, 0, 2], 28);
+        packet[20..22].copy_from_slice(&marker.to_be_bytes());
+        classify_ipv4(&packet).flow
+    }
+
+    fn flow_order(table: &FlowTable) -> Vec<FlowKey> {
+        let mut flows = Vec::with_capacity(table.assignments.len());
+        let mut index = table.oldest;
+        while index != NO_FLOW_INDEX {
+            assert!(flows.len() < table.assignments.len());
+            let entry = table.entries[usize::from(index)];
+            flows.push(entry.flow);
+            index = entry.next;
+        }
+        assert_eq!(
+            flows.last().copied(),
+            (table.newest != NO_FLOW_INDEX).then(|| table.entries[usize::from(table.newest)].flow)
+        );
+        flows
+    }
+
+    #[test]
+    fn flow_table_tracks_exact_recency() {
+        let mut table = FlowTable::default();
+        let a = flow(1);
+        let b = flow(2);
+        let c = flow(3);
+        table.assign(a, 1);
+        table.assign(b, 1);
+        table.assign(c, 1);
+        table.assign(c, 2);
+        table.assign(a, 2);
+        table.assign(b, 3);
+        table.evict_oldest();
+
+        assert!(!table.assignments.contains_key(&c));
+        assert_eq!(flow_order(&table), vec![a, b]);
+        assert_eq!(table.assignment(&a).unwrap().1, 2);
+        assert_eq!(table.assignment(&b).unwrap().1, 3);
+    }
+
+    #[test]
+    fn flow_table_reuses_storage_at_its_bound() {
+        let mut table = FlowTable::default();
+        for marker in 0..MAX_TRACKED_FLOWS * 2 {
+            table.assign(flow(marker as u16), marker % 3 + 1);
+        }
+        assert_eq!(table.assignments.len(), MAX_TRACKED_FLOWS);
+        assert_eq!(table.entries.len(), MAX_TRACKED_FLOWS);
+        assert_eq!(flow_order(&table).len(), MAX_TRACKED_FLOWS);
+        assert!(!table.assignments.contains_key(&flow(0)));
+        assert!(table
+            .assignments
+            .contains_key(&flow((MAX_TRACKED_FLOWS * 2 - 1) as u16)));
+    }
+
+    #[test]
+    fn flow_table_matches_reference_lru_under_churn() {
+        const LIMIT: usize = 64;
+        let mut table = FlowTable::default();
+        let mut expected = HashMap::<FlowKey, (usize, u64)>::new();
+        let mut expected_order = BTreeMap::<u64, FlowKey>::new();
+
+        for step in 0..10_000 {
+            let marker = if step % 5 == 0 {
+                (step % 32) as u16
+            } else {
+                (1000 + (step * 37) % 6000) as u16
+            };
+            let key = flow(marker);
+            if let Some((_, order)) = expected.remove(&key) {
+                expected_order.remove(&order);
+            } else if expected.len() >= LIMIT {
+                table.evict_oldest();
+                let (_, oldest) = expected_order.pop_first().unwrap();
+                expected.remove(&oldest);
+            }
+            let lane = step % 3 + 1;
+            table.assign(key, lane);
+            expected.insert(key, (lane, step as u64));
+            expected_order.insert(step as u64, key);
+
+            assert_eq!(table.assignments.len(), expected.len());
+            if step % 100 == 0 {
+                assert_eq!(
+                    flow_order(&table),
+                    expected_order.values().copied().collect::<Vec<_>>()
+                );
+                for (flow, (lane, _)) in &expected {
+                    assert_eq!(table.assignment(flow).unwrap().1, *lane);
+                }
+            }
+        }
     }
 
     #[tokio::test]
