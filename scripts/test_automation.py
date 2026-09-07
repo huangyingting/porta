@@ -473,6 +473,7 @@ class AutomationTests(unittest.TestCase):
         cargo.chmod(0o755)
         target_dir = self.root / "target"
         self.env.update(
+            ANDROID_NDK_ROOT=str(ndk),
             ANDROID_NDK_HOME=str(ndk),
             CARGO=str(cargo),
             RUSTUP=str(rustup),
