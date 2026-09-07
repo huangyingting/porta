@@ -30,18 +30,56 @@ async function main() {
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
+  const chromeTimeoutMs = 30000;
   const chrome = spawn(chromePath, [
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
-    '--disable-component-update', '--no-first-run', '--no-default-browser-check',
+    '--disable-component-update', '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check',
     '--remote-debugging-pipe', '--user-data-dir=' + profile, 'about:blank',
-  ], {env: {...process.env, TMPDIR: profile}, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']});
+  ], {env: {...process.env, TMPDIR: profile}, stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe']});
   const pending = new Map(), events = new Map();
-  let sequence = 0, buffer = '';
+  let sequence = 0, buffer = '', chromeStderr = '', chromeFailure;
+  let chromeClosing = false, chromeClosed = false;
+  const failure = message => {
+    const details = chromeStderr.trim();
+    return new Error(details ? `${message}\nChrome stderr:\n${details}` : message);
+  };
+  const rejectPending = error => {
+    chromeFailure ||= error;
+    for (const callback of pending.values()) callback.reject(chromeFailure);
+    pending.clear();
+  };
+  const closed = new Promise(resolve => {
+    chrome.once('close', (code, signal) => {
+      chromeClosed = true;
+      if (!chromeClosing) {
+        rejectPending(failure(`Chrome exited before the layout checks completed (code=${code}, signal=${signal})`));
+      }
+      resolve();
+    });
+  });
+  chrome.on('error', error => rejectPending(failure(`Chrome failed to start: ${error.message}`)));
+  chrome.stderr.on('data', data => {
+    chromeStderr = (chromeStderr + data.toString()).slice(-8192);
+  });
+  chrome.stderr.on('error', error => {
+    if (!chromeClosing) rejectPending(failure(`Chrome stderr pipe failed: ${error.message}`));
+  });
+  for (const [name, stream] of [['command', chrome.stdio[3]], ['response', chrome.stdio[4]]]) {
+    stream.on('error', error => {
+      if (!chromeClosing) rejectPending(failure(`Chrome ${name} pipe failed: ${error.message}`));
+    });
+  }
   chrome.stdio[4].on('data', data => {
     buffer += data.toString();
     let end;
     while ((end = buffer.indexOf('\0')) !== -1) {
-      const message = JSON.parse(buffer.slice(0, end));
+      let message;
+      try {
+        message = JSON.parse(buffer.slice(0, end));
+      } catch (error) {
+        rejectPending(failure(`Invalid Chrome protocol response: ${error.message}`));
+        return;
+      }
       buffer = buffer.slice(end + 1);
       if (message.id) {
         const callback = pending.get(message.id);
@@ -54,13 +92,26 @@ async function main() {
     }
   });
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    if (chromeFailure) {
+      reject(chromeFailure);
+      return;
+    }
     const id = ++sequence;
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error('Chrome protocol timeout: ' + method)); }, 10000);
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(failure('Chrome protocol timeout: ' + method));
+    }, chromeTimeoutMs);
     pending.set(id, {
       resolve(value) { clearTimeout(timer); resolve(value); },
       reject(error) { clearTimeout(timer); reject(error); },
     });
-    chrome.stdio[3].write(JSON.stringify({id, method, params, sessionId}) + '\0');
+    try {
+      chrome.stdio[3].write(JSON.stringify({id, method, params, sessionId}) + '\0');
+    } catch (error) {
+      pending.delete(id);
+      clearTimeout(timer);
+      reject(failure(`Chrome command pipe write failed: ${error.message}`));
+    }
   });
   try {
     const {targetId} = await send('Target.createTarget', {url: 'about:blank'});
@@ -72,7 +123,7 @@ async function main() {
     };
     await send('Page.enable', {}, sessionId);
     const loaded = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Browser page load timeout')), 10000);
+      const timer = setTimeout(() => reject(failure('Browser page load timeout')), chromeTimeoutMs);
       events.set(sessionId + ':Page.loadEventFired', () => { clearTimeout(timer); resolve(); });
     });
     await send('Page.navigate', {url: 'http://127.0.0.1:' + server.address().port + '/'}, sessionId);
@@ -113,8 +164,9 @@ async function main() {
     await evaluate('closeTokenDialog();closeDialog();true');
     assert.equal(await evaluate("document.body.classList.contains('modal-open')"), false);
   } finally {
-    chrome.kill();
-    await once(chrome, 'close');
+    chromeClosing = true;
+    if (!chromeClosed) chrome.kill();
+    await closed;
     await new Promise(resolve => server.close(resolve));
     fs.rmSync(profile, {recursive: true, force: true});
   }
