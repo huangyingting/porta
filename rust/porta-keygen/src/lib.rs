@@ -208,7 +208,7 @@ mod tests {
         certificate.verify_signature(None).unwrap();
 
         let key = fs::read_to_string(&key_path).unwrap();
-        assert!(key.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        assert_eq!(key.lines().next(), Some("-----BEGIN PRIVATE KEY-----"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
