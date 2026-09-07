@@ -5,14 +5,14 @@ mod h3;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ipnet::Ipv4Net;
 use porta_wire::device_auth::Proof;
 use rustls::ClientConfig as RustlsClientConfig;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -90,9 +90,55 @@ pub struct Connection {
 struct ConnectionInner {
     outbound: mpsc::Sender<Outbound>,
     inbound: Mutex<mpsc::Receiver<Inbound>>,
+    failure: Arc<FailureSignal>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
     closed: AtomicBool,
+}
+
+#[derive(Default)]
+struct FailureSignal {
+    failed: AtomicBool,
+    error: StdMutex<Option<ClientError>>,
+    changed: Notify,
+}
+
+impl FailureSignal {
+    fn set(&self, error: ClientError) -> bool {
+        let mut current = self.error.lock().expect("tunnel failure lock poisoned");
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(error);
+        self.failed.store(true, Ordering::Release);
+        drop(current);
+        self.changed.notify_waiters();
+        true
+    }
+
+    fn current(&self) -> Option<ClientError> {
+        if !self.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.error
+            .lock()
+            .expect("tunnel failure lock poisoned")
+            .clone()
+    }
+
+    async fn next(&self, inbound: &mut mpsc::Receiver<Inbound>) -> Result<Inbound, ClientError> {
+        loop {
+            let changed = self.changed.notified();
+            if let Some(error) = self.current() {
+                return Err(error);
+            }
+            tokio::select! {
+                biased;
+                _ = changed => {}
+                value = inbound.recv() => return value.ok_or(ClientError::Closed),
+            }
+        }
+    }
 }
 
 enum Outbound {
@@ -102,13 +148,19 @@ enum Outbound {
     },
     Datagram {
         payload: Bytes,
-        result: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
+        result: tokio::sync::oneshot::Sender<Result<DatagramSend, ClientError>>,
     },
     Capsule {
         capsule_type: u64,
         value: Bytes,
         result: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatagramSend {
+    Sent,
+    TooLarge,
 }
 
 enum Inbound {
@@ -123,6 +175,9 @@ impl Connection {
     pub async fn send(&self, packet: &[u8]) -> Result<(), ClientError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ClientError::Closed);
+        }
+        if let Some(error) = self.inner.failure.current() {
+            return Err(error);
         }
         if packet.len() > usize::from(self.lease.mtu) {
             return Err(ClientError::permanent(format!(
@@ -139,9 +194,11 @@ impl Connection {
                 info.source, self.lease.address
             )));
         }
-        send_outbound(&self.inner.outbound, |result| Outbound::Packet {
-            packet: Bytes::copy_from_slice(packet),
-            result,
+        send_outbound(&self.inner.outbound, &self.inner.failure, |result| {
+            Outbound::Packet {
+                packet: Bytes::copy_from_slice(packet),
+                result,
+            }
         })
         .await
     }
@@ -149,8 +206,8 @@ impl Connection {
     pub async fn receive(&self) -> Result<Bytes, ClientError> {
         let mut inbound = self.inner.inbound.lock().await;
         loop {
-            match inbound.recv().await {
-                Some(Inbound::Packet(packet)) => {
+            match self.inner.failure.next(&mut inbound).await? {
+                Inbound::Packet(packet) => {
                     if packet.len() > usize::from(self.lease.mtu) {
                         continue;
                     }
@@ -161,9 +218,8 @@ impl Connection {
                         return Ok(packet);
                     }
                 }
-                Some(Inbound::Failure(error)) => return Err(error),
-                Some(_) => {}
-                None => return Err(ClientError::Closed),
+                Inbound::Failure(error) => return Err(error),
+                _ => {}
             }
         }
     }
@@ -209,16 +265,23 @@ pub async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
     }
 }
 
-async fn send_outbound(
+async fn send_outbound<T>(
     sender: &mpsc::Sender<Outbound>,
-    build: impl FnOnce(tokio::sync::oneshot::Sender<Result<(), ClientError>>) -> Outbound,
-) -> Result<(), ClientError> {
+    failure: &FailureSignal,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, ClientError>>) -> Outbound,
+) -> Result<T, ClientError> {
+    if let Some(error) = failure.current() {
+        return Err(error);
+    }
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    sender
-        .send(build(result_tx))
-        .await
-        .map_err(|_| ClientError::Closed)?;
-    result_rx.await.map_err(|_| ClientError::Closed)?
+    if sender.send(build(result_tx)).await.is_err() {
+        return Err(failure.current().unwrap_or(ClientError::Closed));
+    }
+    match result_rx.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(failure.current().unwrap_or(error)),
+        Err(_) => Err(failure.current().unwrap_or(ClientError::Closed)),
+    }
 }
 
 fn valid_unicast(address: Ipv4Addr) -> bool {
@@ -227,4 +290,37 @@ fn valid_unicast(address: Ipv4Addr) -> bool {
         && !address.is_link_local()
         && !address.is_multicast()
         && address != Ipv4Addr::BROADCAST
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_send_returns_the_stored_terminal_failure() {
+        let failure = Arc::new(FailureSignal::default());
+        let (outbound, mut requests) = mpsc::channel(1);
+        let pending_failure = failure.clone();
+        let pending = tokio::spawn(async move {
+            send_outbound(&outbound, &pending_failure, |result| Outbound::Packet {
+                packet: Bytes::new(),
+                result,
+            })
+            .await
+        });
+        let Outbound::Packet { result, .. } =
+            requests.recv().await.expect("pending outbound request")
+        else {
+            panic!("unexpected outbound request");
+        };
+
+        assert!(failure.set(ClientError::permanent("invalid tunnel response")));
+        result
+            .send(Err(ClientError::retryable("connection cancelled")))
+            .expect("pending request receiver");
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(ClientError::Permanent(message)) if message == "invalid tunnel response"
+        ));
+    }
 }

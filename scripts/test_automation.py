@@ -953,6 +953,17 @@ class AutomationTests(unittest.TestCase):
         for name in ("porta.exe", "porta-cli.exe", "wintun.dll"):
             self.assertIn(f'"{name}"', package)
 
+    def test_windows_ci_proves_native_wfp_acceptance_ran(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        network = (ROOT / "rust/porta-client/src/windows/network.rs").read_text()
+        self.assertIn('PORTA_WFP_NATIVE_TEST: "1"', workflow)
+        self.assertIn("PORTA_WFP_NATIVE_TEST_MARKER", workflow)
+        self.assertIn("native WFP rollback acceptance did not run", workflow)
+        self.assertIn('std::env::var("PORTA_WFP_NATIVE_TEST")', network)
+        self.assertIn('std::env::var_os("PORTA_WFP_NATIVE_TEST_MARKER")', network)
+        self.assertIn("native_wfp_transaction_rollback_accepts_generated_policy", network)
+        self.assertIn("FwpmTransactionAbort0", network)
+
     def test_native_client_security_failures_remain_fail_closed(self):
         windows_network = (
             ROOT / "rust/porta-client/src/windows/network.rs"

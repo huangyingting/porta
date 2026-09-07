@@ -28,8 +28,8 @@ use url::Url;
 
 use super::h2_queue::UploadQueue;
 use super::{
-    valid_unicast, ClientConfig, ClientError, Connection, ConnectionInner, DeliveryMode, Inbound,
-    Lease, Outbound, Transport, TUNNEL_PATH,
+    valid_unicast, ClientConfig, ClientError, Connection, ConnectionInner, DeliveryMode,
+    FailureSignal, Inbound, Lease, Outbound, Transport, TUNNEL_PATH,
 };
 
 const LANE_COUNT: usize = 4;
@@ -172,7 +172,7 @@ struct Group {
     lease: Mutex<Option<Lease>>,
     flows: Mutex<FlowTable>,
     established: AtomicBool,
-    failure: Mutex<Option<ClientError>>,
+    failure: Arc<FailureSignal>,
     cancellation: CancellationToken,
     state_changed: Notify,
     download_ready: Notify,
@@ -197,6 +197,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
     let tasks = TaskTracker::new();
     let (inbound_tx, inbound_rx) = mpsc::channel(256);
     let (outbound_tx, outbound_rx) = mpsc::channel(256);
+    let failure = Arc::new(FailureSignal::default());
 
     let mut receivers = Vec::with_capacity(LANE_COUNT);
     let lanes = std::array::from_fn(|index| {
@@ -220,7 +221,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         lease: Mutex::new(None),
         flows: Mutex::new(FlowTable::default()),
         established: AtomicBool::new(false),
-        failure: Mutex::new(None),
+        failure: failure.clone(),
         cancellation: cancellation.clone(),
         state_changed: Notify::new(),
         download_ready: Notify::new(),
@@ -261,6 +262,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         inner: Arc::new(ConnectionInner {
             outbound: outbound_tx,
             inbound: tokio::sync::Mutex::new(inbound_rx),
+            failure,
             cancellation,
             tasks,
             closed: AtomicBool::new(false),
@@ -841,7 +843,12 @@ async fn dispatch_outbound(group: Arc<Group>, mut outbound: mpsc::Receiver<Outbo
             Outbound::Packet { packet, result } => {
                 let _ = result.send(group.route(packet));
             }
-            Outbound::Datagram { result, .. } | Outbound::Capsule { result, .. } => {
+            Outbound::Datagram { result, .. } => {
+                let _ = result.send(Err(ClientError::permanent(
+                    "invalid outbound operation for HTTP/2",
+                )));
+            }
+            Outbound::Capsule { result, .. } => {
                 let _ = result.send(Err(ClientError::permanent(
                     "invalid outbound operation for HTTP/2",
                 )));
@@ -978,12 +985,10 @@ impl Group {
                 "HTTP/2 upload capacity is unavailable",
             ));
         };
-        if lane
-            .upload
-            .enqueue(packet.clone(), metadata, Instant::now())
-        {
-            return Ok(());
-        }
+        let packet = match lane.upload.enqueue(packet, metadata, Instant::now()) {
+            Ok(()) => return Ok(()),
+            Err(packet) => packet,
+        };
         if metadata.class != PacketClass::Control {
             self.flows
                 .lock()
@@ -997,13 +1002,16 @@ impl Group {
                 .or_else(|| self.control_lane())
         };
         if let Some(fallback) = fallback.filter(|fallback| fallback.index != lane.index) {
-            if fallback.upload.enqueue(packet, metadata, Instant::now()) {
+            if fallback
+                .upload
+                .enqueue(packet, metadata, Instant::now())
+                .is_ok()
+            {
                 return Ok(());
             }
         }
-        Err(ClientError::retryable(
-            "HTTP/2 upload queue rejected a packet",
-        ))
+        // Bounded queue rejection is packet-level congestion, not a failed tunnel.
+        Ok(())
     }
 
     fn control_lane(&self) -> Option<Arc<Lane>> {
@@ -1097,12 +1105,9 @@ impl Group {
     }
 
     fn fail(&self, error: ClientError) {
-        let mut failure = self.failure.lock().expect("HTTP/2 failure lock poisoned");
-        if failure.is_some() {
+        if !self.failure.set(error.clone()) {
             return;
         }
-        *failure = Some(error.clone());
-        drop(failure);
         let _ = self.inbound.try_send(Inbound::Failure(error));
         self.cancellation.cancel();
         self.state_changed.notify_waiters();
@@ -1110,10 +1115,7 @@ impl Group {
     }
 
     fn failure(&self) -> Option<ClientError> {
-        self.failure
-            .lock()
-            .expect("HTTP/2 failure lock poisoned")
-            .clone()
+        self.failure.current()
     }
 }
 
@@ -1131,6 +1133,68 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_group_with_full_upload_queues() -> (Arc<Group>, Vec<mpsc::Receiver<Bytes>>) {
+        let mut receivers = Vec::with_capacity(LANE_COUNT);
+        let lanes = std::array::from_fn(|index| {
+            let (downstream, receiver) = mpsc::channel(1);
+            receivers.push(receiver);
+            Arc::new(Lane {
+                index,
+                upload: Arc::new(UploadQueue::with_limits(1, 64)),
+                downstream,
+                active: AtomicBool::new(true),
+                remote_address: Mutex::new(None),
+            })
+        });
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let (inbound, _received) = mpsc::channel(1);
+        (
+            Arc::new(Group {
+                config: ClientConfig {
+                    url: "https://porta.test".to_owned(),
+                    token: "test".to_owned(),
+                    transport: Transport::Http2,
+                    tls: Arc::new(tls),
+                    timeout: Duration::from_secs(1),
+                    dial_address: None,
+                    proof: Arc::new(|_: &str, _: &str| {
+                        unreachable!("queue routing test does not authenticate")
+                    }),
+                    socket_protector: None,
+                    cancellation: CancellationToken::new(),
+                },
+                endpoint: Url::parse("https://porta.test/v1/tunnel").unwrap(),
+                session: "test".to_owned(),
+                lanes,
+                lease: Mutex::new(None),
+                flows: Mutex::new(FlowTable::default()),
+                established: AtomicBool::new(true),
+                failure: Arc::new(FailureSignal::default()),
+                cancellation: CancellationToken::new(),
+                state_changed: Notify::new(),
+                download_ready: Notify::new(),
+                inbound,
+            }),
+            receivers,
+        )
+    }
+
+    fn tcp_packet(destination_port: u16) -> Bytes {
+        let mut packet = vec![0_u8; 60];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&60_u16.to_be_bytes());
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 10]);
+        packet[20..22].copy_from_slice(&40_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = 0x02;
+        Bytes::from(packet)
+    }
 
     fn lease_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1229,5 +1293,23 @@ mod tests {
         assert!(table.assignment(&flow(0)).is_some());
         assert!(table.assignment(&flow(1)).is_none());
         assert_eq!(table.assignment(&flow(FLOW_LIMIT as u32)).unwrap().1, 2);
+    }
+
+    #[test]
+    fn saturated_upload_queues_drop_a_packet_without_failing_the_tunnel() {
+        let (group, _receivers) = test_group_with_full_upload_queues();
+        let queued = tcp_packet(443);
+        let metadata = porta_wire::ip::classify_ipv4(&queued);
+        assert_eq!(metadata.class, PacketClass::Tcp);
+        for lane in &group.lanes {
+            assert!(lane
+                .upload
+                .enqueue(queued.clone(), metadata, Instant::now())
+                .is_ok());
+        }
+
+        assert!(group.route(tcp_packet(8443)).is_ok());
+        assert!(!group.cancellation.is_cancelled());
+        assert!(group.failure().is_none());
     }
 }

@@ -621,3 +621,24 @@ async fn reused_physical_interface_index_does_not_receive_stale_cleanup() {
     assert_eq!(state.routes["-4 198.51.100.10/32"].len(), 1);
     assert_eq!(state.links["other0"].mtu, 9000);
 }
+
+#[tokio::test]
+async fn renamed_physical_interface_retains_escape_route_cleanup_ownership() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    manager
+        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .await
+        .unwrap();
+    {
+        let mut state = commands.state.lock().unwrap();
+        let mut physical = state.links.remove("eth0").unwrap();
+        physical.name = "wan0".to_owned();
+        state.links.insert(physical.name.clone(), physical);
+        state.routes.get_mut("-4 198.51.100.10/32").unwrap()[0].device = "wan0".to_owned();
+    }
+
+    manager.down().await.unwrap();
+    assert!(!snapshot(&commands)
+        .routes
+        .contains_key("-4 198.51.100.10/32"));
+}

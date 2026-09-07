@@ -29,7 +29,8 @@ use url::Url;
 
 use super::{
     send_outbound, valid_unicast, ClientConfig, ClientError, Connection, ConnectionInner,
-    DeliveryMode, Inbound, Lease, Outbound, Transport, MASQUE_AUTH_PATH, MASQUE_PATH,
+    DatagramSend, DeliveryMode, FailureSignal, Inbound, Lease, Outbound, Transport,
+    MASQUE_AUTH_PATH, MASQUE_PATH,
 };
 
 const CAPSULE_PROTOCOL_HEADER: &str = "capsule-protocol";
@@ -124,6 +125,7 @@ async fn connect_address(
     let tasks = TaskTracker::new();
     let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
     let (outbound_tx, outbound_rx) = mpsc::channel(256);
+    let failure = Arc::new(FailureSignal::default());
 
     let h3_connection = h3_quinn::Connection::new(quic.clone());
     let (mut driver, mut requests) = h3::client::builder()
@@ -151,15 +153,16 @@ async fn connect_address(
 
     let driver_cancellation = cancellation.clone();
     let driver_inbound = inbound_tx.clone();
+    let driver_failure = failure.clone();
     tasks.spawn(async move {
         let error = poll_fn(|context| driver.poll_close(context)).await;
         if !driver_cancellation.is_cancelled() {
-            let _ = driver_inbound
-                .send(Inbound::Failure(ClientError::retryable(format!(
-                    "HTTP/3 connection stopped: {error}"
-                ))))
-                .await;
-            driver_cancellation.cancel();
+            report_failure(
+                &driver_inbound,
+                &driver_failure,
+                &driver_cancellation,
+                ClientError::retryable(format!("HTTP/3 connection stopped: {error}")),
+            );
         }
     });
 
@@ -186,6 +189,7 @@ async fn connect_address(
 
         let writer_cancellation = cancellation.clone();
         let writer_inbound = inbound_tx.clone();
+        let writer_failure = failure.clone();
         tasks.spawn(run_writer(
             outbound_rx,
             send_stream,
@@ -193,15 +197,18 @@ async fn connect_address(
             datagrams,
             writer_cancellation,
             writer_inbound,
+            writer_failure,
         ));
         let reader_cancellation = cancellation.clone();
         let reader_inbound = inbound_tx.clone();
+        let reader_failure = failure.clone();
         tasks.spawn(run_reader(
             receive_stream,
             datagram_reader,
             stream_id,
             reader_cancellation,
             reader_inbound,
+            reader_failure,
         ));
 
         let mut lease = response_lease(response.headers())?;
@@ -211,6 +218,7 @@ async fn connect_address(
             datagrams,
             &outbound_tx,
             &mut inbound_rx,
+            &failure,
             &mut lease,
         )
         .await?;
@@ -223,11 +231,12 @@ async fn connect_address(
         .map_err(ClientError::permanent)?;
         send_capsule(
             &outbound_tx,
+            &failure,
             CAPSULE_ADDRESS_REQUEST,
             Bytes::from(address_request),
         )
         .await?;
-        lease.address = wait_for_address(config.timeout, &mut inbound_rx).await?;
+        lease.address = wait_for_address(config.timeout, &mut inbound_rx, &failure).await?;
         Ok((lease, automatic, ceiling, datagrams))
     }
     .await;
@@ -265,6 +274,7 @@ async fn connect_address(
         inner: Arc::new(ConnectionInner {
             outbound: outbound_tx,
             inbound: tokio::sync::Mutex::new(inbound_rx),
+            failure,
             cancellation,
             tasks,
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -446,6 +456,7 @@ async fn configure_mtu(
     datagrams: bool,
     outbound: &mpsc::Sender<Outbound>,
     inbound: &mut mpsc::Receiver<Inbound>,
+    failure: &FailureSignal,
     lease: &mut Lease,
 ) -> Result<(bool, Option<u16>), ClientError> {
     let Some(offer) = header(headers, MTU_DISCOVERY_HEADER) else {
@@ -459,22 +470,22 @@ async fn configure_mtu(
         ));
     }
     let maximum = lease.mtu.min(MAX_DISCOVERED_MTU);
-    let selected = discover_mtu(token, maximum, outbound, inbound).await?;
+    let selected = discover_mtu(token, maximum, outbound, inbound, failure).await?;
     send_capsule(
         outbound,
+        failure,
         CAPSULE_MTU_SELECT,
         Bytes::copy_from_slice(&masque::encode_mtu_selection(token, selected)),
     )
     .await?;
     let selected_by_gateway = timeout(config.timeout, async {
         loop {
-            match inbound.recv().await {
-                Some(Inbound::MtuSelected(value)) => {
+            match failure.next(inbound).await? {
+                Inbound::MtuSelected(value) => {
                     return decode_selected_mtu(&value, token, maximum);
                 }
-                Some(Inbound::Failure(error)) => return Err(error),
-                Some(_) => {}
-                None => return Err(ClientError::Closed),
+                Inbound::Failure(error) => return Err(error),
+                _ => {}
             }
         }
     })
@@ -494,6 +505,7 @@ async fn discover_mtu(
     maximum: u16,
     outbound: &mpsc::Sender<Outbound>,
     inbound: &mut mpsc::Receiver<Inbound>,
+    failure: &FailureSignal,
 ) -> Result<u16, ClientError> {
     let deadline = Instant::now() + MTU_BUDGET;
     let mut sizes = vec![SAFE_MTU];
@@ -521,15 +533,18 @@ async fn discover_mtu(
             };
             let payload = masque::encode_mtu_probe(probe)
                 .map_err(|_| ClientError::permanent("invalid MTU discovery message"))?;
-            send_datagram(outbound, Bytes::from(payload)).await?;
+            if send_datagram(outbound, failure, Bytes::from(payload)).await?
+                == DatagramSend::TooLarge
+            {
+                return Ok(best);
+            }
             let attempt = (Instant::now() + MTU_ATTEMPT).min(deadline);
             let echoed = timeout_at(attempt, async {
                 loop {
-                    match inbound.recv().await {
-                        Some(Inbound::MtuProbe(value)) if value == probe => return Ok(true),
-                        Some(Inbound::Failure(error)) => return Err(error),
-                        Some(_) => {}
-                        None => return Err(ClientError::Closed),
+                    match failure.next(inbound).await? {
+                        Inbound::MtuProbe(value) if value == probe => return Ok(true),
+                        Inbound::Failure(error) => return Err(error),
+                        _ => {}
                     }
                 }
             })
@@ -565,14 +580,14 @@ fn decode_selected_mtu(
 async fn wait_for_address(
     duration: Duration,
     inbound: &mut mpsc::Receiver<Inbound>,
+    failure: &FailureSignal,
 ) -> Result<Ipv4Net, ClientError> {
     timeout(duration, async {
         loop {
-            match inbound.recv().await {
-                Some(Inbound::Address(address)) => return Ok(address),
-                Some(Inbound::Failure(error)) => return Err(error),
-                Some(_) => {}
-                None => return Err(ClientError::Closed),
+            match failure.next(inbound).await? {
+                Inbound::Address(address) => return Ok(address),
+                Inbound::Failure(error) => return Err(error),
+                _ => {}
             }
         }
     })
@@ -582,17 +597,23 @@ async fn wait_for_address(
 
 async fn send_datagram(
     outbound: &mpsc::Sender<Outbound>,
+    failure: &FailureSignal,
     payload: Bytes,
-) -> Result<(), ClientError> {
-    send_outbound(outbound, |result| Outbound::Datagram { payload, result }).await
+) -> Result<DatagramSend, ClientError> {
+    send_outbound(outbound, failure, |result| Outbound::Datagram {
+        payload,
+        result,
+    })
+    .await
 }
 
 async fn send_capsule(
     outbound: &mpsc::Sender<Outbound>,
+    failure: &FailureSignal,
     capsule_type: u64,
     value: Bytes,
 ) -> Result<(), ClientError> {
-    send_outbound(outbound, |result| Outbound::Capsule {
+    send_outbound(outbound, failure, |result| Outbound::Capsule {
         capsule_type,
         value,
         result,
@@ -607,6 +628,7 @@ async fn run_writer<S, B, H>(
     mut use_datagrams: bool,
     cancellation: CancellationToken,
     inbound: mpsc::Sender<Inbound>,
+    failures: Arc<FailureSignal>,
 ) where
     S: h3::quic::SendStream<B> + Send + 'static,
     B: Buf + From<Bytes> + Send + 'static,
@@ -620,7 +642,7 @@ async fn run_writer<S, B, H>(
                 None => break,
             },
         };
-        let result = match outbound {
+        let failure = match outbound {
             Outbound::Packet { packet, result } => {
                 let sent = if use_datagrams {
                     match datagrams
@@ -658,21 +680,19 @@ async fn run_writer<S, B, H>(
                     )
                     .await
                 };
-                let failed = sent.as_ref().err().map(ToString::to_string);
+                let failed = sent.as_ref().err().cloned();
                 let _ = result.send(sent);
                 failed
             }
             Outbound::Datagram { payload, result } => {
                 let sent = match datagrams.send_datagram(payload.into()) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => Ok(DatagramSend::Sent),
                     Err(error) if datagram_error_kind(&error) == DatagramErrorKind::TooLarge => {
-                        Err(ClientError::permanent(
-                            "MTU probe exceeds the local QUIC datagram limit",
-                        ))
+                        Ok(DatagramSend::TooLarge)
                     }
                     Err(error) => Err(ClientError::retryable(error)),
                 };
-                let failed = sent.as_ref().err().map(ToString::to_string);
+                let failed = sent.as_ref().err().cloned();
                 let _ = result.send(sent);
                 failed
             }
@@ -682,16 +702,13 @@ async fn run_writer<S, B, H>(
                 result,
             } => {
                 let sent = send_capsule_data(&mut stream, capsule_type, &value).await;
-                let failed = sent.as_ref().err().map(ToString::to_string);
+                let failed = sent.as_ref().err().cloned();
                 let _ = result.send(sent);
                 failed
             }
         };
-        if let Some(error) = result {
-            let _ = inbound
-                .send(Inbound::Failure(ClientError::retryable(error)))
-                .await;
-            cancellation.cancel();
+        if let Some(error) = failure {
+            report_failure(&inbound, &failures, &cancellation, error);
             break;
         }
     }
@@ -723,6 +740,7 @@ async fn run_reader<S, B, H>(
     stream_id: h3::quic::StreamId,
     cancellation: CancellationToken,
     inbound: mpsc::Sender<Inbound>,
+    failure: Arc<FailureSignal>,
 ) where
     S: h3::quic::RecvStream + Send + 'static,
     B: Buf + Send + 'static,
@@ -730,7 +748,7 @@ async fn run_reader<S, B, H>(
     H::Buffer: Send + 'static,
 {
     let mut capsules = BytesMut::new();
-    loop {
+    'reader: loop {
         tokio::select! {
             _ = cancellation.cancelled() => break,
             data = stream.recv_data() => {
@@ -740,38 +758,45 @@ async fn run_reader<S, B, H>(
                         loop {
                             match take_capsule(&mut capsules) {
                                 Ok(Some((capsule_type, value))) => {
-                                    if let Err(error) = handle_capsule(capsule_type, value, &inbound).await {
-                                        let _ = inbound.send(Inbound::Failure(error)).await;
-                                        cancellation.cancel();
-                                        return;
+                                    if let Err(error) = handle_capsule(
+                                        capsule_type,
+                                        value,
+                                        &inbound,
+                                        &cancellation,
+                                    ).await {
+                                        report_failure(&inbound, &failure, &cancellation, error);
+                                        break 'reader;
                                     }
                                 }
                                 Ok(None) => break,
                                 Err(error) => {
-                                    let _ = inbound.send(Inbound::Failure(error)).await;
-                                    cancellation.cancel();
-                                    return;
+                                    report_failure(&inbound, &failure, &cancellation, error);
+                                    break 'reader;
                                 }
                             }
                         }
                     }
                     Ok(None) => {
-                        if !capsules.is_empty() {
-                            let _ = inbound.send(Inbound::Failure(ClientError::permanent(
+                        let error = if !capsules.is_empty() {
+                            ClientError::permanent(
                                 "truncated MASQUE capsule stream",
-                            ))).await;
+                            )
                         } else {
-                            let _ = inbound.send(Inbound::Failure(ClientError::retryable(
+                            ClientError::retryable(
                                 "HTTP/3 response stream ended",
-                            ))).await;
-                        }
-                        cancellation.cancel();
-                        return;
+                            )
+                        };
+                        report_failure(&inbound, &failure, &cancellation, error);
+                        break;
                     }
                     Err(error) => {
-                        let _ = inbound.send(Inbound::Failure(ClientError::retryable(error))).await;
-                        cancellation.cancel();
-                        return;
+                        report_failure(
+                            &inbound,
+                            &failure,
+                            &cancellation,
+                            ClientError::retryable(error),
+                        );
+                        break;
                     }
                 }
             }
@@ -782,31 +807,47 @@ async fn run_reader<S, B, H>(
                         let payload = payload.copy_to_bytes(payload.remaining());
                         if masque::is_mtu_probe(&payload) {
                             if let Ok(probe) = masque::decode_mtu_probe(&payload) {
-                                if inbound.send(Inbound::MtuProbe(probe)).await.is_err() {
-                                    return;
+                                if deliver_inbound(
+                                    &inbound,
+                                    &cancellation,
+                                    Inbound::MtuProbe(probe),
+                                ).await.is_err() {
+                                    break 'reader;
                                 }
                             }
                             continue;
                         }
                         match masque::decode_ip_packet(&payload) {
                             Ok(packet) => {
-                                if inbound.send(Inbound::Packet(Bytes::copy_from_slice(packet))).await.is_err() {
-                                    return;
+                                if deliver_inbound(
+                                    &inbound,
+                                    &cancellation,
+                                    Inbound::Packet(Bytes::copy_from_slice(packet)),
+                                ).await.is_err() {
+                                    break 'reader;
                                 }
                             }
                             Err(MasqueError::UnknownContext(_)) => {}
                             Err(error) => {
-                                let _ = inbound.send(Inbound::Failure(ClientError::permanent(error))).await;
-                                cancellation.cancel();
-                                return;
+                                report_failure(
+                                    &inbound,
+                                    &failure,
+                                    &cancellation,
+                                    ClientError::permanent(error),
+                                );
+                                break 'reader;
                             }
                         }
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        let _ = inbound.send(Inbound::Failure(ClientError::retryable(error))).await;
-                        cancellation.cancel();
-                        return;
+                        report_failure(
+                            &inbound,
+                            &failure,
+                            &cancellation,
+                            ClientError::retryable(error),
+                        );
+                        break;
                     }
                 }
             }
@@ -848,13 +889,11 @@ async fn handle_capsule(
     capsule_type: u64,
     value: Bytes,
     inbound: &mpsc::Sender<Inbound>,
+    cancellation: &CancellationToken,
 ) -> Result<(), ClientError> {
     match capsule_type {
         CAPSULE_MTU_SELECTED => {
-            inbound
-                .send(Inbound::MtuSelected(value))
-                .await
-                .map_err(|_| ClientError::Closed)?;
+            deliver_inbound(inbound, cancellation, Inbound::MtuSelected(value)).await?;
         }
         CAPSULE_ADDRESS_ASSIGN => {
             for address in masque::decode_address_assign(&value).map_err(ClientError::permanent)? {
@@ -871,26 +910,51 @@ async fn handle_capsule(
                         "gateway returned an invalid IPv4 /32 lease: {prefix}"
                     )));
                 }
-                inbound
-                    .send(Inbound::Address(prefix))
-                    .await
-                    .map_err(|_| ClientError::Closed)?;
+                deliver_inbound(inbound, cancellation, Inbound::Address(prefix)).await?;
             }
         }
         CAPSULE_ROUTE_ADVERTISEMENT => {
             masque::decode_route_advertisement(&value).map_err(ClientError::permanent)?;
         }
         CAPSULE_DATAGRAM => match masque::decode_ip_packet(&value) {
-            Ok(packet) => inbound
-                .send(Inbound::Packet(Bytes::copy_from_slice(packet)))
-                .await
-                .map_err(|_| ClientError::Closed)?,
+            Ok(packet) => {
+                deliver_inbound(
+                    inbound,
+                    cancellation,
+                    Inbound::Packet(Bytes::copy_from_slice(packet)),
+                )
+                .await?;
+            }
             Err(MasqueError::UnknownContext(_)) => {}
             Err(error) => return Err(ClientError::permanent(error)),
         },
         _ => {}
     }
     Ok(())
+}
+
+async fn deliver_inbound(
+    inbound: &mpsc::Sender<Inbound>,
+    cancellation: &CancellationToken,
+    value: Inbound,
+) -> Result<(), ClientError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ClientError::Closed),
+        result = inbound.send(value) => result.map_err(|_| ClientError::Closed),
+    }
+}
+
+fn report_failure(
+    inbound: &mpsc::Sender<Inbound>,
+    failure: &FailureSignal,
+    cancellation: &CancellationToken,
+    error: ClientError,
+) {
+    if failure.set(error.clone()) {
+        let _ = inbound.try_send(Inbound::Failure(error));
+    }
+    cancellation.cancel();
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1110,14 +1174,20 @@ mod tests {
     #[tokio::test]
     async fn address_assignment_requires_requested_ipv4_unicast_host_route() {
         let (inbound, mut received) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
         let valid = masque::encode_address_assign(&[Address {
             request_id: REQUEST_ID,
             prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 2), 32).unwrap()),
         }])
         .unwrap();
-        handle_capsule(CAPSULE_ADDRESS_ASSIGN, Bytes::from(valid), &inbound)
-            .await
-            .unwrap();
+        handle_capsule(
+            CAPSULE_ADDRESS_ASSIGN,
+            Bytes::from(valid),
+            &inbound,
+            &cancellation,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             received.recv().await,
             Some(Inbound::Address(address)) if address == "10.0.0.2/32".parse().unwrap()
@@ -1129,8 +1199,137 @@ mod tests {
         }])
         .unwrap();
         assert!(matches!(
-            handle_capsule(CAPSULE_ADDRESS_ASSIGN, Bytes::from(invalid), &inbound).await,
+            handle_capsule(
+                CAPSULE_ADDRESS_ASSIGN,
+                Bytes::from(invalid),
+                &inbound,
+                &cancellation,
+            )
+            .await,
             Err(ClientError::Permanent(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn mtu_discovery_stops_at_the_local_quic_datagram_limit() {
+        let token = [9; 16];
+        let (outbound, mut requests) = mpsc::channel(8);
+        let (inbound, mut responses) = mpsc::channel(8);
+        let failure = FailureSignal::default();
+        let writer = tokio::spawn(async move {
+            let mut rejected = 0;
+            while let Some(request) = requests.recv().await {
+                let Outbound::Datagram { payload, result } = request else {
+                    panic!("MTU discovery emitted a non-datagram request");
+                };
+                let probe = masque::decode_mtu_probe(&payload).unwrap();
+                if probe.size > 1280 {
+                    rejected += 1;
+                    let _ = result.send(Ok(DatagramSend::TooLarge));
+                } else {
+                    let _ = result.send(Ok(DatagramSend::Sent));
+                    inbound.send(Inbound::MtuProbe(probe)).await.unwrap();
+                }
+            }
+            rejected
+        });
+
+        assert_eq!(
+            discover_mtu(token, 1400, &outbound, &mut responses, &failure)
+                .await
+                .unwrap(),
+            1280
+        );
+        let probe = MtuProbe {
+            token,
+            sequence: 99,
+            size: SAFE_MTU,
+        };
+        assert_eq!(
+            send_datagram(
+                &outbound,
+                &failure,
+                Bytes::from(masque::encode_mtu_probe(probe).unwrap()),
+            )
+            .await
+            .unwrap(),
+            DatagramSend::Sent
+        );
+        drop(outbound);
+        assert_eq!(writer.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_completes_with_a_saturated_inbound_queue() {
+        let cancellation = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let failure = Arc::new(FailureSignal::default());
+        let (inbound, receiver) = mpsc::channel(1);
+        inbound
+            .send(Inbound::MtuSelected(Bytes::new()))
+            .await
+            .unwrap();
+        let blocked_inbound = inbound.clone();
+        let blocked_cancellation = cancellation.clone();
+        tasks.spawn(async move {
+            let _ = deliver_inbound(
+                &blocked_inbound,
+                &blocked_cancellation,
+                Inbound::MtuSelected(Bytes::new()),
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        let (outbound, _requests) = mpsc::channel(1);
+        let connection = Connection {
+            lease: Lease {
+                address: "10.0.0.2/32".parse().unwrap(),
+                gateway: None,
+                dns: None,
+                mtu: SAFE_MTU,
+            },
+            remote_address: "192.0.2.1:443".parse().unwrap(),
+            transport: Transport::Http3,
+            delivery_mode: DeliveryMode::Datagram,
+            mtu_automatic: true,
+            mtu_ceiling: Some(1400),
+            inner: Arc::new(ConnectionInner {
+                outbound,
+                inbound: tokio::sync::Mutex::new(receiver),
+                failure,
+                cancellation,
+                tasks,
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }),
+        };
+
+        timeout(Duration::from_secs(1), connection.close())
+            .await
+            .expect("HTTP/3 shutdown blocked behind a full inbound queue");
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_survives_a_saturated_inbound_queue() {
+        let cancellation = CancellationToken::new();
+        let failure = FailureSignal::default();
+        let (inbound, mut receiver) = mpsc::channel(1);
+        inbound
+            .send(Inbound::MtuSelected(Bytes::new()))
+            .await
+            .unwrap();
+
+        report_failure(
+            &inbound,
+            &failure,
+            &cancellation,
+            ClientError::permanent("malformed HTTP/3 capsule"),
+        );
+
+        assert!(matches!(
+            failure.next(&mut receiver).await,
+            Err(ClientError::Permanent(message)) if message == "malformed HTTP/3 capsule"
+        ));
+        assert!(cancellation.is_cancelled());
     }
 }

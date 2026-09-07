@@ -69,13 +69,19 @@ jobs:
       - name: Test Windows clients and native WFP transactions
         env:
           PORTA_WFP_NATIVE_TEST: "1"
-        run: >
-          cargo test --manifest-path rust/Cargo.toml --locked
-          --target x86_64-pc-windows-msvc --all-targets
-          --package porta-client-rust
-          --package porta-keygen
-          --package porta-windows
-          --package porta-windows-package
+          PORTA_WFP_NATIVE_TEST_MARKER: ${{ runner.temp }}\porta-wfp-native.ok
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath $env:PORTA_WFP_NATIVE_TEST_MARKER -Force -ErrorAction SilentlyContinue
+          cargo test --manifest-path rust/Cargo.toml --locked `
+            --target x86_64-pc-windows-msvc --all-targets `
+            --package porta-client-rust `
+            --package porta-keygen `
+            --package porta-windows `
+            --package porta-windows-package
+          if (-not (Test-Path -LiteralPath $env:PORTA_WFP_NATIVE_TEST_MARKER)) {
+            throw "native WFP rollback acceptance did not run"
+          }
       - name: Build Windows applications
         run: >
           cargo build --manifest-path rust/Cargo.toml --locked --release

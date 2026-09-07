@@ -82,6 +82,17 @@ impl UploadQueue {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn with_limits(max_packets: usize, max_bytes: usize) -> Self {
+        Self::with_config(QueueConfig {
+            max_packets,
+            max_bytes,
+            tcp_max_age: Duration::from_secs(60),
+            datagram_max_age: Duration::from_secs(60),
+            control_max_age: Duration::from_secs(60),
+        })
+    }
+
     pub(super) fn activate(&self) {
         let mut state = self.state.lock().expect("HTTP/2 upload queue poisoned");
         if !state.closed {
@@ -107,20 +118,25 @@ impl UploadQueue {
         self.ready.notify_waiters();
     }
 
-    pub(super) fn enqueue(&self, packet: Bytes, metadata: PacketMetadata, now: Instant) -> bool {
+    pub(super) fn enqueue(
+        &self,
+        packet: Bytes,
+        metadata: PacketMetadata,
+        now: Instant,
+    ) -> Result<(), Bytes> {
         let mut state = self.state.lock().expect("HTTP/2 upload queue poisoned");
         if state.closed || !state.active {
-            return false;
+            return Err(packet);
         }
         self.drop_expired_locked(&mut state, now);
         if packet.len() > self.config.max_bytes || self.config.max_packets == 0 {
             self.record_rejected(metadata.class);
-            return false;
+            return Err(packet);
         }
         while !self.fits_locked(&state, packet.len()) {
             let Some(victim) = self.oldest_replaceable_locked(&state, metadata.class) else {
                 self.record_rejected(metadata.class);
-                return false;
+                return Err(packet);
             };
             let removed = state
                 .items
@@ -140,7 +156,7 @@ impl UploadQueue {
         if was_empty {
             self.ready.notify_one();
         }
-        true
+        Ok(())
     }
 
     pub(super) async fn take_batch(
@@ -289,24 +305,36 @@ mod tests {
             ..QueueConfig::default()
         });
         let now = Instant::now();
-        assert!(queue.enqueue(Bytes::from_static(&[1]), metadata(PacketClass::Tcp), now));
-        assert!(queue.enqueue(Bytes::from_static(&[2]), metadata(PacketClass::Tcp), now));
-        assert!(!queue.enqueue(Bytes::from_static(&[3]), metadata(PacketClass::Tcp), now));
+        assert!(queue
+            .enqueue(Bytes::from_static(&[1]), metadata(PacketClass::Tcp), now)
+            .is_ok());
+        assert!(queue
+            .enqueue(Bytes::from_static(&[2]), metadata(PacketClass::Tcp), now)
+            .is_ok());
+        assert!(queue
+            .enqueue(Bytes::from_static(&[3]), metadata(PacketClass::Tcp), now)
+            .is_err());
         assert_eq!(queue.stats.tail_drops.load(Ordering::Relaxed), 1);
 
         queue.deactivate_and_clear();
         queue.activate();
-        assert!(queue.enqueue(
-            Bytes::from_static(&[4]),
-            metadata(PacketClass::Datagram),
-            now
-        ));
-        assert!(queue.enqueue(Bytes::from_static(&[5]), metadata(PacketClass::Tcp), now));
-        assert!(queue.enqueue(
-            Bytes::from_static(&[6]),
-            metadata(PacketClass::Control),
-            now
-        ));
+        assert!(queue
+            .enqueue(
+                Bytes::from_static(&[4]),
+                metadata(PacketClass::Datagram),
+                now
+            )
+            .is_ok());
+        assert!(queue
+            .enqueue(Bytes::from_static(&[5]), metadata(PacketClass::Tcp), now)
+            .is_ok());
+        assert!(queue
+            .enqueue(
+                Bytes::from_static(&[6]),
+                metadata(PacketClass::Control),
+                now
+            )
+            .is_ok());
         assert_eq!(queue.stats.oldest_drops.load(Ordering::Relaxed), 1);
     }
 
@@ -319,18 +347,22 @@ mod tests {
             ..QueueConfig::default()
         });
         let old = Instant::now() - Duration::from_millis(10);
-        assert!(queue.enqueue(
-            Bytes::from(vec![1; 20]),
-            metadata(PacketClass::Datagram),
-            old
-        ));
+        assert!(queue
+            .enqueue(
+                Bytes::from(vec![1; 20]),
+                metadata(PacketClass::Datagram),
+                old
+            )
+            .is_ok());
         let now = Instant::now();
         for marker in 2..=4 {
-            assert!(queue.enqueue(
-                Bytes::from(vec![marker; 60]),
-                metadata(PacketClass::Tcp),
-                now
-            ));
+            assert!(queue
+                .enqueue(
+                    Bytes::from(vec![marker; 60]),
+                    metadata(PacketClass::Tcp),
+                    now
+                )
+                .is_ok());
         }
         let cancellation = CancellationToken::new();
         let first = queue.take_batch(&cancellation, 2, 100).await.unwrap();

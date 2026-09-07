@@ -810,11 +810,13 @@ impl NetworkManager {
                 .await?;
             }
             "route" | "escape" | "dns-route" => {
+                let mut current = action.clone();
+                current.interface.clone_from(&link.name);
                 let routes = self
                     .routes(action.family, Some(("exact", action.destination.as_str())))
                     .await?;
-                if routes.iter().any(|route| self.owned_route(route, action)) {
-                    self.invoke_owned("ip", self.route_arguments("del", action), "")
+                if routes.iter().any(|route| self.owned_route(route, &current)) {
+                    self.invoke_owned("ip", self.route_arguments("del", &current), "")
                         .await?;
                 }
             }

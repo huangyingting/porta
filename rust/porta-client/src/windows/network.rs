@@ -1950,6 +1950,32 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[cfg(windows)]
+    struct WfpAllocation<T>(*mut T);
+
+    #[cfg(windows)]
+    impl<T> WfpAllocation<T> {
+        fn get(&self) -> Result<&T, NetworkError> {
+            unsafe { self.0.as_ref() }
+                .ok_or_else(|| NetworkError::Invalid("BFE returned a null object".to_owned()))
+        }
+    }
+
+    #[cfg(windows)]
+    impl<T> Drop for WfpAllocation<T> {
+        fn drop(&mut self) {
+            if self.0.is_null() {
+                return;
+            }
+            let mut raw = self.0.cast();
+            unsafe {
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0(
+                    &mut raw,
+                );
+            }
+        }
+    }
+
     fn test_state() -> NetworkState {
         NetworkState {
             version: NATIVE_MTU_STATE_VERSION,
@@ -1999,6 +2025,493 @@ mod tests {
             },
             application: r"C:\Porta\porta.exe".to_owned(),
         }
+    }
+
+    #[cfg(windows)]
+    fn native_with_engine(
+        operation: impl FnOnce(windows_sys::Win32::Foundation::HANDLE) -> Result<(), NetworkError>,
+    ) -> Result<(), NetworkError> {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmEngineClose0, FwpmEngineOpen0,
+        };
+        use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+
+        let mut engine = null_mut();
+        let code =
+            unsafe { FwpmEngineOpen0(null(), RPC_C_AUTHN_WINNT, null(), null(), &mut engine) };
+        if code != 0 {
+            return Err(NetworkError::Windows {
+                action: "open BFE for native acceptance",
+                code,
+            });
+        }
+        let result = operation(engine);
+        let code = unsafe { FwpmEngineClose0(engine) };
+        combine(
+            result,
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(NetworkError::Windows {
+                    action: "close BFE after native acceptance",
+                    code,
+                })
+            },
+        )
+    }
+
+    #[cfg(windows)]
+    fn native_with_rollback(
+        operation: impl FnOnce(windows_sys::Win32::Foundation::HANDLE) -> Result<(), NetworkError>,
+    ) -> Result<(), NetworkError> {
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmTransactionAbort0, FwpmTransactionBegin0,
+        };
+
+        native_with_engine(|engine| {
+            let code = unsafe { FwpmTransactionBegin0(engine, 0) };
+            if code != 0 {
+                return Err(NetworkError::Windows {
+                    action: "begin native WFP acceptance transaction",
+                    code,
+                });
+            }
+            let result = operation(engine);
+            let code = unsafe { FwpmTransactionAbort0(engine) };
+            combine(
+                result,
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err(NetworkError::Windows {
+                        action: "abort native WFP acceptance transaction",
+                        code,
+                    })
+                },
+            )
+        })
+    }
+
+    #[cfg(windows)]
+    fn native_process_is_elevated() -> Result<bool, NetworkError> {
+        use std::mem::size_of;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(NetworkError::Io {
+                action: "open process token for native WFP acceptance",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0;
+        let queried = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        };
+        let query_error = (queried == 0).then(std::io::Error::last_os_error);
+        let close_error = (unsafe { CloseHandle(token) } == 0).then(std::io::Error::last_os_error);
+        if let Some(source) = query_error {
+            return Err(NetworkError::Io {
+                action: "query process elevation for native WFP acceptance",
+                source,
+            });
+        }
+        if let Some(source) = close_error {
+            return Err(NetworkError::Io {
+                action: "close process token after native WFP acceptance",
+                source,
+            });
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
+    #[cfg(windows)]
+    fn native_loopback_luid() -> Result<u64, NetworkError> {
+        use std::ffi::c_void;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2,
+        };
+
+        struct InterfaceTable(*mut MIB_IF_TABLE2);
+        impl Drop for InterfaceTable {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        FreeMibTable(self.0.cast::<c_void>());
+                    }
+                }
+            }
+        }
+
+        let mut table = null_mut();
+        let code = unsafe { GetIfTable2(&mut table) };
+        if code != 0 {
+            return Err(NetworkError::Windows {
+                action: "enumerate interfaces for native WFP acceptance",
+                code,
+            });
+        }
+        let table = InterfaceTable(table);
+        let table = unsafe { table.0.as_ref() }
+            .ok_or_else(|| NetworkError::Invalid("IP Helper returned a null table".to_owned()))?;
+        let rows =
+            unsafe { std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize) };
+        rows.iter()
+            .find(|row| row.Type == IF_TYPE_SOFTWARE_LOOPBACK)
+            .map(|row| unsafe { row.InterfaceLuid.Value })
+            .filter(|luid| *luid != 0)
+            .ok_or_else(|| {
+                NetworkError::Invalid(
+                    "no loopback interface is available for native WFP acceptance".to_owned(),
+                )
+            })
+    }
+
+    #[cfg(windows)]
+    fn same_guid(left: &windows_sys::core::GUID, right: &windows_sys::core::GUID) -> bool {
+        left.data1 == right.data1
+            && left.data2 == right.data2
+            && left.data3 == right.data3
+            && left.data4 == right.data4
+    }
+
+    #[cfg(windows)]
+    fn native_filter_absent(
+        engine: windows_sys::Win32::Foundation::HANDLE,
+        owner: &str,
+        index: usize,
+    ) -> Result<(), NetworkError> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmFilterGetByKey0, FWPM_FILTER0,
+        };
+
+        let key = guid_from_key(&object_key(owner, index as i32));
+        let mut filter: *mut FWPM_FILTER0 = null_mut();
+        let code = unsafe { FwpmFilterGetByKey0(engine, &key, &mut filter) };
+        let allocation = WfpAllocation(filter);
+        if code == 0x8032_0003 && allocation.0.is_null() {
+            Ok(())
+        } else {
+            Err(NetworkError::Invalid(format!(
+                "native WFP filter {index} exists or absence query failed with {code:#x}"
+            )))
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_guard_absent(
+        engine: windows_sys::Win32::Foundation::HANDLE,
+        owner: &str,
+    ) -> Result<(), NetworkError> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmSubLayerGetByKey0, FWPM_SUBLAYER0,
+        };
+
+        let key = guid_from_key(&object_key(owner, -1));
+        let mut sublayer: *mut FWPM_SUBLAYER0 = null_mut();
+        let code = unsafe { FwpmSubLayerGetByKey0(engine, &key, &mut sublayer) };
+        let allocation = WfpAllocation(sublayer);
+        if code != 0x8032_0007 || !allocation.0.is_null() {
+            return Err(NetworkError::Invalid(format!(
+                "native WFP sublayer exists or absence query failed with {code:#x}"
+            )));
+        }
+        for index in 0..MAX_GUARD_FILTERS {
+            native_filter_absent(engine, owner, index)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn native_application_id(
+        path: &str,
+    ) -> Result<
+        WfpAllocation<
+            windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_BLOB,
+        >,
+        NetworkError,
+    > {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmGetAppIdFromFileName0, FWP_BYTE_BLOB,
+        };
+
+        let path: Vec<u16> = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut application: *mut FWP_BYTE_BLOB = null_mut();
+        let code = unsafe { FwpmGetAppIdFromFileName0(path.as_ptr(), &mut application) };
+        if code != 0 {
+            return Err(NetworkError::Windows {
+                action: "resolve native WFP application identity",
+                code,
+            });
+        }
+        let allocation = WfpAllocation(application);
+        let value = allocation.get()?;
+        if value.size == 0 || value.data.is_null() {
+            return Err(NetworkError::Invalid(
+                "BFE returned an empty application identity".to_owned(),
+            ));
+        }
+        Ok(allocation)
+    }
+
+    #[cfg(windows)]
+    fn native_condition_matches(
+        expected: &Condition,
+        actual: &windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_CONDITION0,
+        expected_application: &[u8],
+    ) -> bool {
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FWP_BYTE_BLOB_TYPE, FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_MATCH_EQUAL,
+            FWP_MATCH_FLAGS_ALL_SET, FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8,
+            FWP_V4_ADDR_MASK, FWP_V6_ADDR_MASK,
+        };
+
+        let expected_field = condition_guid(match expected {
+            Condition::Loopback => "loopback",
+            Condition::Interface(_) => "interface",
+            Condition::Application(_) => "application",
+            Condition::Address(_) => "address",
+            Condition::Protocol(_) => "protocol",
+            Condition::RemotePort(_) => "port",
+            Condition::LocalPort(_) => "local-port",
+        });
+        if !same_guid(&actual.fieldKey, &expected_field) {
+            return false;
+        }
+        let expected_match = if matches!(expected, Condition::Loopback) {
+            FWP_MATCH_FLAGS_ALL_SET
+        } else {
+            FWP_MATCH_EQUAL
+        };
+        if actual.matchType != expected_match {
+            return false;
+        }
+        match expected {
+            Condition::Loopback => {
+                actual.conditionValue.r#type == FWP_UINT32
+                    && unsafe { actual.conditionValue.Anonymous.uint32 }
+                        == FWP_CONDITION_FLAG_IS_LOOPBACK
+            }
+            Condition::Interface(expected) => {
+                let value = unsafe { actual.conditionValue.Anonymous.uint64 };
+                actual.conditionValue.r#type == FWP_UINT64
+                    && !value.is_null()
+                    && unsafe { *value } == *expected
+            }
+            Condition::Application(_) => {
+                let value = unsafe { actual.conditionValue.Anonymous.byteBlob };
+                if actual.conditionValue.r#type != FWP_BYTE_BLOB_TYPE || value.is_null() {
+                    return false;
+                }
+                let value = unsafe { &*value };
+                if value.size == 0 || value.data.is_null() {
+                    return false;
+                }
+                (unsafe { std::slice::from_raw_parts(value.data, value.size as usize) })
+                    == expected_application
+            }
+            Condition::Protocol(expected) => {
+                actual.conditionValue.r#type == FWP_UINT8
+                    && unsafe { actual.conditionValue.Anonymous.uint8 } == *expected
+            }
+            Condition::RemotePort(expected) | Condition::LocalPort(expected) => {
+                actual.conditionValue.r#type == FWP_UINT16
+                    && unsafe { actual.conditionValue.Anonymous.uint16 } == *expected
+            }
+            Condition::Address(IpNet::V4(expected)) => {
+                let value = unsafe { actual.conditionValue.Anonymous.v4AddrMask };
+                let bits = expected.prefix_len();
+                let expected_mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                actual.conditionValue.r#type == FWP_V4_ADDR_MASK
+                    && !value.is_null()
+                    && unsafe {
+                        (*value).addr == u32::from_be_bytes(expected.addr().octets())
+                            && (*value).mask == expected_mask
+                    }
+            }
+            Condition::Address(IpNet::V6(expected)) => {
+                let value = unsafe { actual.conditionValue.Anonymous.v6AddrMask };
+                actual.conditionValue.r#type == FWP_V6_ADDR_MASK
+                    && !value.is_null()
+                    && unsafe {
+                        (*value).addr == expected.addr().octets()
+                            && (*value).prefixLength == expected.prefix_len()
+                    }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_staged_filter(
+        engine: windows_sys::Win32::Foundation::HANDLE,
+        owner: &str,
+        index: usize,
+        expected: &Filter,
+        expected_application: &[u8],
+    ) -> Result<(), NetworkError> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmFilterGetByKey0, FWPM_FILTER0, FWPM_FILTER_FLAG_PERSISTENT, FWP_ACTION_BLOCK,
+            FWP_ACTION_PERMIT, FWP_UINT64,
+        };
+
+        let key = guid_from_key(&object_key(owner, index as i32));
+        let mut filter: *mut FWPM_FILTER0 = null_mut();
+        let code = unsafe { FwpmFilterGetByKey0(engine, &key, &mut filter) };
+        if code != 0 {
+            return Err(NetworkError::Windows {
+                action: "read staged native WFP filter",
+                code,
+            });
+        }
+        let allocation = WfpAllocation(filter);
+        let actual = allocation.get()?;
+        let sublayer = guid_from_key(&object_key(owner, -1));
+        let action = if expected.permit {
+            FWP_ACTION_PERMIT
+        } else {
+            FWP_ACTION_BLOCK
+        };
+        if !same_guid(&actual.filterKey, &key)
+            || !same_guid(&actual.layerKey, &layer_guid(expected.layer))
+            || !same_guid(&actual.subLayerKey, &sublayer)
+            || actual.flags & !0x40 != FWPM_FILTER_FLAG_PERSISTENT
+            || actual.action.r#type != action
+            || actual.numFilterConditions != expected.conditions.len() as u32
+        {
+            return Err(NetworkError::Invalid(format!(
+                "BFE changed native WFP filter {index} identity or policy"
+            )));
+        }
+        for (name, value) in [
+            ("weight", actual.weight),
+            ("effective weight", actual.effectiveWeight),
+        ] {
+            let weight = unsafe { value.Anonymous.uint64 };
+            let expected_weight = if expected.permit { 100 } else { 1 };
+            if value.r#type != FWP_UINT64
+                || weight.is_null()
+                || unsafe { *weight } != expected_weight
+            {
+                return Err(NetworkError::Invalid(format!(
+                    "BFE changed native WFP filter {index} {name}"
+                )));
+            }
+        }
+        let conditions = if actual.numFilterConditions == 0 {
+            &[][..]
+        } else {
+            if actual.filterCondition.is_null() {
+                return Err(NetworkError::Invalid(format!(
+                    "BFE returned null conditions for native WFP filter {index}"
+                )));
+            }
+            unsafe {
+                std::slice::from_raw_parts(
+                    actual.filterCondition,
+                    actual.numFilterConditions as usize,
+                )
+            }
+        };
+        for expected in &expected.conditions {
+            if !conditions
+                .iter()
+                .any(|actual| native_condition_matches(expected, actual, expected_application))
+            {
+                return Err(NetworkError::Invalid(format!(
+                    "BFE changed a condition on native WFP filter {index}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn native_staged_guard(
+        engine: windows_sys::Win32::Foundation::HANDLE,
+        spec: &GuardSpec,
+    ) -> Result<(), NetworkError> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FwpmSubLayerGetByKey0, FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT,
+        };
+
+        let key = guid_from_key(&object_key(&spec.key, -1));
+        let mut sublayer: *mut FWPM_SUBLAYER0 = null_mut();
+        let code = unsafe { FwpmSubLayerGetByKey0(engine, &key, &mut sublayer) };
+        if code != 0 {
+            return Err(NetworkError::Windows {
+                action: "read staged native WFP sublayer",
+                code,
+            });
+        }
+        let allocation = WfpAllocation(sublayer);
+        let actual = allocation.get()?;
+        if !same_guid(&actual.subLayerKey, &key)
+            || actual.flags != FWPM_SUBLAYER_FLAG_PERSISTENT
+            || actual.weight != u16::MAX
+        {
+            return Err(NetworkError::Invalid(
+                "BFE changed the native WFP sublayer".to_owned(),
+            ));
+        }
+        let application = native_application_id(&spec.application)?;
+        let application = application.get()?;
+        let application =
+            unsafe { std::slice::from_raw_parts(application.data, application.size as usize) };
+        let policy = guard_filters(spec);
+        for (index, filter) in policy.iter().enumerate() {
+            native_staged_filter(engine, &spec.key, index, filter, application)?;
+        }
+        for index in policy.len()..MAX_GUARD_FILTERS {
+            native_filter_absent(engine, &spec.key, index)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn native_guard_rollback(mut spec: GuardSpec) -> Result<(), NetworkError> {
+        native_with_engine(|engine| native_guard_absent(engine, &spec.key))?;
+        native_with_rollback(|engine| {
+            for pass in 0..2 {
+                if pass == 1 {
+                    spec.endpoint.ip = if spec.endpoint.ip.is_ipv4() {
+                        "2001:db8::1".parse().expect("static IPv6 endpoint")
+                    } else {
+                        "192.0.2.1".parse().expect("static IPv4 endpoint")
+                    };
+                }
+                install_guard(engine, &spec)?;
+                native_staged_guard(engine, &spec)?;
+            }
+            Ok(())
+        })?;
+        native_with_engine(|engine| native_guard_absent(engine, &spec.key))
     }
 
     #[test]
@@ -2118,6 +2631,86 @@ mod tests {
             "[fe80::1%7]:443".parse().unwrap(),
         ] {
             assert!(parse_endpoint(&endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_wfp_verifier_rejects_mismatched_policy_values() {
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FWPM_FILTER_CONDITION0, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
+            FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
+        };
+
+        let mut address = FWP_V4_ADDR_AND_MASK { addr: 0, mask: 0 };
+        let actual_address = FWPM_FILTER_CONDITION0 {
+            fieldKey: condition_guid("address"),
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_V4_ADDR_MASK,
+                Anonymous: FWP_CONDITION_VALUE0_0 {
+                    v4AddrMask: &mut address,
+                },
+            },
+        };
+        assert!(!native_condition_matches(
+            &Condition::Address("192.0.2.1/32".parse().unwrap()),
+            &actual_address,
+            &[],
+        ));
+
+        let mut application_bytes = [1_u8, 2];
+        let mut application = FWP_BYTE_BLOB {
+            size: application_bytes.len() as u32,
+            data: application_bytes.as_mut_ptr(),
+        };
+        let actual_application = FWPM_FILTER_CONDITION0 {
+            fieldKey: condition_guid("application"),
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_BYTE_BLOB_TYPE,
+                Anonymous: FWP_CONDITION_VALUE0_0 {
+                    byteBlob: &mut application,
+                },
+            },
+        };
+        assert!(!native_condition_matches(
+            &Condition::Application(r"C:\Porta\porta.exe".to_owned()),
+            &actual_application,
+            &[3, 4],
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_wfp_transaction_rollback_accepts_generated_policy() {
+        let enabled = match std::env::var("PORTA_WFP_NATIVE_TEST") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("read PORTA_WFP_NATIVE_TEST: {error}"),
+        };
+        assert_eq!(enabled, "1", "PORTA_WFP_NATIVE_TEST must be 1 or unset");
+        assert!(
+            native_process_is_elevated().unwrap(),
+            "native WFP acceptance requires an elevated administrator token"
+        );
+        let application = std::env::current_exe()
+            .expect("resolve native WFP test executable")
+            .to_string_lossy()
+            .into_owned();
+        let luid = native_loopback_luid().unwrap();
+        for (case, endpoint) in ["192.0.2.1", "2001:db8::1"].into_iter().enumerate() {
+            for (variant, interface_luid) in [0, luid].into_iter().enumerate() {
+                let mut spec = test_spec(endpoint);
+                spec.key = format!("native-abort-{}-{case}-{variant}", std::process::id());
+                spec.application.clone_from(&application);
+                spec.interface_luid = interface_luid;
+                native_guard_rollback(spec).unwrap();
+            }
+        }
+        if let Some(marker) = std::env::var_os("PORTA_WFP_NATIVE_TEST_MARKER") {
+            std::fs::write(marker, b"native WFP rollback acceptance passed\n")
+                .expect("write native WFP acceptance marker");
         }
     }
 }
