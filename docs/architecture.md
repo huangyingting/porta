@@ -150,7 +150,8 @@ count. Each account has an enabled state and a device limit. The loopback-only
 admin API manages accounts, token rotation, and device enrollment without
 restarting the tunnel service. Throttled forward-proxy LastSeen changes are
 coalesced and written outside the authentication lock, with a final durable
-flush during shutdown.
+flush during shutdown. Worker retirement is synchronized with producers so an
+update arriving during task exit schedules another persistence pass.
 
 Traffic accounting uses connection-local atomic counters, so relay reads and
 writes do not contend on the usage store lock. Completed sessions request a
@@ -164,6 +165,12 @@ the source address of every received IPv4 packet matches the authenticated
 lease before writing that packet to TUN. Packets read from TUN are dispatched
 by destination address. Duplicate client IDs replace the older session so that
 reconnects converge quickly.
+
+Lease reservations remain identity-specific even when inactive. Persistence
+failures before file replacement roll back the tentative allocation. A
+directory-sync failure after replacement instead retains the committed
+reservation and rejects the attempted lease, leaving it inactive until a
+successful retry rather than making its address available to another identity.
 
 Linux forwarding and NAT are deliberately outside the daemon. The supplied
 setup script makes these changes explicit and reversible. The daemon itself can
@@ -212,6 +219,9 @@ optional MTU discovery/agreement, ADDRESS_REQUEST writes and ADDRESS_ASSIGN
 receipt. Completing establishment
 removes that startup deadline; it does not limit the lifetime of a working
 tunnel.
+
+Every awaited client transport close drains its workers, including concurrent
+calls and retries after an earlier close future was cancelled.
 
 ## Platform clients
 

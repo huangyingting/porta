@@ -1031,7 +1031,7 @@ impl ClientRegistry {
                 }
                 match registry.flush_metadata().await {
                     Ok(()) => {
-                        if !registry.inner.state.lock().metadata_dirty {
+                        if registry.retire_metadata_worker_if_clean() {
                             return;
                         }
                     }
@@ -1041,6 +1041,16 @@ impl ClientRegistry {
                 }
             }
         }));
+    }
+
+    fn retire_metadata_worker_if_clean(&self) -> bool {
+        let mut worker = self.inner.metadata_worker.lock();
+        if self.inner.state.lock().metadata_dirty {
+            return false;
+        }
+        // Producers must see no cached worker once it has decided to stop.
+        worker.take();
+        true
     }
 
     async fn flush_metadata(&self) -> Result<(), RegistryError> {
@@ -2144,6 +2154,56 @@ mod tests {
             assert_eq!(state.token_index.len(), 1);
         }
         registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_updates_restart_after_a_worker_decides_to_retire() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        drop(
+            registry
+                .authenticate_proxy_session(BOOTSTRAP_TOKEN)
+                .await
+                .unwrap(),
+        );
+        registry.set_metadata_debounce(Duration::from_millis(1));
+
+        let (retired, retirement) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let retiring_registry = registry.clone();
+        *registry.inner.metadata_worker.lock() = Some(tokio::spawn(async move {
+            assert!(retiring_registry.retire_metadata_worker_if_clean());
+            retired.send(()).unwrap();
+            resumed.await.unwrap();
+        }));
+        retirement.await.unwrap();
+        {
+            let mut state = registry.inner.state.lock();
+            state.clients[0].devices[0].last_seen =
+                OffsetDateTime::now_utc() - time::Duration::minutes(2);
+        }
+        drop(
+            registry
+                .authenticate_proxy_session(BOOTSTRAP_TOKEN)
+                .await
+                .unwrap(),
+        );
+        let expected = registry.list()[0].devices[0].last_seen;
+        let completed = tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.inner.state.lock().metadata_dirty {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let disk: RegistryFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        resume.send(()).unwrap();
+        registry.close().await.unwrap();
+        assert!(
+            completed.is_ok(),
+            "metadata was stranded behind a retiring worker"
+        );
+        assert_eq!(disk.clients[0].devices[0].last_seen, expected);
     }
 
     #[tokio::test]

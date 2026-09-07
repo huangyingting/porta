@@ -25,6 +25,8 @@ pub enum PoolError {
         #[source]
         source: io::Error,
     },
+    #[error("lease state was replaced but directory sync failed: {0}")]
+    Durability(#[source] io::Error),
     #[error("{context}: {source}")]
     Json {
         context: &'static str,
@@ -179,6 +181,15 @@ impl Pool {
     }
 
     fn acquire_inner(&self, client_id: &str, group_id: &str) -> Result<Lease> {
+        self.acquire_inner_with_sync(client_id, group_id, sync_directory)
+    }
+
+    fn acquire_inner_with_sync(
+        &self,
+        client_id: &str,
+        group_id: &str,
+        sync_directory: fn(&Path) -> io::Result<()>,
+    ) -> Result<Lease> {
         if !valid_client_id(client_id) {
             return Err(PoolError::Invalid("invalid client ID".to_owned()));
         }
@@ -211,14 +222,18 @@ impl Pool {
                 ..previous
             };
             inner.by_client.insert(client_id.to_owned(), replacement);
-            if let Err(error) = self.persist_state_locked(&inner) {
-                inner.by_client.insert(client_id.to_owned(), previous);
-                match previous_group {
-                    Some(group) => {
-                        inner.groups.insert(client_id.to_owned(), group);
-                    }
-                    None => {
-                        inner.groups.remove(client_id);
+            if let Err(error) = self.persist_state_locked(&inner, sync_directory) {
+                if matches!(error, PoolError::Durability(_)) {
+                    abandon_committed_lease(&mut inner, client_id);
+                } else {
+                    inner.by_client.insert(client_id.to_owned(), previous);
+                    match previous_group {
+                        Some(group) => {
+                            inner.groups.insert(client_id.to_owned(), group);
+                        }
+                        None => {
+                            inner.groups.remove(client_id);
+                        }
                     }
                 }
                 return Err(error);
@@ -241,9 +256,13 @@ impl Pool {
                 };
                 inner.by_client.insert(client_id.to_owned(), record);
                 inner.by_address.insert(address, client_id.to_owned());
-                if let Err(error) = self.persist_state_locked(&inner) {
-                    inner.by_client.remove(client_id);
-                    inner.by_address.remove(&address);
+                if let Err(error) = self.persist_state_locked(&inner, sync_directory) {
+                    if matches!(error, PoolError::Durability(_)) {
+                        abandon_committed_lease(&mut inner, client_id);
+                    } else {
+                        inner.by_client.remove(client_id);
+                        inner.by_address.remove(&address);
+                    }
                     return Err(error);
                 }
                 activate_group(&mut inner, client_id, group_id, generation);
@@ -410,7 +429,11 @@ impl Pool {
         Ok(())
     }
 
-    fn persist_state_locked(&self, inner: &PoolInner) -> Result<()> {
+    fn persist_state_locked(
+        &self,
+        inner: &PoolInner,
+        sync_directory: fn(&Path) -> io::Result<()>,
+    ) -> Result<()> {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
@@ -437,8 +460,18 @@ impl Pool {
             source,
         })?;
         data.push(b'\n');
-        write_state_atomically(path, &data)
+        write_state_atomically(path, &data, sync_directory)
     }
+}
+
+fn abandon_committed_lease(inner: &mut PoolInner, client_id: &str) {
+    // Directory-sync failure cannot undo a rename or free the persisted reservation.
+    inner
+        .by_client
+        .get_mut(client_id)
+        .expect("committed lease remains reserved")
+        .active = false;
+    inner.groups.remove(client_id);
 }
 
 fn activate_group(inner: &mut PoolInner, client_id: &str, group_id: &str, generation: u64) {
@@ -500,7 +533,11 @@ fn state_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn write_state_atomically(path: &Path, data: &[u8]) -> Result<()> {
+fn write_state_atomically(
+    path: &Path,
+    data: &[u8],
+    sync_directory: fn(&Path) -> io::Result<()>,
+) -> Result<()> {
     let directory = state_directory(path);
     create_state_directory(directory).map_err(|source| PoolError::Io {
         context: "create lease state directory",
@@ -526,10 +563,7 @@ fn write_state_atomically(path: &Path, data: &[u8]) -> Result<()> {
             context: "replace lease state",
             source,
         })?;
-        sync_directory(directory).map_err(|source| PoolError::Io {
-            context: "sync lease state directory",
-            source,
-        })
+        sync_directory(directory).map_err(PoolError::Durability)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -774,5 +808,121 @@ mod tests {
                 ));
             }
         }
+    }
+
+    fn fail_directory_sync(_directory: &Path) -> io::Result<()> {
+        Err(io::Error::other("injected directory sync failure"))
+    }
+
+    #[test]
+    fn committed_new_lease_survives_directory_sync_failure() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("leases.json");
+        let pool = Pool::new_persistent("10.66.0.0/30", &path).unwrap();
+        assert!(pool
+            .acquire_inner_with_sync("client-a", "first-group", fail_directory_sync)
+            .is_err());
+        let disk: PoolState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let persisted = &disk.leases["client-a"];
+        {
+            let inner = pool.inner.lock().unwrap();
+            let record = inner
+                .by_client
+                .get("client-a")
+                .expect("a committed reservation must not be rolled back");
+            assert_eq!(record.address.to_string(), persisted.address);
+            assert_eq!(record.generation, persisted.generation);
+            assert!(!record.active);
+            assert!(!inner.groups.contains_key("client-a"));
+        }
+        assert!(matches!(
+            pool.acquire("client-b"),
+            Err(PoolError::Exhausted)
+        ));
+        let recovered = pool.acquire("client-a").unwrap();
+        assert_eq!(recovered.address.to_string(), persisted.address);
+        assert!(recovered.generation() > persisted.generation);
+        pool.release(&recovered);
+        drop(pool);
+
+        let reopened = Pool::new_persistent("10.66.0.0/30", &path).unwrap();
+        assert!(matches!(
+            reopened.acquire("client-b"),
+            Err(PoolError::Exhausted)
+        ));
+        assert_eq!(
+            reopened.acquire("client-a").unwrap().address,
+            recovered.address
+        );
+    }
+
+    #[test]
+    fn committed_replacement_does_not_restore_obsolete_generation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("leases.json");
+        let pool = Pool::new_persistent("10.66.0.0/30", &path).unwrap();
+        let first = pool.acquire_group("client-a", "first-group").unwrap();
+        let second = pool.acquire_group("client-a", "first-group").unwrap();
+        assert!(pool
+            .acquire_inner_with_sync("client-a", "replacement", fail_directory_sync)
+            .is_err());
+        let disk: PoolState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let persisted = &disk.leases["client-a"];
+        assert!(persisted.generation > first.generation());
+        {
+            let inner = pool.inner.lock().unwrap();
+            let record = inner.by_client.get("client-a").unwrap();
+            assert_eq!(record.generation, persisted.generation);
+            assert!(!record.active);
+            assert!(!inner.groups.contains_key("client-a"));
+        }
+        assert!(!pool.register_lease(&first, || panic!("obsolete lease registered")));
+        pool.release(&first);
+        pool.release(&second);
+        let recovered = pool.acquire_group("client-a", "replacement").unwrap();
+        assert_eq!(recovered.address, first.address);
+        assert!(recovered.generation() > persisted.generation);
+        pool.release(&first);
+        assert!(pool.register_lease(&recovered, || {}));
+    }
+
+    #[test]
+    fn failed_rename_preserves_previous_lease_and_group_references() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("leases.json");
+        let backup = directory.path().join("previous.json");
+        let pool = Pool::new_persistent("10.66.0.0/29", &path).unwrap();
+        let first = pool.acquire_group("client-a", "first-group").unwrap();
+        let second = pool.acquire_group("client-a", "first-group").unwrap();
+        fs::rename(&path, &backup).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        for (client, group) in [("client-a", "replacement"), ("client-b", "new-group")] {
+            assert!(matches!(
+                pool.acquire_group(client, group),
+                Err(PoolError::Io {
+                    context: "replace lease state",
+                    ..
+                })
+            ));
+            let inner = pool.inner.lock().unwrap();
+            assert_eq!(inner.by_client.len(), 1);
+            assert_eq!(inner.by_address.len(), 1);
+            assert_eq!(inner.by_client["client-a"].generation, first.generation());
+            assert_eq!(inner.groups["client-a"].references, 2);
+        }
+        assert!(pool.register_lease(&first, || {}));
+        pool.release(&first);
+        assert!(pool.register_lease(&second, || {}));
+        pool.release(&second);
+        assert!(!pool.register_lease(&second, || panic!("released lease registered")));
+
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&backup, &path).unwrap();
+        assert_eq!(
+            pool.acquire("client-b").unwrap().address,
+            "10.66.0.3".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

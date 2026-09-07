@@ -252,8 +252,8 @@ impl Connection {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             self.inner.cancellation.cancel();
             self.inner.tasks.close();
-            self.inner.tasks.wait().await;
         }
+        self.inner.tasks.wait().await;
     }
 }
 
@@ -319,6 +319,65 @@ fn valid_unicast(address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_close_waits_for_workers_even_if_the_first_close_was_cancelled() {
+        for abort_first in [false, true] {
+            let cancellation = CancellationToken::new();
+            let tasks = TaskTracker::new();
+            let finish = Arc::new(Notify::new());
+            let worker_finish = finish.clone();
+            tasks.spawn(async move { worker_finish.notified().await });
+            let (outbound, _) = mpsc::channel(1);
+            let (_, inbound) = mpsc::channel(1);
+            let connection = Arc::new(Connection {
+                lease: Lease {
+                    address: "10.66.0.2/32".parse().unwrap(),
+                    gateway: None,
+                    dns: None,
+                    mtu: 1100,
+                },
+                remote_address: "127.0.0.1:443".parse().unwrap(),
+                transport: Transport::Http3,
+                delivery_mode: DeliveryMode::Capsule,
+                mtu_automatic: false,
+                mtu_ceiling: None,
+                inner: Arc::new(ConnectionInner {
+                    outbound,
+                    inbound: Mutex::new(inbound),
+                    failure: Arc::new(FailureSignal::default()),
+                    cancellation: cancellation.clone(),
+                    tasks: tasks.clone(),
+                    closed: AtomicBool::new(false),
+                }),
+            });
+            let first_connection = connection.clone();
+            let first = tokio::spawn(async move { first_connection.close().await });
+            cancellation.cancelled().await;
+            if abort_first {
+                first.abort();
+            }
+            let closing = connection.close();
+            tokio::pin!(closing);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut closing)
+                    .await
+                    .is_err(),
+                "close returned before the transport worker exited"
+            );
+            finish.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), closing)
+                .await
+                .unwrap();
+            if abort_first {
+                assert!(first.await.unwrap_err().is_cancelled());
+            } else {
+                first.await.unwrap();
+            }
+            assert!(tasks.is_empty());
+            connection.close().await;
+        }
+    }
 
     #[test]
     fn setup_cancellation_guard_cancels_only_while_armed() {
