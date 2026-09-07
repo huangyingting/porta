@@ -206,7 +206,7 @@ thumbprint changes at renewal.
 ## Desktop transport and protection lifecycle
 
 The default `--transport auto` tries HTTP/3 MASQUE and falls back to HTTP/2
-CONNECT-IP when the transport is unavailable. Explicit `--transport h3` and
+packet streams when the transport is unavailable. Explicit `--transport h3` and
 `--transport h2` disable automatic selection. Authentication, certificate,
 wire-version, malformed-control, and invalid-lease failures never justify
 downgrading. A lease-assignment timeout is retryable without downgrading.

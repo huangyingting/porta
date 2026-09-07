@@ -397,6 +397,9 @@ async fn run_session(
                         "Wintun packet reader stopped",
                     )));
                 };
+                if !packet_matches_lease(&packet, connection.lease) {
+                    continue;
+                }
                 match connection.send(&packet).await {
                     Ok(()) => uploaded_bytes = uploaded_bytes.saturating_add(packet.len() as u64),
                     Err(error) if error.is_retryable() => return SessionEnd::Retry(error.to_string()),
@@ -422,6 +425,11 @@ async fn run_session(
             }),
         }
     }
+}
+
+fn packet_matches_lease(packet: &[u8], lease: Lease) -> bool {
+    packet.len() <= usize::from(lease.mtu)
+        && porta_wire::ip::parse_ipv4(packet).is_ok_and(|info| info.source == lease.address.addr())
 }
 
 async fn wait_or_cancel(delay: Duration, cancellation: &CancellationToken) -> bool {
@@ -612,6 +620,37 @@ pub fn reconnect_delay(failures: u32, maximum: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_packets_must_match_the_current_lease() {
+        let lease = Lease {
+            address: "10.0.0.2/24".parse().unwrap(),
+            gateway: None,
+            dns: Some("10.0.0.1".parse().unwrap()),
+            mtu: 1280,
+        };
+        let mut packet = vec![0; usize::from(lease.mtu)];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&lease.mtu.to_be_bytes());
+        packet[12..16].copy_from_slice(&lease.address.addr().octets());
+        assert!(packet_matches_lease(&packet, lease));
+
+        let changed_address = Lease {
+            address: "10.0.0.3/24".parse().unwrap(),
+            ..lease
+        };
+        assert!(!packet_matches_lease(&packet, changed_address));
+        let smaller_mtu = Lease { mtu: 1200, ..lease };
+        assert!(!packet_matches_lease(&packet, smaller_mtu));
+
+        packet[0] = 0x60;
+        assert!(!packet_matches_lease(&packet, lease));
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        assert!(!packet_matches_lease(&packet, lease));
+        assert!(!packet_matches_lease(&[], lease));
+        assert!(!packet_matches_lease(&packet[..19], lease));
+    }
 
     #[test]
     fn reconnect_backoff_is_bounded() {

@@ -154,19 +154,31 @@ async fn connect_address(
         }
     };
 
-    let mut request = Request::builder()
-        .method(Method::CONNECT)
-        .uri(masque_url(parsed)?.as_str())
-        .body(())
-        .map_err(ClientError::permanent)?;
-    request.extensions_mut().insert(Protocol::CONNECT_IP);
-    apply_headers(&mut request, config)?;
     let mut stream = tokio::select! {
         _ = cancellation.cancelled() => return Err(ClientError::Closed),
-        result = timeout_at(deadline, requests.send_request(request)) => {
+        error = poll_fn(|context| driver.poll_close(context)) => {
+            return Err(ClientError::unavailable(format!(
+                "HTTP/3 connection stopped before request: {error}"
+            )));
+        }
+        result = timeout_at(deadline, async {
+            wait_for_peer_settings(&requests, &cancellation, config.timeout).await?;
+            if !requests.settings().enable_extended_connect() {
+                return Err(ClientError::unavailable(
+                    "gateway did not enable HTTP/3 Extended CONNECT",
+                ));
+            }
+            let mut request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(masque_url(parsed)?.as_str())
+                .body(())
+                .map_err(ClientError::permanent)?;
+            request.extensions_mut().insert(Protocol::CONNECT_IP);
+            apply_headers(&mut request, config)?;
+            requests.send_request(request).await.map_err(ClientError::unavailable)
+        }) => {
             result
-                .map_err(|_| ClientError::unavailable("HTTP/3 establishment timed out"))?
-                .map_err(ClientError::unavailable)?
+                .map_err(|_| ClientError::unavailable("HTTP/3 establishment timed out"))??
         }
     };
     let stream_id = stream.id();
@@ -188,17 +200,12 @@ async fn connect_address(
         }
     });
 
+    let mut transport_ready = false;
     let established = tokio::select! {
         _ = cancellation.cancelled() => {
             Err(failure.current().unwrap_or(ClientError::Closed))
         }
         result = timeout_at(deadline, async {
-            wait_for_peer_settings(&requests, &cancellation, config.timeout).await?;
-            if !requests.settings().enable_extended_connect() {
-                return Err(ClientError::unavailable(
-                    "gateway did not enable HTTP/3 Extended CONNECT",
-                ));
-            }
             let datagrams = requests.settings().enable_datagram();
 
             let response = timeout(config.timeout, stream.recv_response())
@@ -206,6 +213,7 @@ async fn connect_address(
                 .map_err(|_| ClientError::unavailable("HTTP/3 response timed out"))?
                 .map_err(ClientError::unavailable)?;
             validate_response(&response)?;
+            transport_ready = true;
             let request_cancellation = cancellation.clone();
             tasks.spawn(async move {
                 request_cancellation.cancelled().await;
@@ -267,7 +275,11 @@ async fn connect_address(
             Ok((lease, automatic, ceiling, datagrams))
         }) => {
             result.unwrap_or_else(|_| {
-                Err(ClientError::unavailable("HTTP/3 establishment timed out"))
+                Err(if transport_ready {
+                    ClientError::retryable("HTTP/3 tunnel configuration timed out")
+                } else {
+                    ClientError::unavailable("HTTP/3 establishment timed out")
+                })
             })
         }
     };
@@ -333,9 +345,7 @@ async fn wait_for_peer_settings(
         while !state.settings_received() {
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    return Err(ClientError::unavailable(
-                        "HTTP/3 connection stopped before peer SETTINGS",
-                    ));
+                    return Err(ClientError::Closed);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {}
             }

@@ -435,7 +435,7 @@ class AutomationTests(unittest.TestCase):
             self.assertIsNotNone(match, manifest)
             self.assertEqual(match.group(1), version, manifest)
 
-    def test_android_rust_libraries_use_requested_output_directory(self):
+    def prepare_android_rust_build(self):
         ndk = self.root / "ndk"
         tools = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
         tools.mkdir(parents=True)
@@ -479,6 +479,10 @@ class AutomationTests(unittest.TestCase):
             RUSTUP=str(rustup),
             CARGO_TARGET_DIR=str(target_dir),
         )
+        return readelf
+
+    def test_android_rust_libraries_use_requested_output_directory(self):
+        self.prepare_android_rust_build()
         self.run_script("build-android-rust.sh", "nested/jni")
         expected = {
             "arm64-v8a": "aarch64-linux-android",
@@ -488,6 +492,26 @@ class AutomationTests(unittest.TestCase):
         for abi, target in expected.items():
             self.assertEqual((self.root / f"nested/jni/{abi}/libporta_android.so").read_text(),
                              target)
+
+    def test_android_rust_build_rejects_failed_or_invalid_elf_inspection(self):
+        readelf = self.prepare_android_rust_build()
+        cases = {
+            "inspection-failed": (
+                "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x4000'\nexit 1\n"
+            ),
+            "empty": "exit 0\n",
+            "no-load-headers": "printf '%s\\n' 'Program Headers:'\n",
+            "malformed": "printf '%s\\n' 'LOAD 0 0 0 0 0 R E invalid'\n",
+            "misaligned": "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x1000'\n",
+            "mixed-alignment": (
+                "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x4000' "
+                "'LOAD 0 0 0 0 0 R E 0x1000'\n"
+            ),
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                readelf.write_text("#!/bin/sh\n" + body)
+                self.run_script("build-android-rust.sh", f"jni-{name}", success=False)
 
     def test_android_soak_restores_wifi_after_failure(self):
         self.update_state(fail_sleep=True)

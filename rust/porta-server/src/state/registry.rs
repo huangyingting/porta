@@ -1589,6 +1589,96 @@ mod tests {
         proof
     }
 
+    async fn cancelled_enrollment_keeps_disk_and_memory_consistent(native: bool) {
+        use crate::integration::{NativeAuthenticator, RegistryProxyAuthorizer};
+        use crate::ops::abuse::AbuseGuard;
+        use crate::ops::metrics::Metrics;
+        use crate::proxy::service::Authorizer;
+        use crate::transport::session::{AuthenticationRequest, Authenticator, DeviceProof};
+
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = Arc::new(ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap());
+        let persistence = registry.inner.persistence.lock().await;
+        let sequence = persistence.persisted_sequence;
+        let authenticating = if native {
+            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let proof = signed_proof(&key, "phone", BOOTSTRAP_TOKEN, 1);
+            let authenticator = NativeAuthenticator::new(
+                registry.clone(),
+                Arc::new(AbuseGuard::default_with_metrics(Arc::new(
+                    Metrics::default(),
+                ))),
+            );
+            tokio::spawn(async move {
+                let session = authenticator
+                    .authenticate(AuthenticationRequest {
+                        bearer_token: BOOTSTRAP_TOKEN.into(),
+                        proof: DeviceProof {
+                            device_id: proof.device_id,
+                            name: proof.name,
+                            public_key: proof.public_key,
+                            timestamp: proof.timestamp,
+                            nonce: proof.nonce,
+                            signature: proof.signature,
+                        },
+                        method: http::Method::POST,
+                        path: "/v1/tunnel".into(),
+                        peer: "127.0.0.1:1234".parse().unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                session.cleanup.close();
+            })
+        } else {
+            let authorizer = RegistryProxyAuthorizer::new(registry.clone());
+            tokio::spawn(async move {
+                let _session = authorizer
+                    .authorize(
+                        BOOTSTRAP_TOKEN,
+                        FORWARD_PROXY_DEVICE_ID,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.inner.state.lock().next_persist_sequence == sequence {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authentication reached its persistence await");
+        authenticating.abort();
+        assert!(authenticating.await.unwrap_err().is_cancelled());
+        drop(persistence);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.inner.persistence.lock().await.persisted_sequence == sequence {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached persistence completed");
+        let mutation = registry.inner.mutations.lock().await;
+        let disk: RegistryFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk.clients[0].devices.len(), 1);
+        assert_eq!(registry.inner.state.lock().clients, disk.clients);
+        assert_eq!(registry.list()[0].active_sessions, 0);
+        drop(mutation);
+        registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_enrollment_is_consistent() {
+        cancelled_enrollment_keeps_disk_and_memory_consistent(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_proxy_enrollment_is_consistent() {
+        cancelled_enrollment_keeps_disk_and_memory_consistent(false).await;
+    }
+
     #[tokio::test]
     async fn opens_go_compatible_version_two_registry_and_preserves_field_names() {
         let directory = tempfile::tempdir().unwrap();

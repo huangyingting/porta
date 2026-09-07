@@ -154,9 +154,7 @@ impl AdminHttpHandler {
         request: Request<Incoming>,
         peer: SocketAddr,
     ) -> Result<Response<ResponseBody>> {
-        if request.method() == http::Method::GET
-            && matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics")
-        {
+        if matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics") {
             return self.operations.clone().call(request, peer).await;
         }
         let context = match collect_request(request, peer.ip(), peer.ip()).await {
@@ -365,6 +363,107 @@ fn full_body(body: Bytes) -> ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn admin_request(handler: Arc<AdminHttpHandler>, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(64 << 10);
+        let connection = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(server),
+                    hyper::service::service_fn(move |request| {
+                        handler
+                            .clone()
+                            .call(request, "127.0.0.1:1234".parse().unwrap())
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        connection.await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_routes_operations_methods() {
+        use crate::app::OperationsHandler;
+        use crate::integration::WebRegistryAdapter;
+        use crate::ops::metrics::Metrics;
+        use crate::ops::readiness::Readiness;
+        use crate::state::{registry::ClientRegistry, usage::Store};
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let registry = Arc::new(
+            ClientRegistry::open(
+                directory.path().join("clients.json"),
+                "test-bootstrap-token",
+            )
+            .await
+            .unwrap(),
+        );
+        for metrics_token in ["", "test-metrics-token"] {
+            let handler = Arc::new(AdminHttpHandler::new(
+                Arc::new(AdminService::new(
+                    WebRegistryAdapter::new(registry.clone(), Arc::new(Store::in_memory())),
+                    b"test-admin-token".to_vec(),
+                )),
+                Arc::new(OperationsHandler::new(
+                    Readiness::new(Vec::new(), Duration::from_secs(1)),
+                    Arc::new(Metrics::default()),
+                    metrics_token.as_bytes().to_vec(),
+                    None,
+                )),
+            ));
+            for (path, status) in [("/healthz", 200), ("/readyz", 503), ("/metrics", 200)] {
+                for method in ["GET", "HEAD", "POST"] {
+                    let response = admin_request(
+                        handler.clone(),
+                        format!(
+                            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer test-metrics-token\r\nContent-Length: 0\r\n\r\n"
+                        ),
+                    )
+                    .await;
+                    let expected = if path == "/metrics" && metrics_token.is_empty() {
+                        404
+                    } else if method == "POST" {
+                        405
+                    } else {
+                        status
+                    };
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {expected} ")),
+                        "{method} {path}: {response}"
+                    );
+                    if expected == 405 {
+                        assert!(response.contains("\r\nallow: GET, HEAD\r\n"));
+                    }
+                    if method == "HEAD" {
+                        assert!(response.ends_with("\r\n\r\n"));
+                    }
+                }
+            }
+            if !metrics_token.is_empty() {
+                let response = admin_request(
+                    handler,
+                    "HEAD /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".into(),
+                )
+                .await;
+                assert!(response.starts_with("HTTP/1.1 401 "));
+            }
+        }
+        registry.close().await.unwrap();
+    }
 
     #[test]
     fn forwarded_addresses_are_trusted_only_from_loopback() {

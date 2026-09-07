@@ -32,7 +32,9 @@ unrestricted tunnel: `/.well-known/masque/ip/*/*/`. HTTP/2 and HTTP/3 requests
 use Extended CONNECT with `:protocol=connect-ip` and
 `Capsule-Protocol: ?1`.
 
-Native clients prefer that endpoint over HTTP/3. Their HTTP/2 fallback uses
+Native clients prefer that endpoint over HTTP/3. They wait for the server's
+`SETTINGS_ENABLE_CONNECT_PROTOCOL` permission before sending Extended CONNECT
+or generating its device proof. Their HTTP/2 fallback uses
 two-byte length-prefixed packets over independent `POST /v1/tunnel` streams
 instead of one ordered MASQUE stream, limiting a lost outer TCP segment to the
 flows assigned to one lane.

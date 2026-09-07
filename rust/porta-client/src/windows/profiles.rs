@@ -268,6 +268,12 @@ fn persist(path: &Path, state: &State) -> std::io::Result<()> {
     let mut data = serde_json::to_vec_pretty(state)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     data.push(b'\n');
+    if data.len() as u64 > MAX_STORE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "profile store exceeds maximum size",
+        ));
+    }
     let directory = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -440,5 +446,67 @@ mod tests {
             store.token(&updated.id),
             Err(ProfileError::NotFound)
         ));
+    }
+
+    #[test]
+    fn oversized_changes_preserve_the_readable_store_and_existing_token() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = directory.path().join("profiles.json");
+        let store = Store::open(path.clone()).unwrap();
+        let saved = store
+            .save(
+                Profile::new("Office", "https://porta.example", Transport::Auto),
+                "original-token",
+            )
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+
+        for update in [true, false] {
+            let mut oversized = saved.clone();
+            if !update {
+                oversized.id.clear();
+            }
+            oversized.ca_path = "\u{00e9}".repeat(MAX_STORE_SIZE as usize / 2);
+            assert!(matches!(
+                store.save(oversized, "replacement-token"),
+                Err(ProfileError::Persist(error))
+                    if error.kind() == std::io::ErrorKind::InvalidData
+            ));
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(store.list().unwrap().len(), 1);
+            assert_eq!(store.token(&saved.id).unwrap(), "original-token");
+            let reopened = Store::open(path.clone()).unwrap();
+            assert_eq!(reopened.token(&saved.id).unwrap(), "original-token");
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn persistence_limit_includes_the_final_newline() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = directory.path().join("profiles.json");
+        let mut state = State {
+            version: STATE_VERSION,
+            profiles: vec![Record {
+                profile: Profile {
+                    id: "boundary".to_owned(),
+                    ..Profile::new("Office", "https://porta.example", Transport::Auto)
+                },
+                protected_token: "unused".to_owned(),
+            }],
+        };
+        let length = serde_json::to_vec_pretty(&state).unwrap().len() + 1;
+        state.profiles[0].profile.ca_path = "a".repeat(MAX_STORE_SIZE as usize - length);
+        persist(&path, &state).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_STORE_SIZE);
+        Store::open(path.clone()).unwrap();
+
+        state.profiles[0].profile.ca_path.push('a');
+        assert_eq!(
+            persist(&path, &state).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_STORE_SIZE);
+        Store::open(path).unwrap();
     }
 }

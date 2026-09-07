@@ -71,16 +71,21 @@ for item in "${targets[@]}"; do
     library="$output_dir/$abi/libporta_android.so"
     mkdir -p "$output_dir/$abi"
     cp "$cargo_target_dir/$target/release/libporta_android.so" "$library"
+    if ! load_segments="$("$toolchain/bin/llvm-readelf" -lW "$library" | awk '$1 == "LOAD"')"; then
+        printf 'Could not inspect Android library ELF LOAD segments: %s\n' "$library" >&2
+        exit 1
+    fi
     load_segment_count=0
     while IFS= read -r segment; do
+        [[ -n "$segment" ]] || continue
         load_segment_count=$((load_segment_count + 1))
         read -r -a fields <<<"$segment"
         alignment="${fields[${#fields[@]} - 1]}"
-        if ((alignment < 0x4000)); then
+        if [[ ! "$alignment" =~ ^0x[0-9a-fA-F]+$ ]] || ((alignment < 0x4000)); then
             printf 'Android library LOAD segment is not 16 KB aligned: %s\n' "$library" >&2
             exit 1
         fi
-    done < <("$toolchain/bin/llvm-readelf" -lW "$library" | awk '$1 == "LOAD"')
+    done <<<"$load_segments"
     if ((load_segment_count == 0)); then
         printf 'Android library has no ELF LOAD segments: %s\n' "$library" >&2
         exit 1

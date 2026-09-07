@@ -32,6 +32,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 pub struct NativeAuthenticator {
     registry: Arc<StateRegistry>,
@@ -65,27 +66,36 @@ impl Authenticator for NativeAuthenticator {
                 nonce: request.proof.nonce,
                 signature: request.proof.signature,
             };
-            let session = registry
-                .authenticate_device_session(
-                    &request.bearer_token,
-                    &proof,
-                    request.method.as_str(),
-                    &request.path,
-                )
-                .await
-                .map_err(|error| {
-                    if !matches!(
-                        error,
-                        StateRegistryError::Unauthorized
-                            | StateRegistryError::Disabled
-                            | StateRegistryError::DeviceLimit
-                            | StateRegistryError::Draining
-                            | StateRegistryError::InvalidDeviceProof
-                    ) {
-                        tracing::error!(%error, "native authentication failed");
-                    }
-                    AuthenticationError::Unauthorized
-                })?;
+            // Enrollment must publish its in-memory state even if the HTTP request
+            // disappears while the registry's detached persistence task is running.
+            let session = tokio::spawn(async move {
+                registry
+                    .authenticate_device_session(
+                        &request.bearer_token,
+                        &proof,
+                        request.method.as_str(),
+                        &request.path,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "native authentication task failed");
+                AuthenticationError::Unauthorized
+            })?
+            .map_err(|error| {
+                if !matches!(
+                    error,
+                    StateRegistryError::Unauthorized
+                        | StateRegistryError::Disabled
+                        | StateRegistryError::DeviceLimit
+                        | StateRegistryError::Draining
+                        | StateRegistryError::InvalidDeviceProof
+                ) {
+                    tracing::error!(%error, "native authentication failed");
+                }
+                AuthenticationError::Unauthorized
+            })?;
             reservation.refund();
             Ok(Authenticated {
                 identity: TransportIdentity {
@@ -138,11 +148,14 @@ impl ProxyAuthorizer for RegistryProxyAuthorizer {
             if device_id != PROXY_DEVICE_ID {
                 return Err("invalid proxy device".into());
             }
-            let session = self
-                .registry
-                .authenticate_proxy_session(token)
-                .await
-                .map_err(|error| -> ProxyError { Box::new(error) })?;
+            let registry = self.registry.clone();
+            let token = Zeroizing::new(token.to_owned());
+            // Keep enrollment and persistence together when a CONNECT is cancelled.
+            let session =
+                tokio::spawn(async move { registry.authenticate_proxy_session(&token).await })
+                    .await
+                    .map_err(|error| -> ProxyError { Box::new(error) })?
+                    .map_err(|error| -> ProxyError { Box::new(error) })?;
             let session_cancellation = session.cancellation;
             let cancellation = CancellationToken::new();
             let merged = cancellation.clone();

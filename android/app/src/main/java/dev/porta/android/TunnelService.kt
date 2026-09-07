@@ -621,13 +621,18 @@ class TunnelService : VpnService() {
         onInvalidated: (String) -> Unit,
     ): SelectedNetworkCallbacks {
         val connectivity = getSystemService(ConnectivityManager::class.java)
-        fun invalidate(reason: String) {
-            if (attemptActive.compareAndSet(true, false) &&
-                isRunActive(runGeneration) &&
-                selectedNetwork.get() == network
-            ) {
-                onInvalidated(reason)
-            }
+        fun invalidate(reason: String, replacement: Network? = null) {
+            invalidateTransportAttempt(
+                this,
+                attemptActive,
+                isCurrentAttempt = {
+                    isRunActive(runGeneration) && selectedNetwork.get() == network
+                },
+                cancel = {
+                    replacement?.let(preferredNetwork::set)
+                    onInvalidated(reason)
+                },
+            )
         }
         val defaultCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(available: Network) {
@@ -636,8 +641,7 @@ class TunnelService : VpnService() {
                 if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                     !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
                 ) {
-                    preferredNetwork.set(available)
-                    invalidate("Underlying network changed")
+                    invalidate("Underlying network changed", available)
                 }
             }
         }
