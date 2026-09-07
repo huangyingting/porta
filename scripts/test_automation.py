@@ -853,6 +853,21 @@ class AutomationTests(unittest.TestCase):
         wrapper = (ROOT / "android/gradle/wrapper/gradle-wrapper.properties").read_text()
         self.assertRegex(wrapper, r"(?m)^distributionSha256Sum=[0-9a-f]{64}$")
 
+    def test_rust_release_uses_compatible_glibc_baseline_and_guard(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("runs-on: ubuntu-22.04", workflow)
+        guard = re.search(r"grep -Eq '([^']*GLIBC[^']*)'", workflow)
+        self.assertIsNotNone(guard)
+        pattern = guard.group(1)
+        for version, accepted in (("2.35", True), ("2.36", False), ("2.40", False)):
+            result = subprocess.run(
+                ["grep", "-Eq", pattern],
+                input=f"GLIBC_{version}\n",
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode == 1, accepted, version)
+
     def signing_environment(self):
         return self.env | {
             "RUNNER_TEMP": str(self.root / "scratch"),

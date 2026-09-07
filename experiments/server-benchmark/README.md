@@ -1,7 +1,7 @@
-# Go versus Rust server experiment
+# Go versus Rust server benchmarks
 
-This experiment compares the current Go gateway data path with a Rust
-implementation before considering a server rewrite.
+The benchmark suite compares Porta's Go and Rust server implementations using
+the production Go client.
 
 Three servers receive the same four-lane Porta HTTP/2/TLS packet workload:
 
@@ -33,6 +33,19 @@ Run the repeatable, CPU-pinned comparison:
 ```sh
 PORTA_RUST_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
 ```
+
+`run.sh` measures the isolated prototype data paths. To compare the complete
+production servers through a real Linux TUN, registry, usage store, TLS stack,
+router, and kernel UDP echo path, run:
+
+```sh
+PORTA_PRODUCTION_BENCH_WORK=/path/out \
+  ./experiments/server-benchmark/run-production.sh
+```
+
+The production benchmark requires passwordless `sudo`, `unshare`, `ip`, `nft`,
+OpenSSL, taskset, Python 3, Go, and stable Rust. It runs in a disposable network
+namespace and does not alter host networking.
 
 Defaults are five interleaved runs at 1, 16, and 64 concurrent clients, with a
 two-second warmup and six-second measurement. Override
@@ -82,9 +95,28 @@ measurement.
 | HTTP/3 | 2 SMT | 64 | 29,378 | 39,075 | +33.0% | 6,593.9 | 5,233.8 | +20.6% | 32.2 / 16.5 |
 | HTTP/3 | 1 thread | 64 | 25,067 | 29,705 | +18.5% | 6,275.8 | 5,681.4 | +9.5% | 29.9 / 16.3 |
 
-Rust clears the threshold for HTTP/3 at every measured concurrency and uses
-49-65% less memory. HTTP/2 does not generalize: at 16 clients Rust is 3.0-9.1%
-slower and improves p95 by only 0.6-5.7%, while the material gain appears only
-at 64 clients. The experiment therefore fails the requirement for a repeatable
-gain across both supported transports. **Keep the Go server; do not start a
-full Rust rewrite.**
+Rust cleared the prototype threshold for HTTP/3 and used 49-65% less memory.
+HTTP/2 prototype results were mixed, so the production implementation was
+measured again after the complete router, persistence, authentication, and
+server lifecycle were integrated.
+
+## 2026-09-07 production result
+
+Three interleaved runs used the complete Go and Rust servers, the production Go
+client, a real TUN, a kernel-routed UDP echo path, one outstanding 1,200-byte
+packet per client, and two SMT threads per process. Negative latency, CPU, and
+RSS changes favor Rust.
+
+| Transport | Clients | Rust throughput | Rust p95 | Rust CPU | Rust RSS |
+|---|---:|---:|---:|---:|---:|
+| HTTP/2 | 1 | -3.1% | -8.5% | -38.0% | -47.9% |
+| HTTP/3 | 1 | +34.6% | -31.5% | -38.8% | -50.4% |
+| HTTP/2 | 16 | +29.5% | -26.7% | -0.9% | -55.9% |
+| HTTP/3 | 16 | +34.5% | -26.6% | -13.7% | -54.5% |
+
+The integrated Rust server has 3.1% lower single-client HTTP/2 throughput, but
+improves its latency by 8.5%, CPU by 38.0%, and RSS by 47.9%. It clears the
+throughput threshold for HTTP/3 and concurrent HTTP/2 while improving latency
+and memory in every measured case. It is now the production build; the Go
+server remains available only as an explicit rollback build during deployment
+acceptance.

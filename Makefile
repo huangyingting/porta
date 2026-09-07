@@ -1,6 +1,8 @@
 GO ?= go
+CARGO ?= cargo
+RUST_SERVER_MANIFEST := rust/porta-server/Cargo.toml
 
-.PHONY: check-version test test-automation test-race test-native-mtu test-native-firewall vet build build-windows android clean
+.PHONY: check-version test test-automation test-race test-native-mtu test-native-firewall test-rust-server vet build build-rust-server build-go-server build-go-clients build-windows android clean
 
 check-version:
 	./scripts/check-version.sh
@@ -26,14 +28,29 @@ test-native-mtu:
 test-native-firewall:
 	./scripts/test-server-firewall.sh
 
+test-rust-server:
+	$(CARGO) fmt --manifest-path $(RUST_SERVER_MANIFEST) --check
+	$(CARGO) test --manifest-path $(RUST_SERVER_MANIFEST) --locked
+	$(CARGO) clippy --manifest-path $(RUST_SERVER_MANIFEST) --locked --all-targets -- -D warnings
+
 vet:
 	$(GO) vet ./...
 
-build:
+build: build-rust-server build-go-clients
+
+build-go-clients:
 	mkdir -p bin
-	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-server ./cmd/porta-server
 	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-client ./cmd/porta-client
 	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-keygen ./cmd/porta-keygen
+
+build-rust-server:
+	$(CARGO) build --manifest-path $(RUST_SERVER_MANIFEST) --locked --release
+	mkdir -p bin
+	cp rust/porta-server/target/release/porta-server bin/porta-server
+
+build-go-server:
+	mkdir -p bin
+	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-server-go ./cmd/porta-server
 
 build-windows:
 	rm -rf bin/windows-amd64
@@ -50,5 +67,6 @@ android:
 
 clean:
 	$(GO) clean
+	rm -rf rust/porta-server/target
 	rm -rf bin/windows-amd64 bin/porta-client-windows-amd64.zip bin/wintun-0.14.1.zip
 	cd android && ./gradlew clean

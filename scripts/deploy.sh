@@ -235,6 +235,8 @@ client_release_assets=(
   porta-android-x86_64.apk
 )
 if $build_local; then
+  build_user=${SUDO_USER:-$(id -un)}
+  build_home=$(getent passwd "$build_user" | cut -d: -f6)
   go_binary=$(command -v go || true)
   if [[ -z $go_binary ]]; then
     for candidate in /usr/local/go/bin/go /usr/local/bin/go /usr/bin/go; do
@@ -245,11 +247,23 @@ if $build_local; then
     done
   fi
   [[ -n $go_binary ]] || die "Go is required to build Porta"
+  cargo_binary=$(command -v cargo || true)
+  if [[ -x $build_home/.cargo/bin/cargo ]]; then
+    cargo_binary=$build_home/.cargo/bin/cargo
+  elif [[ -z $cargo_binary ]]; then
+    for candidate in /usr/local/bin/cargo /usr/bin/cargo; do
+      if [[ -x $candidate ]]; then
+        cargo_binary=$candidate
+        break
+      fi
+    done
+  fi
+  [[ -n $cargo_binary ]] || die "Cargo with a stable Rust toolchain is required to build Porta"
   if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
-    sudo -u "$SUDO_USER" env "HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)" \
-      make GO="$go_binary" build
+    sudo -u "$SUDO_USER" env "HOME=$build_home" \
+      make GO="$go_binary" CARGO="$cargo_binary" build
   else
-    make GO="$go_binary" build
+    make GO="$go_binary" CARGO="$cargo_binary" build
   fi
   server_binary=bin/porta-server
 else

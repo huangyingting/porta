@@ -48,8 +48,19 @@ jobs:
           make test-native-firewall
           make test-native-mtu
       - run: make vet
-      - run: make build
+      - run: make build-go-clients
       - run: make build-windows
+
+  rust-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - run: make test-rust-server
+      - run: make build-rust-server
 
   windows-ui:
     runs-on: windows-latest

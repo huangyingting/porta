@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify release version
@@ -32,6 +32,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install Rust toolchain and Linux targets
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
@@ -62,12 +69,24 @@ jobs:
         run: |
           make test-automation
           make test
+          make test-rust-server
           make vet
-      - name: Build Go release binaries
+      - name: Build release binaries
         run: |
           mkdir -p dist
+          cargo build --manifest-path rust/porta-server/Cargo.toml --locked --release --target x86_64-unknown-linux-gnu
+          cp rust/porta-server/target/x86_64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-amd64
+          CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            cargo build --manifest-path rust/porta-server/Cargo.toml --locked --release --target aarch64-unknown-linux-gnu
+          cp rust/porta-server/target/aarch64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-arm64
+          for binary in dist/porta-server-linux-*; do
+            if readelf --version-info "$binary" | grep -Eq 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
+              echo "$binary requires glibc newer than the Ubuntu 22.04 deployment baseline" >&2
+              exit 1
+            fi
+          done
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-server-linux-$arch" ./cmd/porta-server
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-client-linux-$arch" ./cmd/porta-client
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-keygen-linux-$arch" ./cmd/porta-keygen
           done

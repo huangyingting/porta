@@ -2,12 +2,13 @@
 
 ## Requirements
 
-Go builds require Go 1.26 or newer. Android builds additionally require JDK 17,
-Android SDK 35, Android NDK 27.2.12479018, and matching `gomobile` and `gobind`
-binaries on `PATH`. The Windows desktop uses the pinned Wails v3 module and
-Microsoft Edge WebView2. Production builds must include the `production` build
-tag; the frontend is embedded HTML, CSS, and JavaScript and does not require
-Node.js or an npm build.
+Go builds require Go 1.26 or newer. The Rust server additionally requires the
+stable Rust toolchain with Cargo, Clippy, and rustfmt. Android builds require
+JDK 17, Android SDK 35, Android NDK 27.2.12479018, and matching `gomobile` and
+`gobind` binaries on `PATH`. The Windows desktop uses the pinned Wails v3
+module and Microsoft Edge WebView2. Production builds must include the
+`production` build tag; the frontend is embedded HTML, CSS, and JavaScript and
+does not require Node.js or an npm build.
 
 ## Local validation
 
@@ -16,11 +17,17 @@ make check-version
 make test-automation
 make test
 make test-race
+make test-rust-server
 make vet
 make build
+make build-rust-server
 make build-windows
 make android
 ```
+
+`make build` builds the production Rust server as `bin/porta-server` together
+with the Go clients. `make build-go-server` retains the previous Go server as
+`bin/porta-server-go` for explicit rollback testing during the migration.
 
 `make test` enables the official `GODEBUG=http2xconnect=1` switch required by
 the HTTP/2 Extended CONNECT integration tests.

@@ -2,6 +2,7 @@
 /dist/
 /.rust-benchmark/
 /experiments/server-benchmark/rust-server/target/
+/rust/porta-server/target/
 __pycache__/
 /*.pem
 /*.key
