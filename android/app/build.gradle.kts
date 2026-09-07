@@ -58,11 +58,15 @@ val buildRustAndroid by tasks.registering(Exec::class) {
         rootProject.projectDir.parentFile.resolve("rust/porta-android/Cargo.toml"),
         rootProject.projectDir.parentFile.resolve("rust/porta-client/Cargo.toml"),
         rootProject.projectDir.parentFile.resolve("rust/porta-wire/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/h3/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/hyper/Cargo.toml"),
         rootProject.projectDir.parentFile.resolve("scripts/build-android-rust.sh"),
     )
     inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-android/src"))
     inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-client/src"))
     inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-wire/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/h3/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/hyper/src"))
     outputs.dir(rustJniLibs)
 }
 

@@ -446,6 +446,12 @@ class AutomationTests(unittest.TestCase):
         ):
             (tools / name).write_text("#!/bin/sh\n")
             (tools / name).chmod(0o755)
+        readelf = tools / "llvm-readelf"
+        readelf.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x4000'\n"
+        )
+        readelf.chmod(0o755)
 
         rustup = self.root / "rustup"
         rustup.write_text(
@@ -906,6 +912,27 @@ class AutomationTests(unittest.TestCase):
             return "\n".join(line[10:] for line in script[2:].splitlines())
         return script.strip()
 
+    def deployment_bundle_script(self, path):
+        blocks = re.findall(
+            r"```(?:bash|sh)\n(.*?)\n```",
+            (ROOT / path).read_text(),
+            flags=re.DOTALL,
+        )
+        matches = [
+            block for block in blocks
+            if "porta-deploy.tar.gz" in block
+            and "release-signing-cert.der" in block
+            and "tar -xzf" in block
+        ]
+        self.assertEqual(len(matches), 1, path)
+        return matches[0]
+
+    def write_mock_command(self, name, script):
+        command = self.bin / name
+        command.unlink(missing_ok=True)
+        command.write_text("#!/bin/sh\nset -eu\n" + script)
+        command.chmod(0o755)
+
     def test_workflows_pin_actions_and_gradle_distribution(self):
         action_reference = re.compile(r"^[^@\s]+@[0-9a-f]{40}(?:\s+#\s+v\S+)?$")
         for workflow in (ROOT / ".github/workflows").glob("*.yml"):
@@ -932,8 +959,37 @@ class AutomationTests(unittest.TestCase):
             for path in (ROOT / directory).rglob("*.go")
         )
         self.assertEqual(go_sources, [])
-        for obsolete in ("go.mod", "go.sum", "scripts/build-android-aar.sh"):
+        for obsolete in (
+            "go.mod",
+            "go.sum",
+            "scripts/build-android-aar.sh",
+            "scripts/windows-up.ps1",
+            "scripts/windows-down.ps1",
+        ):
             self.assertFalse((ROOT / obsolete).exists(), obsolete)
+
+    def test_android_rust_build_tracks_patched_transport_sources(self):
+        gradle = (ROOT / "android/app/build.gradle.kts").read_text()
+        for path in (
+            "rust/porta-server/vendor/h3/Cargo.toml",
+            "rust/porta-server/vendor/h3/src",
+            "rust/porta-server/vendor/hyper/Cargo.toml",
+            "rust/porta-server/vendor/hyper/src",
+        ):
+            self.assertIn(path, gradle)
+        build = (ROOT / "scripts/build-android-rust.sh").read_text()
+        self.assertIn("max-page-size=16384", build)
+        self.assertIn("common-page-size=16384", build)
+        self.assertIn("llvm-readelf", build)
+        self.assertNotRegex(build, r"\bmapfile\b")
+
+        manifest = (ROOT / "android/app/src/main/AndroidManifest.xml").read_text()
+        self.assertIn("android.net.VpnService.SUPPORTS_ALWAYS_ON", manifest)
+        self.assertRegex(
+            manifest,
+            r'android:name="android\.net\.VpnService\.SUPPORTS_ALWAYS_ON"\s+'
+            r'android:value="false"',
+        )
 
     def test_android_jni_entrypoints_are_not_obfuscated(self):
         rules = (ROOT / "android/app/proguard-rules.pro").read_text()
@@ -1024,6 +1080,93 @@ class AutomationTests(unittest.TestCase):
         self.assertIn(f"release_signing_fingerprint={expected}", deploy)
         self.assertIn("SignReleaseManifest.java", workflow)
         self.assertIn("SHA256SUMS.sig", workflow)
+
+    def test_documented_release_verification_blocks_extraction_on_failure(self):
+        self.write_mock_command(
+            "gh",
+            """
+if [ "${1:-} ${2:-}" = "release download" ]; then
+    : > porta-deploy.tar.gz
+    : > SHA256SUMS.sig
+    : > release-signing-cert.der
+    printf 'fixture  porta-deploy.tar.gz\\n' > SHA256SUMS
+elif [ "${1:-} ${2:-}" = "auth token" ]; then
+    printf 'test-token\\n'
+else
+    exit 1
+fi
+""",
+        )
+        self.write_mock_command(
+            "openssl",
+            """
+case "$*" in
+    *" -fingerprint "*)
+        if [ "${FAIL_STAGE:-}" = certificate ]; then
+            printf 'sha256 Fingerprint=%s\\n' \
+                0000000000000000000000000000000000000000000000000000000000000000
+        else
+            printf 'sha256 Fingerprint=%s\\n' "$EXPECTED_FINGERPRINT"
+        fi
+        ;;
+    *" -pubkey "*)
+        printf '%s\\n' test-public-key
+        ;;
+    "dgst "*)
+        [ "${FAIL_STAGE:-}" != signature ]
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+""",
+        )
+        self.write_mock_command(
+            "sha256sum",
+            """
+cat >/dev/null
+[ "${FAIL_STAGE:-}" != checksum ]
+""",
+        )
+        self.write_mock_command(
+            "tar",
+            """
+: > "$EXTRACTED_MARKER"
+mkdir porta
+""",
+        )
+
+        for path in ("README.md", "docs/deployment.md"):
+            script = self.deployment_bundle_script(path)
+            expected = re.search(r"expected=([0-9a-f]{64})", script)
+            self.assertIsNotNone(expected, path)
+            for failure in ("certificate", "signature", "checksum", ""):
+                with self.subTest(path=path, failure=failure or "none"):
+                    directory = self.root / f"{Path(path).stem}-{failure or 'ok'}"
+                    directory.mkdir()
+                    marker = directory / "extracted"
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=directory,
+                        env=self.env | {
+                            "EXPECTED_FINGERPRINT": expected.group(1),
+                            "EXTRACTED_MARKER": str(marker),
+                            "FAIL_STAGE": failure,
+                        },
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if failure:
+                        self.assertNotEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+                        self.assertFalse(marker.exists())
+                    else:
+                        self.assertEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+                        self.assertTrue(marker.is_file())
 
     def test_rust_release_uses_compatible_glibc_baseline_and_guard(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

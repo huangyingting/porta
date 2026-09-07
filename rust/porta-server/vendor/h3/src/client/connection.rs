@@ -216,7 +216,8 @@ where
 
         let request_stream = RequestStream {
             inner: connection::RequestStream::new(
-                FrameStream::new(BufRecvStream::new(stream)),
+                FrameStream::new(BufRecvStream::new(stream))
+                    .with_max_field_section_size(self.max_field_section_size),
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,

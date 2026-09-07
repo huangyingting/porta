@@ -318,8 +318,9 @@ async fn header_too_big_response_from_server() {
         //= type=test
         //# An HTTP/3 implementation MAY impose a limit on the maximum size of
         //# the message header it will accept on an individual HTTP message.
+        // Fit the encoded block so this exercises the decoded field-section limit.
         let mut incoming_req = server::builder()
-            .max_field_section_size(12)
+            .max_field_section_size(32)
             .build(conn)
             .await
             .unwrap();
@@ -336,7 +337,7 @@ async fn header_too_big_response_from_server() {
             err_kind,
             StreamError::HeaderTooBig {
                 actual_size: 42,
-                max_size: 12
+                max_size: 32
             }
         );
 
@@ -659,8 +660,9 @@ async fn header_too_big_discard_from_client_trailers() {
         //# that exceeds the indicated size, as the peer will likely refuse to
         //# process it.
 
+        // Fit the encoded trailers so this exercises the decoded field-section limit.
         let (mut driver, mut client) = client::builder()
-            .max_field_section_size(200)
+            .max_field_section_size(400)
             // Don't send settings, so server doesn't know about the low max_field_section_size
             .send_settings(false)
             .build::<_, _, Bytes>(pair.client().await)
@@ -681,7 +683,7 @@ async fn header_too_big_discard_from_client_trailers() {
                 err_kind,
                 StreamError::HeaderTooBig {
                     actual_size: 539,
-                    max_size: 200,
+                    max_size: 400,
                     ..
                 }
             );
@@ -1360,6 +1362,77 @@ async fn request_invalid_trailing_byte() {
 }
 
 #[tokio::test]
+async fn request_header_declaration_exceeds_buffering_limit() {
+    for limit in [1024, VarInt::MAX.into_inner()] {
+        request_sequence_check_with_limit(
+            |buf| {
+                FrameType::HEADERS.encode(buf);
+                VarInt::from_u64(limit.saturating_add(3).min(VarInt::MAX.into_inner()))
+                    .unwrap()
+                    .encode(buf);
+            },
+            Some(Code::H3_EXCESSIVE_LOAD),
+            limit,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn response_header_declaration_exceeds_configured_limit() {
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, mut client) = client::builder()
+            .max_field_section_size(1024)
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let mut stream = client
+            .send_request(Request::get("https://localhost/").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_matches!(
+            stream.recv_response().await,
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_EXCESSIVE_LOAD,
+                    ..
+                }
+            }))
+        );
+        assert_matches!(
+            future::poll_fn(|cx| driver.poll_close(cx)).await,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_EXCESSIVE_LOAD,
+                    ..
+                }
+            }
+        );
+    };
+    let server_fut = async {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, _recv) = connection.accept_bi().await.unwrap();
+        let mut prefix = BytesMut::new();
+        FrameType::HEADERS.encode(&mut prefix);
+        VarInt::from(1027u32).encode(&mut prefix);
+        send.write_all(&prefix).await.unwrap();
+        // Keep the stream open: rejection must not depend on FIN or a payload.
+        assert_matches!(
+            connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(error)
+                if error.error_code.into_inner() == Code::H3_EXCESSIVE_LOAD.value()
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("response declaration was not rejected promptly");
+}
+
+#[tokio::test]
 async fn request_invalid_data_frame_length_too_large() {
     request_sequence_frame_error(|mut buf| {
         request_encode(
@@ -1463,6 +1536,16 @@ async fn request_sequence_check<F>(request: F, expected_error_code: Option<Code>
 where
     F: Fn(&mut BytesMut),
 {
+    request_sequence_check_with_limit(request, expected_error_code, VarInt::MAX.into_inner()).await;
+}
+
+async fn request_sequence_check_with_limit<F>(
+    request: F,
+    expected_error_code: Option<Code>,
+    max_field_section_size: u64,
+) where
+    F: Fn(&mut BytesMut),
+{
     init_tracing();
     let mut pair = Pair::default();
     let mut server = pair.server();
@@ -1514,7 +1597,11 @@ where
 
     let server_fut = async {
         let conn = server.next().await;
-        let mut incoming = server::Connection::new(conn).await.unwrap();
+        let mut incoming = server::builder()
+            .max_field_section_size(max_field_section_size)
+            .build(conn)
+            .await
+            .unwrap();
         let request_resolver = incoming
             .accept()
             .await

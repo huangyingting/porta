@@ -1,6 +1,7 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write};
 use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +19,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter as _, Manager as _, State, WindowEvent};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -104,7 +108,7 @@ struct DesktopState {
 struct Controller {
     store: Store,
     network_state: PathBuf,
-    log_path: PathBuf,
+    log: ActivityLog,
     startup_error: Option<String>,
     state: Mutex<DesktopState>,
     log_lock: Mutex<()>,
@@ -114,7 +118,7 @@ impl Controller {
     fn new(
         store: Store,
         network_state: PathBuf,
-        log_path: PathBuf,
+        log: ActivityLog,
         startup_error: Option<String>,
     ) -> Result<Self, String> {
         let profiles = store.list().map_err(|error| error.to_string())?;
@@ -153,7 +157,7 @@ impl Controller {
                 "offline".to_owned(),
             )
         };
-        let mut activity = load_activity(&log_path);
+        let mut activity = load_activity(&mut log.open().map_err(|error| error.to_string())?);
         if recovery {
             push_activity(
                 &mut activity,
@@ -167,7 +171,7 @@ impl Controller {
         Ok(Self {
             store,
             network_state,
-            log_path,
+            log,
             startup_error,
             state: Mutex::new(DesktopState {
                 selected_id,
@@ -700,13 +704,10 @@ impl Controller {
             .log_lock
             .lock()
             .map_err(|_| "activity log lock is poisoned".to_owned())?;
-        let rotated = self.log_path.with_extension("log.1");
-        for path in [&self.log_path, &rotated] {
-            if let Err(error) = fs::remove_file(path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    return Err(error.to_string());
-                }
-            }
+        self.log.validate().map_err(|error| error.to_string())?;
+        let rotated = self.log.path.with_extension("log.1");
+        for path in [&self.log.path, &rotated] {
+            remove_log_file(path).map_err(|error| error.to_string())?;
         }
         self.lock_state()?.activity.clear();
         self.publish(app);
@@ -718,21 +719,16 @@ impl Controller {
         if activity.is_empty() {
             return Ok(String::new());
         }
-        let directory = self
-            .log_path
-            .parent()
-            .ok_or_else(|| "activity log directory is unavailable".to_owned())?
-            .join("exports");
-        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        self.log.validate().map_err(|error| error.to_string())?;
+        let directory = self.log.directory_path().join("exports");
+        let secured_directory =
+            paths::prepare_admin_directory(&directory).map_err(|error| error.to_string())?;
+        paths::validate_admin_directory(&secured_directory).map_err(|error| error.to_string())?;
         let path = directory.join(format!(
             "porta-activity-{}.log",
             Local::now().format("%Y%m%d-%H%M%S-%3f")
         ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
+        let mut file = create_log_file(&path).map_err(|error| error.to_string())?;
         for line in activity {
             writeln!(file, "{line}").map_err(|error| error.to_string())?;
         }
@@ -741,11 +737,8 @@ impl Controller {
     }
 
     fn open_log_folder(&self) -> Result<String, String> {
-        let directory = self
-            .log_path
-            .parent()
-            .ok_or_else(|| "activity log directory is unavailable".to_owned())?;
-        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        self.log.validate().map_err(|error| error.to_string())?;
+        let directory = self.log.directory_path();
         open_folder(directory)?;
         Ok(directory.display().to_string())
     }
@@ -772,22 +765,7 @@ impl Controller {
         let Ok(_guard) = self.log_lock.lock() else {
             return;
         };
-        let Some(directory) = self.log_path.parent() else {
-            return;
-        };
-        if fs::create_dir_all(directory).is_err() {
-            return;
-        }
-        if fs::metadata(&self.log_path).is_ok_and(|metadata| metadata.len() >= 1 << 20) {
-            let rotated = self.log_path.with_extension("log.1");
-            let _ = fs::remove_file(&rotated);
-            let _ = fs::rename(&self.log_path, rotated);
-        }
-        let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
-        else {
+        let Ok(mut file) = self.log.open_for_append() else {
             return;
         };
         let _ = writeln!(
@@ -795,6 +773,98 @@ impl Controller {
             "{} {line}",
             Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
         );
+    }
+}
+
+struct ActivityLog {
+    path: PathBuf,
+    root: File,
+    directory: File,
+}
+
+impl ActivityLog {
+    fn new() -> std::io::Result<Self> {
+        let program_data = paths::program_data()?;
+        let root = paths::prepare_admin_directory(&program_data.join("Porta"))?;
+        let directory_path = activity_log_directory(&program_data);
+        let directory = paths::prepare_admin_directory(&directory_path)?;
+        let log = Self {
+            path: directory_path.join("porta.log"),
+            root,
+            directory,
+        };
+        log.open()?;
+        Ok(log)
+    }
+
+    fn directory_path(&self) -> &Path {
+        self.path.parent().expect("activity log has a directory")
+    }
+
+    fn validate(&self) -> std::io::Result<()> {
+        paths::validate_admin_directory(&self.root)?;
+        paths::validate_admin_directory(&self.directory)
+    }
+
+    fn open(&self) -> std::io::Result<File> {
+        self.validate()?;
+        match create_log_file(&self.path) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                open_log_file(&self.path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_for_append(&self) -> std::io::Result<File> {
+        let file = self.open()?;
+        if file.metadata()?.len() < 1 << 20 {
+            return Ok(file);
+        }
+        drop(file);
+        let rotated = self.path.with_extension("log.1");
+        remove_log_file(&rotated)?;
+        fs::rename(&self.path, rotated)?;
+        self.open()
+    }
+}
+
+fn activity_log_directory(program_data: &Path) -> PathBuf {
+    program_data.join("Porta").join("logs")
+}
+
+fn log_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+}
+
+fn create_log_file(path: &Path) -> std::io::Result<File> {
+    let file = log_file_options().create_new(true).open(path)?;
+    paths::secure_new_admin_file(path, &file)?;
+    paths::validate_admin_file(&file)?;
+    Ok(file)
+}
+
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let file = log_file_options().open(path)?;
+    paths::validate_admin_file(&file)?;
+    Ok(file)
+}
+
+fn remove_log_file(path: &Path) -> std::io::Result<()> {
+    match open_log_file(path) {
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -903,12 +973,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     fs::create_dir_all(&data_directory)?;
     let store = Store::open(data_directory.join("profiles.json"))?;
-    let controller = Arc::new(Controller::new(
-        store,
-        network_state,
-        data_directory.join("porta.log"),
-        startup_error,
-    )?);
+    let log = ActivityLog::new()
+        .map_err(|error| format!("initialize protected activity log: {error}"))?;
+    let controller = Arc::new(Controller::new(store, network_state, log, startup_error)?);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -1130,11 +1197,7 @@ fn update_rates(state: &mut DesktopState, uploaded: u64, downloaded: u64) {
 }
 
 fn add_activity(state: &mut DesktopState, message: &str) -> Option<String> {
-    let message = message.trim();
-    if message.is_empty() {
-        return None;
-    }
-    let line = format!("{}  {message}", Local::now().format("%H:%M:%S"));
+    let line = activity_line(message)?;
     state.activity.push(line.clone());
     if state.activity.len() > MAX_ACTIVITY_LINES {
         state
@@ -1145,21 +1208,46 @@ fn add_activity(state: &mut DesktopState, message: &str) -> Option<String> {
 }
 
 fn push_activity(activity: &mut Vec<String>, message: &str) {
-    let line = format!("{}  {}", Local::now().format("%H:%M:%S"), message.trim());
+    let Some(line) = activity_line(message) else {
+        return;
+    };
     activity.push(line);
     if activity.len() > MAX_ACTIVITY_LINES {
         activity.drain(..activity.len() - MAX_ACTIVITY_LINES);
     }
 }
 
-fn load_activity(path: &Path) -> Vec<String> {
-    let Ok(contents) = fs::read_to_string(path) else {
+fn activity_line(message: &str) -> Option<String> {
+    let message = sanitize_activity(message);
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(format!("{}  {message}", Local::now().format("%H:%M:%S")))
+}
+
+fn sanitize_activity(message: &str) -> String {
+    message
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn load_activity(file: &mut File) -> Vec<String> {
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
         return Vec::new();
-    };
+    }
     let mut lines = contents
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
+        .map(sanitize_activity)
         .collect::<Vec<_>>();
     if lines.len() > MAX_ACTIVITY_LINES {
         lines.drain(..lines.len() - MAX_ACTIVITY_LINES);
@@ -1213,4 +1301,81 @@ fn wide_os(value: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::current_dir().unwrap().join(format!(
+                ".porta-log-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn activity_messages_cannot_inject_records_or_terminal_controls() {
+        let message = "Profile\r\nforged\t\0\u{1b}\u{7f}\u{85}\u{2028}\u{2029}é";
+        assert_eq!(sanitize_activity(message), "Profile  forged       é");
+        let line = activity_line(message).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.chars().any(char::is_control));
+        assert!(activity_line("\r\n\t\0").is_none());
+        let mut activity = Vec::new();
+        push_activity(&mut activity, message);
+        assert_eq!(activity.len(), 1);
+        assert!(activity[0].ends_with(&sanitize_activity(message)));
+    }
+
+    #[test]
+    fn logs_are_selected_under_program_data_not_the_profile_directory() {
+        assert_eq!(
+            activity_log_directory(Path::new(r"C:\ProgramData")),
+            PathBuf::from(r"C:\ProgramData\Porta\logs")
+        );
+    }
+
+    #[test]
+    fn existing_log_and_export_hard_links_are_rejected_without_modification() {
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target");
+        let log = directory.0.join("porta.log");
+        fs::write(&target, b"unchanged").unwrap();
+        fs::hard_link(&target, &log).unwrap();
+        let error = open_log_file(&log).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("singly linked"), "{error}");
+        assert!(create_log_file(&log).is_err());
+        assert!(remove_log_file(&log).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        assert!(log.exists());
+    }
+
+    #[test]
+    fn existing_logs_with_user_directory_acls_are_not_adopted() {
+        let directory = TestDirectory::new();
+        let log = directory.0.join("porta.log");
+        fs::write(&log, b"unchanged").unwrap();
+        let error = open_log_file(&log).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&log).unwrap(), b"unchanged");
+    }
 }

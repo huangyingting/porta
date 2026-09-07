@@ -285,10 +285,12 @@ where
         }
     }
 
-    pub fn into_stream(self) -> AcceptedRecvStream<S, B> {
+    pub fn into_stream(self, max_field_section_size: u64) -> AcceptedRecvStream<S, B> {
         match self.ty.expect("Stream type not resolved yet") {
-            StreamType::CONTROL => AcceptedRecvStream::Control(FrameStream::new(self.stream)),
-            StreamType::PUSH => AcceptedRecvStream::Push(FrameStream::new(self.stream)),
+            StreamType::CONTROL => AcceptedRecvStream::Control(FrameStream::control(self.stream)),
+            StreamType::PUSH => AcceptedRecvStream::Push(
+                FrameStream::new(self.stream).with_max_field_section_size(max_field_section_size),
+            ),
             StreamType::ENCODER => AcceptedRecvStream::Encoder(self.stream),
             StreamType::DECODER => AcceptedRecvStream::Decoder(self.stream),
             StreamType::WEBTRANSPORT_UNI => AcceptedRecvStream::WebTransportUni(

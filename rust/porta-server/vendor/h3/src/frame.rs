@@ -13,8 +13,9 @@ use crate::stream::{BufRecvStream, WriteBuf};
 use crate::{
     buf::BufList,
     proto::{
-        frame::{self, Frame, PayloadLen},
+        frame::{self, Frame, FrameType, PayloadLen},
         stream::StreamId,
+        varint::VarInt,
     },
     quic::{BidiStream, RecvStream, SendStream},
 };
@@ -34,6 +35,18 @@ impl<S, B> FrameStream<S, B> {
             decoder: FrameDecoder::default(),
             remaining_data: 0,
         }
+    }
+
+    pub(crate) fn with_max_field_section_size(mut self, limit: u64) -> Self {
+        // QPACK's field section prefix is not included in the decoded field size.
+        self.decoder.max_field_section_size = limit.saturating_add(2);
+        self
+    }
+
+    pub(crate) fn control(stream: BufRecvStream<S, B>) -> Self {
+        let mut framed = Self::new(stream);
+        framed.decoder.require_settings = true;
+        framed
     }
 
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
@@ -88,9 +101,8 @@ where
                 Poll::Ready(false) => continue,
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(true) => {
-                    if self.stream.buf_mut().has_remaining() {
-                        // Reached the end of receive stream, but there is still some data:
-                        // The frame is incomplete.
+                    if self.stream.buf_mut().has_remaining() || !self.decoder.is_idle() {
+                        // A buffered frame or an incrementally discarded frame is incomplete.
                         return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
                     } else {
                         return Poll::Ready(Ok(None));
@@ -145,7 +157,7 @@ where
     }
 
     pub(crate) fn is_eos(&self) -> bool {
-        self.stream.is_eos() && !self.stream.buf().has_remaining()
+        self.stream.is_eos() && !self.stream.buf().has_remaining() && self.decoder.is_idle()
     }
 
     fn try_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, FrameStreamError>> {
@@ -212,12 +224,43 @@ where
     }
 }
 
-#[derive(Default)]
+// Bound buffering even when SETTINGS_MAX_FIELD_SECTION_SIZE is left unlimited.
+// Control frames use this independent cap, not the request/response header limit.
+const MAX_BUFFERED_FRAME_SIZE: u64 = 64 * 1024;
+
+#[derive(Debug, Default)]
+enum DecodeState {
+    #[default]
+    Header,
+    Buffered {
+        expected: usize,
+    },
+    Discard {
+        remaining: u64,
+    },
+}
+
 pub struct FrameDecoder {
-    expected: Option<usize>,
+    state: DecodeState,
+    max_field_section_size: u64,
+    require_settings: bool,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self {
+            state: DecodeState::Header,
+            max_field_section_size: MAX_BUFFERED_FRAME_SIZE,
+            require_settings: false,
+        }
+    }
 }
 
 impl FrameDecoder {
+    fn is_idle(&self) -> bool {
+        matches!(self.state, DecodeState::Header)
+    }
+
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
@@ -225,13 +268,83 @@ impl FrameDecoder {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
-            if !src.has_remaining() {
-                return Ok(None);
-            }
-
-            if let Some(min) = self.expected {
-                if src.remaining() < min {
-                    return Ok(None);
+            match &mut self.state {
+                DecodeState::Discard { remaining } => {
+                    let discarded = (*remaining).min(src.remaining() as u64) as usize;
+                    src.advance(discarded);
+                    *remaining -= discarded as u64;
+                    if *remaining != 0 {
+                        return Ok(None);
+                    }
+                    self.state = DecodeState::Header;
+                    continue;
+                }
+                DecodeState::Buffered { expected } => {
+                    if src.remaining() < *expected {
+                        return Ok(None);
+                    }
+                }
+                DecodeState::Header => {
+                    // Keep at most two varints until the declaration is complete.
+                    // No payload may be accumulated before this preflight succeeds.
+                    let mut cur = src.cursor();
+                    let Ok(ty) = FrameType::decode(&mut cur) else {
+                        return Ok(None);
+                    };
+                    if self.require_settings && ty != FrameType::SETTINGS {
+                        return Err(FrameStreamError::Proto(FrameProtocolError::MissingSettings));
+                    }
+                    let Ok(value) = VarInt::decode(&mut cur) else {
+                        return Ok(None);
+                    };
+                    let header_len = cur.position();
+                    let len = value.into_inner();
+                    let limit = match ty {
+                        // WebTransport's second varint is a session ID, not a length.
+                        FrameType::WEBTRANSPORT_BI_STREAM => 0,
+                        FrameType::DATA => {
+                            let len = usize::try_from(len).map_err(|_| {
+                                FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad)
+                            })?;
+                            src.advance(header_len);
+                            return Ok(Some(Frame::Data(PayloadLen(len))));
+                        }
+                        FrameType::HEADERS => self.max_field_section_size,
+                        FrameType::PUSH_PROMISE => self
+                            .max_field_section_size
+                            .saturating_add(VarInt::MAX_SIZE as u64),
+                        FrameType::SETTINGS
+                        | FrameType::CANCEL_PUSH
+                        | FrameType::GOAWAY
+                        | FrameType::MAX_PUSH_ID => MAX_BUFFERED_FRAME_SIZE,
+                        FrameType::H2_PRIORITY
+                        | FrameType::H2_PING
+                        | FrameType::H2_WINDOW_UPDATE
+                        | FrameType::H2_CONTINUATION => {
+                            return Err(FrameStreamError::Proto(
+                                FrameProtocolError::ForbiddenFrame(ty.value()),
+                            ));
+                        }
+                        _ => {
+                            #[cfg(feature = "tracing")]
+                            trace!("ignore unknown frame type {:?}", ty);
+                            src.advance(header_len);
+                            self.state = DecodeState::Discard { remaining: len };
+                            continue;
+                        }
+                    };
+                    let payload_len = if ty == FrameType::WEBTRANSPORT_BI_STREAM {
+                        0
+                    } else {
+                        if len > limit.min(MAX_BUFFERED_FRAME_SIZE) {
+                            return Err(FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad));
+                        }
+                        len as usize
+                    };
+                    self.state = DecodeState::Buffered {
+                        expected: header_len + payload_len,
+                    };
+                    continue;
                 }
             }
 
@@ -242,28 +355,16 @@ impl FrameDecoder {
             };
 
             match decoded {
-                Err(frame::FrameError::UnknownFrame(_ty)) => {
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                    //# Frames of unknown types (Section 9), including reserved frames
-                    //# (Section 7.2.8) MAY be sent on a request or push stream before,
-                    //# after, or interleaved with other frames described in this section.
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-                    //# Endpoints MUST
-                    //# NOT consider these frames to have any meaning upon receipt.
-                    #[cfg(feature = "tracing")]
-                    trace!("ignore unknown frame type {:#x}", _ty);
-
-                    src.advance(pos);
-                    self.expected = None;
-                    continue;
+                Err(frame::FrameError::UnknownFrame(_)) => {
+                    unreachable!("unknown frames are discarded during preflight");
                 }
-                Err(frame::FrameError::Incomplete(min)) => {
-                    self.expected = Some(min);
-                    return Ok(None);
+                Err(frame::FrameError::Incomplete(_)) => {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
                 Ok(frame) => {
                     src.advance(pos);
-                    self.expected = None;
+                    self.state = DecodeState::Header;
+                    self.require_settings = false;
                     return Ok(Some(frame));
                 }
                 // -------------- Map the error Values --------------
@@ -309,6 +410,8 @@ pub enum FrameStreamError {
 #[derive(Debug, PartialEq)]
 /// Protocol specific errors that can occur while decoding frames in a stream
 pub enum FrameProtocolError {
+    ExcessiveLoad,
+    MissingSettings,
     Malformed,
     ForbiddenFrame(u64), // Known (http2) frames that should generate an error
     InvalidFrameValue,
@@ -478,6 +581,203 @@ mod tests {
             CHUNK_COUNT.div_ceil(FRAMES_PER_CHUNK),
             "transport was polled while complete frames were still buffered"
         );
+    }
+
+    #[tokio::test]
+    async fn huge_buffered_frames_are_rejected_from_the_prefix() {
+        for ty in [
+            FrameType::HEADERS,
+            FrameType::SETTINGS,
+            FrameType::PUSH_PROMISE,
+            FrameType::CANCEL_PUSH,
+            FrameType::GOAWAY,
+            FrameType::MAX_PUSH_ID,
+        ] {
+            let mut prefix = BytesMut::new();
+            ty.encode(&mut prefix);
+            VarInt::MAX.encode(&mut prefix);
+            assert!(prefix.len() <= 16);
+
+            let mut recv = FakeRecv::default();
+            for byte in &prefix {
+                recv.chunk(Bytes::copy_from_slice(&[*byte]));
+            }
+            recv.chunk(Bytes::from(vec![0; 1024]));
+            let polls = recv.poll_count.clone();
+            let mut stream: FrameStream<_, ()> =
+                FrameStream::new(BufRecvStream::new(recv)).with_max_field_section_size(1024);
+
+            let error = poll_fn(|cx| stream.poll_next(cx)).await.unwrap_err();
+            let FrameStreamError::Proto(error) = error else {
+                panic!("expected a protocol error");
+            };
+            assert_eq!(error, FrameProtocolError::ExcessiveLoad);
+            assert_eq!(
+                crate::error::internal_error::InternalConnectionError::got_frame_error(error).code,
+                Code::H3_EXCESSIVE_LOAD
+            );
+            assert_eq!(polls.get(), prefix.len(), "read past the frame declaration");
+            assert_eq!(stream.stream.buf().remaining(), prefix.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_header_limit_is_checked_before_the_body() {
+        let mut prefix = BytesMut::new();
+        FrameType::HEADERS.encode(&mut prefix);
+        VarInt::from(1027u32).encode(&mut prefix);
+        let mut recv = FakeRecv::default();
+        recv.chunk(prefix.freeze());
+        let polls = recv.poll_count.clone();
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).with_max_field_section_size(1024);
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad))
+        );
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn huge_unknown_frame_is_discarded_incrementally() {
+        let mut prefix = BytesMut::new();
+        // Exercise eight-byte type and length varints without allocating a huge body.
+        VarInt::MAX.encode(&mut prefix);
+        VarInt::MAX.encode(&mut prefix);
+        let mut buf = BufList::from(prefix.freeze());
+        let mut decoder = FrameDecoder::default();
+        assert_matches!(decoder.decode(&mut buf), Ok(None));
+        assert_eq!(buf.remaining(), 0);
+
+        let chunk = Bytes::from(vec![0; 1024]);
+        for count in 1..=128 {
+            buf.push(chunk.clone());
+            assert_matches!(decoder.decode(&mut buf), Ok(None));
+            assert_eq!(buf.remaining(), 0, "retained unknown frame payload");
+            assert_matches!(
+                decoder.state,
+                DecodeState::Discard { remaining }
+                    if remaining == VarInt::MAX.into_inner() - count * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_frame_discard_resumes_at_the_next_frame() {
+        let mut prefix = BytesMut::new();
+        FrameType::RESERVED.encode(&mut prefix);
+        VarInt::from(1024 * 1024u32).encode(&mut prefix);
+        let mut buf = BufList::from(prefix.freeze());
+        let mut decoder = FrameDecoder::default();
+        assert_matches!(decoder.decode(&mut buf), Ok(None));
+
+        let chunk = Bytes::from(vec![0; 1024]);
+        for _ in 0..1023 {
+            buf.push(chunk.clone());
+            assert_matches!(decoder.decode(&mut buf), Ok(None));
+            assert_eq!(buf.remaining(), 0);
+        }
+        let mut last = BytesMut::from(chunk.as_ref());
+        Frame::headers(&b"next"[..]).encode_with_payload(&mut last);
+        buf.push(last.freeze());
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Ok(Some(Frame::Headers(headers))) if headers == b"next"[..]
+        );
+        assert_eq!(buf.remaining(), 0);
+        assert!(decoder.is_idle());
+    }
+
+    #[tokio::test]
+    async fn truncated_unknown_frame_is_not_a_clean_end() {
+        let mut prefix = BytesMut::new();
+        FrameType::RESERVED.encode(&mut prefix);
+        VarInt::MAX.encode(&mut prefix);
+        let mut recv = FakeRecv::default();
+        recv.chunk(prefix.freeze());
+        recv.chunk(Bytes::from_static(b"partial payload"));
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::UnexpectedEnd)
+        );
+        assert_eq!(stream.stream.buf().remaining(), 0);
+        assert!(!stream.is_eos());
+    }
+
+    #[tokio::test]
+    async fn control_frames_use_an_independent_buffering_limit() {
+        let mut buf = BytesMut::new();
+        let mut settings = frame::Settings::default();
+        settings
+            .insert(frame::SettingId::MAX_HEADER_LIST_SIZE, 0)
+            .unwrap();
+        Frame::<Bytes>::Settings(settings).encode(&mut buf);
+        FrameType::RESERVED.encode(&mut buf);
+        VarInt::from(3u32).encode(&mut buf);
+        buf.put_slice(b"xyz");
+        Frame::<Bytes>::Goaway(VarInt::from(0u32)).encode(&mut buf);
+        let mut recv = FakeRecv::default();
+        recv.chunk(buf.freeze());
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::control(BufRecvStream::new(recv)).with_max_field_section_size(0);
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Settings(_))));
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Goaway(_))));
+    }
+
+    #[tokio::test]
+    async fn control_stream_cannot_skip_unknown_frames_before_settings() {
+        let mut prefix = BytesMut::new();
+        FrameType::RESERVED.encode(&mut prefix);
+        VarInt::MAX.encode(&mut prefix);
+        let mut recv = FakeRecv::default();
+        recv.chunk(prefix.freeze());
+        let mut stream: FrameStream<_, ()> = FrameStream::control(BufRecvStream::new(recv));
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Proto(FrameProtocolError::MissingSettings))
+        );
+    }
+
+    #[tokio::test]
+    async fn data_declaration_is_not_subject_to_buffering_limits() {
+        let mut prefix = BytesMut::new();
+        FrameType::DATA.encode(&mut prefix);
+        VarInt::from(1024 * 1024u32).encode(&mut prefix);
+        let mut recv = FakeRecv::default();
+        recv.chunk(prefix.freeze());
+        recv.chunk(Bytes::from_static(b"body"));
+        let polls = recv.poll_count.clone();
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).with_max_field_section_size(0);
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::Data(PayloadLen(1048576))))
+        );
+        assert_eq!(polls.get(), 1);
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Ok(Some(body)) if body == b"body"[..]
+        );
+    }
+
+    #[test]
+    fn webtransport_header_is_not_a_length_prefixed_frame() {
+        let mut prefix = BytesMut::new();
+        FrameType::WEBTRANSPORT_BI_STREAM.encode(&mut prefix);
+        VarInt::from(1024 * 1024u32).encode(&mut prefix);
+        let mut decoder = FrameDecoder::default();
+        let mut buf = BufList::new();
+        for byte in &prefix[..prefix.len() - 1] {
+            buf.push(Bytes::copy_from_slice(&[*byte]));
+            assert_matches!(decoder.decode(&mut buf), Ok(None));
+        }
+        buf.push(Bytes::copy_from_slice(&prefix[prefix.len() - 1..]));
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Ok(Some(Frame::WebTransportStream(_)))
+        );
+        assert_eq!(buf.remaining(), 0);
     }
 
     #[tokio::test]

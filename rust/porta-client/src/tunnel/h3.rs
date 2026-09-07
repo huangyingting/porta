@@ -28,9 +28,9 @@ use tokio_util::task::TaskTracker;
 use url::Url;
 
 use super::{
-    send_outbound, valid_unicast, ClientConfig, ClientError, Connection, ConnectionInner,
-    DatagramSend, DeliveryMode, FailureSignal, Inbound, Lease, Outbound, Transport,
-    MASQUE_AUTH_PATH, MASQUE_PATH,
+    send_outbound, valid_unicast, CancellationGuard, ClientConfig, ClientError, Connection,
+    ConnectionInner, DatagramSend, DeliveryMode, FailureSignal, Inbound, Lease, Outbound,
+    Transport, MASQUE_AUTH_PATH, MASQUE_PATH,
 };
 
 const CAPSULE_PROTOCOL_HEADER: &str = "capsule-protocol";
@@ -39,6 +39,7 @@ const MTU_ATTEMPT: Duration = Duration::from_millis(150);
 const REQUEST_ID: u64 = 1;
 
 pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
+    let deadline = Instant::now() + config.timeout;
     let parsed = parse_origin(&config.url)?;
     let host = parsed
         .host_str()
@@ -51,10 +52,15 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
     let addresses = if let Some(address) = config.dial_address {
         vec![address]
     } else {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(ClientError::unavailable)?
-            .collect::<Vec<_>>()
+        tokio::select! {
+            _ = config.cancellation.cancelled() => return Err(ClientError::Closed),
+            result = timeout_at(deadline, tokio::net::lookup_host((host.as_str(), port))) => {
+                result
+                    .map_err(|_| ClientError::unavailable("HTTP/3 establishment timed out"))?
+                    .map_err(ClientError::unavailable)?
+                    .collect::<Vec<_>>()
+            }
+        }
     };
     if addresses.is_empty() {
         return Err(ClientError::unavailable(
@@ -64,7 +70,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
 
     let mut last_error = None;
     for remote_address in addresses {
-        match connect_address(&config, &parsed, &host, remote_address).await {
+        match connect_address(&config, &parsed, &host, remote_address, deadline).await {
             Ok(connection) => return Ok(connection),
             Err(error) if error.is_transport_unavailable() => last_error = Some(error),
             Err(error) => return Err(error),
@@ -78,7 +84,10 @@ async fn connect_address(
     parsed: &Url,
     host: &str,
     remote_address: SocketAddr,
+    deadline: Instant,
 ) -> Result<Connection, ClientError> {
+    let cancellation = config.cancellation.child_token();
+    let mut setup_guard = CancellationGuard::new(cancellation.clone());
     let bind_address = match remote_address {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -117,24 +126,33 @@ async fn connect_address(
     let connecting = endpoint
         .connect(remote_address, host)
         .map_err(ClientError::unavailable)?;
-    let quic = timeout(config.timeout, connecting)
-        .await
-        .map_err(|_| ClientError::unavailable("QUIC handshake timed out"))?
-        .map_err(classify_quic_connection)?;
-    let cancellation = config.cancellation.child_token();
+    let quic = tokio::select! {
+        _ = cancellation.cancelled() => return Err(ClientError::Closed),
+        result = timeout_at(deadline, connecting) => {
+            result
+                .map_err(|_| ClientError::unavailable("HTTP/3 establishment timed out"))?
+                .map_err(classify_quic_connection)?
+        }
+    };
     let tasks = TaskTracker::new();
     let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
     let (outbound_tx, outbound_rx) = mpsc::channel(256);
     let failure = Arc::new(FailureSignal::default());
 
     let h3_connection = h3_quinn::Connection::new(quic.clone());
-    let (mut driver, mut requests) = h3::client::builder()
+    let mut builder = h3::client::builder();
+    builder
         .enable_extended_connect(true)
         .enable_datagram(true)
-        .max_field_section_size(16 << 10)
-        .build::<_, _, Bytes>(h3_connection)
-        .await
-        .map_err(ClientError::unavailable)?;
+        .max_field_section_size(16 << 10);
+    let (mut driver, mut requests) = tokio::select! {
+        _ = cancellation.cancelled() => return Err(ClientError::Closed),
+        result = timeout_at(deadline, builder.build::<_, _, Bytes>(h3_connection)) => {
+            result
+                .map_err(|_| ClientError::unavailable("HTTP/3 establishment timed out"))?
+                .map_err(ClientError::unavailable)?
+        }
+    };
 
     let mut request = Request::builder()
         .method(Method::CONNECT)
@@ -143,10 +161,14 @@ async fn connect_address(
         .map_err(ClientError::permanent)?;
     request.extensions_mut().insert(Protocol::CONNECT_IP);
     apply_headers(&mut request, config)?;
-    let mut stream = requests
-        .send_request(request)
-        .await
-        .map_err(ClientError::unavailable)?;
+    let mut stream = tokio::select! {
+        _ = cancellation.cancelled() => return Err(ClientError::Closed),
+        result = timeout_at(deadline, requests.send_request(request)) => {
+            result
+                .map_err(|_| ClientError::unavailable("HTTP/3 establishment timed out"))?
+                .map_err(ClientError::unavailable)?
+        }
+    };
     let stream_id = stream.id();
     let datagram_sender = driver.get_datagram_sender(stream_id);
     let datagram_reader = driver.get_datagram_reader();
@@ -166,80 +188,89 @@ async fn connect_address(
         }
     });
 
-    let established = async {
-        wait_for_peer_settings(&requests, &cancellation, config.timeout).await?;
-        if !requests.settings().enable_extended_connect() {
-            return Err(ClientError::unavailable(
-                "gateway did not enable HTTP/3 Extended CONNECT",
-            ));
+    let established = tokio::select! {
+        _ = cancellation.cancelled() => {
+            Err(failure.current().unwrap_or(ClientError::Closed))
         }
-        let datagrams = requests.settings().enable_datagram();
+        result = timeout_at(deadline, async {
+            wait_for_peer_settings(&requests, &cancellation, config.timeout).await?;
+            if !requests.settings().enable_extended_connect() {
+                return Err(ClientError::unavailable(
+                    "gateway did not enable HTTP/3 Extended CONNECT",
+                ));
+            }
+            let datagrams = requests.settings().enable_datagram();
 
-        let response = timeout(config.timeout, stream.recv_response())
-            .await
-            .map_err(|_| ClientError::unavailable("HTTP/3 response timed out"))?
-            .map_err(ClientError::unavailable)?;
-        validate_response(&response)?;
-        let request_cancellation = cancellation.clone();
-        tasks.spawn(async move {
-            request_cancellation.cancelled().await;
-            drop(requests);
-        });
-        let (send_stream, receive_stream) = stream.split();
+            let response = timeout(config.timeout, stream.recv_response())
+                .await
+                .map_err(|_| ClientError::unavailable("HTTP/3 response timed out"))?
+                .map_err(ClientError::unavailable)?;
+            validate_response(&response)?;
+            let request_cancellation = cancellation.clone();
+            tasks.spawn(async move {
+                request_cancellation.cancelled().await;
+                drop(requests);
+            });
+            let (send_stream, receive_stream) = stream.split();
 
-        let writer_cancellation = cancellation.clone();
-        let writer_inbound = inbound_tx.clone();
-        let writer_failure = failure.clone();
-        tasks.spawn(run_writer(
-            outbound_rx,
-            send_stream,
-            datagram_sender,
-            datagrams,
-            writer_cancellation,
-            writer_inbound,
-            writer_failure,
-        ));
-        let reader_cancellation = cancellation.clone();
-        let reader_inbound = inbound_tx.clone();
-        let reader_failure = failure.clone();
-        tasks.spawn(run_reader(
-            receive_stream,
-            datagram_reader,
-            stream_id,
-            reader_cancellation,
-            reader_inbound,
-            reader_failure,
-        ));
+            let writer_cancellation = cancellation.clone();
+            let writer_inbound = inbound_tx.clone();
+            let writer_failure = failure.clone();
+            tasks.spawn(run_writer(
+                outbound_rx,
+                send_stream,
+                datagram_sender,
+                datagrams,
+                writer_cancellation,
+                writer_inbound,
+                writer_failure,
+            ));
+            let reader_cancellation = cancellation.clone();
+            let reader_inbound = inbound_tx.clone();
+            let reader_failure = failure.clone();
+            tasks.spawn(run_reader(
+                receive_stream,
+                datagram_reader,
+                stream_id,
+                reader_cancellation,
+                reader_inbound,
+                reader_failure,
+            ));
 
-        let mut lease = response_lease(response.headers())?;
-        let (automatic, ceiling) = configure_mtu(
-            config,
-            response.headers(),
-            datagrams,
-            &outbound_tx,
-            &mut inbound_rx,
-            &failure,
-            &mut lease,
-        )
-        .await?;
-        let address_request = masque::encode_address_request(&[Address {
-            request_id: REQUEST_ID,
-            prefix: IpNet::V4(
-                Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).expect("the IPv4 unspecified /32 is valid"),
-            ),
-        }])
-        .map_err(ClientError::permanent)?;
-        send_capsule(
-            &outbound_tx,
-            &failure,
-            CAPSULE_ADDRESS_REQUEST,
-            Bytes::from(address_request),
-        )
-        .await?;
-        lease.address = wait_for_address(config.timeout, &mut inbound_rx, &failure).await?;
-        Ok((lease, automatic, ceiling, datagrams))
-    }
-    .await;
+            let mut lease = response_lease(response.headers())?;
+            let (automatic, ceiling) = configure_mtu(
+                config,
+                response.headers(),
+                datagrams,
+                &outbound_tx,
+                &mut inbound_rx,
+                &failure,
+                &mut lease,
+            )
+            .await?;
+            let address_request = masque::encode_address_request(&[Address {
+                request_id: REQUEST_ID,
+                prefix: IpNet::V4(
+                    Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32)
+                        .expect("the IPv4 unspecified /32 is valid"),
+                ),
+            }])
+            .map_err(ClientError::permanent)?;
+            send_capsule(
+                &outbound_tx,
+                &failure,
+                CAPSULE_ADDRESS_REQUEST,
+                Bytes::from(address_request),
+            )
+            .await?;
+            lease.address = wait_for_address(config.timeout, &mut inbound_rx, &failure).await?;
+            Ok((lease, automatic, ceiling, datagrams))
+        }) => {
+            result.unwrap_or_else(|_| {
+                Err(ClientError::unavailable("HTTP/3 establishment timed out"))
+            })
+        }
+    };
     let (lease, automatic, ceiling, datagrams) = match established {
         Ok(established) => established,
         Err(error) => {
@@ -260,6 +291,7 @@ async fn connect_address(
         endpoint.wait_idle().await;
     });
 
+    setup_guard.disarm();
     Ok(Connection {
         lease,
         remote_address,

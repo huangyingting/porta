@@ -53,8 +53,10 @@ for item in "${targets[@]}"; do
         exit 1
     fi
     linker_var="CARGO_TARGET_$(tr '[:lower:]-' '[:upper:]_' <<<"$target")_LINKER"
+    rustflags_var="CARGO_TARGET_$(tr '[:lower:]-' '[:upper:]_' <<<"$target")_RUSTFLAGS"
     target_var="$(tr '-' '_' <<<"$target")"
     env "$linker_var=$linker_path" \
+        "$rustflags_var=-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384" \
         "CARGO_TARGET_DIR=$cargo_target_dir" \
         "CC_$target_var=$linker_path" \
         "CXX_$target_var=$toolchain/bin/${linker}++" \
@@ -66,7 +68,21 @@ for item in "${targets[@]}"; do
         --target "$target" \
         --release \
         --locked
+    library="$output_dir/$abi/libporta_android.so"
     mkdir -p "$output_dir/$abi"
-    cp "$cargo_target_dir/$target/release/libporta_android.so" \
-        "$output_dir/$abi/libporta_android.so"
+    cp "$cargo_target_dir/$target/release/libporta_android.so" "$library"
+    load_segment_count=0
+    while IFS= read -r segment; do
+        load_segment_count=$((load_segment_count + 1))
+        read -r -a fields <<<"$segment"
+        alignment="${fields[${#fields[@]} - 1]}"
+        if ((alignment < 0x4000)); then
+            printf 'Android library LOAD segment is not 16 KB aligned: %s\n' "$library" >&2
+            exit 1
+        fi
+    done < <("$toolchain/bin/llvm-readelf" -lW "$library" | awk '$1 == "LOAD"')
+    if ((load_segment_count == 0)); then
+        printf 'Android library has no ELF LOAD segments: %s\n' "$library" >&2
+        exit 1
+    fi
 done

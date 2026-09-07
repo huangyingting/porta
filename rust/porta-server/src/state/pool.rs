@@ -252,33 +252,8 @@ impl Pool {
             candidate = increment(address);
         }
 
-        let reclaim = inner
-            .by_client
-            .iter()
-            .filter(|(_, record)| !record.active)
-            .min_by_key(|(_, record)| record.generation)
-            .map(|(client, record)| (client.clone(), *record));
-        if let Some((reclaimed_client, reclaimed)) = reclaim {
-            inner.by_client.remove(&reclaimed_client);
-            inner.groups.remove(&reclaimed_client);
-            let replacement = LeaseRecord {
-                address: reclaimed.address,
-                generation,
-                active: true,
-            };
-            inner.by_client.insert(client_id.to_owned(), replacement);
-            inner
-                .by_address
-                .insert(replacement.address, client_id.to_owned());
-            if let Err(error) = self.persist_state_locked(&inner) {
-                inner.by_client.remove(client_id);
-                inner.by_client.insert(reclaimed_client.clone(), reclaimed);
-                inner.by_address.insert(reclaimed.address, reclaimed_client);
-                return Err(error);
-            }
-            activate_group(&mut inner, client_id, group_id, generation);
-            return Ok(self.lease(client_id, replacement));
-        }
+        // Inactive reservations still own their addresses: cross-identity reuse is
+        // unsafe until old conntrack state can be retired fail-closed.
         Err(PoolError::Exhausted)
     }
 
@@ -688,11 +663,18 @@ mod tests {
             Err(PoolError::Exhausted)
         ));
         pool.release(&second);
-        assert_eq!(pool.acquire("client-b").unwrap().address, first.address);
+        assert!(!pool.register_lease(&second, || panic!("released lease registered")));
+        assert!(matches!(
+            pool.acquire("client-b"),
+            Err(PoolError::Exhausted)
+        ));
+        let reconnected = pool.acquire_group("client-a", "session-87654321").unwrap();
+        assert_eq!(reconnected.address, first.address);
+        assert!(reconnected.generation() > first.generation());
     }
 
     #[test]
-    fn full_pool_reclaims_oldest_inactive_lease_deterministically() {
+    fn full_pool_keeps_inactive_reservations_identity_specific() {
         let pool = Pool::new("10.66.0.0/29").unwrap();
         let mut leases = Vec::new();
         for client in ["a", "b", "c", "d", "e"] {
@@ -702,7 +684,12 @@ mod tests {
         }
         let refreshed = pool.acquire("a").unwrap();
         pool.release(&refreshed);
-        assert_eq!(pool.acquire("f").unwrap().address, leases[1].address);
+        assert!(matches!(pool.acquire("f"), Err(PoolError::Exhausted)));
+        for previous in leases {
+            let current = pool.acquire(previous.client_id()).unwrap();
+            assert_eq!(current.address, previous.address);
+            assert!(current.generation() > previous.generation());
+        }
     }
 
     #[test]
@@ -748,17 +735,44 @@ mod tests {
     }
 
     #[test]
-    fn persistent_restart_preserves_reclamation_order() {
+    fn persistent_restart_preserves_identity_reservations() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("leases.json");
-        let oldest;
-        {
-            let pool = Pool::new_persistent("10.66.0.0/30", &path).unwrap();
-            let first = pool.acquire("client-a").unwrap();
-            oldest = first.address;
-            pool.release(&first);
+        for (bits, clients) in [(30, 1), (29, 5)] {
+            let path = directory.path().join(format!("leases-{bits}.json"));
+            let cidr = format!("10.66.0.0/{bits}");
+            let mut leases = Vec::new();
+            {
+                let pool = Pool::new_persistent(&cidr, &path).unwrap();
+                for index in 0..clients {
+                    let lease = pool.acquire(&format!("client-{index}")).unwrap();
+                    pool.release(&lease);
+                    leases.push(lease);
+                }
+                assert!(matches!(
+                    pool.acquire("new-client"),
+                    Err(PoolError::Exhausted)
+                ));
+            }
+            for _ in 0..2 {
+                let persisted = fs::read(&path).unwrap();
+                let pool = Pool::new_persistent(&cidr, &path).unwrap();
+                assert!(matches!(
+                    pool.acquire("new-client"),
+                    Err(PoolError::Exhausted)
+                ));
+                assert_eq!(fs::read(&path).unwrap(), persisted);
+                for previous in &mut leases {
+                    let current = pool.acquire(previous.client_id()).unwrap();
+                    assert_eq!(current.address, previous.address);
+                    assert!(current.generation() > previous.generation());
+                    pool.release(&current);
+                    *previous = current;
+                }
+                assert!(matches!(
+                    pool.acquire("new-client"),
+                    Err(PoolError::Exhausted)
+                ));
+            }
         }
-        let pool = Pool::new_persistent("10.66.0.0/30", &path).unwrap();
-        assert_eq!(pool.acquire("client-b").unwrap().address, oldest);
     }
 }

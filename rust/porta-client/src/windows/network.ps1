@@ -98,6 +98,9 @@ if ($Operation -eq "retire-interface") {
     }).Count -gt 0) {
         throw "The previous tunnel adapter still exists or its identity is unknown; explicit Disconnect is required."
     }
+    foreach ($owned in @($state.routes | Where-Object { $_.kind -in @("tunnel", "dns") })) {
+        Retire-OwnedRoute $owned
+    }
     Set-StateField "interface_luid" 0
     Set-StateField "interface_index" 0
     Set-StateField "interface_guid" ""

@@ -17,9 +17,11 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import portamobile.Portamobile
 import portamobile.Dialer
+import portamobile.NativeFailureKind
 import portamobile.Protector
 import portamobile.ProofProvider
 import portamobile.Session
+import portamobile.nativeFailureKind
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.EOFException
@@ -416,7 +418,11 @@ class TunnelService : VpnService() {
             updateConnectionStatus("Connected over $transport", runGeneration)
             sender.start()
             while (isRunActive(runGeneration) && attemptActive.get()) {
-                val packet = activeSession.receive()
+                val packet = try {
+                    activeSession.receive()
+                } catch (error: Exception) {
+                    throw classifyNativeSessionFailure(error, "Native tunnel receive stopped")
+                }
                 if (!isRunActive(runGeneration) || !attemptActive.get()) break
                 tunnelOutput.write(packet)
                 if (isRunActive(runGeneration)) {
@@ -426,7 +432,9 @@ class TunnelService : VpnService() {
             if (isRunActive(runGeneration)) throw IOException("Gateway closed the native tunnel")
         } catch (error: Exception) {
             val uploadError = senderError.get()
-            if (uploadError != null) throw IOException("Native tunnel upload stopped", uploadError)
+            if (uploadError != null) {
+                throw classifyNativeSessionFailure(uploadError, "Native tunnel upload stopped")
+            }
             if (isRunActive(runGeneration)) throw error
         } finally {
             attemptActive.set(false)
@@ -445,6 +453,15 @@ class TunnelService : VpnService() {
                     Thread.currentThread().interrupt()
                 }
             }
+        }
+    }
+
+    private fun classifyNativeSessionFailure(error: Exception, context: String): Exception {
+        val message = error.message.orEmpty().ifBlank { context }
+        return when (nativeFailureKind(message)) {
+            NativeFailureKind.PERMANENT -> PermanentTunnelException(message, error)
+            NativeFailureKind.RETRYABLE,
+            NativeFailureKind.TRANSPORT_UNAVAILABLE -> IOException("$context: $message", error)
         }
     }
 
@@ -987,7 +1004,10 @@ class TunnelService : VpnService() {
         val physicalCallback: ConnectivityManager.NetworkCallback,
     )
 
-    private class PermanentTunnelException(message: String) : Exception(message)
+    private class PermanentTunnelException(
+        message: String,
+        cause: Throwable? = null,
+    ) : Exception(message, cause)
 }
 
 internal data class TrafficSnapshot(

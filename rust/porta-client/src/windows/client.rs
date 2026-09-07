@@ -406,10 +406,11 @@ async fn run_session(
             packet = connection.receive() => {
                 match packet {
                     Ok(packet) => {
-                        if let Err(error) = tun.write_packet(&packet) {
-                            return SessionEnd::Terminal(Box::new(error));
+                        match tun.write_packet(&packet) {
+                            Ok(outcome) => downloaded_bytes = downloaded_bytes
+                                .saturating_add(outcome.delivered_bytes(packet.len())),
+                            Err(error) => return SessionEnd::Terminal(Box::new(error)),
                         }
-                        downloaded_bytes = downloaded_bytes.saturating_add(packet.len() as u64);
                     }
                     Err(error) if error.is_retryable() => return SessionEnd::Retry(error.to_string()),
                     Err(error) => return SessionEnd::Terminal(Box::new(error)),

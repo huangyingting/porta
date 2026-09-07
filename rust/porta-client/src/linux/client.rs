@@ -574,6 +574,7 @@ async fn run_connection(
     let upload_errors = errors_tx.clone();
     let outbound = runtime.outbound_rx.clone();
     let upload_counters = runtime.counters.clone();
+    let leased_source = connection.lease.address.addr();
     let upload = tokio::spawn(async move {
         loop {
             let packet = tokio::select! {
@@ -586,6 +587,9 @@ async fn run_connection(
                     None => return,
                 }
             };
+            if !packet_has_source(&packet, leased_source) {
+                continue;
+            }
             let result = tokio::select! {
                 _ = upload_cancellation.cancelled() => return,
                 result = upload_connection.send(&packet) => result,
@@ -776,6 +780,10 @@ fn restored_endpoints(endpoint: &Url, saved: Vec<SocketAddr>) -> Result<Vec<Sock
     Ok(endpoints)
 }
 
+fn packet_has_source(packet: &[u8], source: Ipv4Addr) -> bool {
+    porta_wire::ip::parse_ipv4(packet).is_ok_and(|info| info.source == source)
+}
+
 fn normalize_ip(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V6(address) => address
@@ -829,6 +837,22 @@ mod tests {
             reconnect_delay(100, Duration::from_secs(5)),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn upload_packets_must_match_the_active_lease_source() {
+        let mut packet = vec![0_u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        packet[12..16].copy_from_slice(&[10, 66, 0, 2]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 1]);
+
+        assert!(packet_has_source(&packet, Ipv4Addr::new(10, 66, 0, 2)));
+        assert!(!packet_has_source(&packet, Ipv4Addr::new(192, 0, 2, 10)));
+        assert!(!packet_has_source(
+            &packet[..10],
+            Ipv4Addr::new(10, 66, 0, 2)
+        ));
     }
 
     #[tokio::test]

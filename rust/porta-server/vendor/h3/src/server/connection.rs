@@ -150,7 +150,7 @@ where
             stream_id: stream.send_id(),
         });
         RequestResolver {
-            frame_stream: stream,
+            frame_stream: stream.with_max_field_section_size(self.max_field_section_size),
             request_end: Some(request_end),
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,

@@ -96,6 +96,30 @@ struct ConnectionInner {
     closed: AtomicBool,
 }
 
+struct CancellationGuard {
+    cancellation: Option<CancellationToken>,
+}
+
+impl CancellationGuard {
+    fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation: Some(cancellation),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cancellation = None;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+}
+
 #[derive(Default)]
 struct FailureSignal {
     failed: AtomicBool,
@@ -295,6 +319,22 @@ fn valid_unicast(address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_cancellation_guard_cancels_only_while_armed() {
+        let cancelled = CancellationToken::new();
+        {
+            let _guard = CancellationGuard::new(cancelled.clone());
+        }
+        assert!(cancelled.is_cancelled());
+
+        let retained = CancellationToken::new();
+        {
+            let mut guard = CancellationGuard::new(retained.clone());
+            guard.disarm();
+        }
+        assert!(!retained.is_cancelled());
+    }
 
     #[tokio::test]
     async fn pending_send_returns_the_stored_terminal_failure() {

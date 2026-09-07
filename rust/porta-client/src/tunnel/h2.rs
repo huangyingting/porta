@@ -26,10 +26,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use url::Url;
 
-use super::h2_queue::UploadQueue;
+use super::h2_queue::{EnqueueError, UploadQueue};
 use super::{
-    valid_unicast, ClientConfig, ClientError, Connection, ConnectionInner, DeliveryMode,
-    FailureSignal, Inbound, Lease, Outbound, Transport, TUNNEL_PATH,
+    valid_unicast, CancellationGuard, ClientConfig, ClientError, Connection, ConnectionInner,
+    DeliveryMode, FailureSignal, Inbound, Lease, Outbound, Transport, TUNNEL_PATH,
 };
 
 const LANE_COUNT: usize = 4;
@@ -194,6 +194,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         .map_err(|error| ClientError::permanent(error.to_string()))?;
     let session = new_session_id()?;
     let cancellation = config.cancellation.child_token();
+    let mut setup_guard = CancellationGuard::new(cancellation.clone());
     let tasks = TaskTracker::new();
     let (inbound_tx, inbound_rx) = mpsc::channel(256);
     let (outbound_tx, outbound_rx) = mpsc::channel(256);
@@ -252,6 +253,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
     tasks.spawn(merge_downstream(group.clone(), receivers));
     tasks.spawn(monitor_capacity(group));
 
+    setup_guard.disarm();
     Ok(Connection {
         lease,
         remote_address,
@@ -565,7 +567,9 @@ fn classify_tls_error(error: std::io::Error) -> ClientError {
 }
 
 fn classify_h2_startup(error: ::h2::Error) -> ClientError {
-    if error.is_io() || matches!(error.reason(), Some(::h2::Reason::REFUSED_STREAM)) {
+    if matches!(error.reason(), Some(::h2::Reason::NO_ERROR)) {
+        ClientError::retryable(error)
+    } else if error.is_io() || matches!(error.reason(), Some(::h2::Reason::REFUSED_STREAM)) {
         ClientError::unavailable(error)
     } else {
         ClientError::permanent(error)
@@ -987,7 +991,12 @@ impl Group {
         };
         let packet = match lane.upload.enqueue(packet, metadata, Instant::now()) {
             Ok(()) => return Ok(()),
-            Err(packet) => packet,
+            Err(EnqueueError::Full(_)) if metadata.class != PacketClass::Control => {
+                // A healthy queue already owns this flow's prefix. Tail-drop
+                // instead of moving later packets onto a faster lane.
+                return Ok(());
+            }
+            Err(EnqueueError::Full(packet) | EnqueueError::Unavailable(packet)) => packet,
         };
         if metadata.class != PacketClass::Control {
             self.flows
@@ -1240,6 +1249,22 @@ mod tests {
     }
 
     #[test]
+    fn graceful_goaway_is_retryable() {
+        assert!(matches!(
+            classify_h2_startup(::h2::Error::from(::h2::Reason::NO_ERROR)),
+            ClientError::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_h2_startup(::h2::Error::from(::h2::Reason::REFUSED_STREAM)),
+            ClientError::TransportUnavailable(_)
+        ));
+        assert!(matches!(
+            classify_h2_startup(::h2::Error::from(::h2::Reason::PROTOCOL_ERROR)),
+            ClientError::Permanent(_)
+        ));
+    }
+
+    #[test]
     fn downstream_merge_prioritizes_control_without_starving_data() {
         let mut receivers = Vec::new();
         let mut senders = Vec::new();
@@ -1311,5 +1336,36 @@ mod tests {
         assert!(group.route(tcp_packet(8443)).is_ok());
         assert!(!group.cancellation.is_cancelled());
         assert!(group.failure().is_none());
+    }
+
+    #[test]
+    fn saturated_healthy_lane_preserves_tcp_flow_affinity() {
+        let (group, _receivers) = test_group_with_full_upload_queues();
+        let packet = tcp_packet(443);
+        let metadata = porta_wire::ip::classify_ipv4(&packet);
+        group
+            .flows
+            .lock()
+            .expect("HTTP/2 flow lock poisoned")
+            .assign(metadata.flow, 1);
+        assert!(group.lanes[1]
+            .upload
+            .enqueue(packet.clone(), metadata, Instant::now())
+            .is_ok());
+
+        assert!(group.route(packet).is_ok());
+        assert_eq!(
+            group
+                .flows
+                .lock()
+                .expect("HTTP/2 flow lock poisoned")
+                .assignment(&metadata.flow)
+                .expect("flow assignment remains")
+                .1,
+            1
+        );
+        for lane in [&group.lanes[0], &group.lanes[2], &group.lanes[3]] {
+            assert_eq!(lane.upload.queued_bytes_at(Instant::now()), 0);
+        }
     }
 }

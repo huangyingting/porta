@@ -12,6 +12,23 @@ fun interface ProofProvider {
     fun proof(method: String, path: String): String
 }
 
+internal enum class NativeFailureKind {
+    TRANSPORT_UNAVAILABLE,
+    RETRYABLE,
+    PERMANENT,
+}
+
+internal fun nativeFailureKind(message: String): NativeFailureKind {
+    val normalized = message.removePrefix("Rust error: ")
+    return when {
+        normalized.startsWith("transport unavailable: ") ->
+            NativeFailureKind.TRANSPORT_UNAVAILABLE
+        normalized.startsWith("retryable: ") || normalized == "tunnel is closed" ->
+            NativeFailureKind.RETRYABLE
+        else -> NativeFailureKind.PERMANENT
+    }
+}
+
 class Dialer internal constructor(handle: Long) : AutoCloseable {
     private val handle = AtomicLong(handle)
 
@@ -124,14 +141,10 @@ object Portamobile {
     }
 
     fun isTransportUnavailable(message: String): Boolean =
-        message.removePrefix("Rust error: ").startsWith("transport unavailable: ")
+        nativeFailureKind(message) == NativeFailureKind.TRANSPORT_UNAVAILABLE
 
-    fun isRetryable(message: String): Boolean {
-        val normalized = message.removePrefix("Rust error: ")
-        return normalized.startsWith("retryable: ") ||
-            normalized.startsWith("transport unavailable: ") ||
-            normalized == "tunnel is closed"
-    }
+    fun isRetryable(message: String): Boolean =
+        nativeFailureKind(message) != NativeFailureKind.PERMANENT
 
     internal fun <T> callNative(block: () -> T): T =
         try {

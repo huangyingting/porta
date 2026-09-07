@@ -28,8 +28,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
@@ -200,11 +201,21 @@ fn open_admin_path(path: &Path, directory: bool) -> std::io::Result<File> {
         } else {
             0
         };
+    let access = READ_CONTROL
+        | WRITE_DAC
+        | WRITE_OWNER
+        | FILE_READ_ATTRIBUTES
+        | if directory { FILE_LIST_DIRECTORY } else { 0 };
+    let share = if directory {
+        FILE_SHARE_READ
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    };
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
-            READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            access,
+            share,
             null(),
             OPEN_EXISTING,
             flags,
@@ -225,10 +236,12 @@ fn open_admin_probe(path: &Path, directory: bool) -> std::io::Result<File> {
         } else {
             0
         };
+    let access =
+        READ_CONTROL | FILE_READ_ATTRIBUTES | if directory { FILE_LIST_DIRECTORY } else { 0 };
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
-            READ_CONTROL | FILE_READ_ATTRIBUTES,
+            access,
             FILE_SHARE_READ,
             null(),
             OPEN_EXISTING,
@@ -569,4 +582,40 @@ fn known_folder(id: &GUID) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_SHARE_DELETE};
+
+    #[test]
+    fn directory_guard_rejects_preexisting_writable_handles() {
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = temporary.path().join("guarded");
+        fs::create_dir(&path).unwrap();
+        let encoded = wide_path(&path).unwrap();
+        let handle = unsafe {
+            CreateFileW(
+                encoded.as_ptr(),
+                FILE_ADD_FILE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let writer = unsafe { File::from_raw_handle(handle.cast()) };
+
+        let error = open_admin_probe(&path, true).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+
+        drop(writer);
+        let guard = open_admin_probe(&path, true).unwrap();
+        fs::write(path.join("child"), b"ok").unwrap();
+        drop(guard);
+    }
 }

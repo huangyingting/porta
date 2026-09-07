@@ -56,6 +56,11 @@ struct QueueState {
     active: bool,
 }
 
+pub(super) enum EnqueueError {
+    Unavailable(Bytes),
+    Full(Bytes),
+}
+
 pub(super) struct UploadQueue {
     state: Mutex<QueueState>,
     ready: Notify,
@@ -123,20 +128,20 @@ impl UploadQueue {
         packet: Bytes,
         metadata: PacketMetadata,
         now: Instant,
-    ) -> Result<(), Bytes> {
+    ) -> Result<(), EnqueueError> {
         let mut state = self.state.lock().expect("HTTP/2 upload queue poisoned");
         if state.closed || !state.active {
-            return Err(packet);
+            return Err(EnqueueError::Unavailable(packet));
         }
         self.drop_expired_locked(&mut state, now);
         if packet.len() > self.config.max_bytes || self.config.max_packets == 0 {
             self.record_rejected(metadata.class);
-            return Err(packet);
+            return Err(EnqueueError::Full(packet));
         }
         while !self.fits_locked(&state, packet.len()) {
             let Some(victim) = self.oldest_replaceable_locked(&state, metadata.class) else {
                 self.record_rejected(metadata.class);
-                return Err(packet);
+                return Err(EnqueueError::Full(packet));
             };
             let removed = state
                 .items

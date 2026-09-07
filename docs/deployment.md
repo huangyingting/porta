@@ -31,21 +31,23 @@ not 443.
 Each tagged GitHub release contains a deployment bundle plus standalone server
 and client binaries. Download and verify the latest bundle:
 
-```sh
+```bash
+set -o pipefail
 gh release download --repo huangyingting/porta \
   --pattern porta-deploy.tar.gz --pattern SHA256SUMS \
-  --pattern SHA256SUMS.sig --pattern release-signing-cert.der
-expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8
+  --pattern SHA256SUMS.sig --pattern release-signing-cert.der &&
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8 &&
 actual=$(openssl x509 -inform DER -in release-signing-cert.der \
-  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
-test "$actual" = "$expected"
-openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout > release-public-key.pem
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]') &&
+test "$actual" = "$expected" &&
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout > release-public-key.pem &&
 openssl dgst -sha256 -verify release-public-key.pem \
-  -signature SHA256SUMS.sig SHA256SUMS
-grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
-tar -xzf porta-deploy.tar.gz
-cd porta
-export GH_TOKEN=$(gh auth token)
+  -signature SHA256SUMS.sig SHA256SUMS &&
+grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c - &&
+tar -xzf porta-deploy.tar.gz &&
+cd porta &&
+GH_TOKEN=$(gh auth token) &&
+export GH_TOKEN
 ```
 
 The repository is private, so `gh` must be authenticated with an account that

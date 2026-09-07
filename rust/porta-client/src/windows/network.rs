@@ -35,6 +35,13 @@ const MAX_GUARD_FILTERS: usize = 128;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
 const NETWORK_SCRIPT: &str = include_str!("network.ps1");
+#[cfg(windows)]
+const POWERSHELL_BOOTSTRAP: &str = concat!(
+    "$ErrorActionPreference = 'Stop'; try { ",
+    "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); ",
+    "& ([ScriptBlock]::Create([Console]::In.ReadToEnd())); exit 0 ",
+    "} catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"
+);
 
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -1158,7 +1165,7 @@ where
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-Command")
-        .arg("-")
+        .arg(POWERSHELL_BOOTSTRAP)
         .current_dir(&system_directory)
         .env_clear()
         .env("SystemRoot", windows_directory)
@@ -1202,7 +1209,6 @@ where
                 "network helper standard input is unavailable",
             )
         })?;
-        stdin.write_all(b"\xef\xbb\xbf").await?;
         stdin.write_all(NETWORK_SCRIPT.as_bytes()).await?;
         stdin.shutdown().await?;
         drop(stdin);
@@ -1951,6 +1957,55 @@ mod tests {
     use std::collections::HashSet;
 
     #[cfg(windows)]
+    async fn native_script(script: &str) -> std::process::Output {
+        let powershell = paths::system_directory()
+            .unwrap()
+            .join(r"WindowsPowerShell\v1.0\powershell.exe");
+        timeout(COMMAND_TIMEOUT, async {
+            let mut child = Command::new(powershell)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    POWERSHELL_BOOTSTRAP,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(script.as_bytes()).await.unwrap();
+            stdin.shutdown().await.unwrap();
+            drop(stdin);
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("PowerShell bootstrap timed out")
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_powershell_bootstrap_executes_one_eof_terminated_script() {
+        let output = native_script(
+            "if ($true) {\n    Write-Output 'multiline-é'\n}\nreturn\nWrite-Output 'unreachable'",
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("multiline-"), "{output:?}");
+        assert!(!stdout.contains("unreachable"), "{output:?}");
+
+        let output = native_script("if ($true) {\n    throw 'bootstrap-failure'\n}").await;
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("bootstrap-failure"),
+            "{output:?}"
+        );
+    }
+
+    #[cfg(windows)]
     struct WfpAllocation<T>(*mut T);
 
     #[cfg(windows)]
@@ -2523,6 +2578,60 @@ mod tests {
             let decoded: NetworkState = serde_json::from_slice(&data).unwrap();
             validate_state(&decoded).unwrap();
         }
+    }
+
+    #[test]
+    fn retiring_interface_preserves_only_physical_routes_and_guard_ownership() {
+        let script = include_str!("network.ps1");
+        let retirement = script
+            .split("if ($Operation -eq \"retire-interface\") {")
+            .nth(1)
+            .unwrap()
+            .split("if ($Operation -eq \"down\") {")
+            .next()
+            .unwrap();
+        let retire_routes = retirement
+            .find("Where-Object { $_.kind -in @(\"tunnel\", \"dns\") }")
+            .unwrap();
+        assert!(retirement[retire_routes..].contains("Retire-OwnedRoute $owned"));
+        assert!(
+            retire_routes
+                < retirement
+                    .find("Set-StateField \"interface_luid\" 0")
+                    .unwrap()
+        );
+        assert!(!retirement.contains("guard_key"));
+        assert!(!retirement.contains("\"escape\""));
+
+        let mut state = test_state();
+        let escape = state.routes.clone();
+        let guard = state.guard_key.clone();
+        for (kind, prefix) in [("tunnel", "0.0.0.0/1"), ("dns", "1.1.1.1/32")] {
+            state.routes.push(RouteState {
+                kind: kind.to_owned(),
+                prefix: prefix.to_owned(),
+                interface_index: state.interface_index,
+                interface_guid: state.interface_guid.clone(),
+                next_hop: "0.0.0.0".to_owned(),
+                metric: 1,
+            });
+        }
+        validate_state(&state).unwrap();
+        state
+            .routes
+            .retain(|route| !matches!(route.kind.as_str(), "tunnel" | "dns"));
+        state.interface_luid = 0;
+        state.interface_index = 0;
+        state.interface_guid.clear();
+        state.addresses.clear();
+        state.dns = None;
+        state.mtu = None;
+        state.original_dhcp.clear();
+        let persisted = serde_json::to_vec(&state).unwrap();
+        let restored: NetworkState = serde_json::from_slice(&persisted).unwrap();
+        validate_state(&restored).unwrap();
+        assert_eq!(restored.routes, escape);
+        assert_eq!(restored.guard_key, guard);
     }
 
     #[test]
