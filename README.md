@@ -101,10 +101,13 @@ sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 
 ### Linux client
 
-```sh
+```bash
 chmod +x porta-client-linux-amd64
-sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
+read -rsp "Client token: " PORTA_TOKEN && echo
+export PORTA_TOKEN
+sudo --preserve-env=PORTA_TOKEN ./porta-client-linux-amd64 \
   --server https://vpn.example.com:8443
+unset PORTA_TOKEN
 ```
 
 Linux configures routes, DNS, and an owned fail-closed firewall automatically;

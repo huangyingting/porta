@@ -984,6 +984,11 @@ class AutomationTests(unittest.TestCase):
             'value.startsWith("Waiting") || value.startsWith("Connection blocked")',
             android_ui,
         )
+        client_docs = "\n".join(
+            (ROOT / path).read_text() for path in ("README.md", "docs/clients.md")
+        )
+        self.assertNotRegex(client_docs, r"sudo\s+PORTA_TOKEN=")
+        self.assertIn("--preserve-env=PORTA_TOKEN", client_docs)
 
     def test_wintun_checksum_is_consistent(self):
         expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"

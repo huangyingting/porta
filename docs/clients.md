@@ -71,11 +71,17 @@ policy-routing rules are rejected rather than silently left unprotected.
 
 Make the downloaded binary executable, then run:
 
-```sh
+```bash
 chmod +x porta-client-linux-amd64
-sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
+read -rsp "Client token: " PORTA_TOKEN && echo
+export PORTA_TOKEN
+sudo --preserve-env=PORTA_TOKEN ./porta-client-linux-amd64 \
   --server https://vpn.example.com:8443
+unset PORTA_TOKEN
 ```
+
+Do not place the token assignment after `sudo`; `sudo` treats it as a process
+argument that other local users can read.
 
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
 full-tunnel routes, and per-link DNS automatically. Its owned nftables OUTPUT
