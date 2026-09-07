@@ -990,6 +990,12 @@ class AutomationTests(unittest.TestCase):
         self.assertNotRegex(client_docs, r"sudo\s+PORTA_TOKEN=")
         self.assertIn("--preserve-env=PORTA_TOKEN", client_docs)
 
+    def test_benchmark_defaults_to_allowed_cpu_affinity(self):
+        benchmark = (ROOT / "experiments/server-benchmark/run.sh").read_text()
+        self.assertIn('Cpus_allowed_list:', benchmark)
+        self.assertNotIn('PORTA_SERVER_BENCH_SERVER_CPUS:-"0,1"', benchmark)
+        self.assertNotIn('PORTA_SERVER_BENCH_CLIENT_CPUS:-"2,3"', benchmark)
+
     def test_wintun_checksum_is_consistent(self):
         expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
         makefile = (ROOT / "Makefile").read_text().lower()

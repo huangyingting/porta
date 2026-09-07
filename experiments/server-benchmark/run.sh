@@ -240,10 +240,58 @@ duration=${PORTA_SERVER_BENCH_DURATION:-1s}
 warmup=${PORTA_SERVER_BENCH_WARMUP:-500ms}
 clients=${PORTA_SERVER_BENCH_CLIENTS:-"1 16"}
 payload=${PORTA_SERVER_BENCH_PAYLOAD:-1200}
-server_cpus=${PORTA_SERVER_BENCH_SERVER_CPUS:-"0,1"}
-client_cpus=${PORTA_SERVER_BENCH_CLIENT_CPUS:-"2,3"}
-server_threads=${PORTA_SERVER_BENCH_SERVER_THREADS:-2}
-client_threads=${PORTA_SERVER_BENCH_CLIENT_THREADS:-2}
+
+expand_cpu_list() {
+	local specification=$1
+	local part first last cpu
+	local parts=()
+	IFS=',' read -r -a parts <<<"$specification"
+	for part in "${parts[@]}"; do
+		if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+			first=${BASH_REMATCH[1]}
+			last=${BASH_REMATCH[2]}
+			for ((cpu = first; cpu <= last; cpu++)); do
+				printf '%s\n' "$cpu"
+			done
+		elif [[ $part =~ ^[0-9]+$ ]]; then
+			printf '%s\n' "$part"
+		else
+			echo "invalid allowed CPU list: $specification" >&2
+			return 1
+		fi
+	done
+}
+
+allowed_cpu_list=$(awk '$1 == "Cpus_allowed_list:" { print $2 }' /proc/self/status)
+mapfile -t allowed_cpus < <(expand_cpu_list "$allowed_cpu_list")
+if ((${#allowed_cpus[@]} >= 4)); then
+	default_server_cpus="${allowed_cpus[0]},${allowed_cpus[1]}"
+	default_client_cpus="${allowed_cpus[2]},${allowed_cpus[3]}"
+	default_server_threads=2
+	default_client_threads=2
+elif ((${#allowed_cpus[@]} == 3)); then
+	default_server_cpus=${allowed_cpus[0]}
+	default_client_cpus="${allowed_cpus[1]},${allowed_cpus[2]}"
+	default_server_threads=1
+	default_client_threads=2
+elif ((${#allowed_cpus[@]} == 2)); then
+	default_server_cpus=${allowed_cpus[0]}
+	default_client_cpus=${allowed_cpus[1]}
+	default_server_threads=1
+	default_client_threads=1
+elif ((${#allowed_cpus[@]} == 1)); then
+	default_server_cpus=${allowed_cpus[0]}
+	default_client_cpus=${allowed_cpus[0]}
+	default_server_threads=1
+	default_client_threads=1
+else
+	echo "the benchmark process has no allowed CPUs" >&2
+	exit 2
+fi
+server_cpus=${PORTA_SERVER_BENCH_SERVER_CPUS:-"$default_server_cpus"}
+client_cpus=${PORTA_SERVER_BENCH_CLIENT_CPUS:-"$default_client_cpus"}
+server_threads=${PORTA_SERVER_BENCH_SERVER_THREADS:-"$default_server_threads"}
+client_threads=${PORTA_SERVER_BENCH_CLIENT_THREADS:-"$default_client_threads"}
 inflight=${PORTA_SERVER_BENCH_INFLIGHT:-1}
 transports=${PORTA_SERVER_BENCH_TRANSPORTS:-"h2 h3"}
 auto_mtu=${PORTA_SERVER_BENCH_AUTO_MTU:-false}

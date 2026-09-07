@@ -24,7 +24,9 @@ CPU scaling can be measured with `PORTA_SERVER_BENCH_SERVER_CPUS`,
 `PORTA_SERVER_BENCH_CLIENT_CPUS`, `PORTA_SERVER_BENCH_SERVER_THREADS`, and
 `PORTA_SERVER_BENCH_CLIENT_THREADS`. `PORTA_SERVER_BENCH_TRANSPORTS` selects
 `h2`, `h3`, and/or `auto`; setting `PORTA_SERVER_BENCH_AUTO_MTU=true` also
-requires every HTTP/3 connection to complete automatic MTU negotiation.
+requires every HTTP/3 connection to complete automatic MTU negotiation. When
+CPU settings are omitted, the harness partitions CPUs from its current
+affinity mask so it also works inside constrained CI runners and containers.
 `PORTA_SERVER_BENCH_INFLIGHT` controls outstanding packets per tunnel.
 
 For migration comparisons, provide space-separated `label=executable` entries.

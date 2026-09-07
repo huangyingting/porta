@@ -300,7 +300,9 @@ fn persist(path: &Path, signing_key: &SigningKey) -> Result<(), IdentityError> {
         file.sync_all()?;
         drop(file);
         fs::rename(&pending, path)?;
-        File::open(directory)?.sync_all()
+        #[cfg(unix)]
+        File::open(directory)?.sync_all()?;
+        Ok(())
     })();
     let _ = fs::remove_file(&pending);
     result.map_err(IdentityError::Persist)
