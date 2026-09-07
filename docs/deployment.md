@@ -238,9 +238,10 @@ curl --proxy https://vpn.example.com:8443 \
   https://example.com/
 ```
 
-Porta supports HTTPS `CONNECT`, including CONNECT over HTTP/2. Ordinary HTTP
-proxy requests are rejected, and only public destinations on port 443 are
-permitted.
+Porta supports HTTPS `CONNECT` over HTTP/1.1 and HTTP/2. HTTP/3 is reserved for
+the native MASQUE CONNECT-IP tunnel and rejects ordinary forward-proxy
+CONNECT requests. Ordinary HTTP proxy requests are rejected, and only public
+destinations on port 443 are permitted.
 DNS results are checked before dialing, and any private, loopback, link-local,
 metadata, multicast, documentation, or benchmark address rejects the request.
 Only complete, validated public address sets enter the bounded 30-second DNS

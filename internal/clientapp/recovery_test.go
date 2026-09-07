@@ -18,7 +18,7 @@ import (
 
 	"github.com/huangyingting/porta/internal/clientid"
 	"github.com/huangyingting/porta/internal/device"
-	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go"
 )
@@ -85,7 +85,7 @@ func TestInitialTransientRetriesAndReportsActualTransport(t *testing.T) {
 		}
 	}, func(_ context.Context, config tunnel.Config) (*clientConnection, error) {
 		calls++
-		proof, proofErr := config.DeviceProof(http.MethodConnect, gateway.MasquePath)
+		proof, proofErr := config.DeviceProof(http.MethodConnect, protocol.MasquePath)
 		if want, _ := testIdentity(); proofErr != nil || proof.DeviceID != want.ID || proof.Name != want.Name {
 			t.Fatalf("retry or fallback lost device identity: proof=%#v error=%v", proof, proofErr)
 		}

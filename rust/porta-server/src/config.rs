@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -319,12 +319,17 @@ where
         )
 }
 
-fn parse_listen_address(value: &str) -> Result<SocketAddr> {
-    if let Some(port) = value.strip_prefix(':') {
+pub(crate) fn parse_listen_address(value: &str) -> Result<SocketAddr> {
+    let address = if let Some(port) = value.strip_prefix(':') {
         let port = port.parse::<u16>()?;
-        return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+    } else {
+        value.parse()?
+    };
+    if address.port() == 0 {
+        bail!("listen port must be between 1 and 65535");
     }
-    Ok(value.parse()?)
+    Ok(address)
 }
 
 fn validate_loopback_address(value: &str, option: &str) -> Result<()> {
@@ -378,11 +383,22 @@ mod tests {
     }
 
     #[test]
-    fn accepts_go_style_wildcard_listen_address() {
+    fn accepts_go_style_wildcard_as_dual_stack_address() {
         assert_eq!(
             parse_listen_address(":8443").unwrap(),
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 8443))
+        );
+        assert_eq!(
+            parse_listen_address("0.0.0.0:8443").unwrap(),
             SocketAddr::from(([0, 0, 0, 0], 8443))
         );
+    }
+
+    #[test]
+    fn rejects_zero_listen_ports() {
+        assert!(parse_listen_address(":0").is_err());
+        assert!(parse_listen_address("127.0.0.1:0").is_err());
+        assert!(parse_listen_address("[::1]:0").is_err());
     }
 
     #[test]

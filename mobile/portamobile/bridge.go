@@ -20,7 +20,7 @@ import (
 
 	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/deviceauth"
-	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
@@ -127,7 +127,7 @@ func dial(ctx context.Context, serverURL, token, deviceName, publicKey, timestam
 		URL:   endpoint.String(),
 		Token: token,
 		DeviceProof: func(method, path string) (deviceauth.Proof, error) {
-			if method != http.MethodConnect || path != gateway.MasquePath {
+			if method != http.MethodConnect || path != protocol.MasquePath {
 				return deviceauth.Proof{}, errors.New("unexpected native device proof target")
 			}
 			return proof, nil

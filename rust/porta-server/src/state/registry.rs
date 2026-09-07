@@ -213,6 +213,10 @@ pub struct ClientRegistry {
     inner: Arc<RegistryInner>,
 }
 
+pub(crate) struct DeviceRetirement {
+    _drain: DrainGuard,
+}
+
 struct AuthenticationAttempt {
     inner: Arc<RegistryInner>,
     epoch: u64,
@@ -549,6 +553,15 @@ impl ClientRegistry {
         account_id: &str,
         device_id: &str,
     ) -> Result<(), RegistryError> {
+        let _retirement = self.retire_device(account_id, device_id).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn retire_device(
+        &self,
+        account_id: &str,
+        device_id: &str,
+    ) -> Result<DeviceRetirement, RegistryError> {
         self.ensure_open()?;
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -588,12 +601,12 @@ impl ClientRegistry {
         }
         let key = DeviceKey::new(account_id, device_id);
         self.inner.state.lock().nonces.remove(&key);
-        let _drain = self.begin_device_drain(&key);
+        let drain = self.begin_device_drain(&key);
         self.inner
             .sessions
             .cancel_device(account_id, device_id)
             .await;
-        Ok(())
+        Ok(DeviceRetirement { _drain: drain })
     }
 
     pub async fn delete_device(
@@ -1730,6 +1743,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(registry.list()[0].device_count, 1);
+        registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_retirement_fences_reenrollment_until_cleanup_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let first = signed_proof(&key, "phone", BOOTSTRAP_TOKEN, 1);
+        let session = registry
+            .authenticate_device_session(BOOTSTRAP_TOKEN, &first, "POST", "/v1/tunnel")
+            .await
+            .unwrap();
+        let account_id = session.identity.account_id.clone();
+        let device_id = session.device_id.clone();
+        drop(session);
+
+        let retirement = registry
+            .retire_device(&account_id, &device_id)
+            .await
+            .unwrap();
+        let replacement = signed_proof(&key, "phone", BOOTSTRAP_TOKEN, 2);
+        assert!(matches!(
+            registry
+                .authenticate_device_session(BOOTSTRAP_TOKEN, &replacement, "POST", "/v1/tunnel")
+                .await,
+            Err(RegistryError::Draining)
+        ));
+
+        drop(retirement);
+        registry
+            .authenticate_device_session(BOOTSTRAP_TOKEN, &replacement, "POST", "/v1/tunnel")
+            .await
+            .unwrap();
         registry.close().await.unwrap();
     }
 

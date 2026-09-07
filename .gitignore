@@ -1,7 +1,7 @@
 /bin/
 /dist/
-/.rust-benchmark/
-/experiments/server-benchmark/rust-server/target/
+/.server-benchmark/
+/.server-interop/
 /rust/porta-server/target/
 __pycache__/
 /*.pem

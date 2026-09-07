@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/deviceauth"
-	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/quic-go/quic-go"
@@ -824,6 +823,6 @@ func masqueEndpoint(origin string) (*url.URL, error) {
 		return nil, errors.New("gateway URL has an invalid port")
 	}
 	parsed.Host = net.JoinHostPort(parsed.Hostname(), port)
-	parsed.Path = gateway.MasquePath
+	parsed.Path = protocol.MasquePath
 	return parsed, nil
 }

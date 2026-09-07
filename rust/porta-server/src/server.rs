@@ -47,13 +47,8 @@ pub struct ServeOptions {
 }
 
 pub fn bind_tcp_listener(address: SocketAddr) -> Result<TcpListener> {
-    let dual_stack = address.ip().is_unspecified();
-    let bind_address = if dual_stack {
-        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), address.port())
-    } else {
-        address
-    };
-    let domain = if bind_address.is_ipv6() {
+    let dual_stack = address.is_ipv6() && address.ip().is_unspecified();
+    let domain = if address.is_ipv6() {
         Domain::IPV6
     } else {
         Domain::IPV4
@@ -64,19 +59,14 @@ pub fn bind_tcp_listener(address: SocketAddr) -> Result<TcpListener> {
         socket.set_only_v6(false)?;
     }
     socket.set_nonblocking(true)?;
-    socket.bind(&SockAddr::from(bind_address))?;
+    socket.bind(&SockAddr::from(address))?;
     socket.listen(1024)?;
     Ok(TcpListener::from_std(socket.into())?)
 }
 
 pub fn bind_udp_socket(address: SocketAddr) -> Result<std::net::UdpSocket> {
-    let dual_stack = address.ip().is_unspecified();
-    let bind_address = if dual_stack {
-        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), address.port())
-    } else {
-        address
-    };
-    let domain = if bind_address.is_ipv6() {
+    let dual_stack = address.is_ipv6() && address.ip().is_unspecified();
+    let domain = if address.is_ipv6() {
         Domain::IPV6
     } else {
         Domain::IPV4
@@ -87,7 +77,7 @@ pub fn bind_udp_socket(address: SocketAddr) -> Result<std::net::UdpSocket> {
         socket.set_only_v6(false)?;
     }
     socket.set_nonblocking(true)?;
-    socket.bind(&SockAddr::from(bind_address))?;
+    socket.bind(&SockAddr::from(address))?;
     Ok(socket.into())
 }
 
@@ -472,6 +462,14 @@ mod tests {
     fn plain_response_sets_no_store() {
         let response = plain_response(StatusCode::OK, "ok\n");
         assert_eq!(response.headers()[http::header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn explicit_ipv4_wildcards_remain_ipv4() {
+        let tcp = bind_tcp_listener("0.0.0.0:0".parse().unwrap()).unwrap();
+        assert!(tcp.local_addr().unwrap().is_ipv4());
+        let udp = bind_udp_socket("0.0.0.0:0".parse().unwrap()).unwrap();
+        assert!(udp.local_addr().unwrap().is_ipv4());
     }
 
     #[tokio::test]

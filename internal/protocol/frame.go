@@ -17,6 +17,8 @@ const (
 	HeaderMinVersion = "X-Porta-Min-Version"
 	HeaderMaxVersion = "X-Porta-Max-Version"
 	ContentType      = "application/x-porta-packets"
+	TunnelPath       = "/v1/tunnel"
+	MasquePath       = "/.well-known/masque/ip/*/*/"
 	MaxPacket        = 65535
 )
 

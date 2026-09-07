@@ -1,78 +1,33 @@
-# Go versus Rust server benchmarks
+# Server performance regression benchmark
 
-The benchmark suite compares Porta's Go and Rust server implementations using
-the production Go client.
+The live benchmark exercises Porta's production Rust server with the production
+Go client over both HTTP/2 and HTTP/3. It uses a real Linux TUN, registry, usage
+store, TLS stack, router, and kernel UDP echo path, then reports throughput,
+p95 latency, server CPU, and peak RSS.
 
-Three servers receive the same four-lane Porta HTTP/2/TLS packet workload:
-
-- `go-porta` uses the production gateway handler, address pool, router, packet
-  queues, framing, source validation, and a fake echo TUN;
-- `go-direct` is a minimal Go relay with the same validation and echo behavior
-  as the Rust prototype;
-- `rust-direct` is the Tokio, rustls, and h2 implementation.
-
-With `PORTA_RUST_BENCH_TRANSPORT=h3`, the direct servers instead implement
-RFC 9484 Extended CONNECT-IP over HTTP/3, ADDRESS_ASSIGN and route capsules,
-and Context ID 0 QUIC datagrams. The Rust implementation pins the upstream
-`hyperium/h3` revision that adds `connect-ip`, because that support is newer
-than its latest crates.io release.
-
-`PORTA_RUST_BENCH_INFLIGHT` controls the maximum number of outstanding
-packets per tunnel. The default of one measures interactive ping-pong latency;
-larger values explore pipelining. HTTP/3 datagrams are intentionally
-unreliable, so the load generator fails the run if excessive offered load
-causes packet loss rather than silently reporting successful operations only.
-
-The load generator uses Porta's production Go client. It establishes four
-independent HTTP/2 connections per client, signs the ordinary device headers,
-sends valid 1,200-byte IPv4 UDP packets across changing flows, and verifies one
-response for every upload.
-
-Run the repeatable, CPU-pinned comparison:
+Run the repeatable, CPU-pinned benchmark:
 
 ```sh
-PORTA_RUST_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
+PORTA_SERVER_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
 ```
 
-`run.sh` measures the isolated prototype data paths. To compare the complete
-production servers through a real Linux TUN, registry, usage store, TLS stack,
-router, and kernel UDP echo path, run:
-
-```sh
-PORTA_PRODUCTION_BENCH_WORK=/path/out \
-  ./experiments/server-benchmark/run-production.sh
-```
-
-The production benchmark requires passwordless `sudo`, `unshare`, `ip`, `nft`,
-OpenSSL, taskset, Python 3, Go, and stable Rust. It runs in a disposable network
+The benchmark requires passwordless `sudo`, `unshare`, `ip`, `nft`, OpenSSL,
+taskset, Python 3, Go, and stable Rust. It runs in a disposable network
 namespace and does not alter host networking.
 
-Defaults are five interleaved runs at 1, 16, and 64 concurrent clients, with a
-two-second warmup and six-second measurement. Override
-`PORTA_RUST_BENCH_REPEATS`, `PORTA_RUST_BENCH_CLIENTS`,
-`PORTA_RUST_BENCH_WARMUP`, `PORTA_RUST_BENCH_DURATION`, or
-`PORTA_RUST_BENCH_PAYLOAD` as needed.
-CPU scaling can be measured with `PORTA_RUST_BENCH_SERVER_CPUS`,
-`PORTA_RUST_BENCH_CLIENT_CPUS`, `PORTA_RUST_BENCH_SERVER_THREADS`, and
-`PORTA_RUST_BENCH_CLIENT_THREADS`. Use
-`PORTA_RUST_BENCH_IMPLEMENTATIONS="go-direct rust-direct"` to omit the
-production-shaped context run. HTTP/3 defaults to the two direct relays because
-the strict one-response-per-upload check intentionally fails a run if the
-production datagram path drops a packet.
+Defaults are three runs at 1 and 16 concurrent clients, with a 500-millisecond
+warmup and one-second measurement. Override `PORTA_SERVER_BENCH_REPEATS`,
+`PORTA_SERVER_BENCH_CLIENTS`, `PORTA_SERVER_BENCH_WARMUP`,
+`PORTA_SERVER_BENCH_DURATION`, or `PORTA_SERVER_BENCH_PAYLOAD` as needed.
+CPU scaling can be measured with `PORTA_SERVER_BENCH_SERVER_CPUS`,
+`PORTA_SERVER_BENCH_CLIENT_CPUS`, `PORTA_SERVER_BENCH_SERVER_THREADS`, and
+`PORTA_SERVER_BENCH_CLIENT_THREADS`. `PORTA_SERVER_BENCH_TRANSPORTS` selects
+`h2`, `h3`, and/or `auto`; setting `PORTA_SERVER_BENCH_AUTO_MTU=true` also
+requires every HTTP/3 connection to complete automatic MTU negotiation.
 
-The rewrite threshold is a repeatable improvement of at least 10% in median
-throughput or p95 latency at equivalent concurrency, without higher server
-memory use or protocol-correctness regressions. The analyzer requires at least
-three paired runs for every compared concurrency group and two qualifying
-groups with 16 or more clients. This local benchmark is a go/no-go screen, not
-a substitute for WAN impairment and production load testing.
-
-A single `run.sh` invocation reports only whether that transport qualifies.
-Pass both result files to make the full-rewrite decision:
-
-```sh
-python3 experiments/server-benchmark/analyze.py h2-results.jsonl h3-results.jsonl
-```
+The historical Go-versus-Rust results below are retained as migration evidence.
+The obsolete prototype and Go server implementations were removed after the
+Rust server became the only supported production server.
 
 ## 2026-09-06 result
 
@@ -118,8 +73,8 @@ At this point the integrated Rust server had 3.1% lower single-client HTTP/2
 throughput, but improved its latency by 8.5%, CPU by 38.0%, and RSS by 47.9%.
 It cleared the throughput threshold for HTTP/3 and concurrent HTTP/2 while
 improving latency and memory in every measured case. It became the production
-build; the Go server remains available only as an explicit rollback build
-during deployment acceptance.
+build, and the temporary Go rollback was later removed after deployment
+acceptance.
 
 ## 2026-09-07 HTTP/2 flow-churn optimization
 
@@ -141,8 +96,8 @@ The single-client runs used ten-second measurements; the 16-client runs used
 15-second measurements. HTTP/3 bypasses the multi-lane flow table, and its
 control runs remained within approximately 2%, as expected.
 
-A fresh production-path HTTP/2 comparison against the Go rollback server then
-measured:
+A fresh production-path HTTP/2 comparison against the then-current Go rollback
+server measured:
 
 | Clients | Duration | Rust throughput | Rust p95 | Rust CPU | Rust RSS |
 |---:|---:|---:|---:|---:|---:|

@@ -1,3 +1,5 @@
+use crate::config::parse_listen_address;
+use crate::server::bind_tcp_listener;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -81,8 +83,7 @@ impl AutomaticCertificateManager {
             let address =
                 parse_listen_address(&config.http_listen).context("parse --acme-http-listen")?;
             Some(
-                TcpListener::bind(address)
-                    .await
+                bind_tcp_listener(address)
                     .with_context(|| format!("listen for ACME HTTP-01 on {address}"))?,
             )
         };
@@ -539,16 +540,6 @@ fn redirect_host(value: Option<&http::HeaderValue>) -> Option<String> {
     Some(value.to_string())
 }
 
-fn parse_listen_address(value: &str) -> Result<SocketAddr> {
-    if let Some(port) = value.strip_prefix(':') {
-        return Ok(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            port.parse()?,
-        ));
-    }
-    Ok(value.parse()?)
-}
-
 pub fn normalize_domain(domain: &str) -> String {
     let domain = domain.trim();
     domain
@@ -652,9 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_go_style_http_listen_address() {
+    fn parses_go_style_http_listen_as_dual_stack_address() {
         assert_eq!(
             parse_listen_address(":80").unwrap(),
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 80))
+        );
+        assert_eq!(
+            parse_listen_address("0.0.0.0:80").unwrap(),
             SocketAddr::from(([0, 0, 0, 0], 80))
         );
     }

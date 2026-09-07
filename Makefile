@@ -2,28 +2,20 @@ GO ?= go
 CARGO ?= cargo
 RUST_SERVER_MANIFEST := rust/porta-server/Cargo.toml
 
-.PHONY: check-version test test-automation test-race test-native-mtu test-native-firewall test-rust-server vet build build-rust-server build-go-server build-go-clients build-windows android clean
+.PHONY: check-version test test-automation test-race test-native-firewall test-rust-server test-rust-interop test-server-web vet build build-rust-server build-go-clients build-windows android clean
 
 check-version:
 	./scripts/check-version.sh
 
 test:
-	GODEBUG=http2xconnect=1 $(GO) test ./...
+	$(GO) test ./...
 
 test-automation:
 	python3 scripts/test_automation.py
 	$(GO) test ./scripts/package-windows.go ./scripts/package-windows_test.go
 
 test-race:
-	GODEBUG=http2xconnect=1 $(GO) test -race ./...
-
-test-native-mtu:
-	@set -eu; directory=$$(mktemp -d); \
-	trap 'rm -f "$$directory/gateway.test"; rmdir "$$directory"' EXIT; \
-	$(GO) test -c -o "$$directory/gateway.test" ./internal/gateway; \
-	cd internal/gateway; \
-	sudo -n unshare --net -- env PORTA_MTU_NATIVE_TEST=1 "$$directory/gateway.test" \
-		-test.run '^TestNativeMTU' -test.count=1 -test.v -test.timeout=30s
+	$(GO) test -race ./...
 
 test-native-firewall:
 	./scripts/test-server-firewall.sh
@@ -32,6 +24,30 @@ test-rust-server:
 	$(CARGO) fmt --manifest-path $(RUST_SERVER_MANIFEST) --check
 	$(CARGO) test --manifest-path $(RUST_SERVER_MANIFEST) --locked
 	$(CARGO) clippy --manifest-path $(RUST_SERVER_MANIFEST) --locked --all-targets -- -D warnings
+	$(MAKE) test-server-web
+
+test-rust-interop:
+	PORTA_SERVER_BENCH_WORK="$(CURDIR)/.server-interop" \
+	PORTA_SERVER_BENCH_REPEATS=1 \
+	PORTA_SERVER_BENCH_DURATION=250ms \
+	PORTA_SERVER_BENCH_WARMUP=100ms \
+	PORTA_SERVER_BENCH_CLIENTS=1 \
+	PORTA_SERVER_BENCH_SERVER_CPUS=0 \
+	PORTA_SERVER_BENCH_CLIENT_CPUS=0 \
+	PORTA_SERVER_BENCH_SERVER_THREADS=1 \
+	PORTA_SERVER_BENCH_CLIENT_THREADS=1 \
+	PORTA_SERVER_BENCH_TRANSPORTS="h2 h3 auto" \
+	PORTA_SERVER_BENCH_AUTO_MTU=true \
+	CARGO="$(CARGO)" \
+	./experiments/server-benchmark/run.sh
+
+test-server-web:
+	@if command -v node >/dev/null 2>&1; then \
+		node scripts/tests/profile_qr_ui.cjs rust/porta-server/assets/admin.html; \
+		node scripts/tests/onboarding_layout.cjs; \
+	else \
+		echo "Node.js not found; skipping server browser regressions"; \
+	fi
 
 vet:
 	$(GO) vet ./...
@@ -47,10 +63,6 @@ build-rust-server:
 	$(CARGO) build --manifest-path $(RUST_SERVER_MANIFEST) --locked --release
 	mkdir -p bin
 	cp rust/porta-server/target/release/porta-server bin/porta-server
-
-build-go-server:
-	mkdir -p bin
-	CGO_ENABLED=0 $(GO) build -trimpath -o bin/porta-server-go ./cmd/porta-server
 
 build-windows:
 	rm -rf bin/windows-amd64

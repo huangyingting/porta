@@ -330,7 +330,10 @@ impl Services {
         self: &Arc<Self>,
         request: OpenSessionRequest,
     ) -> Result<Session, OpenSessionError> {
+        let peer = request.authentication.peer;
         let proof = request.authentication.proof.clone();
+        let transport = request.transport.clone();
+        let session_id = request.group_id.clone().unwrap_or_default();
         let authenticated = match self
             .authenticator
             .authenticate(request.authentication)
@@ -386,16 +389,30 @@ impl Services {
         let usage = self.usage.begin(UsageMetadata {
             account_id: authenticated.identity.account_id.clone(),
             device_id: proof.device_id.clone(),
-            transport: request.transport,
+            transport: transport.clone(),
             address: lease.address,
-            session_id: request.group_id.unwrap_or_default(),
+            session_id: session_id.clone(),
         });
         self.metrics.connected();
+        tracing::info!(
+            account_id = %authenticated.identity.account_id,
+            device_id = %proof.device_id,
+            device_name = %proof.name,
+            address = %lease.address,
+            transport,
+            peer = %peer,
+            session_id,
+            "tunnel connected"
+        );
         Ok(Session {
             services: self.clone(),
             identity: authenticated.identity,
             proof,
             lease,
+            peer,
+            transport,
+            session_id,
+            opened_at: Instant::now(),
             downlink: route.downlink,
             cancellation: route.cancellation,
             collapsed_backend: route.collapsed_backend,
@@ -413,6 +430,10 @@ pub struct Session {
     pub identity: ClientIdentity,
     pub proof: DeviceProof,
     pub lease: Lease,
+    peer: std::net::SocketAddr,
+    transport: String,
+    session_id: String,
+    opened_at: Instant,
     pub downlink: Arc<dyn PacketSource>,
     pub cancellation: CancellationToken,
     pub collapsed_backend: bool,
@@ -435,6 +456,16 @@ impl Session {
         self.usage.close();
         self.auth_cleanup.close();
         self.services.metrics.disconnected();
+        tracing::info!(
+            account_id = %self.identity.account_id,
+            device_id = %self.proof.device_id,
+            address = %self.lease.address,
+            transport = %self.transport,
+            peer = %self.peer,
+            session_id = %self.session_id,
+            duration_ms = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "tunnel disconnected"
+        );
     }
 
     pub fn services(&self) -> &Arc<Services> {

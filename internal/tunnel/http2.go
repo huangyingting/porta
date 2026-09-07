@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/deviceauth"
-	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/protocol"
 	"golang.org/x/net/http2"
 )
@@ -108,7 +107,7 @@ func dialFramedHTTP2(
 	tlsConfig *tls.Config,
 ) (*Conn, error) {
 	endpoint := *masqueURL
-	endpoint.Path = gateway.TunnelPath
+	endpoint.Path = protocol.TunnelPath
 	sessionID, err := newHTTP2SessionID()
 	if err != nil {
 		return nil, PermanentError{Err: fmt.Errorf("create HTTP/2 lane session: %w", err)}

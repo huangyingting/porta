@@ -17,8 +17,43 @@ import (
 	"golang.org/x/net/http2"
 )
 
+const testToken = "0123456789abcdef0123456789abcdef"
+
 func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
-	handler, router, dev := testGateway(t, false)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", protocol.ContentType)
+		w.Header().Set(protocol.HeaderVersion, protocol.Version)
+		w.Header().Set("X-Porta-Address", "10.66.0.2/29")
+		w.Header().Set("X-Porta-Gateway", "10.66.0.1")
+		w.Header().Set("X-Porta-DNS", "1.1.1.1")
+		w.Header().Set("X-Porta-MTU", "1300")
+		w.Header().Set("X-Porta-Lane-Session", r.Header.Get("X-Porta-Lane-Session"))
+		w.Header().Set("X-Porta-Lane", r.Header.Get("X-Porta-Lane"))
+		w.Header().Set("X-Porta-Lanes", r.Header.Get("X-Porta-Lanes"))
+		w.WriteHeader(http.StatusOK)
+		encoder := protocol.NewEncoder(w)
+		if err := encoder.WritePacket(nil); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		decoder := protocol.NewDecoder(r.Body)
+		for {
+			packet, err := decoder.ReadPacket()
+			if err != nil {
+				return
+			}
+			if len(packet) == 0 {
+				continue
+			}
+			reply := append([]byte(nil), packet...)
+			copy(reply[12:16], packet[16:20])
+			copy(reply[16:20], packet[12:16])
+			if err := encoder.WritePacket(reply); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	})
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true
 	if err := http2.ConfigureServer(server.Config, &http2.Server{}); err != nil {
@@ -30,10 +65,12 @@ func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := tunnel.Config{
-		URL: "https://vpn.example.invalid:" + port, DialAddress: server.Listener.Addr().String(),
-		Token: testToken, Transport: tunnel.TransportAuto,
-		Timeout: time.Second,
+	config := withTestDeviceProof(tunnel.Config{
+		URL:         "https://vpn.example.invalid:" + port,
+		DialAddress: server.Listener.Addr().String(),
+		Token:       testToken,
+		Transport:   tunnel.TransportAuto,
+		Timeout:     time.Second,
 		TLSConfig: &tls.Config{
 			InsecureSkipVerify: true, // test server certificate; identity assertion below
 			VerifyConnection: func(state tls.ConnectionState) error {
@@ -43,9 +80,31 @@ func TestAutomaticTransportFallsBackWithPinnedTLSIdentity(t *testing.T) {
 				return nil
 			},
 		},
+	})
+	connection, err := tunnel.Dial(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if selected := testPacketRoundTrip(t, router, dev, config); selected != tunnel.TransportHTTP2 {
-		t.Fatalf("automatic transport = %s, want HTTP/2", selected)
+	t.Cleanup(func() { _ = connection.Close() })
+	if connection.Transport != tunnel.TransportHTTP2 {
+		t.Fatalf("automatic transport = %s, want HTTP/2", connection.Transport)
+	}
+	packet := []byte{
+		0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0,
+		10, 66, 0, 2, 1, 1, 1, 1,
+	}
+	if err := connection.Send(packet); err != nil {
+		t.Fatal(err)
+	}
+	received, err := connection.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := append([]byte(nil), packet...)
+	copy(expected[12:16], packet[16:20])
+	copy(expected[16:20], packet[12:16])
+	if string(received) != string(expected) {
+		t.Fatal("fallback transport changed packet")
 	}
 }
 

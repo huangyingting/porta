@@ -367,11 +367,11 @@ impl WebRegistry for WebRegistryAdapter {
         let device_id = device_id.to_owned();
         Box::pin(async move {
             join_web_mutation(tokio::spawn(async move {
-                registry
-                    .forget_device(&client_id, &device_id)
+                let retirement = registry
+                    .retire_device(&client_id, &device_id)
                     .await
                     .map_err(web_registry_error)?;
-                usage
+                let result = usage
                     .delete_device(&client_id, &device_id)
                     .map_err(|error| {
                         tracing::error!(
@@ -381,7 +381,9 @@ impl WebRegistry for WebRegistryAdapter {
                             "delete device usage failed"
                         );
                         WebRegistryError::Internal
-                    })
+                    });
+                drop(retirement);
+                result
             }))
             .await
         })

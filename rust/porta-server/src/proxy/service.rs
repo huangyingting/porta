@@ -169,6 +169,8 @@ pub struct ConnectPlan {
     target: Box<str>,
     session: AuthorizedSession,
     request_cancellation: CancellationToken,
+    client_ip: IpAddr,
+    started: Instant,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -191,6 +193,9 @@ pub struct EstablishedTunnel {
     session: AuthorizedSession,
     request_cancellation: CancellationToken,
     usage: Box<dyn UsageSession>,
+    target: Box<str>,
+    client_ip: IpAddr,
+    started: Instant,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -339,39 +344,76 @@ impl ForwardProxy {
                 ));
             }
         };
+        tracing::info!(
+            account_id = %session.identity().account_id,
+            device_id = %session.identity().device_id,
+            method = "CONNECT",
+            target,
+            remote = %request.client_ip,
+            "forward proxy request"
+        );
         ProxyAction::Connect(ConnectPlan {
             destination,
             target: target.into(),
             session,
             request_cancellation: request.cancellation,
+            client_ip: request.client_ip,
+            started: Instant::now(),
             _permit: permit,
         })
     }
 
     pub async fn establish(&self, plan: ConnectPlan) -> Result<EstablishedTunnel, ProxyResponse> {
-        let cancellation = plan.session.cancellation();
+        let ConnectPlan {
+            destination,
+            target,
+            session,
+            request_cancellation,
+            client_ip,
+            started,
+            _permit,
+        } = plan;
+        let cancellation = session.cancellation();
         let upstream = tokio::select! {
-            _ = plan.request_cancellation.cancelled() => return Err(response(
+            _ = request_cancellation.cancelled() => Err(response(
                 StatusCode::BAD_GATEWAY,
                 "proxy destination unavailable\n",
             )),
-            _ = cancellation.cancelled() => return Err(response(
+            _ = cancellation.cancelled() => Err(response(
                 StatusCode::BAD_GATEWAY,
                 "proxy destination unavailable\n",
             )),
-            result = self.connector.connect(&plan.destination) => {
-                result.map_err(dial_response)?
+            result = self.connector.connect(&destination) => {
+                result.map_err(dial_response)
+            }
+        };
+        let upstream = match upstream {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::info!(
+                    account_id = %session.identity().account_id,
+                    device_id = %session.identity().device_id,
+                    target = %target,
+                    remote = %client_ip,
+                    status = error.status.as_u16(),
+                    duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "forward proxy request complete"
+                );
+                return Err(error);
             }
         };
         let usage = self
             .usage
-            .begin(plan.session.identity(), "https-connect", &plan.target);
+            .begin(session.identity(), "https-connect", &target);
         Ok(EstablishedTunnel {
             upstream,
-            session: plan.session,
-            request_cancellation: plan.request_cancellation,
+            session,
+            request_cancellation,
             usage,
-            _permit: plan._permit,
+            target,
+            client_ip,
+            started,
+            _permit,
         })
     }
 
@@ -525,8 +567,12 @@ where
         session,
         request_cancellation,
         usage,
+        target,
+        client_ip,
+        started,
         _permit,
     } = tunnel;
+    let identity = session.identity().clone();
     let session_cancellation = session.cancellation();
     let activity = Activity::new();
     let (upstream_reader, upstream_writer) = tokio::io::split(upstream);
@@ -555,6 +601,15 @@ where
     drop(usage);
     drop(_permit);
     drop(session);
+    tracing::info!(
+        account_id = %identity.account_id,
+        device_id = %identity.device_id,
+        target = %target,
+        remote = %client_ip,
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        outcome = if result.is_ok() { "completed" } else { "error" },
+        "forward proxy request complete"
+    );
     result
 }
 

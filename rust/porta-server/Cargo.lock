@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "porta-server-rust"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1705,6 +1705,7 @@ dependencies = [
  "hmac",
  "http",
  "http-body-util",
+ "httpdate",
  "humantime",
  "hyper",
  "hyper-util",

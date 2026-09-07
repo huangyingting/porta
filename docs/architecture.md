@@ -205,10 +205,6 @@ HTTP/2 has no unreliable Datagram frame. It carries the Context ID 0 payload in
 DATAGRAM capsules on the reliable CONNECT stream. This is interoperable but
 inherits TCP head-of-line blocking.
 
-The current `golang.org/x/net/http2` server gates Extended CONNECT behind the
-official `GODEBUG=http2xconnect=1` switch. The gateway re-executes itself once
-with this setting if it is absent. Tests set it before process startup.
-
 Client establishment has one timeout covering transport setup, request headers,
 optional MTU discovery/agreement, ADDRESS_REQUEST writes and ADDRESS_ASSIGN
 receipt. Completing establishment

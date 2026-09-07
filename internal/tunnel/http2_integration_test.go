@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/deviceauth"
-	"github.com/huangyingting/porta/internal/gateway"
 	"github.com/huangyingting/porta/internal/protocol"
 	"golang.org/x/net/http2"
 )
@@ -275,7 +274,7 @@ func startHTTP2LaneServer(
 		Timeout:   2 * time.Second,
 		DeviceProof: func(method, path string) (deviceauth.Proof, error) {
 			call := proofCalls.Add(1)
-			if method != http.MethodPost || path != gateway.TunnelPath {
+			if method != http.MethodPost || path != protocol.TunnelPath {
 				badProof.Store(true)
 			}
 			return deviceauth.Proof{

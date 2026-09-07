@@ -599,6 +599,7 @@ where
                     match capsule_type {
                         CAPSULE_MTU_SELECT => {
                             let responder = mtu.as_mut().ok_or(MasqueError::InvalidMtuMessage)?;
+                            let first_selection = !responder.committed;
                             let selected = responder.commit(&value)?;
                             let mut control = BytesMut::with_capacity(selected.len() + 16);
                             append_capsule(&mut control, CAPSULE_MTU_SELECTED, &selected)?;
@@ -608,6 +609,16 @@ where
                                 &session.cancellation,
                             )
                             .await?;
+                            if first_selection {
+                                tracing::info!(
+                                    account_id = %session.identity.account_id,
+                                    device_id = %session.proof.device_id,
+                                    address = %session.lease.address,
+                                    mtu = responder.selected,
+                                    ceiling = server.config.mtu,
+                                    "tunnel MTU selected"
+                                );
+                            }
                         }
                         CAPSULE_ADDRESS_REQUEST => {
                             if mtu.as_ref().is_some_and(|responder| !responder.committed) {

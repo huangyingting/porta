@@ -18,6 +18,8 @@ make test-automation
 make test
 make test-race
 make test-rust-server
+make test-rust-interop
+make test-native-firewall
 make vet
 make build
 make build-rust-server
@@ -26,22 +28,19 @@ make android
 ```
 
 `make build` builds the production Rust server as `bin/porta-server` together
-with the Go clients. `make build-go-server` retains the previous Go server as
-`bin/porta-server-go` for explicit rollback testing during the migration.
+with the Go clients. Rust is the only supported server implementation.
 
-`make test` enables the official `GODEBUG=http2xconnect=1` switch required by
-the HTTP/2 Extended CONNECT integration tests.
 `make test-automation` uses Python 3's standard library and Go tests to exercise
 deployment, certificate sync, firewall cleanup and packaging with isolated
 fixtures and mocked system commands. It does not change host services or
 network settings.
 
-For two-step QR onboarding, the focused server suite also invokes Node.js
-regressions for invitation generation, dialog cleanup, fragment redemption,
-and profile-copy controls:
+The Rust server suite also invokes the focused Node.js browser regressions when
+Node.js is available. They cover invitation generation, dialog cleanup,
+fragment redemption, profile-copy controls, and compact admin layouts:
 
 ```sh
-GODEBUG=http2xconnect=1 go test ./cmd/porta-server -run 'Test(ClientAccess|ProfileQR|Portal|Admin)' -count=1
+make test-server-web
 ```
 
 Run `make android` for the in-app scanner/paste parser and signed APK build.
@@ -50,25 +49,17 @@ admin dialogs at 390x844, 320x568, and 844x390. A valid first QR must open downl
 without a token prompt; only that authenticated client page shows the profile QR.
 The Android camera and clipboard UI still require device acceptance.
 
-`make test-native-mtu` separately exercises MTU feedback through a real Linux
-TUN, veth pair, forwarding and NAT. It requires `ip`, `nft`, `sysctl`, and
-passwordless `sudo` permission for `unshare --net`. The target compiles the
-existing Go tests, enters a new network namespace, and enables
-`PORTA_MTU_NATIVE_TEST=1`; the native test refuses to run in PID 1's network
-namespace or a namespace with existing non-loopback interfaces. No host routes,
-firewall rules, or sysctls are changed. Ordinary
-Go runs skip this opt-in test; Linux CI runs the isolated target explicitly.
-Do not enable the environment variable directly against host networking.
-
 `make test-native-firewall` runs the production `server-up.sh` and
 `server-down.sh` inside a disposable network namespace. It validates native
 nftables parsing, atomic replacement, the IPv4/IPv6 TCP and UDP source meters,
-and complete cleanup without changing the host firewall or interfaces. It
-requires `ip`, `nft`, `sysctl`, `unshare`, and passwordless `sudo`.
-Both native targets set `PORTA_RUNTIME_DIRECTORY` to a private, per-test
-temporary directory and clean it afterward. Network namespaces alone do not
-isolate files, so the tests never use the installed service's `/run/porta`
-recovery journals or an inherited runtime-directory override.
+automatic-MTU sysctls on only the owned TUN interface, and complete cleanup
+without changing the host firewall or interfaces. It requires `ip`, `nft`,
+`sysctl`, `unshare`, and passwordless `sudo`. The test sets
+`PORTA_RUNTIME_DIRECTORY` to a private, per-test temporary directory and cleans
+it afterward. Network namespaces alone do not isolate files, so the test never
+uses the installed service's `/run/porta` recovery journals or an inherited
+runtime-directory override. Rust unit tests separately verify fragmentation and
+ICMP generation.
 
 Windows networking script regressions use isolated PowerShell mocks. They run
 when `pwsh` is on `PATH`, or with Windows PowerShell on Windows; otherwise those
@@ -103,7 +94,6 @@ allocation costs:
 
 ```sh
 go test ./internal/masque ./internal/protocol ./internal/tunnel \
-  ./internal/usage ./internal/forwardproxy \
   -run '^$' -bench . -benchmem -count=3
 ```
 
@@ -113,24 +103,17 @@ is not a prediction of end-to-end VPN speed. Network tests should compare
 HTTP/3, HTTP/2 fallback and CONNECT separately under the same latency, loss,
 client count and server load.
 
-The transport round-trip benchmark exercises the complete local HTTP/2 framed
-or HTTP/3 Datagram path, including the gateway router and a fake TUN:
+For complete HTTP/2 and HTTP/3 measurements through the production Rust
+server, real TUN, kernel UDP echo path, and production Go client, run:
 
 ```sh
-go test ./internal/tunnel -run '^$' \
-  -bench '^BenchmarkTransportPacketRoundTrip$' -benchmem -count=3
+PORTA_SERVER_BENCH_WORK=/path/out ./experiments/server-benchmark/run.sh
 ```
 
-For controlled impairment, `scripts/benchmark-transports.sh` builds the
-loss-tolerant transport probe once and runs it in disposable network
-namespaces. It reports bidirectional delivery and control-packet latency rather
-than blocking when an HTTP/3 Datagram is intentionally lost. It does not alter
-the host qdisc. The defaults cover 20/80/150 ms RTT, 0/0.5/1/2 percent loss,
-and 20/100 Mbit/s. Override the matrix with `PORTA_BENCH_RTT_MS`,
-`PORTA_BENCH_LOSS_PERCENT`, `PORTA_BENCH_RATES`, `PORTA_BENCH_PACKETS`,
-`PORTA_BENCH_TIMEOUT_SECONDS`, `PORTA_BENCH_PACING_MICROS`, and
-`PORTA_BENCH_COUNT`. The script requires `ip`, `tc`, `unshare`, and passwordless
-`sudo`.
+`make test-rust-interop` runs a short form of this benchmark across HTTP/2,
+HTTP/3, and automatic transport with automatic MTU enabled. The benchmark
+requires `ip`, `nft`, `unshare`, and passwordless `sudo`, and runs entirely in
+a disposable network namespace.
 
 ## Android signing
 

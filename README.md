@@ -69,6 +69,8 @@ synchronization, client downloads, and the loopback operations listener.
 
 The HTTPS forward proxy is enabled by default. Add
 `--disable-forward-proxy` only for a VPN-only deployment.
+Forward-proxy CONNECT uses HTTP/1.1 or HTTP/2; HTTP/3 is reserved for the
+native MASQUE CONNECT-IP tunnel.
 
 ## Use
 

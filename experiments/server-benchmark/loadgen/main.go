@@ -35,6 +35,9 @@ type result struct {
 	ConnectMS      int64   `json:"connect_ms"`
 	PayloadBytes   int     `json:"payload_bytes"`
 	Transport      string  `json:"transport"`
+	Selected       string  `json:"selected_transport"`
+	MTU            int     `json:"mtu"`
+	MTUAutomatic   bool    `json:"mtu_automatic"`
 	Inflight       int     `json:"inflight"`
 	GOMAXPROCS     int     `json:"gomaxprocs"`
 	SampledLatency int     `json:"sampled_latencies"`
@@ -46,7 +49,8 @@ func main() {
 	duration := flag.Duration("duration", 6*time.Second, "measured duration")
 	warmup := flag.Duration("warmup", 2*time.Second, "warmup duration")
 	payloadBytes := flag.Int("payload", 1200, "IPv4 packet size")
-	transport := flag.String("transport", "h2", "transport: h2 or h3")
+	transport := flag.String("transport", "h2", "transport: h2, h3, or auto")
+	requireAutomaticMTU := flag.Bool("require-auto-mtu", false, "require HTTP/3 automatic MTU selection")
 	inflight := flag.Int("inflight", 1, "maximum outstanding packets per tunnel")
 	flag.Parse()
 	if *clients <= 0 || *duration <= 0 || *warmup < 0 || *payloadBytes < 36 ||
@@ -60,6 +64,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	for index, connection := range connections {
+		if *requireAutomaticMTU && connection.Transport == tunnel.TransportHTTP3 && !connection.MTUAutomatic {
+			fmt.Fprintf(os.Stderr, "client %d did not negotiate automatic MTU\n", index)
+			os.Exit(1)
+		}
+		if *requireAutomaticMTU && *transport == "auto" && connection.Transport != tunnel.TransportHTTP3 {
+			fmt.Fprintf(os.Stderr, "client %d automatic transport selected %s, want HTTP/3\n", index, connection.Transport)
+			os.Exit(1)
+		}
 	}
 	defer func() {
 		for _, connection := range connections {
@@ -201,6 +215,9 @@ func main() {
 		ConnectMS:      connectElapsed.Milliseconds(),
 		PayloadBytes:   *payloadBytes,
 		Transport:      *transport,
+		Selected:       string(connections[0].Transport),
+		MTU:            connections[0].Lease.MTU,
+		MTUAutomatic:   connections[0].MTUAutomatic,
 		Inflight:       *inflight,
 		GOMAXPROCS:     runtime.GOMAXPROCS(0),
 		SampledLatency: len(allSamples),
@@ -218,6 +235,8 @@ func connectAll(serverURL string, count int, selectedTransport string) ([]*tunne
 		transport = tunnel.TransportHTTP2
 	case "h3":
 		transport = tunnel.TransportHTTP3
+	case "auto":
+		transport = tunnel.TransportAuto
 	default:
 		return nil, fmt.Errorf("unknown transport %q", selectedTransport)
 	}

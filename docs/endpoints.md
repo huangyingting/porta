@@ -25,9 +25,10 @@
   native clients. A group declares two through four lanes.
   Every lane carries an independent signed native-device proof; requests
   without valid lane metadata or a supported protocol version are rejected.
-- Standard HTTP `CONNECT` requests form the authenticated HTTPS forward proxy.
-  The Basic-auth username is ignored and the password is a client token. All
-  forward-proxy requests for an account use the logical device ID
+- Standard HTTP `CONNECT` requests over HTTP/1.1 or HTTP/2 form the
+  authenticated HTTPS forward proxy. HTTP/3 is reserved for native MASQUE
+  CONNECT-IP. The Basic-auth username is ignored and the password is a client
+  token. All forward-proxy requests for an account use the logical device ID
   `forward-proxy`.
 
 A token identifies a client account. Native requests additionally send:

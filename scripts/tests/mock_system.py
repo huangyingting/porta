@@ -130,16 +130,17 @@ elif name == "systemctl":
         raise RuntimeError(f"unexpected systemctl call: {args}")
 elif name == "sysctl":
     values = state.setdefault("sysctl", {})
-    if args[0] == "-n":
-        print(values[args[1]])
-    elif args[0] == "-w":
-        key, value = args[1].split("=", 1)
-        values[key] = value
-    elif args[0] == "-p":
-        for line in safe(args[1]).read_text().splitlines():
+    operation = [arg for arg in args if arg != "-q"]
+    if operation[0] == "-n":
+        print(values[operation[1].replace("/", ".")])
+    elif operation[0] == "-w":
+        key, value = operation[1].split("=", 1)
+        values[key.replace("/", ".")] = value
+    elif operation[0] == "-p":
+        for line in safe(operation[1]).read_text().splitlines():
             if line and not line.startswith("#"):
                 key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
+                values[key.strip().replace("/", ".")] = value.strip()
 elif name == "ip":
     if "show" in args and state.get("fail_ip_list"):
         code = 2

@@ -10,9 +10,9 @@ async function main() {
   const chromePath = process.env.CHROME_BIN || '/usr/bin/google-chrome';
   const profile = path.join(root, '.cache', 'onboarding-layout-' + process.pid);
   fs.mkdirSync(profile, {recursive: true});
-  const html = fs.readFileSync(path.join(root, 'cmd/porta-server/admin_page.go'), 'utf8')
-    .match(/var adminHTML = `([\s\S]*)`/)[1];
-  const font = fs.readFileSync(path.join(root, 'cmd/porta-server/assets/MonaSans.woff2'));
+  const assets = path.join(root, 'rust/porta-server/assets');
+  const html = fs.readFileSync(path.join(assets, 'admin.html'), 'utf8');
+  const font = fs.readFileSync(path.join(assets, 'MonaSans.woff2'));
   const server = http.createServer((request, response) => {
     if (request.url === '/api/clients') {
       response.setHeader('Content-Type', 'application/json');
