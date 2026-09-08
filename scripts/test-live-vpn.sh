@@ -178,10 +178,19 @@ if [[ ${1:-} == --inside ]]; then
   forwarding=$(sysctl -n net.ipv4.ip_forward)
   server_host=
   server_address=
+  forward_from_namespace=false
+  forward_to_namespace=false
 
   cleanup() {
     status=$?
     trap - EXIT
+    if [[ $forward_to_namespace == true ]]; then
+      iptables -w -D FORWARD -o "$host_interface" -m conntrack \
+        --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || status=1
+    fi
+    if [[ $forward_from_namespace == true ]]; then
+      iptables -w -D FORWARD -i "$host_interface" -j ACCEPT >/dev/null 2>&1 || status=1
+    fi
     nft delete table ip "$nat_table" >/dev/null 2>&1 || true
     ip netns delete "$namespace" >/dev/null 2>&1 || true
     ip link delete "$host_interface" >/dev/null 2>&1 || true
@@ -229,6 +238,11 @@ PY
   nft add rule ip "$nat_table" forward iifname "$host_interface" ip daddr "$gateway" drop
   nft "add chain ip $nat_table postrouting { type nat hook postrouting priority srcnat; policy accept; }"
   nft add rule ip "$nat_table" postrouting ip saddr 192.0.2.0/30 masquerade
+  iptables -w -I FORWARD 1 -i "$host_interface" -j ACCEPT
+  forward_from_namespace=true
+  iptables -w -I FORWARD 1 -o "$host_interface" -m conntrack \
+    --ctstate ESTABLISHED,RELATED -j ACCEPT
+  forward_to_namespace=true
 
   mkdir -p "/etc/netns/$namespace"
   printf 'nameserver 127.0.0.53\n' >"/etc/netns/$namespace/resolv.conf"
@@ -244,7 +258,7 @@ PY
   cleanup
 fi
 
-for command in awk base64 getent grep install ip nft ping python3 sudo sysctl; do
+for command in awk base64 getent grep install ip iptables nft ping python3 sudo sysctl; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 1

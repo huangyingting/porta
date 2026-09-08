@@ -225,9 +225,9 @@ jobs:
           cache-workspace-crates: "false"
       - name: Install native VPN test dependencies
         run: |
-          if ! command -v nft >/dev/null || ! command -v ping >/dev/null; then
+          if ! command -v iptables >/dev/null || ! command -v nft >/dev/null || ! command -v ping >/dev/null; then
             sudo apt-get update
-            sudo apt-get install -y nftables iproute2 iputils-ping
+            sudo apt-get install -y iptables nftables iproute2 iputils-ping
           fi
       - name: Exercise the real VPN data path
         env:
