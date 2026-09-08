@@ -257,6 +257,7 @@ jobs:
           cores: 2
           ram-size: 2048M
           heap-size: 512M
+          disk-size: 2048M
           ndk: 27.2.12479018
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
