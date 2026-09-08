@@ -30,6 +30,7 @@ pub struct Config {
     pub token: String,
     pub transport: Transport,
     pub interface_name: String,
+    pub identity_path: Option<PathBuf>,
     pub ca_path: Option<PathBuf>,
     pub thumbprint: Option<String>,
     pub insecure: bool,
@@ -289,7 +290,7 @@ pub async fn run(
         config.thumbprint.as_deref(),
         config.insecure,
     )?;
-    let identity = Arc::new(identity::current()?);
+    let identity = Arc::new(identity::current_at(config.identity_path.as_deref())?);
     observer(Event {
         state: State::Connecting,
         message: format!("Device: {} ({})", identity.name, identity.id),

@@ -38,6 +38,8 @@ pub enum IdentityError {
     MissingConfigDirectory,
     #[error("user config directory is not absolute")]
     RelativeConfigDirectory,
+    #[error("device identity path must be absolute")]
+    RelativeIdentityPath,
     #[error("read machine name: {0}")]
     Hostname(#[source] std::io::Error),
     #[error("prepare device identity storage: {0}")]
@@ -125,7 +127,16 @@ impl Identity {
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub fn current() -> Result<Identity, IdentityError> {
-    let path = identity_path()?;
+    current_at(None)
+}
+
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+pub fn current_at(path: Option<&Path>) -> Result<Identity, IdentityError> {
+    let path = match path {
+        Some(path) if !path.is_absolute() => return Err(IdentityError::RelativeIdentityPath),
+        Some(path) => path.to_owned(),
+        None => identity_path()?,
+    };
     let name = hostname().map_err(IdentityError::Hostname)?;
     Identity::load_or_create(&path, &name)
 }
@@ -395,6 +406,15 @@ mod tests {
         assert!(matches!(
             Identity::load_or_create(&path, "Office PC"),
             Err(IdentityError::Decode(_))
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    #[test]
+    fn explicit_linux_identity_path_must_be_absolute() {
+        assert!(matches!(
+            current_at(Some(Path::new("relative/device.json"))),
+            Err(IdentityError::RelativeIdentityPath)
         ));
     }
 }

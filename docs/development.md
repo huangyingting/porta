@@ -99,6 +99,43 @@ negotiation, and rejection of an invalid account before enrollment. They do not
 establish a VPN, modify runner routes, consume a device slot, or replace physical
 device testing of the full VPN data path.
 
+CI also runs a separate credentialed Linux full-tunnel test every day. Use the
+**Run workflow** action with `vpn_e2e` enabled to run it for an allowed branch.
+The `vpn-e2e-linux` job is attached to the branch-restricted `development`
+environment and reads two environment secrets:
+
+- `PORTA_E2E_TOKEN` is the token for a dedicated client limited to one device.
+- `PORTA_E2E_LINUX_IDENTITY_BASE64` is that device's fixed private identity file.
+
+The identity is reused so scheduled runs do not consume additional persistent
+device slots. The test starts the production Linux client with both HTTP/3 and
+HTTP/2 inside a disposable network namespace. It applies real TUN routes and
+nftables leak protection, confirms that `10.66.0.1` is unreachable before
+connection, verifies the route uses the Porta TUN, exchanges normal and
+1,200-byte don't-fragment ICMP packets with the server TUN gateway, then stops
+the client and requires the TUN, recovery journal, routes, leak-protection table,
+and gateway reachability to disappear. Only `resolvectl` is replaced by a
+namespace-local adapter because the host's systemd-resolved instance cannot see
+interfaces inside the disposable namespace.
+
+Run the same test locally after supplying the two protected values:
+
+```sh
+PORTA_E2E_TOKEN='...' \
+PORTA_E2E_LINUX_IDENTITY_BASE64='...' \
+  make test-live-vpn
+```
+
+When running the test on the development server itself, set
+`PORTA_E2E_SERVER_ADDRESS=192.0.2.1` to reach its listener through the test
+namespace's host-side veth while preserving normal hostname and certificate
+validation. Hosted CI leaves this unset and resolves the public server address.
+
+Never expose these values to pull-request jobs or store the development server's
+admin token in GitHub. The CI account and identity are dedicated to this test;
+rotating either one requires removing the old enrolled device and updating both
+environment secrets together.
+
 `make test-native-firewall` runs the production `server-up.sh` and
 `server-down.sh` inside a disposable network namespace. It validates native
 nftables parsing, atomic replacement, the IPv4/IPv6 TCP and UDP source meters,

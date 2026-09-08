@@ -48,6 +48,8 @@ mod linux {
         transport: TransportArgument,
         #[arg(long, default_value = "porta0", help = "TUN interface name")]
         interface: String,
+        #[arg(long, help = "Optional absolute private device identity path")]
+        identity: Option<PathBuf>,
         #[arg(long, help = "Optional PEM CA certificate")]
         ca: Option<PathBuf>,
         #[arg(long, help = "Optional SHA-256 gateway certificate thumbprint")]
@@ -128,6 +130,7 @@ mod linux {
                     token,
                     transport: arguments.transport.into(),
                     interface_name: arguments.interface,
+                    identity_path: arguments.identity,
                     ca_path: arguments.ca,
                     thumbprint: arguments.thumbprint,
                     insecure: arguments.insecure,
@@ -188,6 +191,17 @@ mod linux {
             let error =
                 Arguments::try_parse_from(["porta-client", "--token", "secret"]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+
+        #[test]
+        fn linux_identity_path_is_explicit() {
+            let arguments =
+                Arguments::try_parse_from(["porta-client", "--identity", "/run/porta/id.json"])
+                    .unwrap();
+            assert_eq!(
+                arguments.identity,
+                Some(PathBuf::from("/run/porta/id.json"))
+            );
         }
     }
 }

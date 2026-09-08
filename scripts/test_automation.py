@@ -1084,6 +1084,53 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("NetworkManager", probe)
         self.assertNotIn("Tun::open", probe)
 
+    def test_full_vpn_ci_is_protected_isolated_and_credentialed(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        workflow_settings = workflow[:workflow.index("jobs:")]
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name != 'schedule' && !inputs.vpn_e2e }}",
+            workflow_settings,
+        )
+        vpn = workflow[
+            workflow.index("  vpn-e2e-linux:"):workflow.index("  live-windows:")
+        ]
+        self.assertIn("environment: development", vpn)
+        self.assertIn("permissions:\n      contents: read", vpn)
+        self.assertIn("group: porta-development-vpn-e2e", vpn)
+        self.assertIn("cancel-in-progress: false", vpn)
+        self.assertIn("secrets.PORTA_E2E_TOKEN", vpn)
+        self.assertIn("secrets.PORTA_E2E_LINUX_IDENTITY_BASE64", vpn)
+        self.assertIn("./scripts/test-live-vpn.sh", vpn)
+        self.assertNotIn("pull_request", vpn)
+        before_exercise = vpn[:vpn.index("- name: Exercise the real VPN data path")]
+        self.assertNotIn("secrets.PORTA_E2E_", before_exercise)
+        harness = (ROOT / "scripts/test-live-vpn.sh").read_text()
+        for fragment in [
+            "ip netns add",
+            "type veth",
+            "masquerade",
+            "ip daddr \"$gateway\" drop",
+            "--transport \"$transport\"",
+            "--identity \"$identity_path\"",
+            "connected address=.* transport=$transport",
+            "ip -4 route show proto 186",
+            "ip -4 route get \"$gateway\"",
+            "ping -n -c 3",
+            "ping -n -c 1 -W 5 -M do -s 1200",
+            "Porta-owned routes remain",
+            "Porta leak-protection table remains",
+            "private Porta gateway remains reachable",
+            "sudo -n test -d \"$work/artifacts\"",
+            "PORTA_E2E_ARTIFACT_DIR must not already exist",
+        ]:
+            self.assertIn(fragment, harness)
+        self.assertNotIn("--token", harness)
+        self.assertIn('install -o "$(id -u)" -g "$(id -g)" -m 0600', harness)
+        self.assertNotIn(
+            'chown -R "$(id -u):$(id -g)" "$artifact_directory"',
+            harness,
+        )
+
     def test_windows_release_uses_native_msvc_package(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertRegex(workflow, r"(?ms)^  windows:\n.*?runs-on: windows-latest")
