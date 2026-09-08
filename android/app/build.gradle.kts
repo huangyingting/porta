@@ -159,6 +159,8 @@ android {
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
 
+    testBuildType = providers.gradleProperty("porta.testBuildType").getOrElse("debug")
+
     signingConfigs {
         create("release") {
             if (hasReleaseSigning) {
@@ -216,6 +218,10 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")
     testImplementation("junit:junit:4.13.2")
+    androidTestCompileOnly(files(
+        android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.base.jar"),
+        android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.runner.jar"),
+    ))
 }
 
 tasks.named("preBuild").configure {

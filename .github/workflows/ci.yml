@@ -6,6 +6,14 @@ on:
       - "**"
   pull_request:
   workflow_dispatch:
+    inputs:
+      live_clients:
+        description: Run credential-free Windows and Android probes against the development server
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 3 * * *"
 
 permissions:
   contents: read
@@ -16,6 +24,7 @@ concurrency:
 
 jobs:
   rust:
+    if: ${{ github.event_name != 'schedule' && !inputs.live_clients }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -61,6 +70,7 @@ jobs:
       - run: make test-rust-interop
 
   windows:
+    if: ${{ github.event_name != 'schedule' && !inputs.live_clients }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -73,6 +83,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: rust -> target
+          shared-key: windows
           cache-bin: "false"
           cache-targets: "true"
           cache-all-crates: "false"
@@ -137,6 +148,7 @@ jobs:
           if-no-files-found: error
 
   android:
+    if: ${{ github.event_name != 'schedule' && !inputs.live_clients }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -148,6 +160,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: rust -> target
+          shared-key: android
           cache-bin: "false"
           cache-targets: "true"
           cache-all-crates: "false"
@@ -175,3 +188,82 @@ jobs:
         with:
           name: android-debug-apks
           path: android/app/build/outputs/apk/debug/*.apk
+
+  live-windows:
+    if: ${{ github.event_name == 'schedule' || inputs.live_clients || (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch) }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Restore Windows Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          shared-key: windows
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+      - name: Probe the live gateway with native Windows transports
+        run: >
+          cargo test --manifest-path rust/Cargo.toml --locked
+          --package porta-client-rust --test platform_tls
+          -- --ignored --nocapture
+
+  live-android:
+    if: ${{ github.event_name == 'schedule' || inputs.live_clients || (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Restore Android Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          shared-key: android
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Probe the live gateway from an Android emulator
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 35
+          target: aosp_atd
+          arch: x86_64
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          ndk: 27.2.12479018
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          disable-spellchecker: true
+          working-directory: android
+          script: >-
+            ./gradlew connectedDebugAndroidTest --no-daemon --max-workers=2
+            -Pandroid.testInstrumentationRunnerArguments.class=dev.porta.android.CertificateVerificationTest
+            -Pandroid.testInstrumentationRunnerArguments.portaTlsOrigin=https://porta-dev.i-csu.org:8443

@@ -50,6 +50,55 @@ admin dialogs at 390x844, 320x568, and 844x390. A valid first QR must open downl
 without a token prompt; only that authenticated client page shows the profile QR.
 The Android camera and clipboard UI still require device acceptance.
 
+### Certificate integration probes
+
+Android uses the platform certificate verifier. Its network policy permits HTTP
+only for Let's Encrypt's public, issuer-signed CRLs under `c.lencr.org`; all other
+application traffic remains HTTPS-only. This enables CRL fallback for certificates
+without an OCSP responder rather than ignoring a revocation failure. The network
+configuration uses system trust anchors and enables user-CA overrides only for
+debuggable builds.
+Porta's own process is excluded from its VPN so platform certificate fetches can
+complete during reconnects, while other applications remain routed through the VPN.
+
+Run the policy and live certificate regressions on an Android device or emulator:
+
+```sh
+cd android
+ANDROID_SERIAL=emulator-5680 ./gradlew connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.porta.android.CertificateVerificationTest \
+  -Pandroid.testInstrumentationRunnerArguments.portaTlsOrigin=https://porta-dev.i-csu.org:8443
+```
+
+Use `-Pporta.testBuildType=release connectedReleaseAndroidTest` instead to exercise
+the signed, minified release APK. The live probes verify the certificate and the
+Rust TLS handshake without enrolling a VPN device, and reject expired and altered
+certificates. `portaTlsOrigin` is required for the live probes. To run only the
+offline policy assertion, select
+`CertificateVerificationTest#testCleartextIsRestrictedToPublicCertificateRevocationHosts`.
+
+Linux and Windows use separate platform-verifier backends. Run their opt-in
+TCP/HTTP2 and QUIC/HTTP3 certificate probe with `PORTA_TLS_TEST_URL` set to the
+gateway URL:
+
+```sh
+PORTA_TLS_TEST_URL=https://porta-dev.i-csu.org:8443 \
+  cargo test --manifest-path rust/Cargo.toml --package porta-client-rust \
+  --test platform_tls --locked -- --ignored --nocapture
+```
+
+This probe does not create a TUN, modify routes, or enroll a device. Execute it
+natively on Windows to exercise Windows certificate APIs; cross-compilation alone
+does not validate the Windows trust store.
+
+CI runs the same credential-free native Windows and Android emulator probes
+against `https://porta-dev.i-csu.org:8443` every day and after default-branch
+pushes. Use the **Run workflow** action with `live_clients` enabled to
+test another branch. The live jobs validate platform trust, HTTP/2 and HTTP/3
+negotiation, and rejection of an invalid account before enrollment. They do not
+establish a VPN, modify runner routes, consume a device slot, or replace physical
+device testing of the full VPN data path.
+
 `make test-native-firewall` runs the production `server-up.sh` and
 `server-down.sh` inside a disposable network namespace. It validates native
 nftables parsing, atomic replacement, the IPv4/IPv6 TCP and UDP source meters,

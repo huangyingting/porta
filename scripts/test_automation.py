@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 import uuid
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1021,6 +1022,64 @@ class AutomationTests(unittest.TestCase):
         for symbol in ("portamobile.Portamobile", "portamobile.ProofProvider",
                        "portamobile.Protector", "native <methods>"):
             self.assertIn(symbol, rules)
+
+    def test_android_certificate_fetch_policy_is_scoped(self):
+        namespace = "{http://schemas.android.com/apk/res/android}"
+        manifest = ET.parse(ROOT / "android/app/src/main/AndroidManifest.xml").getroot()
+        application = manifest.find("application")
+        self.assertEqual(application.get(namespace + "usesCleartextTraffic"), "false")
+        self.assertEqual(
+            application.get(namespace + "networkSecurityConfig"),
+            "@xml/network_security_config",
+        )
+        configuration = ET.parse(
+            ROOT / "android/app/src/main/res/xml/network_security_config.xml"
+        ).getroot()
+        base = configuration.find("base-config")
+        self.assertEqual(base.get("cleartextTrafficPermitted"), "false")
+        self.assertEqual(
+            [certificate.get("src") for certificate in base.findall("trust-anchors/certificates")],
+            ["system"],
+        )
+        domains = configuration.findall("domain-config")
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0].get("cleartextTrafficPermitted"), "true")
+        self.assertEqual(
+            [(domain.text, domain.get("includeSubdomains")) for domain in domains[0].findall("domain")],
+            [("c.lencr.org", "true")],
+        )
+        self.assertEqual(
+            [certificate.get("src") for certificate in configuration.findall(
+                "debug-overrides/trust-anchors/certificates"
+            )],
+            ["user"],
+        )
+        for manifest_path in (ROOT / "android/app/src/debug").rglob("AndroidManifest.xml"):
+            self.assertNotIn("networkSecurityConfig", manifest_path.read_text())
+
+        service = (ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt").read_text()
+        self.assertLess(
+            service.index("builder.addDisallowedApplication(packageName)"),
+            service.index("builder.establish()"),
+        )
+
+    def test_live_client_ci_is_credential_free_and_non_enrolling(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        live = workflow[workflow.index("  live-windows:"):]
+        self.assertNotIn("secrets.", live)
+        self.assertIn("PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443", live)
+        self.assertIn("--test platform_tls", live)
+        self.assertIn("connectedDebugAndroidTest", live)
+        self.assertIn(
+            "android.testInstrumentationRunnerArguments.portaTlsOrigin="
+            "https://porta-dev.i-csu.org:8443",
+            live,
+        )
+        probe = (ROOT / "rust/porta-client/tests/platform_tls.rs").read_text()
+        self.assertIn("ci-live-probe-invalid-account", probe)
+        self.assertIn("HTTP 401", probe)
+        self.assertNotIn("NetworkManager", probe)
+        self.assertNotIn("Tun::open", probe)
 
     def test_windows_release_uses_native_msvc_package(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

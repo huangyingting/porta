@@ -507,6 +507,8 @@ class TunnelService : VpnService() {
             .addAddress(configuration.address, configuration.prefix)
             .addRoute("0.0.0.0", 0)
             .setBlocking(true)
+        // Platform certificate checks create Java sockets outside the native socket protector.
+        builder.addDisallowedApplication(packageName)
         if (configuration.dns.isNotBlank()) builder.addDnsServer(configuration.dns)
         val vpn = builder.establish() ?: throw PermanentTunnelException("Android refused to establish the VPN")
         val previousReader = vpnReader
