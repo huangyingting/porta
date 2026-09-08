@@ -24,6 +24,8 @@ pub const CLIENT_ACCESS_ERROR: &str =
 pub const PORTAL_JOIN_SCRIPT_PATH: &str = "/assets/portal-join.js";
 pub const PORTAL_CLIENT_SCRIPT_PATH: &str = "/assets/portal-client.js";
 
+const PORTAL_ACCESS_HTML: &str = include_str!("../../assets/portal-access.html");
+const PORTAL_DOWNLOADS_HTML: &str = include_str!("../../assets/portal-downloads.html");
 const PORTAL_JOIN_HTML: &str = include_str!("../../assets/portal-join.html");
 const PORTAL_JOIN_SCRIPT: &str = include_str!("../../assets/portal-join.js");
 const PORTAL_CLIENT_SETUP_HTML: &str = include_str!("../../assets/portal-client-setup.html");
@@ -869,9 +871,7 @@ fn access_page_response(request: &RequestContext, invalid: bool, status: u16) ->
     } else {
         ""
     };
-    let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/assets/porta-mark.svg\" type=\"image/svg+xml\"><title>Get access · Porta</title><style>@font-face{{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\") format(\"woff2-variations\");font-weight:200 900;font-display:swap}}:root{{font-family:\"Mona Sans\",sans-serif;color:#171923;background:#f5f6fa}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}}.card{{width:min(430px,100%);padding:30px;border-radius:22px;background:#fff}}h1{{font-size:38px}}input,button{{width:100%;padding:13px;margin-top:12px}}.error{{color:#b44858}}@media(max-width:430px){{.card{{padding:23px}}}}</style></head><body><main class=\"card\"><a href=\"/\"><img src=\"/assets/porta-mark.svg\" alt=\"\" width=\"32\">Porta</a><h1>Get access.</h1><p>Enter the token provided for your account.</p><form method=\"post\" action=\"/access\"><label for=\"token\">Access token</label><input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"current-password\" autofocus required><button type=\"submit\">Continue</button></form>{message}<p>Credentials are exchanged for a secure, temporary browser session.</p></main></body></html>"
-    );
+    let body = render_asset_template(PORTAL_ACCESS_HTML, &[("%%PORTA_ACCESS_MESSAGE%%", message)]);
     let mut response = Response::html(status, body.into_bytes());
     response.set_header("Cache-Control", "no-store");
     set_portal_security_headers(&mut response);
@@ -992,15 +992,25 @@ fn downloads_page_html(
     release_tickets: &ReleaseDownloadTickets,
     profile: Option<&DownloadProfile>,
 ) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/assets/porta-mark.svg\" type=\"image/svg+xml\"><title>Porta downloads</title><style>@font-face{{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\")}}:root{{font-family:\"Mona Sans\",sans-serif;background:#f5f6fa}}.page{{width:min(900px,calc(100% - 28px));margin:auto}}.download-row{{display:grid;grid-template-columns:40px 1fr auto 118px;gap:13px;padding:13px;background:#fff;margin:8px;border-radius:13px}}@media(max-width:680px){{.download-row{{grid-template-columns:40px 1fr 104px}}}}@media(max-width:430px){{.download-row{{grid-template-columns:36px 1fr}}}}</style></head><body><main class=\"page\"><form method=\"post\" action=\"/portal/logout\"><button>Sign out</button></form><section><div>Client version <span>{}</span></div><h1>Downloads</h1><p>Welcome, {}. Choose the package for your device and use your existing Porta token to connect.</p><code>https://{}</code></section><section>{rows}{}</section><p><a href=\"/download/SHA256SUMS?ticket={}\" download>SHA256 checksums</a> · <a href=\"/download/SHA256SUMS.sig?ticket={}\" download>Manifest signature</a> · <a href=\"/download/release-signing-cert.der?ticket={}\" download>Signing certificate</a></p></main></body></html>",
-        html_escape(version),
-        html_escape(client_name),
-        html_escape(host),
-        client_setup_html(profile),
-        html_escape(&release_tickets.checksums),
-        html_escape(&release_tickets.signature),
-        html_escape(&release_tickets.certificate),
+    let version = html_escape(version);
+    let client_name = html_escape(client_name);
+    let host = html_escape(host);
+    let setup = client_setup_html(profile);
+    let checksums = html_escape(&release_tickets.checksums);
+    let signature = html_escape(&release_tickets.signature);
+    let certificate = html_escape(&release_tickets.certificate);
+    render_asset_template(
+        PORTAL_DOWNLOADS_HTML,
+        &[
+            ("%%PORTA_VERSION%%", &version),
+            ("%%PORTA_CLIENT_NAME%%", &client_name),
+            ("%%PORTA_HOST%%", &host),
+            ("%%PORTA_DOWNLOAD_ROWS%%", rows),
+            ("%%PORTA_CLIENT_SETUP%%", &setup),
+            ("%%PORTA_CHECKSUMS_TICKET%%", &checksums),
+            ("%%PORTA_SIGNATURE_TICKET%%", &signature),
+            ("%%PORTA_CERTIFICATE_TICKET%%", &certificate),
+        ],
     )
 }
 
@@ -1708,6 +1718,276 @@ mod tests {
         assert!(!setup.contains(&profile.notice));
         assert!(setup.contains("type=\"password\""));
         assert!(setup.contains("Copy setup"));
+    }
+
+    fn assert_private_portal_headers(response: &Response) {
+        assert_eq!(
+            response.header("Content-Type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(response.header("Cache-Control"), Some("no-store"));
+        assert_eq!(response.header("Referrer-Policy"), Some("no-referrer"));
+        assert_eq!(
+            response.header("Content-Security-Policy"),
+            Some("default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        );
+    }
+
+    #[test]
+    fn access_page_restores_go_layout_and_responsive_styles() {
+        for (method, invalid, status) in [("GET", false, 200), ("POST", true, 401)] {
+            let request = RequestContext::new(method, "/access");
+            let response = access_page_response(&request, invalid, status);
+            assert_eq!(response.status, status);
+            assert_private_portal_headers(&response);
+            let page = String::from_utf8(response.body).unwrap();
+            for fragment in [
+                "font-weight:200 900;font-display:swap",
+                "*{box-sizing:border-box}",
+                "body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(",
+                ".card{width:min(430px,100%);padding:30px;border:1px solid rgba(255,255,255,.9);border-radius:22px;background:rgba(255,255,255,.86);box-shadow:0 28px 80px rgba(35,40,68,.12)}",
+                ".brand{display:flex;align-items:center;gap:10px;",
+                "h1{margin:44px 0 10px;font-size:38px;letter-spacing:-.05em}",
+                ".field{display:grid;gap:7px;margin-top:24px}",
+                ".field input:focus{border-color:#8f86ef;box-shadow:0 0 0 3px rgba(102,92,246,.1)}",
+                "outline:none;font:inherit;font-size:14px",
+                "button{width:100%;margin-top:12px;border:0;border-radius:11px;background:#171923;color:white;",
+                "font:inherit;font-size:13px;font-weight:750",
+                ".note{margin:14px 0 0;font-size:11px}",
+                "@media(max-width:430px){body{place-items:start center;padding:14px}.card{margin-top:8vh;padding:23px;border-radius:18px}h1{margin-top:32px;font-size:34px}.field{margin-top:20px}}",
+                "<a class=\"brand\" href=\"/\">",
+                "<form method=\"post\" action=\"/access\">",
+                "<div class=\"field\">",
+                "<input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"current-password\" autofocus required>",
+                "<p class=\"note\">Credentials are exchanged for a secure, temporary browser session.</p>",
+            ] {
+                assert!(page.contains(fragment), "missing access design: {fragment}");
+            }
+            assert_eq!(
+                page.contains(
+                    "<p class=\"error\" role=\"alert\">Access could not be verified.</p>"
+                ),
+                invalid
+            );
+            assert!(!page.contains("%%PORTA_"));
+            assert!(!page.contains("<script"));
+        }
+        let head = access_page_response(&RequestContext::new("HEAD", "/access"), false, 200);
+        assert_eq!(head.status, 200);
+        assert_private_portal_headers(&head);
+        assert!(head.body.is_empty());
+    }
+
+    #[test]
+    fn downloads_page_restores_go_layout_and_responsive_styles() {
+        let tickets = ReleaseDownloadTickets {
+            checksums: "checksums-ticket".into(),
+            signature: "signature-ticket".into(),
+            certificate: "certificate-ticket".into(),
+        };
+        let page = downloads_page_html("Phone", "porta.test", "v1.2.3", "", &tickets, None);
+        for fragment in [
+            "@font-face{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\") format(\"woff2-variations\");font-weight:200 900;font-display:swap}",
+            ":root{font-family:\"Mona Sans\",sans-serif;color:#171923;background:#f5f6fa;--violet:#6558ed;--line:#e2e4ea}",
+            "*{box-sizing:border-box}",
+            "body{margin:0;min-height:100vh;background:radial-gradient(circle at 85% 0,rgba(115,217,208,.3),transparent 25rem),#f5f6fa}",
+            ".page{width:min(900px,calc(100% - 28px));margin:auto;padding:24px 0 44px}",
+            ".top{display:flex;justify-content:space-between;align-items:center}",
+            ".brand{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:800}",
+            ".logout{border:1px solid var(--line);border-radius:8px;",
+            "font-family:inherit;font-size:11px;cursor:pointer",
+            ".hero{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:end;margin:38px 0 22px}",
+            ".eyebrow{color:var(--violet);",
+            ".version{display:inline-flex;margin-left:7px;padding:3px 7px;border-radius:999px;background:#ece9ff;",
+            "h1{margin:8px 0 8px;font-size:clamp(36px,5vw,48px);line-height:1;letter-spacing:-.05em}",
+            ".lead{max-width:560px;margin:0;color:#747987;font-size:13px;line-height:1.6}",
+            ".endpoint{min-width:240px;padding:12px 14px;",
+            ".endpoint small{display:block;",
+            ".files{display:grid;gap:8px}",
+            ".download-row{display:grid;grid-template-columns:40px minmax(0,1fr) auto 118px;gap:13px;align-items:center;padding:13px 14px;",
+            ".platform-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:11px;background:linear-gradient(145deg,#ece9ff,#e5f8f5);",
+            ".platform-line{display:flex;align-items:center;gap:7px}",
+            ".platform-line h2{margin:0;font-size:15px;letter-spacing:-.02em}",
+            ".package p{margin:3px 0 0;color:#7d828f;font-size:11px;line-height:1.4}",
+            ".recommended{padding:3px 6px;border-radius:5px;background:#e6f7f2;color:#218568;",
+            ".meta{display:flex;gap:5px}",
+            ".meta span{padding:5px 7px;border-radius:6px;background:#f1f2f6;",
+            ".download-button{display:flex;align-items:center;justify-content:space-between;border-radius:8px;background:#171923;color:white;",
+            ".support{display:flex;justify-content:space-between;gap:18px;",
+            ".support a{color:#665cf6;text-decoration:none}",
+            ".release-links{display:flex;flex-wrap:wrap;gap:8px 12px}",
+            ".empty{padding:34px;border:1px dashed #ccd0da;border-radius:13px;text-align:center}",
+            "@media(max-width:680px){.hero{grid-template-columns:1fr;margin-top:32px}.endpoint{min-width:0}.download-row{grid-template-columns:40px minmax(0,1fr) 104px}.meta{display:none}}",
+            "@media(max-width:430px){.page{width:min(100% - 20px,900px)}.download-row{grid-template-columns:36px minmax(0,1fr)}.platform-icon{width:36px;height:36px}.download-button{grid-column:1/-1}.support{align-items:flex-start;flex-direction:column}}",
+            "<main class=\"page\">",
+            "<div class=\"top\">",
+            "<div class=\"brand\"><img src=\"/assets/porta-mark.svg\" alt=\"\">Porta</div>",
+            "<form method=\"post\" action=\"/portal/logout\"><button class=\"logout\">Sign out</button></form>",
+            "<section class=\"hero\">",
+            "<div class=\"eyebrow\">Client version <span class=\"version\">v1.2.3</span></div>",
+            "<p class=\"lead\">Welcome, Phone.",
+            "<div class=\"endpoint\"><small>Server address</small><code>https://porta.test</code></div>",
+            "<section class=\"files\">",
+            "<div class=\"support\">",
+            "<span>Verify package integrity before installation.</span>",
+            "<span class=\"release-links\">",
+        ] {
+            assert!(page.contains(fragment), "missing downloads design: {fragment}");
+        }
+        assert!(!page.contains("%%PORTA_"));
+    }
+
+    #[test]
+    fn downloads_page_escapes_values_without_replacing_injected_template_markers() {
+        let name = "<name> & \"' %%PORTA_DOWNLOAD_ROWS%%";
+        let host = "porta.test/\"<&' %%PORTA_CLIENT_SETUP%%";
+        let version = "<version> & \"' %%PORTA_CLIENT_NAME%%";
+        let tickets = ReleaseDownloadTickets {
+            checksums: "<checksums> & \"' %%PORTA_SIGNATURE_TICKET%%".into(),
+            signature: "<signature> & \"' %%PORTA_CERTIFICATE_TICKET%%".into(),
+            certificate: "<certificate> & \"' %%PORTA_VERSION%%".into(),
+        };
+        let profile = DownloadProfile {
+            server: "https://\"<&' %%PORTA_SETUP_TOKEN%% %%PORTA_DOWNLOAD_ROWS%%".into(),
+            token: "<private> & \"' %%PORTA_CLIENT_NAME%%".into(),
+            notice: "<notice> & \"' %%PORTA_SETUP_SERVER%%".into(),
+            setup_uri: "porta://profile?v=1&token=\"<&' %%PORTA_VERSION%%".into(),
+            qr_code: "javascript:alert(1)".into(),
+        };
+        let rows = "<article class=\"download-row\">trusted row</article>";
+        let page = downloads_page_html(name, host, version, rows, &tickets, Some(&profile));
+        for value in [
+            name,
+            host,
+            version,
+            &tickets.checksums,
+            &tickets.signature,
+            &tickets.certificate,
+            &profile.server,
+            &profile.token,
+            &profile.notice,
+            &profile.setup_uri,
+        ] {
+            assert!(!page.contains(value), "unescaped value: {value}");
+            assert!(
+                page.contains(&html_escape(value)),
+                "missing escaped value: {value}"
+            );
+        }
+        for (file, ticket) in [
+            ("SHA256SUMS", &tickets.checksums),
+            ("SHA256SUMS.sig", &tickets.signature),
+            ("release-signing-cert.der", &tickets.certificate),
+        ] {
+            assert!(page.contains(&format!(
+                "href=\"/download/{file}?ticket={}\" download",
+                html_escape(ticket)
+            )));
+        }
+        assert_eq!(page.matches(rows).count(), 1);
+        assert_eq!(page.matches("id=\"client-setup\"").count(), 1);
+        assert!(page.contains(&format!(
+            "id=\"setup-token\" type=\"password\" value=\"{}\"",
+            html_escape(&profile.token)
+        )));
+        assert!(!page.contains(&profile.qr_code));
+    }
+
+    #[test]
+    fn downloads_portal_keeps_all_packages_signed_links_and_client_only_setup() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        for (name, ..) in DOWNLOAD_CATALOG {
+            std::fs::write(directory.path().join(name), b"package").unwrap();
+        }
+        std::fs::write(directory.path().join("CLIENT_VERSION"), b"v1.2.3\n").unwrap();
+        let client_token = "client-token-0123456789";
+        let admin_token = "admin-token-0123456789";
+        let registry: Arc<dyn ClientRegistry> = Arc::new(Registry::new(client_token));
+        let portal = Portal::new(
+            registry,
+            admin_token,
+            directory.path().to_str().unwrap(),
+            false,
+        )
+        .unwrap();
+        let now = 1_000;
+        let request_for_token = |token: &str| {
+            let sign_in = portal.sign_in(
+                &RequestContext::new("POST", "/access")
+                    .with_body(format!("token={}", form_urlencode(token)).into_bytes()),
+                now,
+            );
+            assert_eq!(sign_in.status, 303);
+            RequestContext::new("GET", "/portal/downloads")
+                .with_host("porta.test")
+                .with_header(
+                    "Cookie",
+                    sign_in
+                        .header("Set-Cookie")
+                        .unwrap()
+                        .split(';')
+                        .next()
+                        .unwrap(),
+                )
+        };
+        let client_request = request_for_token(client_token);
+        let admin_request = request_for_token(admin_token);
+        for (request, is_client) in [(&client_request, true), (&admin_request, false)] {
+            let response = portal.serve_downloads_page(request, now);
+            assert_eq!(response.status, 200);
+            assert_private_portal_headers(&response);
+            let page = String::from_utf8(response.body).unwrap();
+            assert_eq!(page.matches("<article class=\"download-row\">").count(), 6);
+            assert_eq!(page.matches("<span class=\"recommended\">").count(), 1);
+            assert_eq!(page.matches("<div class=\"meta\">").count(), 6);
+            assert!(page.contains("<span class=\"version\">v1.2.3</span>"));
+            for name in DOWNLOAD_CATALOG.iter().map(|artifact| artifact.0).chain([
+                "SHA256SUMS",
+                "SHA256SUMS.sig",
+                "release-signing-cert.der",
+            ]) {
+                let prefix = format!("href=\"/download/{name}?ticket=");
+                let ticket = page
+                    .split_once(&prefix)
+                    .unwrap()
+                    .1
+                    .split('"')
+                    .next()
+                    .unwrap();
+                assert!(portal.valid_download_ticket(name, ticket, now), "{name}");
+            }
+            for fragment in [
+                "id=\"client-setup\"",
+                "id=\"setup-qr\" class=\"setup-qr\" src=\"data:image/png;base64,",
+                "id=\"setup-server\" value=\"https://porta.test\"",
+                "id=\"setup-token\" type=\"password\"",
+                "id=\"setup-copy-server\"",
+                "id=\"setup-copy-token\"",
+                "id=\"setup-reveal-token\"",
+                "id=\"setup-copy-uri\"",
+                "id=\"setup-uri\" type=\"hidden\" value=\"porta://profile?",
+                "<script defer src=\"/assets/portal-client.js\"></script>",
+                client_token,
+            ] {
+                assert_eq!(page.contains(fragment), is_client, "{fragment}");
+            }
+            assert!(!page.contains(admin_token));
+            assert!(!page.contains("%%PORTA_"));
+            assert_eq!(page.matches("<script").count(), usize::from(is_client));
+            let mut head_request = (*request).clone();
+            head_request.method = "HEAD".into();
+            let head = portal.serve_downloads_page(&head_request, now);
+            assert_eq!(head.status, 200);
+            assert_private_portal_headers(&head);
+            assert!(head.body.is_empty());
+        }
+        for (name, ..) in DOWNLOAD_CATALOG {
+            std::fs::remove_file(directory.path().join(name)).unwrap();
+        }
+        let empty = portal.serve_downloads_page(&admin_request, now);
+        let page = String::from_utf8(empty.body).unwrap();
+        assert!(page.contains("<div class=\"empty\"><strong>Downloads are being prepared.</strong><span>Check back shortly.</span></div>"));
+        assert!(!page.contains("<article class=\"download-row\">"));
     }
 
     #[tokio::test]
