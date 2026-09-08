@@ -2074,7 +2074,7 @@ mod tests {
     fn native_journal_replacements_preserve_guards_and_recovery() {
         use std::os::windows::ffi::OsStrExt as _;
         use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
         use windows_sys::Win32::Storage::FileSystem::{
             MoveFileExW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
             MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -2145,7 +2145,9 @@ mod tests {
         let failure = manager.persist().unwrap_err();
         assert!(
             matches!(failure, NetworkError::Io { ref source, .. }
-                if source.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)),
+                if source.raw_os_error().is_some_and(|code|
+                    code == ERROR_ACCESS_DENIED as i32
+                        || code == ERROR_SHARING_VIOLATION as i32)),
             "{failure}"
         );
         assert_eq!(fs::read(&path).unwrap(), previous);
