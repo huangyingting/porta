@@ -1070,6 +1070,9 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443", live)
         self.assertIn("--test platform_tls", live)
         self.assertIn("connectedDebugAndroidTest", live)
+        self.assertIn("disk-size: 2048M", live)
+        self.assertIn("/usr/share/dotnet", live)
+        self.assertIn("/usr/local/share/boost", live)
         self.assertIn(
             "android.testInstrumentationRunnerArguments.portaTlsOrigin="
             "https://porta-dev.i-csu.org:8443",
