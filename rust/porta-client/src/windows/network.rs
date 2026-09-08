@@ -1331,7 +1331,21 @@ fn unlock_file(_file: &File) -> Result<(), NetworkError> {
 fn replace_journal(source: &Path, destination: &Path) -> Result<(), NetworkError> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let replace_existing = match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            secure_existing_file(destination, "validate network state before replacement")?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(NetworkError::Io {
+                action: "inspect network state before replacement",
+                source,
+            });
+        }
     };
 
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -1341,11 +1355,22 @@ fn replace_journal(source: &Path, destination: &Path) -> Result<(), NetworkError
         .chain(Some(0))
         .collect();
     let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
+        if replace_existing {
+            ReplaceFileW(
+                destination.as_ptr(),
+                source.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } else {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
     };
     if result == 0 {
         return Err(NetworkError::Io {
@@ -2068,6 +2093,91 @@ mod tests {
                 pending: 0,
             }),
         }
+    }
+
+    #[cfg(windows)]
+    fn native_journal_replacements_preserve_guards_and_recovery() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = temporary.path().join("guarded").join("network-state.json");
+        let mut manager = NetworkManager::open(path.clone()).unwrap();
+        let directory_guard = paths::prepare_admin_directory(path.parent().unwrap()).unwrap();
+        manager.acquire().unwrap();
+        manager.state = test_state();
+        manager.persist().expect("create guarded recovery journal");
+        assert_eq!(read_state(&path).unwrap().unwrap(), manager.state);
+
+        let previous = fs::read(&path).unwrap();
+        let pending = pending_path(&path);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .unwrap();
+        secure_new_file(&pending, &file, "secure regression journal").unwrap();
+        file.write_all(&previous).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let source: Vec<u16> = pending.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let legacy = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        assert_eq!(
+            legacy, 0,
+            "legacy rename must reproduce the guarded-directory conflict"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        fs::remove_file(&pending).unwrap();
+
+        for mtu in [1360, 1400, 1280] {
+            manager.state.mtu.as_mut().unwrap().pending = mtu;
+            manager.persist().expect("replace guarded recovery journal");
+            assert_eq!(read_state(&path).unwrap().unwrap(), manager.state);
+            assert!(!pending_path(&path).exists());
+        }
+
+        let previous = fs::read(&path).unwrap();
+        let reader = open_state_file(&path).unwrap();
+        manager.state.mtu.as_mut().unwrap().pending = 1300;
+        let failure = manager.persist().unwrap_err();
+        assert!(
+            matches!(failure, NetworkError::Io { ref source, .. }
+                if source.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)),
+            "{failure}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert!(!pending_path(&path).exists());
+        drop(reader);
+        manager
+            .persist()
+            .expect("retry after an external reader closes");
+        assert_eq!(read_state(&path).unwrap().unwrap(), manager.state);
+
+        let rename = fs::rename(path.parent().unwrap(), temporary.path().join("renamed"));
+        assert_eq!(
+            rename.unwrap_err().raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+        paths::validate_admin_directory(&directory_guard).unwrap();
+        let expected = manager.state.clone();
+        drop(manager);
+        drop(directory_guard);
+        let reopened = NetworkManager::open(path).unwrap();
+        assert_eq!(reopened.state, expected);
     }
 
     fn test_spec(ip: &str) -> GuardSpec {
@@ -2803,6 +2913,7 @@ mod tests {
             native_process_is_elevated().unwrap(),
             "native WFP acceptance requires an elevated administrator token"
         );
+        native_journal_replacements_preserve_guards_and_recovery();
         let application = std::env::current_exe()
             .expect("resolve native WFP test executable")
             .to_string_lossy()

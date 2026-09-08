@@ -240,7 +240,9 @@ calls and retries after an earlier close future was cancelled.
   explicitly sets the Windows IP-interface MTU: Wintun's buffer MTU does not
   configure the OS network stack. MTU/DNS/routes are journaled for retryable
   recovery under administrator-only, high-integrity ProgramData storage that
-  rejects reparse points and hard links. Guarded reconnects revalidate the
+  rejects reparse points and hard links. Existing journals use Windows atomic
+  file replacement while directory guards remain held; an unsuccessful update
+  leaves the prior recovery journal intact. Guarded reconnects revalidate the
   adapter before restoring its exemption.
 - Android uses `VpnService` with the shared native Rust transport. The UDP
   socket is protected from the VPN routing loop and bound to Android's selected
