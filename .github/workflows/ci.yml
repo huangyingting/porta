@@ -208,7 +208,6 @@ jobs:
       PORTA_E2E_SERVER: https://porta-dev.i-csu.org:8443
       PORTA_E2E_GATEWAY: 10.66.0.1
       PORTA_E2E_TRANSPORTS: h3 h2
-      PORTA_E2E_ARTIFACT_DIR: ${{ runner.temp }}/porta-vpn-e2e
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
@@ -234,6 +233,7 @@ jobs:
         env:
           PORTA_E2E_TOKEN: ${{ secrets.PORTA_E2E_TOKEN }}
           PORTA_E2E_LINUX_IDENTITY_BASE64: ${{ secrets.PORTA_E2E_LINUX_IDENTITY_BASE64 }}
+          PORTA_E2E_ARTIFACT_DIR: ${{ runner.temp }}/porta-vpn-e2e
         run: ./scripts/test-live-vpn.sh
       - name: Upload VPN diagnostics
         if: ${{ always() }}

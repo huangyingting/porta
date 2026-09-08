@@ -1101,6 +1101,10 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("secrets.PORTA_E2E_TOKEN", vpn)
         self.assertIn("secrets.PORTA_E2E_LINUX_IDENTITY_BASE64", vpn)
         self.assertIn("./scripts/test-live-vpn.sh", vpn)
+        self.assertIn(
+            "PORTA_E2E_ARTIFACT_DIR: ${{ runner.temp }}/porta-vpn-e2e",
+            vpn[vpn.index("- name: Exercise the real VPN data path"):],
+        )
         self.assertNotIn("pull_request", vpn)
         before_exercise = vpn[:vpn.index("- name: Exercise the real VPN data path")]
         self.assertNotIn("secrets.PORTA_E2E_", before_exercise)
