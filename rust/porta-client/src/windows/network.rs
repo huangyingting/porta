@@ -1331,21 +1331,7 @@ fn unlock_file(_file: &File) -> Result<(), NetworkError> {
 fn replace_journal(source: &Path, destination: &Path) -> Result<(), NetworkError> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let replace_existing = match fs::symlink_metadata(destination) {
-        Ok(_) => {
-            secure_existing_file(destination, "validate network state before replacement")?;
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(source) => {
-            return Err(NetworkError::Io {
-                action: "inspect network state before replacement",
-                source,
-            });
-        }
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -1355,22 +1341,11 @@ fn replace_journal(source: &Path, destination: &Path) -> Result<(), NetworkError
         .chain(Some(0))
         .collect();
     let result = unsafe {
-        if replace_existing {
-            ReplaceFileW(
-                destination.as_ptr(),
-                source.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        } else {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
-        }
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     };
     if result == 0 {
         return Err(NetworkError::Io {
@@ -2098,9 +2073,11 @@ mod tests {
     #[cfg(windows)]
     fn native_journal_replacements_preserve_guards_and_recovery() {
         use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
         use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            MoveFileExW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         };
 
         let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
@@ -2125,6 +2102,12 @@ mod tests {
         drop(file);
         let source: Vec<u16> = pending.as_os_str().encode_wide().chain(Some(0)).collect();
         let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let legacy_directory_guard = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path.parent().unwrap())
+            .unwrap();
         let legacy = unsafe {
             MoveFileExW(
                 source.as_ptr(),
@@ -2142,6 +2125,7 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), previous);
         fs::remove_file(&pending).unwrap();
+        drop(legacy_directory_guard);
 
         for mtu in [1360, 1400, 1280] {
             manager.state.mtu.as_mut().unwrap().pending = mtu;
@@ -2152,6 +2136,11 @@ mod tests {
 
         let previous = fs::read(&path).unwrap();
         let reader = open_state_file(&path).unwrap();
+        let overwrite = OpenOptions::new().write(true).open(&path).unwrap_err();
+        assert_eq!(
+            overwrite.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
         manager.state.mtu.as_mut().unwrap().pending = 1300;
         let failure = manager.persist().unwrap_err();
         assert!(
@@ -2167,14 +2156,14 @@ mod tests {
             .expect("retry after an external reader closes");
         assert_eq!(read_state(&path).unwrap().unwrap(), manager.state);
 
+        let expected = manager.state.clone();
+        drop(manager);
         let rename = fs::rename(path.parent().unwrap(), temporary.path().join("renamed"));
         assert_eq!(
             rename.unwrap_err().raw_os_error(),
             Some(ERROR_SHARING_VIOLATION as i32)
         );
         paths::validate_admin_directory(&directory_guard).unwrap();
-        let expected = manager.state.clone();
-        drop(manager);
         drop(directory_guard);
         let reopened = NetworkManager::open(path).unwrap();
         assert_eq!(reopened.state, expected);

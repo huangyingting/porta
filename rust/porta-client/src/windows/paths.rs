@@ -90,6 +90,7 @@ pub fn prepare_admin_directory(path: &Path) -> std::io::Result<File> {
     if !created {
         validate_adoptable_owner(&probe)?;
     }
+    // Keep the strict probe until the compatible lifetime guard is secured.
     let directory = open_admin_path(path, true)?;
     validate_same_file(&probe, &directory)?;
     validate_directory_type(&directory)?;
@@ -206,11 +207,9 @@ fn open_admin_path(path: &Path, directory: bool) -> std::io::Result<File> {
         | WRITE_OWNER
         | FILE_READ_ATTRIBUTES
         | if directory { FILE_LIST_DIRECTORY } else { 0 };
-    let share = if directory {
-        FILE_SHARE_READ
-    } else {
-        FILE_SHARE_READ | FILE_SHARE_WRITE
-    };
+    // Child-file renames need write sharing; omitting delete sharing still pins
+    // the directory itself. The preparation probe excludes preexisting writers.
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),

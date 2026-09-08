@@ -240,8 +240,10 @@ calls and retries after an earlier close future was cancelled.
   explicitly sets the Windows IP-interface MTU: Wintun's buffer MTU does not
   configure the OS network stack. MTU/DNS/routes are journaled for retryable
   recovery under administrator-only, high-integrity ProgramData storage that
-  rejects reparse points and hard links. Existing journals use Windows atomic
-  file replacement while directory guards remain held; an unsuccessful update
+  rejects reparse points and hard links. A strict directory probe excludes
+  preexisting writers until ownership, ACLs and integrity are secured. Lifetime
+  guards permit child-file updates but deny renaming the protected directories.
+  Rust journal updates use same-directory atomic renames; a failed rename
   leaves the prior recovery journal intact. Guarded reconnects revalidate the
   adapter before restoring its exemption.
 - Android uses `VpnService` with the shared native Rust transport. The UDP
