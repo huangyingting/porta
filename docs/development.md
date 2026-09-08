@@ -112,12 +112,13 @@ device slots. The test starts the production Linux client with both HTTP/3 and
 HTTP/2 inside a disposable network namespace. It applies real TUN routes and
 nftables leak protection, adds temporary forwarding accepts scoped to the test
 veth, confirms that `10.66.0.1` is unreachable before connection, verifies the
-route uses the Porta TUN, exchanges normal and 1,200-byte don't-fragment ICMP
-packets with the server TUN gateway, then stops the client and requires the TUN,
-recovery journal, routes, leak-protection table, and gateway reachability to
-disappear. The forwarding rules are removed with the namespace. Only
-`resolvectl` is replaced by a namespace-local adapter because the host's
-systemd-resolved instance cannot see interfaces inside the disposable namespace.
+route uses the Porta TUN, exchanges normal ICMP and a don't-fragment payload
+sized to the negotiated TUN MTU and capped at 1,200 bytes, then stops the client
+and requires the TUN, recovery journal, routes, leak-protection table, and
+gateway reachability to disappear. The forwarding rules are removed with the
+namespace. Only `resolvectl` is replaced by a namespace-local adapter because
+the host's systemd-resolved instance cannot see interfaces inside the disposable
+namespace.
 
 Run the same test locally after supplying the two protected values:
 

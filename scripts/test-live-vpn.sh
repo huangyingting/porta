@@ -14,6 +14,8 @@ if [[ ${1:-} == --namespace ]]; then
   token_file=$work/client-token
   fake_bin=$work/bin
   client_pid=
+  interface_mtu=
+  df_payload=
 
   stop_client() {
     if [[ -z $client_pid ]]; then
@@ -133,7 +135,16 @@ EOF
     done
     nft list tables | grep -q '^table inet porta_'
     ping -n -c 3 -W 5 "$gateway" >/dev/null
-    ping -n -c 1 -W 5 -M do -s 1200 "$gateway" >/dev/null
+    interface_mtu=$(<"/sys/class/net/$interface/mtu")
+    if [[ ! $interface_mtu =~ ^[0-9]+$ ]] || ((interface_mtu < 576)); then
+      echo "invalid MTU $interface_mtu on $interface for $transport" >&2
+      exit 1
+    fi
+    df_payload=$((interface_mtu - 28))
+    if ((df_payload > 1200)); then
+      df_payload=1200
+    fi
+    ping -n -c 1 -W 5 -M do -s "$df_payload" "$gateway" >/dev/null
 
     stop_client
     if ip link show dev "$interface" >/dev/null 2>&1; then
