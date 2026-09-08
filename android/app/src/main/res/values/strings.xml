@@ -58,6 +58,8 @@
     <string name="disconnected">Disconnected</string>
     <string name="connecting">Connecting</string>
     <string name="waiting_for_network">Waiting for network</string>
+    <string name="reconnecting">Reconnecting in %1$d s</string>
+    <string name="reconnecting_secure_tunnel">Restoring the secure tunnel…</string>
     <string name="transport_http3">HTTP/3 MASQUE • Fast and resilient</string>
     <string name="transport_http2">4-lane HTTP/2 fallback • Encrypted</string>
     <string name="connection_auto_mtu">Auto MTU: %1$d bytes</string>
@@ -84,4 +86,9 @@
     <string name="unknown_state">Unknown state</string>
     <string name="https_required">Gateway must begin with https://</string>
     <string name="credentials_required">Enter a valid access token.</string>
+    <string name="notification_channel">VPN connection</string>
+    <string name="notification_disconnect">Disconnect</string>
+    <string name="notification_connected">Secure tunnel connected</string>
+    <string name="notification_connected_transport">Connected over %1$s</string>
+    <string name="notification_permission_revoked">VPN permission revoked</string>
 </resources>

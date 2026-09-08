@@ -3,136 +3,177 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>Porta</title>
   <link rel="stylesheet" href="/app.css">
-  <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <main class="shell">
-    <header class="app-header">
+  <div class="shell">
+    <header class="topbar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 48 48"><path d="M24 4 40 10v12c0 10.4-6.5 18.3-16 22C14.5 40.3 8 32.4 8 22V10l16-6Z"/><path d="M18 24.5 22 28l8-9"/></svg>
+          <svg viewBox="0 0 24 24">
+            <path d="M12 2.7 4.4 6.1v5.4c0 4.8 3.2 8.9 7.6 10.1 4.4-1.2 7.6-5.3 7.6-10.1V6.1L12 2.7Zm0 3 4.7 2.1v3.7c0 3.2-1.9 6-4.7 7.1-2.8-1.1-4.7-3.9-4.7-7.1V7.8L12 5.7Z"/>
+          </svg>
         </div>
         <div>
-          <div class="brand-row"><h1>Porta</h1><span id="version" class="version"></span></div>
-          <p>Private network access</p>
+          <p class="brand-name">Porta</p>
+          <p class="brand-subtitle" data-i18n="tagline">Private access, simply.</p>
         </div>
       </div>
-      <nav class="header-actions" aria-label="Primary">
-        <button id="home-action" class="text-action hidden" type="button">Home</button>
-        <button id="activity-action" class="text-action" type="button">Activity</button>
-        <button id="add-action" class="icon-action" type="button" aria-label="Add profile">+</button>
-      </nav>
+      <div class="header-actions">
+        <button id="home-action" class="icon-button hidden" type="button" data-i18n-aria-label="back" data-i18n-title="back">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m14.7 5.3-1.4-1.4L5.2 12l8.1 8.1 1.4-1.4L9 13h10v-2H9l5.7-5.7Z"/>
+          </svg>
+        </button>
+        <button id="language-action" class="language-button" type="button">中</button>
+        <button id="activity-action" class="icon-button" type="button" data-i18n-aria-label="openLog" data-i18n-title="openLog">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm2 4v2h10V7H7Zm0 4v2h10v-2H7Zm0 4v2h7v-2H7Z"/>
+          </svg>
+        </button>
+        <button id="add-action" class="icon-button accent" type="button" data-i18n-aria-label="addProfile" data-i18n-title="addProfile">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"/>
+          </svg>
+        </button>
+      </div>
     </header>
 
-    <section id="error-banner" class="error-banner hidden" role="alert">
-      <span id="error-message"></span>
-      <button id="dismiss-error" type="button" aria-label="Dismiss error">×</button>
-    </section>
-
-    <section id="home-view">
-      <section id="status-card" class="status-card card" aria-live="polite">
-        <span id="status-dot" class="status-dot offline"></span>
-        <div class="status-copy">
-          <h2 id="status-title">Disconnected</h2>
-          <p id="status-detail">Choose a profile to connect securely.</p>
-        </div>
-        <button id="primary-connect" class="primary compact" type="button" disabled>Connect</button>
-      </section>
-
-      <section id="traffic-card" class="traffic-card card">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">TRAFFIC</p>
-            <h2>Private tunnel</h2>
+    <main>
+      <section id="home-view" class="view">
+        <section class="status-card" aria-live="polite">
+          <div id="status-icon" class="status-icon">
+            <span class="status-ring"></span>
+            <span class="status-dot"></span>
           </div>
-          <span id="traffic-state" class="live-label">IDLE</span>
-        </div>
-        <canvas id="traffic-chart" height="84" aria-label="Recent upload and download rates"></canvas>
-        <div class="traffic-values">
-          <div><span class="traffic-swatch download"></span><span>Download</span><strong id="download-rate">0 B/s</strong></div>
-          <div><span class="traffic-swatch upload"></span><span>Upload</span><strong id="upload-rate">0 B/s</strong></div>
-        </div>
-        <div class="connection-meta">
-          <span id="connection-address">No address</span>
-          <span id="connection-duration">00:00:00</span>
-          <span id="connection-total">0 B received · 0 B sent</span>
-        </div>
-      </section>
-
-      <section id="profiles-section" class="profiles-section">
-        <div class="section-heading profiles-heading">
-          <div>
-            <p class="eyebrow">VPN PROFILES</p>
-            <h2>Your gateways</h2>
+          <div class="status-copy">
+            <p class="eyebrow" data-i18n="connection">Connection</p>
+            <h1 id="status-text">Disconnected</h1>
+            <p id="status-detail" class="muted">Choose a profile to connect.</p>
           </div>
-          <p>Choose a card, then connect.</p>
-        </div>
-        <div id="profiles" class="profile-list"></div>
-        <section id="empty-state" class="empty-state card hidden">
-          <div class="empty-icon" aria-hidden="true">+</div>
-          <h2>Add your first profile</h2>
-          <p>Use the gateway URL and client token from your Porta access page.</p>
-          <button id="empty-add" class="primary" type="button">Add profile</button>
+        </section>
+
+        <section id="traffic-card" class="card traffic-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow" data-i18n="traffic">Real-time traffic</p>
+              <h2 id="traffic-state">Idle</h2>
+            </div>
+            <span id="transport-badge" class="transport-badge hidden"></span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="traffic-chart" aria-hidden="true"></canvas>
+          </div>
+          <div class="rate-grid">
+            <div class="rate-cell">
+              <span class="rate-direction download" aria-hidden="true">↓</span>
+              <div>
+                <p data-i18n="download">Download</p>
+                <strong id="download-rate">0 B/s</strong>
+              </div>
+            </div>
+            <div class="rate-cell">
+              <span class="rate-direction upload" aria-hidden="true">↑</span>
+              <div>
+                <p data-i18n="upload">Upload</p>
+                <strong id="upload-rate">0 B/s</strong>
+              </div>
+            </div>
+          </div>
+          <div class="session-grid">
+            <div>
+              <span data-i18n="address">Address</span>
+              <strong id="session-address">—</strong>
+            </div>
+            <div>
+              <span data-i18n="duration">Duration</span>
+              <strong id="session-duration">00:00</strong>
+            </div>
+            <div>
+              <span data-i18n="total">Total</span>
+              <strong id="session-total">0 B ↓ · 0 B ↑</strong>
+            </div>
+          </div>
+        </section>
+
+        <section id="profiles-section" class="profiles-section">
+          <div class="section-heading profiles-heading">
+            <div>
+              <p class="eyebrow" data-i18n="profiles">VPN profiles</p>
+              <h2 data-i18n="chooseConnection">Choose a connection</h2>
+            </div>
+          </div>
+          <div id="profiles" class="profiles"></div>
+          <div id="empty-state" class="empty-state hidden">
+            <div class="empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12 2.7 4.4 6.1v5.4c0 4.8 3.2 8.9 7.6 10.1 4.4-1.2 7.6-5.3 7.6-10.1V6.1L12 2.7Zm0 3 4.7 2.1v3.7c0 3.2-1.9 6-4.7 7.1-2.8-1.1-4.7-3.9-4.7-7.1V7.8L12 5.7Z"/>
+              </svg>
+            </div>
+            <h2 data-i18n="emptyTitle">Add your first profile</h2>
+            <p data-i18n="emptyDetail">Enter the gateway and access token from your administrator.</p>
+            <button id="empty-add" class="primary-button compact" type="button" data-i18n="addProfile">Add profile</button>
+          </div>
         </section>
       </section>
 
-      <footer id="home-footer">
-        Tokens stay protected by Windows DPAPI. Closing or minimizing keeps Porta available in the notification area.
-      </footer>
-    </section>
-
-    <section id="activity-view" class="hidden">
-      <section class="activity-card card">
-        <div class="section-heading activity-heading">
-          <div>
-            <p class="eyebrow">ACTIVITY</p>
-            <h2>Connection timeline</h2>
-          </div>
-          <div class="activity-actions">
-            <button id="open-log-action" class="secondary" type="button">Open folder</button>
-            <button id="save-log-action" class="secondary" type="button">Export log</button>
-            <button id="clear-log-action" class="quiet-danger" type="button">Clear</button>
-            <button id="restore-action" class="secondary" type="button" disabled>Restore network</button>
-          </div>
+      <section id="activity-view" class="view hidden">
+        <section class="page-heading">
+          <p class="eyebrow" data-i18n="log">Log</p>
+          <h1 data-i18n="connectionLog">Connection log</h1>
+          <p class="muted" data-i18n="logDetail">Recent activity stays on this device.</p>
+        </section>
+        <div id="activity-actions" class="activity-actions">
+          <button id="restore-action" class="secondary-button hidden" type="button" data-i18n="restoreNetwork">Restore network</button>
+          <button id="export-action" class="secondary-button" type="button" data-i18n="export">Export</button>
+          <button id="clear-action" class="secondary-button danger-text" type="button" data-i18n="clear">Clear</button>
         </div>
-        <p id="activity-message" class="activity-message hidden" role="status"></p>
-        <pre id="activity-log" tabindex="0" aria-label="Porta connection activity"></pre>
+        <p id="activity-message" class="activity-message hidden" aria-live="polite"></p>
+        <section class="card activity-card">
+          <pre id="activity-log" tabindex="0" data-i18n-aria-label="connectionLog"></pre>
+          <div id="activity-empty" class="activity-empty hidden" data-i18n="logEmpty">No activity yet.</div>
+        </section>
       </section>
-    </section>
 
-    <section id="editor" class="editor-panel hidden" aria-labelledby="editor-title">
-      <form id="profile-form" class="editor-card card" autocomplete="off">
-        <div class="editor-header">
-          <div>
-            <p class="eyebrow">PROFILE</p>
-            <h2 id="editor-title">Add profile</h2>
+      <section id="editor-view" class="view hidden">
+        <section class="page-heading">
+          <p class="eyebrow" data-i18n="profile">Profile</p>
+          <h1 id="editor-title">Add profile</h1>
+          <p class="muted" data-i18n="editorDetail">Porta automatically chooses the fastest secure transport.</p>
+        </section>
+        <form id="profile-form" class="card editor-card" novalidate>
+          <label>
+            <span data-i18n="profileName">Profile name</span>
+            <input id="profile-name" maxlength="80" autocomplete="off" data-i18n-placeholder="profileNamePlaceholder" placeholder="Home, work, travel…">
+          </label>
+          <label>
+            <span data-i18n="gateway">Gateway URL</span>
+            <input id="profile-server" type="url" inputmode="url" spellcheck="false" autocapitalize="off" autocomplete="url" placeholder="https://vpn.example.com:8443">
+          </label>
+          <label>
+            <span data-i18n="accessToken">Access token</span>
+            <input id="profile-token" type="password" spellcheck="false" autocapitalize="off" autocomplete="off" data-i18n-placeholder="accessTokenPlaceholder" placeholder="Paste the token from your administrator">
+          </label>
+          <p id="token-help" class="field-help" data-i18n="tokenHelpNew">Stored securely for this Windows account.</p>
+          <div id="editor-error" class="inline-error hidden" role="alert"></div>
+          <div class="form-actions">
+            <button id="delete-profile" class="secondary-button danger-text hidden" type="button" data-i18n="delete">Delete</button>
+            <span class="form-spacer"></span>
+            <button id="editor-cancel" class="secondary-button" type="button" data-i18n="cancel">Cancel</button>
+            <button id="save-profile" class="primary-button" type="submit" data-i18n="save">Save</button>
           </div>
-          <button id="editor-close" class="text-action" type="button">Cancel</button>
-        </div>
-        <input id="profile-id" type="hidden">
-        <label>Profile name<input id="profile-name" maxlength="80" required placeholder="Home"></label>
-        <label>Gateway URL<input id="profile-server" type="url" required value="https://" spellcheck="false"></label>
-        <label>Transport
-          <select id="profile-transport">
-            <option value="auto">Automatic (recommended)</option>
-            <option value="h3">HTTP/3 only</option>
-            <option value="h2">HTTP/2 only</option>
-          </select>
-        </label>
-        <label>Client token <span id="token-hint">Required for a new profile</span>
-          <input id="profile-token" type="password" autocomplete="new-password" spellcheck="false">
-        </label>
-        <div class="editor-actions">
-          <button id="delete-profile" class="danger-action hidden" type="button">Delete</button>
-          <span class="action-spacer"></span>
-          <button id="cancel-edit" class="secondary" type="button">Cancel</button>
-          <button class="primary" type="submit">Save profile</button>
-        </div>
-      </form>
-    </section>
-  </main>
+        </form>
+      </section>
+    </main>
+
+    <div id="error-banner" class="error-banner hidden" role="alert">
+      <span id="error-text"></span>
+      <button id="error-dismiss" type="button" data-i18n-aria-label="dismiss" aria-label="Dismiss">×</button>
+    </div>
+  </div>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

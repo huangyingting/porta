@@ -3396,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "porta-android"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "base64 0.22.1",
  "jni 0.22.4",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "porta-client-rust"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3456,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "porta-keygen"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "clap",
  "humantime",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "porta-loadgen"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "anyhow",
  "humantime",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "porta-server-rust"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "porta-windows"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "chrono",
  "humantime",
@@ -3555,7 +3555,7 @@ dependencies = [
 
 [[package]]
 name = "porta-windows-package"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "tempfile",
  "zip",
@@ -3563,7 +3563,7 @@ dependencies = [
 
 [[package]]
 name = "porta-wire"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "base64 0.22.1",
  "hex",

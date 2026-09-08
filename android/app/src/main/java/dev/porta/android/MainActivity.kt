@@ -399,7 +399,9 @@ class MainActivity : Activity() {
             value.contains("HTTP/3") -> getString(R.string.transport_http3)
             value.contains("HTTP/2") -> getString(R.string.transport_http2)
             blocked -> value.substringAfter(": ", getString(R.string.connection_blocked))
-            value.startsWith("Reconnecting") || value.startsWith("Connection lost") || waiting -> value
+            value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
+                getString(R.string.reconnecting_secure_tunnel)
+            waiting -> getString(R.string.waiting_for_network)
             active -> getString(R.string.establishing_secure_tunnel)
             else -> getString(R.string.choose_profile)
         }

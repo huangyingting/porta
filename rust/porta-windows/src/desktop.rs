@@ -1,6 +1,5 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
-use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,11 +18,10 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter as _, Manager as _, State, WindowEvent};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const MAX_ACTIVITY_LINES: usize = 200;
 const NETWORK_ACTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -75,6 +73,15 @@ struct DesktopSnapshot {
     upload_rate: u64,
     download_rate: u64,
     activity: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTraffic {
+    bytes_uploaded: u64,
+    bytes_downloaded: u64,
+    upload_rate: u64,
+    download_rate: u64,
 }
 
 struct DesktopState {
@@ -226,7 +233,7 @@ impl Controller {
         };
         let _ = app.emit("porta:snapshot", snapshot.clone());
         if let Some(tray) = app.tray_by_id("porta") {
-            let _ = tray.set_tooltip(Some(format!("Porta - {}", snapshot.status)));
+            let _ = tray.set_tooltip(Some(format!("Porta - {}", tray_status(&snapshot.status))));
         }
     }
 
@@ -490,6 +497,7 @@ impl Controller {
 
     fn handle_connection_event(&self, app: &AppHandle, event: Event) {
         let activity;
+        let mut traffic = None;
         {
             let mut state = match self.lock_state() {
                 Ok(state) => state,
@@ -552,6 +560,7 @@ impl Controller {
                     downloaded_bytes,
                 } => {
                     update_rates(&mut state, uploaded_bytes, downloaded_bytes);
+                    traffic = Some(traffic_from(&state));
                     None
                 }
                 Event::Reconnecting { reason, delay } => {
@@ -574,6 +583,10 @@ impl Controller {
                     add_activity(&mut state, "Stopping tunnel")
                 }
             };
+        }
+        if let Some(traffic) = traffic {
+            let _ = app.emit("porta:traffic", traffic);
+            return;
         }
         if let Some(line) = activity {
             self.write_activity(Some(line));
@@ -734,13 +747,6 @@ impl Controller {
         }
         file.sync_all().map_err(|error| error.to_string())?;
         Ok(path.display().to_string())
-    }
-
-    fn open_log_folder(&self) -> Result<String, String> {
-        self.log.validate().map_err(|error| error.to_string())?;
-        let directory = self.log.directory_path();
-        open_folder(directory)?;
-        Ok(directory.display().to_string())
     }
 
     fn profile(&self, id: &str) -> Result<Profile, String> {
@@ -936,11 +942,6 @@ fn save_activity_log(controller: State<'_, Arc<Controller>>) -> Result<String, S
     controller.save_activity_log()
 }
 
-#[tauri::command]
-fn open_log_folder(controller: State<'_, Arc<Controller>>) -> Result<String, String> {
-    controller.open_log_folder()
-}
-
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.len() == 1 && matches!(arguments[0].as_str(), "--version" | "-version") {
@@ -991,20 +992,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             disconnect,
             restore_network,
             clear_activity,
-            save_activity_log,
-            open_log_folder
+            save_activity_log
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("Porta {}", porta_client::VERSION.trim()));
             }
+            let labels = tray_labels();
             let menu = MenuBuilder::new(app)
-                .text("open", "Open Porta")
-                .text("connect", "Connect or disconnect")
-                .text("activity", "Activity")
-                .text("restore", "Restore network")
+                .text("open", labels.open)
+                .text("connect", labels.connect)
+                .text("activity", labels.log)
+                .text("restore", labels.restore)
                 .separator()
-                .text("quit", "Quit Porta")
+                .text("quit", labels.quit)
                 .build()?;
             let icon = app
                 .default_window_icon()
@@ -1012,7 +1013,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or_else(|| std::io::Error::other("Porta window icon is unavailable"))?;
             TrayIconBuilder::with_id("porta")
                 .icon(icon)
-                .tooltip("Porta - Disconnected")
+                .tooltip(format!("Porta - {}", tray_status("Disconnected")))
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
@@ -1127,6 +1128,78 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
         download_rate: state.download_rate,
         activity: state.activity.clone(),
     }
+}
+
+fn traffic_from(state: &DesktopState) -> DesktopTraffic {
+    DesktopTraffic {
+        bytes_uploaded: state.bytes_uploaded,
+        bytes_downloaded: state.bytes_downloaded,
+        upload_rate: state.upload_rate,
+        download_rate: state.download_rate,
+    }
+}
+
+struct TrayLabels {
+    open: &'static str,
+    connect: &'static str,
+    log: &'static str,
+    restore: &'static str,
+    quit: &'static str,
+}
+
+fn tray_labels() -> TrayLabels {
+    if uses_chinese_locale() {
+        TrayLabels {
+            open: "打开 Porta",
+            connect: "连接或断开",
+            log: "连接日志",
+            restore: "恢复网络",
+            quit: "退出 Porta",
+        }
+    } else {
+        TrayLabels {
+            open: "Open Porta",
+            connect: "Connect or disconnect",
+            log: "Connection log",
+            restore: "Restore network",
+            quit: "Quit Porta",
+        }
+    }
+}
+
+fn tray_status(status: &str) -> String {
+    if !uses_chinese_locale() {
+        return status.to_owned();
+    }
+    match status {
+        "Action required" => "需要处理",
+        "Configuring network" => "正在配置网络",
+        "Connected" => "已连接",
+        "Connecting" => "正在连接",
+        "Connection error" => "连接错误",
+        "Disconnected" => "已断开",
+        "Disconnecting" => "正在断开",
+        "Network recovery available" => "可以恢复网络",
+        "Network recovery failed" => "网络恢复失败",
+        "Ready" => "就绪",
+        "Reconnecting" => "正在重新连接",
+        "Recovering network" => "正在恢复网络",
+        "Restoring network" => "正在恢复网络",
+        _ => status,
+    }
+    .to_owned()
+}
+
+fn uses_chinese_locale() -> bool {
+    let mut name = [0_u16; 85];
+    // SAFETY: Windows writes at most the supplied UTF-16 buffer length.
+    let length = unsafe { GetUserDefaultLocaleName(name.as_mut_ptr(), name.len() as i32) };
+    if length <= 1 || length as usize > name.len() {
+        return false;
+    }
+    String::from_utf16_lossy(&name[..length as usize - 1])
+        .to_ascii_lowercase()
+        .starts_with("zh")
 }
 
 fn parse_transport(value: &str) -> Result<Transport, String> {
@@ -1267,40 +1340,6 @@ fn show_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
-}
-
-fn open_folder(path: &Path) -> Result<(), String> {
-    let operation = wide("open");
-    let path = wide_os(path);
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            path.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    if result as isize <= 32 {
-        return Err(format!(
-            "open activity log directory failed ({})",
-            result as isize
-        ));
-    }
-    Ok(())
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn wide_os(value: &Path) -> Vec<u16> {
-    value
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
 }
 
 #[cfg(test)]

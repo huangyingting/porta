@@ -934,14 +934,14 @@ class TunnelService : VpnService() {
         )
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle(currentProfileName ?: "Porta")
-            .setContentText(text)
+            .setContentText(localizedNotificationText(text))
             .setSmallIcon(R.drawable.ic_porta_status)
             .setOngoing(true)
             .setContentIntent(openApp)
             .addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, R.drawable.ic_porta),
-                    "Disconnect",
+                    getString(R.string.notification_disconnect),
                     disconnect,
                 ).build(),
             )
@@ -954,8 +954,31 @@ class TunnelService : VpnService() {
 
     private fun createNotificationChannel() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "VPN connection", NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel),
+                NotificationManager.IMPORTANCE_LOW,
+            ),
         )
+    }
+
+    private fun localizedNotificationText(value: String): String = when {
+        value == "Connecting" -> getString(R.string.connecting)
+        value == "Disconnected" -> getString(R.string.disconnected)
+        value == "Connection blocked" -> getString(R.string.connection_blocked)
+        value == "VPN permission revoked" -> getString(R.string.notification_permission_revoked)
+        value.startsWith("Reconnecting in ") -> {
+            val seconds = value.substringAfter("Reconnecting in ").substringBefore("s").toLongOrNull()
+            if (seconds == null) getString(R.string.profile_reconnecting)
+            else getString(R.string.reconnecting, seconds)
+        }
+        value.contains("HTTP/3") ->
+            getString(R.string.notification_connected_transport, "HTTP/3")
+        value.contains("HTTP/2") ->
+            getString(R.string.notification_connected_transport, "HTTP/2")
+        value.startsWith("Connected") ->
+            getString(R.string.notification_connected)
+        else -> value
     }
 
     companion object {

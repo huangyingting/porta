@@ -11,16 +11,16 @@
       {
         "label": "main",
         "title": "Porta",
-        "width": 440,
-        "height": 600,
-        "minWidth": 440,
-        "minHeight": 520,
-        "resizable": false,
+        "width": 500,
+        "height": 720,
+        "minWidth": 420,
+        "minHeight": 600,
+        "resizable": true,
         "maximizable": false,
-        "minimizable": false,
+        "minimizable": true,
         "center": true,
         "devtools": false,
-        "backgroundColor": "#101318"
+        "backgroundColor": "#08111f"
       }
     ],
     "security": {

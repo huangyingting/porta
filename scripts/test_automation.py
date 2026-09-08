@@ -1200,6 +1200,97 @@ class AutomationTests(unittest.TestCase):
         self.assertNotRegex(client_docs, r"sudo\s+PORTA_TOKEN=")
         self.assertIn("--preserve-env=PORTA_TOKEN", client_docs)
 
+    def test_native_client_ui_is_bilingual_and_traffic_updates_are_incremental(self):
+        frontend = ROOT / "rust/porta-windows/frontend"
+        html = (frontend / "index.html").read_text()
+        javascript = (frontend / "app.js").read_text()
+        css = (frontend / "app.css").read_text()
+        desktop = (ROOT / "rust/porta-windows/src/desktop.rs").read_text()
+        tauri = json.loads((ROOT / "rust/porta-windows/tauri.conf.json").read_text())
+
+        self.assertIn('id="language-action"', html)
+        self.assertIn('data-i18n="connectionLog"', html)
+        self.assertNotIn('id="primary-connect"', html)
+        self.assertNotIn('id="profile-transport"', html)
+        self.assertNotIn("OpenLogFolder", javascript)
+        self.assertIn('"zh-CN": {', javascript)
+        self.assertIn('listen("porta:traffic"', javascript)
+        self.assertIn("function profileSignature()", javascript)
+        self.assertIn("if (canvas.width !== pixelWidth || canvas.height !== pixelHeight)", javascript)
+        self.assertNotIn("open_log_folder", desktop)
+        traffic_handler = javascript.split("function applyTraffic", 1)[1].split(
+            "function renderTraffic", 1
+        )[0]
+        self.assertNotIn("renderProfiles", traffic_handler)
+        self.assertIn("contain: content", css)
+
+        progress = desktop.split("Event::Progress {", 1)[1].split(
+            "Event::Reconnecting", 1
+        )[0]
+        self.assertIn("traffic = Some(traffic_from(&state))", progress)
+        lightweight_publish = desktop.split("if let Some(traffic) = traffic", 1)[1].split(
+            "if let Some(line) = activity", 1
+        )[0]
+        self.assertIn('app.emit("porta:traffic", traffic)', lightweight_publish)
+        self.assertIn("return;", lightweight_publish)
+
+        window = tauri["app"]["windows"][0]
+        self.assertTrue(window["resizable"])
+        self.assertGreaterEqual(window["width"], 480)
+        self.assertGreaterEqual(window["height"], 680)
+
+        def dictionary_keys(block):
+            matches = re.findall(
+                r'^\s+(?:"([^"]+)"|([A-Za-z][A-Za-z0-9]*)):',
+                block,
+                flags=re.MULTILINE,
+            )
+            return {quoted or bare for quoted, bare in matches}
+
+        english_dictionary = javascript.split("en: {", 1)[1].split(
+            '\n  },\n  "zh-CN"',
+            1,
+        )[0]
+        chinese_dictionary = javascript.split('"zh-CN": {', 1)[1].split(
+            "\n  },\n};",
+            1,
+        )[0]
+        english_keys = dictionary_keys(english_dictionary)
+        chinese_keys = dictionary_keys(chinese_dictionary)
+        self.assertSetEqual(english_keys, chinese_keys)
+        static_keys = set(re.findall(
+            r'data-i18n(?:-placeholder|-aria-label|-title)?="([^"]+)"',
+            html,
+        ))
+        self.assertTrue(static_keys <= english_keys)
+
+        english = ET.parse(
+            ROOT / "android/app/src/main/res/values/strings.xml"
+        ).getroot()
+        chinese = ET.parse(
+            ROOT / "android/app/src/main/res/values-zh-rCN/strings.xml"
+        ).getroot()
+        english_names = {element.attrib["name"] for element in english.findall("string")}
+        chinese_names = {element.attrib["name"] for element in chinese.findall("string")}
+        self.assertSetEqual(english_names, chinese_names)
+
+        manifest = ET.parse(ROOT / "android/app/src/main/AndroidManifest.xml").getroot()
+        android_namespace = "{http://schemas.android.com/apk/res/android}"
+        application = manifest.find("application")
+        self.assertEqual(
+            application.attrib[android_namespace + "localeConfig"],
+            "@xml/locales_config",
+        )
+        android_service = (
+            ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt"
+        ).read_text()
+        self.assertIn(".setContentText(localizedNotificationText(text))", android_service)
+        self.assertIn("R.string.notification_disconnect", android_service)
+        android_activity = (
+            ROOT / "android/app/src/main/java/dev/porta/android/MainActivity.kt"
+        ).read_text()
+        self.assertIn("R.string.reconnecting_secure_tunnel", android_activity)
+
     def test_benchmark_defaults_to_allowed_cpu_affinity(self):
         benchmark = (ROOT / "experiments/server-benchmark/run.sh").read_text()
         self.assertIn('Cpus_allowed_list:', benchmark)

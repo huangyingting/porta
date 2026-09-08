@@ -126,18 +126,26 @@ DPAPI, configures routes, DNS, and the negotiated Windows IP-interface MTU,
 and restores Porta-owned network state on intentional disconnect. An
 interrupted run keeps the guard active; a reconnect
 resumes the protected tunnel, while explicit cleanup removes the guard.
-The desktop uses a compact, task-focused dashboard with profile cards, live
-connection state, tunnel traffic and an on-device activity timeline. Profile
-editing stays within the main window rather than opening another dialog.
-The compact Activity view can clear its local history, export the visible log
-to `%APPDATA%\Porta\exports`, or open the log directory in Explorer.
-The desktop stays at a fixed compact width without minimize or maximize
-controls. Closing it hides Porta in the notification area instead of ending the
-tunnel. Its native tray menu can open the window, connect or disconnect, show
-Activity, restore retained network state, or quit safely. Porta snapshots,
-applies, and restores the Wintun IPv4 MTU through the native Windows IP Helper
-API. This avoids depending on PowerShell's `NlMtuBytes` projection, which can be
-empty for otherwise usable Wintun adapters.
+The desktop uses the same task-focused hierarchy as Android: connection
+summary, real-time traffic, and VPN profile cards. A profile's switch is the
+single connection control; Porta chooses HTTP/3 with HTTP/2 fallback
+automatically. Profile editing stays within the main window rather than opening
+another dialog. The compact Log view can clear its local history or export it
+to `%APPDATA%\Porta\exports`; network recovery appears only when retained state
+actually needs attention.
+
+The window opens at a comfortable dashboard size, can be resized or minimized,
+and keeps readable spacing at its compact minimum. Closing it hides Porta in
+the notification area instead of ending the tunnel. Its native tray menu can
+open the window, connect or disconnect, show the connection log, restore
+retained network state, or quit safely. The interface supports English and
+Simplified Chinese, initially follows the Windows language, and provides a
+persistent language switch in the header. The tray follows the Windows
+language.
+
+Porta snapshots, applies, and restores the Wintun IPv4 MTU through the native
+Windows IP Helper API. This avoids depending on PowerShell's `NlMtuBytes`
+projection, which can be empty for otherwise usable Wintun adapters.
 
 The desktop interface is rendered by the pinned Tauri 2 runtime and requires
 the Microsoft Edge WebView2 Runtime. It is included with Windows 11 and current
@@ -274,6 +282,9 @@ routing and firewall/kill-switch rules.
 
 Use `porta-android-arm64-v8a.apk` for most current physical devices,
 `armeabi-v7a` for older 32-bit ARM devices, or `x86_64` for an emulator.
+The interface and VPN notification support English and Simplified Chinese.
+Android 13 and newer expose Porta in the system per-app language settings;
+older releases follow the device language.
 
 QR onboarding has two steps:
 
