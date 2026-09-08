@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -21,6 +25,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
       - name: Verify application version
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -57,6 +69,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
       - name: Lint Windows clients
         run: >
           cargo clippy --manifest-path rust/Cargo.toml --locked
@@ -124,6 +144,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
@@ -136,7 +164,7 @@ jobs:
         env:
           PORTA_ANDROID_SIGNING_PROPERTIES: ${{ runner.temp }}/missing-porta-signing.properties
         run: |
-          if ./gradlew :app:assembleRelease --no-daemon > "$RUNNER_TEMP/porta-signing-check.log" 2>&1; then
+          if ./gradlew :app:validatePortaReleaseSigning --no-daemon > "$RUNNER_TEMP/porta-signing-check.log" 2>&1; then
             echo "Release signing unexpectedly succeeded without the persistent key" >&2
             exit 1
           fi
