@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryController};
 use crate::transport::session::{
@@ -151,7 +152,7 @@ async fn serve_connection(
         connection.close(0_u32.into(), b"connection limit reached");
         return Ok(());
     }
-    let quic = h3_quinn::Connection::new(connection);
+    let quic = h3_quinn::Connection::new(connection.clone());
     let mut builder = h3::server::builder();
     builder
         .enable_extended_connect(true)
@@ -230,6 +231,7 @@ async fn serve_connection(
                     let datagram_reader = h3.get_datagram_reader();
                     let tunnel_slot = TunnelSlot(tunnel_active.clone());
                     let tunnel_server = server.clone();
+                    let tunnel_connection = connection.clone();
                     requests.spawn(async move {
                         let _tunnel_slot = tunnel_slot;
                         if let Err(error) = serve_tunnel(
@@ -239,6 +241,7 @@ async fn serve_connection(
                             datagram_reader,
                             peer,
                             tunnel_server,
+                            tunnel_connection,
                         )
                         .await
                         {
@@ -396,10 +399,11 @@ where
 async fn serve_tunnel<S, B, SendHandler, RecvHandler>(
     request: http::Request<()>,
     mut stream: h3::server::RequestStream<S, B>,
-    mut datagram_sender: h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
-    mut datagram_reader: h3_datagram::datagram_handler::DatagramReader<RecvHandler>,
+    datagram_sender: h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
+    datagram_reader: h3_datagram::datagram_handler::DatagramReader<RecvHandler>,
     peer: SocketAddr,
     server: Arc<Http3Server>,
+    connection: quinn::Connection,
 ) -> Result<()>
 where
     S: h3::quic::BidiStream<B> + Send + 'static,
@@ -493,7 +497,7 @@ where
         }
     };
     let use_datagrams = server.config.enable_datagrams && peer_datagrams;
-    let mut mtu = if server.config.auto_mtu
+    let mtu = if server.config.auto_mtu
         && server.config.mtu > SAFE_MTU
         && use_datagrams
         && request
@@ -532,6 +536,61 @@ where
             return Ok(());
         }
     };
+    let span = tracing::info_span!(
+        "http3_tunnel",
+        tunnel_id = session.tunnel_id,
+        account_id = %session.identity.account_id,
+        device_id = %session.proof.device_id,
+        address = %session.lease.address,
+        peer = %peer,
+        stream_id = stream.id().into_inner(),
+    );
+    async {
+        let mut diagnostics = Http3Diagnostics::new(
+            connection,
+            stream.id().into_inner(),
+            use_datagrams,
+            server.config.mtu,
+        );
+        let result = run_tunnel(
+            stream,
+            datagram_sender,
+            datagram_reader,
+            &session,
+            &server,
+            mtu,
+            &mut diagnostics,
+        )
+        .await;
+        let termination = tunnel_termination(
+            &result,
+            session.cancellation.is_cancelled(),
+            diagnostics.connection.close_reason().as_ref(),
+        );
+        diagnostics.finish(termination, &session);
+        session.close_with_reason(termination.reason);
+        result.map(|_| ())
+    }
+    .instrument(span)
+    .await
+}
+
+async fn run_tunnel<S, B, SendHandler, RecvHandler>(
+    mut stream: h3::server::RequestStream<S, B>,
+    mut datagram_sender: h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
+    mut datagram_reader: h3_datagram::datagram_handler::DatagramReader<RecvHandler>,
+    session: &Session,
+    server: &Http3Server,
+    mut mtu: Option<MtuResponder>,
+    diagnostics: &mut Http3Diagnostics,
+) -> Result<&'static str>
+where
+    S: h3::quic::BidiStream<B> + Send + 'static,
+    B: Buf + From<Bytes> + Send + 'static,
+    SendHandler: h3_datagram::quic_traits::SendDatagram<B> + Send,
+    RecvHandler: h3_datagram::quic_traits::RecvDatagram + Send + 'static,
+    RecvHandler::Buffer: Send + 'static,
+{
     let response = success_response(&server.config, mtu.as_ref());
     let response_sent = tokio::select! {
         biased;
@@ -544,16 +603,15 @@ where
     if !response_sent {
         stream.stop_stream(h3::error::Code::H3_NO_ERROR);
         stream.stop_sending(h3::error::Code::H3_NO_ERROR);
-        return Ok(());
+        return Ok("cancelled");
     }
     let stream_id = stream.id();
     let (mut send_stream, mut receive_stream) = stream.split();
-    let mut use_datagrams = use_datagrams;
     let datagram_cancellation = CancellationToken::new();
     let datagram_stop = datagram_cancellation.clone();
     let (datagram_tx, mut datagram_rx) =
         mpsc::channel::<std::result::Result<Bytes, h3::error::StreamError>>(32);
-    let datagram_task = use_datagrams.then(|| {
+    let datagram_task = diagnostics.datagrams_enabled.then(|| {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -585,14 +643,14 @@ where
     let mut downlink_ready = false;
     let mut icmp_after = Instant::now();
 
-    let result: Result<()> = async {
+    let mut result: Result<&'static str> = async {
         'tunnel: loop {
             tokio::select! {
             biased;
-            _ = session.cancellation.cancelled() => break Ok(()),
+            _ = session.cancellation.cancelled() => break Ok("cancelled"),
             incoming = receive_stream.recv_data() => {
                 let Some(mut incoming) = incoming? else {
-                    break Ok(());
+                    break Ok("client_eof");
                 };
                 capsules.extend_from_slice(&incoming.copy_to_bytes(incoming.remaining()));
                 while let Some((capsule_type, value)) = take_capsule(&mut capsules)? {
@@ -601,6 +659,7 @@ where
                             let responder = mtu.as_mut().ok_or(MasqueError::InvalidMtuMessage)?;
                             let first_selection = !responder.committed;
                             let selected = responder.commit(&value)?;
+                            diagnostics.selected_mtu = responder.selected;
                             let mut control = BytesMut::with_capacity(selected.len() + 16);
                             append_capsule(&mut control, CAPSULE_MTU_SELECTED, &selected)?;
                             send_h3_data(
@@ -647,7 +706,7 @@ where
                         CAPSULE_DATAGRAM => {
                             if assigned.load(Ordering::Acquire) {
                                 if let Ok(packet) = decode_ip_bytes(value) {
-                                    inject_packet(&session, packet, selected_mtu(&mtu, server.config.mtu)).await?;
+                                    inject_packet(session, packet, selected_mtu(&mtu, server.config.mtu)).await?;
                                 } else {
                                     session.services().metrics.dropped_from_client();
                                 }
@@ -665,9 +724,9 @@ where
                     }
                 }
             }
-            datagram = datagram_rx.recv(), if use_datagrams => {
+            datagram = datagram_rx.recv(), if diagnostics.datagrams_enabled => {
                 let Some(datagram) = datagram else {
-                    use_datagrams = false;
+                    diagnostics.disable_datagrams("reader_ended");
                     continue;
                 };
                 let value = datagram?;
@@ -678,7 +737,9 @@ where
                                         Ok(()) => responder.probe_echoed(&value)?,
                                         Err(error) => match datagram_error_kind(&error) {
                                             DatagramErrorKind::TooLarge => {}
-                                            DatagramErrorKind::NotAvailable => use_datagrams = false,
+                                            DatagramErrorKind::NotAvailable => {
+                                                diagnostics.disable_datagrams("not_available");
+                                            }
                                             DatagramErrorKind::Connection => break Err(error.into()),
                                         },
                                     },
@@ -694,23 +755,23 @@ where
                 }
                 match decode_ip_bytes(value) {
                     Ok(packet) => {
-                        inject_packet(&session, packet, selected_mtu(&mtu, server.config.mtu)).await?;
+                        inject_packet(session, packet, selected_mtu(&mtu, server.config.mtu)).await?;
                     }
                     Err(_) => session.services().metrics.dropped_from_client(),
                 }
             }
             packet = session.downlink.next_packet(), if downlink_ready => {
                 let Some(packet) = packet else {
-                    break Ok(());
+                    break Ok("downlink_closed");
                 };
                 send_downlink(
-                    &session,
+                    session,
                     packet,
                     selected_mtu(&mtu, server.config.mtu),
-                    &mut use_datagrams,
                     &mut datagram_sender,
                     &mut send_stream,
                     &mut icmp_after,
+                    diagnostics,
                 ).await?;
             }
             }
@@ -719,22 +780,336 @@ where
     .await;
     datagram_cancellation.cancel();
     if let Some(datagram_task) = datagram_task {
-        let _ = datagram_task.await;
+        if let Err(error) = datagram_task.await {
+            diagnostics.datagram_reader_failed = true;
+            if result.is_ok() {
+                result = Err(error.into());
+            }
+        }
     }
     receive_stream.stop_sending(h3::error::Code::H3_NO_ERROR);
     if result.is_ok() && !session.cancellation.is_cancelled() {
         let finished = tokio::select! {
             biased;
             _ = session.cancellation.cancelled() => false,
-            _ = send_stream.finish() => true,
+            finished = send_stream.finish() => {
+                if let Err(error) = finished {
+                    result = Err(error.into());
+                }
+                true
+            },
         };
         if !finished {
+            result = Ok("cancelled");
             send_stream.stop_stream(h3::error::Code::H3_NO_ERROR);
         }
     } else {
         send_stream.stop_stream(h3::error::Code::H3_NO_ERROR);
     }
     result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TunnelTermination {
+    reason: &'static str,
+    unexpected: bool,
+    code: Option<u64>,
+}
+
+impl TunnelTermination {
+    fn normal(reason: &'static str) -> Self {
+        Self {
+            reason,
+            unexpected: false,
+            code: None,
+        }
+    }
+
+    fn failure(reason: &'static str, code: Option<u64>) -> Self {
+        Self {
+            reason,
+            unexpected: true,
+            code,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("session cancelled")]
+struct SessionCancelled;
+
+fn tunnel_termination(
+    result: &Result<&'static str>,
+    cancelled: bool,
+    quic_close: Option<&quinn::ConnectionError>,
+) -> TunnelTermination {
+    use h3::error::{Code, StreamError};
+    let error = match result {
+        Ok(reason) => return TunnelTermination::normal(reason),
+        Err(error) => error,
+    };
+    if error.is::<SessionCancelled>() || (cancelled && error.is::<RouteError>()) {
+        return TunnelTermination::normal("cancelled");
+    }
+    if let Some(error) = error.downcast_ref::<StreamError>() {
+        if error.is_h3_no_error() {
+            return TunnelTermination::normal("h3_no_error");
+        }
+        match error {
+            StreamError::RemoteClosing => return TunnelTermination::normal("peer_closing"),
+            StreamError::RemoteTerminate {
+                code: Code::H3_REQUEST_CANCELLED,
+                ..
+            } => {
+                return TunnelTermination::normal("client_cancelled");
+            }
+            StreamError::RemoteTerminate { code, .. } | StreamError::StreamError { code, .. } => {
+                return TunnelTermination::failure("h3_stream_error", Some(code.value()));
+            }
+            StreamError::HeaderTooBig { .. } => {
+                return TunnelTermination::failure("h3_headers_too_large", None);
+            }
+            StreamError::ConnectionError(error) => {
+                return h3_connection_termination(error, quic_close);
+            }
+            _ => {}
+        }
+    }
+    if let Some(error) = error.downcast_ref::<h3::error::ConnectionError>() {
+        return h3_connection_termination(error, quic_close);
+    }
+    if error.is::<MasqueError>() {
+        return TunnelTermination::failure("capsule_protocol_error", None);
+    }
+    if error.is::<RouteError>() {
+        return TunnelTermination::failure("router_error", None);
+    }
+    if error.is::<tokio::task::JoinError>() {
+        return TunnelTermination::failure("datagram_reader_failed", None);
+    }
+    quic_close
+        .map(quic_termination)
+        .unwrap_or_else(|| TunnelTermination::failure("tunnel_error", None))
+}
+
+fn h3_connection_termination(
+    error: &h3::error::ConnectionError,
+    quic_close: Option<&quinn::ConnectionError>,
+) -> TunnelTermination {
+    use h3::error::{ConnectionError, LocalError};
+    if error.is_h3_no_error() {
+        return TunnelTermination::normal("h3_no_error");
+    }
+    match error {
+        ConnectionError::Timeout => TunnelTermination::failure("quic_timeout", None),
+        ConnectionError::Local {
+            error: LocalError::Application { code, .. },
+            ..
+        } => TunnelTermination::failure("h3_connection_error", Some(code.value())),
+        ConnectionError::Remote(h3::quic::ConnectionErrorIncoming::ApplicationClose {
+            error_code,
+        }) => {
+            if *error_code == 0 {
+                TunnelTermination::normal("peer_closed")
+            } else {
+                TunnelTermination::failure("peer_application_error", Some(*error_code))
+            }
+        }
+        _ => quic_close
+            .map(quic_termination)
+            .unwrap_or_else(|| TunnelTermination::failure("h3_connection_error", None)),
+    }
+}
+
+fn quic_termination(error: &quinn::ConnectionError) -> TunnelTermination {
+    use quinn::ConnectionError;
+    match error {
+        ConnectionError::LocallyClosed => TunnelTermination::normal("local_close"),
+        ConnectionError::ApplicationClosed(close)
+            if close.error_code.into_inner() == 0
+                || close.error_code.into_inner() == h3::error::Code::H3_NO_ERROR.value() =>
+        {
+            TunnelTermination::normal("peer_closed")
+        }
+        ConnectionError::ConnectionClosed(close) if u64::from(close.error_code) == 0 => {
+            TunnelTermination::normal("peer_closed")
+        }
+        ConnectionError::ApplicationClosed(close) => TunnelTermination::failure(
+            "peer_application_error",
+            Some(close.error_code.into_inner()),
+        ),
+        ConnectionError::TransportError(error) => {
+            TunnelTermination::failure("quic_transport_error", Some(u64::from(error.code)))
+        }
+        ConnectionError::ConnectionClosed(close) => {
+            TunnelTermination::failure("quic_transport_error", Some(u64::from(close.error_code)))
+        }
+        ConnectionError::TimedOut => TunnelTermination::failure("quic_timeout", None),
+        ConnectionError::Reset => TunnelTermination::failure("quic_reset", None),
+        _ => TunnelTermination::failure("quic_connection_error", None),
+    }
+}
+
+#[derive(Default)]
+struct Http3SendCounters {
+    // DATAGRAM enqueue can be evicted; capsule submissions can still block or fail.
+    datagram_queued_packets: u64,
+    datagram_queued_ip_bytes: u64,
+    capsule_submitted_packets: u64,
+    capsule_submitted_ip_bytes: u64,
+    oversize_fallback_packets: u64,
+    oversize_fallback_ip_bytes: u64,
+    max_oversize_ip_bytes: usize,
+    unavailable_fallback_packets: u64,
+}
+
+impl Http3SendCounters {
+    fn datagram_queued(&mut self, ip_bytes: usize) {
+        self.datagram_queued_packets += 1;
+        self.datagram_queued_ip_bytes += ip_bytes as u64;
+    }
+
+    fn capsule_submitted(&mut self, ip_bytes: usize, packets: u64) {
+        self.capsule_submitted_packets += packets;
+        self.capsule_submitted_ip_bytes += ip_bytes as u64;
+    }
+
+    fn fallback(&mut self, kind: DatagramErrorKind, ip_bytes: usize) -> bool {
+        match kind {
+            DatagramErrorKind::TooLarge => {
+                self.oversize_fallback_packets += 1;
+                self.oversize_fallback_ip_bytes += ip_bytes as u64;
+                self.max_oversize_ip_bytes = self.max_oversize_ip_bytes.max(ip_bytes);
+                self.oversize_fallback_packets == 1
+            }
+            DatagramErrorKind::NotAvailable => {
+                self.unavailable_fallback_packets += 1;
+                self.unavailable_fallback_packets == 1
+            }
+            DatagramErrorKind::Connection => false,
+        }
+    }
+}
+
+struct Http3Diagnostics {
+    connection: quinn::Connection,
+    stream_id: u64,
+    selected_mtu: u16,
+    datagrams_enabled: bool,
+    datagrams_disabled_reason: &'static str,
+    datagram_reader_failed: bool,
+    min_oversize_ip_capacity: Option<usize>,
+    sends: Http3SendCounters,
+}
+
+impl Http3Diagnostics {
+    fn new(connection: quinn::Connection, stream_id: u64, datagrams: bool, mtu: u16) -> Self {
+        let stats = connection.stats();
+        tracing::info!(
+            datagrams_enabled = datagrams,
+            configured_mtu = mtu,
+            quic_datagram_capacity = ?connection.max_datagram_size(),
+            ip_datagram_capacity = ?ip_datagram_capacity(connection.max_datagram_size(), stream_id),
+            quic_path_mtu = stats.path.current_mtu,
+            quic_rtt_ms = stats.path.rtt.as_millis() as u64,
+            quic_path_sent_packets = stats.path.sent_packets,
+            quic_path_lost_packets = stats.path.lost_packets,
+            quic_path_congestion_events = stats.path.congestion_events,
+            quic_path_black_holes = stats.path.black_holes_detected,
+            "HTTP/3 tunnel transport started"
+        );
+        Self {
+            connection,
+            stream_id,
+            selected_mtu: mtu,
+            datagrams_enabled: datagrams,
+            datagrams_disabled_reason: if datagrams { "none" } else { "not_negotiated" },
+            datagram_reader_failed: false,
+            min_oversize_ip_capacity: None,
+            sends: Http3SendCounters::default(),
+        }
+    }
+
+    fn fallback(&mut self, kind: DatagramErrorKind, ip_bytes: usize) {
+        let capacity = self.connection.max_datagram_size();
+        let ip_capacity = ip_datagram_capacity(capacity, self.stream_id);
+        if kind == DatagramErrorKind::TooLarge {
+            if let Some(capacity) = ip_capacity {
+                self.min_oversize_ip_capacity = Some(
+                    self.min_oversize_ip_capacity
+                        .map_or(capacity, |previous| previous.min(capacity)),
+                );
+            }
+        }
+        if self.sends.fallback(kind, ip_bytes) {
+            tracing::info!(
+                reason = if kind == DatagramErrorKind::TooLarge { "too_large" } else { "not_available" },
+                ip_bytes,
+                quic_datagram_capacity = ?capacity,
+                ip_datagram_capacity = ?ip_capacity,
+                "HTTP/3 downlink capsule fallback started"
+            );
+        }
+    }
+
+    fn disable_datagrams(&mut self, reason: &'static str) {
+        if self.datagrams_enabled {
+            self.datagrams_enabled = false;
+            self.datagrams_disabled_reason = reason;
+            tracing::info!(reason, "HTTP/3 tunnel switched to capsules");
+        }
+    }
+
+    fn finish(&self, termination: TunnelTermination, session: &Session) {
+        let stats = self.connection.stats();
+        if termination.unexpected || self.datagram_reader_failed {
+            tracing::warn!(
+                tunnel_id = session.tunnel_id,
+                account_id = %session.identity.account_id,
+                device_id = %session.proof.device_id,
+                reason = termination.reason,
+                error_code = ?termination.code,
+                datagram_reader_failed = self.datagram_reader_failed,
+                "authenticated HTTP/3 tunnel stopped unexpectedly"
+            );
+        }
+        tracing::info!(
+            reason = termination.reason,
+            error_code = ?termination.code,
+            selected_mtu = self.selected_mtu,
+            datagrams_enabled = self.datagrams_enabled,
+            datagrams_disabled_reason = self.datagrams_disabled_reason,
+            quic_datagram_capacity = ?self.connection.max_datagram_size(),
+            ip_datagram_capacity = ?ip_datagram_capacity(self.connection.max_datagram_size(), self.stream_id),
+            quic_path_mtu = stats.path.current_mtu,
+            quic_rtt_ms = stats.path.rtt.as_millis() as u64,
+            quic_path_sent_packets = stats.path.sent_packets,
+            quic_path_lost_packets = stats.path.lost_packets,
+            quic_path_congestion_events = stats.path.congestion_events,
+            quic_path_black_holes = stats.path.black_holes_detected,
+            datagram_queued_packets = self.sends.datagram_queued_packets,
+            datagram_queued_ip_bytes = self.sends.datagram_queued_ip_bytes,
+            capsule_submitted_packets = self.sends.capsule_submitted_packets,
+            capsule_submitted_ip_bytes = self.sends.capsule_submitted_ip_bytes,
+            oversize_fallback_packets = self.sends.oversize_fallback_packets,
+            oversize_fallback_ip_bytes = self.sends.oversize_fallback_ip_bytes,
+            max_oversize_ip_bytes = self.sends.max_oversize_ip_bytes,
+            min_oversize_ip_capacity = ?self.min_oversize_ip_capacity,
+            unavailable_fallback_packets = self.sends.unavailable_fallback_packets,
+            "HTTP/3 tunnel transport summary"
+        );
+    }
+}
+
+fn ip_datagram_capacity(quic_capacity: Option<usize>, stream_id: u64) -> Option<usize> {
+    // QUIC's payload limit includes the HTTP/3 quarter stream ID and CONNECT-IP context ID.
+    let stream_id_bytes = match stream_id / 4 {
+        0..=63 => 1,
+        64..=16_383 => 2,
+        16_384..=1_073_741_823 => 4,
+        _ => 8,
+    };
+    quic_capacity.map(|capacity| capacity.saturating_sub(stream_id_bytes + 1))
 }
 
 fn is_connect_ip(request: &http::Request<()>) -> bool {
@@ -1015,10 +1390,10 @@ async fn send_downlink<S, B, SendHandler>(
     session: &Session,
     packet: Bytes,
     mtu: u16,
-    use_datagrams: &mut bool,
     datagram_sender: &mut h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
     send_stream: &mut h3::server::RequestStream<S, B>,
     icmp_after: &mut Instant,
+    diagnostics: &mut Http3Diagnostics,
 ) -> Result<()>
 where
     S: h3::quic::SendStream<B>,
@@ -1030,14 +1405,7 @@ where
             Ok(fragments) => {
                 session.services().metrics.mtu_fragmented();
                 for fragment in fragments {
-                    send_one(
-                        session,
-                        fragment,
-                        use_datagrams,
-                        datagram_sender,
-                        send_stream,
-                    )
-                    .await?;
+                    send_one(session, fragment, datagram_sender, send_stream, diagnostics).await?;
                 }
                 return Ok(());
             }
@@ -1076,7 +1444,7 @@ where
             }
         }
     }
-    if !*use_datagrams {
+    if !diagnostics.datagrams_enabled {
         let mut control = BytesMut::with_capacity(packet.len() + 16);
         append_ip_capsule(&mut control, &packet)?;
         let mut count = 1;
@@ -1093,18 +1461,19 @@ where
             session.services().metrics.sent_to_client();
             session.usage.downloaded(packet.len() as u64, 1);
         }
+        diagnostics.sends.capsule_submitted(bytes, count as u64);
         send_h3_data(send_stream, control.freeze().into(), &session.cancellation).await?;
         return Ok(());
     }
-    send_one(session, packet, use_datagrams, datagram_sender, send_stream).await
+    send_one(session, packet, datagram_sender, send_stream, diagnostics).await
 }
 
 async fn send_one<S, B, SendHandler>(
     session: &Session,
     packet: Bytes,
-    use_datagrams: &mut bool,
     datagram_sender: &mut h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
     send_stream: &mut h3::server::RequestStream<S, B>,
+    diagnostics: &mut Http3Diagnostics,
 ) -> Result<()>
 where
     S: h3::quic::SendStream<B>,
@@ -1115,18 +1484,22 @@ where
     value.extend_from_slice(&[0]);
     value.extend_from_slice(&packet);
     match datagram_sender.send_datagram(value.freeze().into()) {
-        Ok(()) => {}
+        Ok(()) => diagnostics.sends.datagram_queued(packet.len()),
         Err(error) => match datagram_error_kind(&error) {
             DatagramErrorKind::TooLarge => {
                 session.services().metrics.datagram_oversize();
+                diagnostics.fallback(DatagramErrorKind::TooLarge, packet.len());
                 let mut control = BytesMut::with_capacity(packet.len() + 16);
                 append_ip_capsule(&mut control, &packet)?;
+                diagnostics.sends.capsule_submitted(packet.len(), 1);
                 send_h3_data(send_stream, control.freeze().into(), &session.cancellation).await?;
             }
             DatagramErrorKind::NotAvailable => {
-                *use_datagrams = false;
+                diagnostics.fallback(DatagramErrorKind::NotAvailable, packet.len());
+                diagnostics.disable_datagrams("not_available");
                 let mut control = BytesMut::with_capacity(packet.len() + 16);
                 append_ip_capsule(&mut control, &packet)?;
+                diagnostics.sends.capsule_submitted(packet.len(), 1);
                 send_h3_data(send_stream, control.freeze().into(), &session.cancellation).await?;
             }
             DatagramErrorKind::Connection => return Err(error.into()),
@@ -1152,11 +1525,12 @@ where
             Ok(())
         }
         _ = cancellation.cancelled() => {
-            anyhow::bail!("session cancelled")
+            Err(SessionCancelled.into())
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DatagramErrorKind {
     TooLarge,
     NotAvailable,
@@ -1321,6 +1695,152 @@ mod tests {
     };
     use futures_util::future::BoxFuture;
     use std::sync::Mutex;
+
+    #[test]
+    fn tunnel_termination_distinguishes_normal_closes_from_failures() {
+        use h3::error::{Code, ConnectionError, StreamError};
+        for (error, reason, unexpected) in [
+            (
+                StreamError::RemoteTerminate {
+                    code: Code::H3_NO_ERROR,
+                },
+                "h3_no_error",
+                false,
+            ),
+            (
+                StreamError::RemoteTerminate {
+                    code: Code::H3_REQUEST_CANCELLED,
+                },
+                "client_cancelled",
+                false,
+            ),
+            (StreamError::RemoteClosing, "peer_closing", false),
+            (
+                StreamError::RemoteTerminate {
+                    code: Code::H3_MESSAGE_ERROR,
+                },
+                "h3_stream_error",
+                true,
+            ),
+            (
+                StreamError::ConnectionError(ConnectionError::Timeout),
+                "quic_timeout",
+                true,
+            ),
+        ] {
+            let result = Err(anyhow::Error::new(error).context("stream operation"));
+            let termination = tunnel_termination(&result, false, None);
+            assert_eq!(termination.reason, reason);
+            assert_eq!(termination.unexpected, unexpected);
+        }
+        let result = Err(SessionCancelled.into());
+        assert_eq!(
+            tunnel_termination(&result, false, None),
+            TunnelTermination::normal("cancelled")
+        );
+        let result = Err(RouteError::Unavailable.into());
+        assert_eq!(
+            tunnel_termination(&result, true, None),
+            TunnelTermination::normal("cancelled")
+        );
+        assert_eq!(
+            tunnel_termination(&result, false, None).reason,
+            "router_error"
+        );
+        let result = Err(MasqueError::InvalidMtuMessage.into());
+        let termination =
+            tunnel_termination(&result, true, Some(&quinn::ConnectionError::LocallyClosed));
+        assert_eq!(termination.reason, "capsule_protocol_error");
+        assert!(termination.unexpected);
+        for reason in ["client_eof", "cancelled", "downlink_closed"] {
+            assert_eq!(
+                tunnel_termination(&Ok(reason), false, None),
+                TunnelTermination::normal(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn quic_termination_uses_codes_not_peer_reason_text() {
+        for (code, unexpected) in [(0_u32, false), (0x100, false), (0x102, true)] {
+            let close = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: code.into(),
+                reason: Bytes::from_static(b"untrusted peer close reason"),
+            });
+            let termination = tunnel_termination(
+                &Err(anyhow::anyhow!("datagram send failed")),
+                false,
+                Some(&close),
+            );
+            assert_eq!(termination.unexpected, unexpected);
+            assert!(!format!("{termination:?}").contains("untrusted"));
+            if unexpected {
+                assert_eq!(termination.code, Some(u64::from(code)));
+            }
+        }
+        assert_eq!(
+            quic_termination(&quinn::ConnectionError::Reset).reason,
+            "quic_reset"
+        );
+        assert_eq!(
+            quic_termination(&quinn::ConnectionError::TimedOut).reason,
+            "quic_timeout"
+        );
+        assert!(!quic_termination(&quinn::ConnectionError::LocallyClosed).unexpected);
+    }
+
+    #[test]
+    fn capsule_fallback_counters_bound_first_event_and_count_submissions() {
+        let mut sends = Http3SendCounters::default();
+        sends.datagram_queued(100);
+        assert!(sends.fallback(DatagramErrorKind::TooLarge, 1300));
+        sends.capsule_submitted(1300, 1);
+        for _ in 0..10_000 {
+            assert!(!sends.fallback(DatagramErrorKind::TooLarge, 1400));
+        }
+        assert!(sends.fallback(DatagramErrorKind::NotAvailable, 800));
+        assert!(!sends.fallback(DatagramErrorKind::NotAvailable, 800));
+        assert!(!sends.fallback(DatagramErrorKind::Connection, 800));
+        sends.capsule_submitted(900, 3);
+        assert_eq!(sends.datagram_queued_packets, 1);
+        assert_eq!(sends.datagram_queued_ip_bytes, 100);
+        assert_eq!(sends.capsule_submitted_packets, 4);
+        assert_eq!(sends.capsule_submitted_ip_bytes, 2200);
+        assert_eq!(sends.oversize_fallback_packets, 10_001);
+        assert_eq!(sends.oversize_fallback_ip_bytes, 14_001_300);
+        assert_eq!(sends.max_oversize_ip_bytes, 1400);
+        assert_eq!(sends.unavailable_fallback_packets, 2);
+    }
+
+    #[test]
+    fn ip_datagram_capacity_accounts_for_both_context_headers() {
+        assert_eq!(ip_datagram_capacity(None, 0), None);
+        assert_eq!(ip_datagram_capacity(Some(1), 0), Some(0));
+        for stream_id in [0, 252, 256, 65_532, 65_536, 4_294_967_292, 4_294_967_296] {
+            let overhead = crate::wire::masque::encode_varint(stream_id / 4)
+                .unwrap()
+                .len()
+                + 1;
+            assert_eq!(
+                ip_datagram_capacity(Some(1400), stream_id),
+                Some(1400 - overhead)
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn lease() -> Lease {
         Lease {
@@ -1498,7 +2018,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_router_accepts_only_assigned_source() {
+    async fn fake_router_accepts_only_assigned_source_and_close_logs_accounting_once() {
+        let logs = LogCapture::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let packets = Arc::new(Mutex::new(Vec::new()));
         let services = Arc::new(Services {
             authenticator: Arc::new(FakeAuthenticator),
@@ -1538,5 +2066,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(packets.lock().unwrap().len(), 1);
+        session.usage.downloaded(1000, 2);
+        session.close_with_reason("client_eof");
+        session.close();
+        drop(session);
+        let output = logs.0.lock().unwrap();
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let closes: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["message"] == "tunnel disconnected")
+            .collect();
+        assert_eq!(closes.len(), 1);
+        let fields = &closes[0]["fields"];
+        assert_eq!(fields["reason"], "client_eof");
+        assert_eq!(fields["uploaded_ip_bytes"], 20);
+        assert_eq!(fields["uploaded_ip_packets"], 1);
+        assert_eq!(fields["downlink_accounted_ip_bytes"], 1000);
+        assert_eq!(fields["downlink_accounted_ip_packets"], 2);
+        assert_eq!(fields["account_id"], "account");
+        let opened = events
+            .iter()
+            .find(|event| event["fields"]["message"] == "tunnel connected")
+            .unwrap();
+        assert_eq!(opened["fields"]["tunnel_id"], fields["tunnel_id"]);
     }
 }

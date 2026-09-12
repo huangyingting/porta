@@ -37,6 +37,18 @@ deployment, certificate sync, firewall cleanup and packaging with isolated
 fixtures and mocked system commands. It does not change host services or
 network settings.
 
+The workspace patches `quinn-proto` for all server and native client builds.
+The locked upstream `0.11.17` release double-counts evicted datagrams, causing
+queue accounting to underflow and panic under sustained send pressure.
+The vendored copy carries the exact upstream backport; see
+[`rust/porta-server/vendor/README.md`](../rust/porta-server/vendor/README.md).
+The focused end-to-end queue regression is:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml --locked \
+  --package porta-client-rust --test quic_datagrams
+```
+
 The server and desktop suites also use Node.js, when available, to syntax-check
 the embedded browser JavaScript:
 

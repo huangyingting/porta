@@ -490,6 +490,29 @@ Public admission metrics are
 `porta_abuse_rejections_total{surface="native|proxy|portal|invitation"}`.
 Source addresses are never metric labels.
 
+Authenticated HTTP/3 tunnels emit an INFO transport-start event and final
+transport summary, correlated with connection/disconnection events by the
+process-local `tunnel_id` (in the `http3_tunnel` span for transport events).
+Unexpected failures also emit a WARN with a bounded reason and, where available,
+a numeric error code, without logging peer-supplied close text. Normal EOF,
+cancellation, and graceful peer closes remain INFO.
+
+The summary records the selected MTU, current QUIC and IP datagram capacities,
+RTT, path loss/congestion/black-hole counters, and per-tunnel datagram/capsule
+counts. QUIC path counters are connection snapshots, not tunnel-only deltas;
+compare the start and end records. `datagram_queued_*` counts successful enqueue
+operations, which may later be evicted. `capsule_submitted_*` counts IP data
+submitted to reliable writes, including writes that later fail or are cancelled.
+The disconnect record's `downlink_accounted_*` fields and
+`porta_packets_to_client_total` likewise do not confirm delivery.
+
+Oversized fallback logs only its first occurrence per tunnel and accumulates
+the total, largest packet, and smallest observed IP datagram capacity in the
+summary. A switch to capsule-only operation is logged once. These records help
+distinguish QUIC failures from frequent reliable-capsule fallback without
+per-packet logs or global DEBUG logging. Fallback counters alone do not prove a
+path-MTU black hole or explain every stall.
+
 ## Android
 
 Install the APK, tap **Add profile**, and enter the direct endpoint:

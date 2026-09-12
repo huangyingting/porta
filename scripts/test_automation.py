@@ -1001,6 +1001,8 @@ class AutomationTests(unittest.TestCase):
             "rust/porta-server/vendor/h3/src",
             "rust/porta-server/vendor/hyper/Cargo.toml",
             "rust/porta-server/vendor/hyper/src",
+            "rust/porta-server/vendor/quinn-proto/Cargo.toml",
+            "rust/porta-server/vendor/quinn-proto/src",
         ):
             self.assertIn(path, gradle)
         build = (ROOT / "scripts/build-android-rust.sh").read_text()

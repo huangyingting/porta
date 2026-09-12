@@ -196,7 +196,7 @@ impl Metrics {
             &mut output,
             "porta_packets_to_client_total",
             "counter",
-            "IPv4 packets sent to tunnel clients.",
+            "IPv4 downlink packets accounted for by tunnel transports, not confirmed delivered.",
             self.packets_to_client.load(Ordering::Relaxed),
         );
         metric(
@@ -402,5 +402,6 @@ mod tests {
         let output = metrics.render_prometheus();
         assert!(output.contains("porta_active_tunnels 1"));
         assert!(output.contains("porta_public_connections{transport=\"tcp\"} 1"));
+        assert!(output.contains("not confirmed delivered"));
     }
 }

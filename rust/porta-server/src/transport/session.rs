@@ -27,6 +27,7 @@ pub const MIN_LANES: u8 = 2;
 pub const MAX_LANES: u8 = 4;
 pub const PACKET_BATCH: usize = 16;
 pub const BATCH_BYTES: usize = 16 << 10;
+static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeviceProof {
@@ -265,6 +266,45 @@ impl UsageSession for NoopUsageSession {
     fn close(&self) {}
 }
 
+struct CountedUsage {
+    inner: Arc<dyn UsageSession>,
+    uploaded_bytes: AtomicU64,
+    uploaded_packets: AtomicU64,
+    downloaded_bytes: AtomicU64,
+    downloaded_packets: AtomicU64,
+}
+
+impl CountedUsage {
+    fn new(inner: Arc<dyn UsageSession>) -> Self {
+        Self {
+            inner,
+            uploaded_bytes: AtomicU64::new(0),
+            uploaded_packets: AtomicU64::new(0),
+            downloaded_bytes: AtomicU64::new(0),
+            downloaded_packets: AtomicU64::new(0),
+        }
+    }
+}
+
+impl UsageSession for CountedUsage {
+    fn uploaded(&self, bytes: u64, packets: u64) {
+        self.uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.uploaded_packets.fetch_add(packets, Ordering::Relaxed);
+        self.inner.uploaded(bytes, packets);
+    }
+
+    fn downloaded(&self, bytes: u64, packets: u64) {
+        self.downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.downloaded_packets
+            .fetch_add(packets, Ordering::Relaxed);
+        self.inner.downloaded(bytes, packets);
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueDrop {
     Closed,
@@ -386,15 +426,17 @@ impl Services {
                 return Err(error.into());
             }
         };
-        let usage = self.usage.begin(UsageMetadata {
+        let usage = Arc::new(CountedUsage::new(self.usage.begin(UsageMetadata {
             account_id: authenticated.identity.account_id.clone(),
             device_id: proof.device_id.clone(),
             transport: transport.clone(),
             address: lease.address,
             session_id: session_id.clone(),
-        });
+        })));
+        let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
         self.metrics.connected();
         tracing::info!(
+            tunnel_id,
             account_id = %authenticated.identity.account_id,
             device_id = %proof.device_id,
             device_name = %proof.name,
@@ -412,6 +454,7 @@ impl Services {
             peer,
             transport,
             session_id,
+            tunnel_id,
             opened_at: Instant::now(),
             downlink: route.downlink,
             cancellation: route.cancellation,
@@ -419,7 +462,8 @@ impl Services {
             auth_cancellation: authenticated.cancellation,
             auth_cleanup: authenticated.cleanup,
             route_cleanup: route.cleanup,
-            usage,
+            usage: usage.clone(),
+            counted_usage: usage,
             closed: AtomicBool::new(false),
         })
     }
@@ -433,6 +477,7 @@ pub struct Session {
     peer: std::net::SocketAddr,
     transport: String,
     session_id: String,
+    pub(crate) tunnel_id: u64,
     opened_at: Instant,
     pub downlink: Arc<dyn PacketSource>,
     pub cancellation: CancellationToken,
@@ -441,11 +486,20 @@ pub struct Session {
     auth_cleanup: Arc<dyn Cleanup>,
     route_cleanup: Arc<dyn Cleanup>,
     pub usage: Arc<dyn UsageSession>,
+    counted_usage: Arc<CountedUsage>,
     closed: AtomicBool,
 }
 
 impl Session {
     pub fn close(&self) {
+        self.close_with_reason(if self.cancellation.is_cancelled() {
+            "cancelled"
+        } else {
+            "unspecified"
+        });
+    }
+
+    pub(crate) fn close_with_reason(&self, reason: &'static str) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -457,6 +511,7 @@ impl Session {
         self.auth_cleanup.close();
         self.services.metrics.disconnected();
         tracing::info!(
+            tunnel_id = self.tunnel_id,
             account_id = %self.identity.account_id,
             device_id = %self.proof.device_id,
             address = %self.lease.address,
@@ -464,6 +519,12 @@ impl Session {
             peer = %self.peer,
             session_id = %self.session_id,
             duration_ms = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            reason,
+            uploaded_ip_bytes = self.counted_usage.uploaded_bytes.load(Ordering::Relaxed),
+            uploaded_ip_packets = self.counted_usage.uploaded_packets.load(Ordering::Relaxed),
+            // Usage accounting can precede the transport write; these are not delivery counters.
+            downlink_accounted_ip_bytes = self.counted_usage.downloaded_bytes.load(Ordering::Relaxed),
+            downlink_accounted_ip_packets = self.counted_usage.downloaded_packets.load(Ordering::Relaxed),
             "tunnel disconnected"
         );
     }
@@ -1230,6 +1291,42 @@ fn subnet_broadcast(address: Ipv4Addr, lease: &Lease) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn usage_counters_forward_accounting_without_changing_calls() {
+        #[derive(Default)]
+        struct RecordingUsage {
+            uploads: Mutex<Vec<(u64, u64)>>,
+            downloads: Mutex<Vec<(u64, u64)>>,
+            closes: AtomicUsize,
+        }
+        impl UsageSession for RecordingUsage {
+            fn uploaded(&self, bytes: u64, packets: u64) {
+                self.uploads.lock().push((bytes, packets));
+            }
+            fn downloaded(&self, bytes: u64, packets: u64) {
+                self.downloads.lock().push((bytes, packets));
+            }
+            fn close(&self) {
+                self.closes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let inner = Arc::new(RecordingUsage::default());
+        let usage = CountedUsage::new(inner.clone());
+        assert_eq!(usage.uploaded_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(usage.downloaded_bytes.load(Ordering::Relaxed), 0);
+        usage.uploaded(1200, 1);
+        usage.uploaded(2400, 2);
+        usage.downloaded(100, 1);
+        usage.close();
+        assert_eq!(usage.uploaded_bytes.load(Ordering::Relaxed), 3600);
+        assert_eq!(usage.uploaded_packets.load(Ordering::Relaxed), 3);
+        assert_eq!(usage.downloaded_bytes.load(Ordering::Relaxed), 100);
+        assert_eq!(usage.downloaded_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(*inner.uploads.lock(), [(1200, 1), (2400, 2)]);
+        assert_eq!(*inner.downloads.lock(), [(100, 1)]);
+        assert_eq!(inner.closes.load(Ordering::Relaxed), 1);
+    }
 
     #[derive(Default)]
     struct TestMetrics {
