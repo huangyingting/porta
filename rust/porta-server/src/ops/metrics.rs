@@ -20,6 +20,7 @@ pub struct Metrics {
     packets_to_client: AtomicU64,
     dropped_packets_from_client: AtomicU64,
     datagram_oversize: AtomicU64,
+    datagram_mtu_reductions: AtomicU64,
     queue_oldest_drops: AtomicU64,
     queue_full_drops: AtomicU64,
     queue_tail_drops: AtomicU64,
@@ -105,6 +106,10 @@ impl Metrics {
 
     pub fn datagram_oversize(&self) {
         self.datagram_oversize.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn datagram_mtu_reduced(&self) {
+        self.datagram_mtu_reductions.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn queue_drop(&self, reason: &str) {
@@ -210,8 +215,15 @@ impl Metrics {
             &mut output,
             "porta_datagram_oversize_total",
             "counter",
-            "Outgoing datagram payload-limit errors requiring capsule fallback.",
+            "Oversized downlink packets submitted to the capsule compatibility queue, not confirmed delivered.",
             self.datagram_oversize.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "porta_datagram_mtu_reductions_total",
+            "counter",
+            "Live HTTP/3 downlink packet MTU reductions; negotiated interface MTUs are unchanged.",
+            self.datagram_mtu_reductions.load(Ordering::Relaxed),
         );
         family(
             &mut output,
@@ -398,10 +410,14 @@ mod tests {
         let metrics = Metrics::default();
         metrics.public_connection_opened("tcp");
         metrics.connected();
+        metrics.datagram_mtu_reduced();
+        metrics.datagram_oversize();
         metrics.adjust_queue_bytes(1, 4096);
         let output = metrics.render_prometheus();
         assert!(output.contains("porta_active_tunnels 1"));
         assert!(output.contains("porta_public_connections{transport=\"tcp\"} 1"));
         assert!(output.contains("not confirmed delivered"));
+        assert!(output.contains("porta_datagram_mtu_reductions_total 1"));
+        assert!(output.contains("porta_datagram_oversize_total 1"));
     }
 }

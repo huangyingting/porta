@@ -10,7 +10,8 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::wire::ip::{classify_ipv4, internet_checksum, parse_ipv4, FlowKey, PacketClass};
+use crate::wire::ip::{classify_ipv4, FlowKey, PacketClass};
+pub use porta_wire::mtu::MtuError;
 
 pub const TUNNEL_PATH: &str = "/v1/tunnel";
 pub const MASQUE_PATH: &str = "/.well-known/masque/ip/%2A/%2A/";
@@ -322,6 +323,7 @@ pub trait Metrics: Send + Sync {
     fn sent_to_client(&self) {}
     fn dropped_from_client(&self) {}
     fn datagram_oversize(&self) {}
+    fn datagram_mtu_reduced(&self) {}
     fn collapsed_lane_group(&self) {}
     fn queue_drop(&self, _lane: i8, _reason: QueueDrop) {}
     fn queue_bytes(&self, _lane: i8, _delta: isize) {}
@@ -1098,112 +1100,9 @@ fn select_data_lane(group: &mut LaneGroup, flow: FlowKey, hash: u32) -> u8 {
     selected
 }
 
-#[derive(Debug, Error)]
-pub enum MtuError {
-    #[error("invalid IPv4 packet")]
-    InvalidPacket,
-    #[error("IPv4 fragmentation needed")]
-    FragmentationNeeded,
-    #[error("ICMP response suppressed")]
-    IcmpSuppressed,
-    #[error("invalid MTU")]
-    InvalidMtu,
-}
-
 pub fn fragment_ipv4(packet: &Bytes, mtu: usize) -> Result<Vec<Bytes>, MtuError> {
-    if !(68..=u16::MAX as usize).contains(&mtu) {
-        return Err(MtuError::InvalidMtu);
-    }
-    let info = parse_ipv4(packet).map_err(|_| MtuError::InvalidPacket)?;
-    if internet_checksum(&packet[..info.header_length]) != 0 {
-        return Err(MtuError::InvalidPacket);
-    }
-    let flags = u16::from_be_bytes([packet[6], packet[7]]);
-    if flags & 0x8000 != 0 {
-        return Err(MtuError::InvalidPacket);
-    }
-    if packet.len() <= mtu {
-        return Ok(vec![packet.clone()]);
-    }
-    if flags & 0x4000 != 0 {
-        return Err(MtuError::FragmentationNeeded);
-    }
-    let copied_options = copied_ipv4_options(&packet[20..info.header_length])?;
-    let payload = &packet[info.header_length..];
-    let mut absolute_offset = usize::from(flags & 0x1fff) * 8;
-    if (flags & 0x2000 != 0 && !payload.len().is_multiple_of(8))
-        || (flags & 0x3fff != 0 && payload.is_empty())
-        || 20 + copied_options.len() + absolute_offset + payload.len() > u16::MAX as usize
-    {
-        return Err(MtuError::InvalidPacket);
-    }
-    let mut consumed = 0;
-    let mut fragments = Vec::with_capacity(2);
-    while consumed < payload.len() {
-        let options = if absolute_offset == 0 {
-            &packet[20..info.header_length]
-        } else {
-            copied_options.as_slice()
-        };
-        let header_length = 20 + options.len();
-        if mtu < header_length + 8 {
-            return Err(MtuError::InvalidMtu);
-        }
-        let remaining = payload.len() - consumed;
-        let length = if remaining > mtu - header_length {
-            (mtu - header_length) & !7
-        } else {
-            remaining
-        };
-        let mut fragment = vec![0; header_length + length];
-        fragment[..20].copy_from_slice(&packet[..20]);
-        fragment[20..header_length].copy_from_slice(options);
-        fragment[0] = 0x40 | (header_length / 4) as u8;
-        let total = fragment.len() as u16;
-        fragment[2..4].copy_from_slice(&total.to_be_bytes());
-        let mut new_flags = (absolute_offset / 8) as u16;
-        if consumed + length < payload.len() || flags & 0x2000 != 0 {
-            new_flags |= 0x2000;
-        }
-        fragment[6..8].copy_from_slice(&new_flags.to_be_bytes());
-        fragment[header_length..].copy_from_slice(&payload[consumed..consumed + length]);
-        set_header_checksum(&mut fragment[..header_length]);
-        fragments.push(Bytes::from(fragment));
-        consumed += length;
-        absolute_offset += length;
-    }
-    Ok(fragments)
-}
-
-fn copied_ipv4_options(options: &[u8]) -> Result<Vec<u8>, MtuError> {
-    let mut copied = Vec::with_capacity(options.len());
-    let mut index = 0;
-    while index < options.len() {
-        match options[index] {
-            0 => {
-                if options[index..].iter().any(|value| *value != 0) {
-                    return Err(MtuError::InvalidPacket);
-                }
-                break;
-            }
-            1 => index += 1,
-            kind => {
-                let length = *options.get(index + 1).ok_or(MtuError::InvalidPacket)? as usize;
-                if length < 2 || index + length > options.len() {
-                    return Err(MtuError::InvalidPacket);
-                }
-                if kind & 0x80 != 0 {
-                    while copied.len() % 4 != index % 4 {
-                        copied.push(1);
-                    }
-                    copied.extend_from_slice(&options[index..index + length]);
-                }
-                index += length;
-            }
-        }
-    }
-    copied.resize((copied.len() + 3) & !3, 0);
-    Ok(copied)
+    porta_wire::mtu::fragment_ipv4(packet, mtu)
+        .map(|fragments| fragments.into_iter().map(Bytes::from).collect())
 }
 
 pub fn icmp_fragmentation_needed(
@@ -1212,84 +1111,23 @@ pub fn icmp_fragmentation_needed(
     mtu: usize,
     identification: u16,
 ) -> Result<Bytes, MtuError> {
-    if !(68..=u16::MAX as usize).contains(&mtu) {
-        return Err(MtuError::InvalidMtu);
-    }
-    let info = parse_ipv4(packet).map_err(|_| MtuError::InvalidPacket)?;
-    if internet_checksum(&packet[..info.header_length]) != 0 {
-        return Err(MtuError::InvalidPacket);
-    }
-    let flags = u16::from_be_bytes([packet[6], packet[7]]);
-    if packet.len() <= mtu
-        || flags & 0x1fff != 0
-        || flags & 0x4000 == 0
-        || !unicast(lease.gateway)
-        || !unicast(info.source)
-        || !unicast(info.destination)
-        || subnet_broadcast(info.source, lease)
-        || subnet_broadcast(info.destination, lease)
-    {
-        return Err(MtuError::IcmpSuppressed);
-    }
-    if packet[9] == 1 {
-        if packet.len() - info.header_length < 8 {
-            return Err(MtuError::IcmpSuppressed);
-        }
-        let icmp_type = *packet
-            .get(info.header_length)
-            .ok_or(MtuError::IcmpSuppressed)?;
-        if !matches!(
-            icmp_type,
-            0 | 8 | 9 | 10 | 13 | 14 | 15 | 16 | 17 | 18 | 42 | 43
-        ) {
-            return Err(MtuError::IcmpSuppressed);
-        }
-    }
-    let quote_length = packet.len().min(info.header_length + 8);
-    let mut response = vec![0; 28 + quote_length];
-    response[0] = 0x45;
-    let total = response.len() as u16;
-    response[2..4].copy_from_slice(&total.to_be_bytes());
-    response[4..6].copy_from_slice(&identification.to_be_bytes());
-    response[8] = 64;
-    response[9] = 1;
-    response[12..16].copy_from_slice(&lease.gateway.octets());
-    response[16..20].copy_from_slice(&info.source.octets());
-    response[20] = 3;
-    response[21] = 4;
-    response[26..28].copy_from_slice(&(mtu as u16).to_be_bytes());
-    response[28..].copy_from_slice(&packet[..quote_length]);
-    let icmp_checksum = internet_checksum(&response[20..]).to_be_bytes();
-    response[22..24].copy_from_slice(&icmp_checksum);
-    set_header_checksum(&mut response[..20]);
-    Ok(Bytes::from(response))
-}
-
-fn set_header_checksum(header: &mut [u8]) {
-    header[10] = 0;
-    header[11] = 0;
-    let checksum = internet_checksum(header).to_be_bytes();
-    header[10..12].copy_from_slice(&checksum);
-}
-
-fn unicast(address: Ipv4Addr) -> bool {
-    let first = address.octets()[0];
-    first != 0 && first != 127 && first < 224
-}
-
-fn subnet_broadcast(address: Ipv4Addr, lease: &Lease) -> bool {
-    if lease.prefix_len >= 31 {
-        return false;
-    }
-    let address = u32::from(address);
-    let leased = u32::from(lease.address);
-    let host_mask = u32::MAX >> lease.prefix_len;
-    address & !host_mask == leased & !host_mask && address & host_mask == host_mask
+    porta_wire::mtu::icmp_fragmentation_needed(
+        packet,
+        porta_wire::mtu::IcmpContext {
+            gateway: lease.gateway,
+            address: lease.address,
+            prefix_len: lease.prefix_len,
+        },
+        mtu,
+        identification,
+    )
+    .map(Bytes::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::ip::{internet_checksum, parse_ipv4, set_ipv4_header_checksum};
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -1355,7 +1193,7 @@ mod tests {
         packet[12..16].copy_from_slice(&source);
         packet[16..20].copy_from_slice(&destination);
         packet[20..24].copy_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
-        set_header_checksum(&mut packet[..20]);
+        set_ipv4_header_checksum(&mut packet).unwrap();
         Bytes::from(packet)
     }
 
@@ -1487,7 +1325,7 @@ mod tests {
 
         let mut df = original.to_vec();
         df[6] = 0x40;
-        set_header_checksum(&mut df[..20]);
+        set_ipv4_header_checksum(&mut df).unwrap();
         let df = Bytes::from(df);
         assert!(matches!(
             fragment_ipv4(&df, 1100),
@@ -1504,5 +1342,55 @@ mod tests {
         assert_eq!(&reply[20..22], &[3, 4]);
         assert_eq!(u16::from_be_bytes([reply[26], reply[27]]), 1100);
         assert_eq!(internet_checksum(&reply[20..]), 0);
+    }
+
+    #[test]
+    fn mtu_wrappers_match_shared_packets_and_errors() {
+        let original = packet([8, 8, 8, 8], [10, 66, 0, 2], 1300);
+        for mtu in [68, 1100, 1300] {
+            let expected = porta_wire::mtu::fragment_ipv4(&original, mtu).unwrap();
+            let actual = fragment_ipv4(&original, mtu).unwrap();
+            assert_eq!(
+                actual.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
+                expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(fragment_ipv4(&original, 67), Err(MtuError::InvalidMtu));
+        let mut df = original.to_vec();
+        df[6] = 0x40;
+        set_ipv4_header_checksum(&mut df).unwrap();
+        let df = Bytes::from(df);
+        let mut lease = Lease {
+            address: "10.66.0.2".parse().unwrap(),
+            prefix_len: 24,
+            gateway: "10.66.0.1".parse().unwrap(),
+            opaque_id: 1,
+        };
+        let expected = porta_wire::mtu::icmp_fragmentation_needed(
+            &df,
+            porta_wire::mtu::IcmpContext {
+                address: lease.address,
+                gateway: lease.gateway,
+                prefix_len: lease.prefix_len,
+            },
+            1100,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            icmp_fragmentation_needed(&df, &lease, 1100, 7)
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert_eq!(
+            icmp_fragmentation_needed(&original, &lease, 1100, 7),
+            Err(MtuError::IcmpSuppressed)
+        );
+        lease.prefix_len = 33;
+        assert_eq!(
+            icmp_fragmentation_needed(&df, &lease, 1100, 7),
+            Err(MtuError::InvalidPacket)
+        );
     }
 }

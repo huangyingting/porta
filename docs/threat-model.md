@@ -118,12 +118,16 @@ not conceal transport fingerprints from network inspection.
   on the CONNECT stream, but Datagrams may be lost or reordered.
 - Default automatic MTU selection is bounded and authenticated, not continuous
   path-MTU discovery or a guarantee that a path will never change. Lost probes
-  cannot raise the MTU. A later QUIC payload-limit reduction uses reliable
-  capsules; this cannot repair a path unable to carry QUIC's minimum UDP packet
-  size. IPv4 DF feedback still depends on remote hosts accepting ICMP, and
-  fragmented packets can be lost like other unreliable IP traffic.
-- Automatic-MTU ICMP feedback permits locally sourced ingress only on the
-  owned server TUN, using `accept_local=1` and loose `rp_filter=2`. Incoming
+  cannot raise the interface MTU. A later QUIC payload-limit reduction lowers
+  the send budget and uses IPv4 fragmentation or rate-limited DF feedback.
+  Non-adapting DF flows have a bounded-state, explicitly reported reliable
+  compatibility escape; it retains stream head-of-line blocking. Independent
+  bounded writers prevent that backpressure from monopolizing active receive
+  processing. None of this repairs a path unable to carry QUIC's minimum UDP
+  packet size. Fragmented packets can still be lost or reordered.
+- MTU ICMP feedback, in fixed and automatic modes, permits locally sourced
+  ingress only on the owned server TUN, using `accept_local=1` and loose
+  `rp_filter=2`. Incoming
   client packet sources must still match their authenticated lease. Physical
   interfaces and global reverse-path filtering are not weakened.
 - Native clients mitigate fallback head-of-line blocking with independent

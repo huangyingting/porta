@@ -789,6 +789,10 @@ impl Metrics for OperationalMetrics {
         OperationalMetrics::datagram_oversize(self);
     }
 
+    fn datagram_mtu_reduced(&self) {
+        OperationalMetrics::datagram_mtu_reduced(self);
+    }
+
     fn collapsed_lane_group(&self) {
         OperationalMetrics::lane_collapsed(self);
     }
@@ -840,6 +844,16 @@ mod tests {
     use std::future::{pending, Future};
     use std::io;
     use std::pin::Pin;
+
+    #[test]
+    fn mtu_reduction_adapter_updates_operational_counter() {
+        let metrics = OperationalMetrics::default();
+        Metrics::datagram_mtu_reduced(&metrics);
+        assert!(metrics
+            .render_prometheus()
+            .lines()
+            .any(|line| line == "porta_datagram_mtu_reductions_total 1"));
+    }
 
     #[derive(Default)]
     struct MemoryDevice {

@@ -23,7 +23,6 @@ pub struct SystemReadinessConfig {
     pub require_nat: bool,
     pub require_input_guard: bool,
     pub public_port: u16,
-    pub auto_mtu: bool,
     pub timeout: Duration,
     pub egress_url: Option<String>,
     pub dns_name: Option<String>,
@@ -179,19 +178,16 @@ pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
                 }
             }),
     ));
-    checks.push(optional_or_required_probe(
-        "mtu_feedback",
-        config.auto_mtu,
-        config.auto_mtu.then(|| {
-            let interface = config.interface.clone();
-            move |cancellation| {
-                let interface = interface.clone();
-                async move { check_mtu_feedback(&interface, cancellation).await }
-            }
-        }),
-    ));
+    checks.push(mtu_feedback_probe(config.interface.clone()));
 
     Ok(Readiness::new(checks, config.timeout))
+}
+
+fn mtu_feedback_probe(interface: String) -> ReadinessCheck {
+    required_probe("mtu_feedback", move |cancellation| {
+        let interface = interface.clone();
+        async move { check_mtu_feedback(&interface, cancellation).await }
+    })
 }
 
 fn validate_config(config: &SystemReadinessConfig) -> Result<()> {
@@ -374,7 +370,7 @@ async fn check_mtu_feedback(interface: &str, cancellation: CancellationToken) ->
     )
     .await?;
     if accept_local.trim() != "1" {
-        bail!("automatic MTU requires net/ipv4/conf/{interface}/accept_local=1 for ICMP feedback");
+        bail!("tunnel MTU feedback requires net/ipv4/conf/{interface}/accept_local=1");
     }
     let mut effective_rpf = 0u8;
     for name in ["all", interface] {
@@ -1103,7 +1099,6 @@ mod tests {
             require_nat: true,
             require_input_guard: true,
             public_port: 8443,
-            auto_mtu: true,
             timeout: Duration::from_secs(1),
             egress_url: None,
             dns_name: None,
@@ -1121,6 +1116,14 @@ mod tests {
         invalid = base;
         invalid.dns_name = Some("health.example".to_string());
         assert!(validate_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn mtu_feedback_is_required_independently_of_startup_discovery() {
+        let check = mtu_feedback_probe("porta0".into());
+        assert_eq!(check.name, "mtu_feedback");
+        assert!(check.required);
+        assert!(check.probe.is_some());
     }
 
     #[test]

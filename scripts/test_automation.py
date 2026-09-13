@@ -240,7 +240,7 @@ class AutomationTests(unittest.TestCase):
                 )
         self.assertFalse((self.root / "commands.jsonl").exists())
 
-    def test_automatic_mtu_scopes_icmp_acceptance_to_owned_tun(self):
+    def test_mtu_feedback_scopes_icmp_acceptance_to_owned_tun(self):
         self.run_script("server-up.sh", "porta.0", "10.66.0.1/24",
                         "10.66.0.0/24", "eth0", "8443")
         calls = self.commands()
@@ -251,11 +251,10 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(ipv4_changes), 2)
         self.assertTrue(all("/porta.0/" in value for value in ipv4_changes))
 
-    def test_fixed_mtu_does_not_change_source_validation(self):
+    def test_network_setup_rejects_obsolete_mtu_mode_argument(self):
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
-                        "eth0", "8443", "--auto-mtu=false")
-        self.assertFalse(any("accept_local" in " ".join(call) or "rp_filter" in " ".join(call)
-                             for call in self.commands()))
+                        "eth0", "8443", "--auto-mtu=false", success=False)
+        self.assertFalse((self.root / "commands.jsonl").exists())
 
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
@@ -683,7 +682,7 @@ class AutomationTests(unittest.TestCase):
             (self.root / "system/etc/porta/landing/custom.html").read_text(),
             "<h1>custom landing</h1>",
         )
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443;", unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", unit)
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
@@ -694,16 +693,16 @@ class AutomationTests(unittest.TestCase):
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1280", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
-    def test_deploy_fixed_mtu_disables_discovery_and_helper_settings(self):
+    def test_deploy_fixed_mtu_disables_discovery_but_preserves_feedback_setup(self):
         deploy = self.prepare_deploy(timer=False)
         self.run_deploy(deploy, "--build-local", "--auto-mtu=false", "--mtu", "1100")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=false", unit)
         self.assertNotIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1100", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=false", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
     def test_bundled_service_uses_automatic_mtu_defaults(self):
         unit = (ROOT / "deploy/porta.service").read_text()
@@ -712,8 +711,8 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--auto-mtu=true", start)
         self.assertIn("--mtu 1400", unit)
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
-        self.assertIn("--auto-mtu=true", setup)
-        self.assertIn("eth0 8443 --auto-mtu=true", setup)
+        self.assertNotIn("--auto-mtu", setup)
+        self.assertIn("eth0 8443;", setup)
         self.assertIn("RuntimeDirectoryPreserve=yes", unit)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):

@@ -172,7 +172,9 @@ Re-run `scripts/deploy.sh` to upgrade while preserving credentials, client
 records, usage, and leases.
 
 Automatic HTTP/3 tunnel MTU selection is enabled by default, with a 1400
-ceiling and a conservative 1100 baseline. Clients require no extra setting.
+ceiling and a conservative 1100 baseline. Datagram packet budgets also adapt
+downward when QUIC's capacity shrinks, without resizing the live VPN interface.
+Clients require no extra setting.
 Use `--auto-mtu=false --mtu 1100` for a fixed MTU. See
 [MTU selection](docs/architecture.md#stable-per-connection-mtu-selection)
 for fallback, IPv4 handling, and nested-VPN limits.

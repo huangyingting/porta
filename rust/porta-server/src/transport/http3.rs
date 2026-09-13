@@ -4,12 +4,14 @@ use h3::ext::Protocol;
 use h3::ConnectionState;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use porta_wire::mtu::{ip_datagram_capacity, DatagramMtu, FeedbackPolicy};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument;
@@ -18,8 +20,8 @@ use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryControlle
 use crate::transport::session::{
     bearer_token, fragment_ipv4, icmp_fragmentation_needed, AuthenticationRequest, DeviceProof,
     Lease, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind,
-    Services, Session, BATCH_BYTES, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION,
-    MASQUE_AUTH_PATH, MASQUE_PATH, PACKET_BATCH, PROTOCOL_VERSION,
+    Services, Session, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH,
+    MASQUE_PATH, PROTOCOL_VERSION,
 };
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
@@ -37,6 +39,12 @@ use crate::wire::masque::{
 const CAPSULE_PROTOCOL: &str = "Capsule-Protocol";
 const MAX_WEB_BODY: usize = 16 << 10;
 const MAX_MTU_PROBES: usize = 16;
+const RELIABLE_CONTROL_COMMANDS: usize = 8;
+const RELIABLE_DATA_COMMANDS: usize = 32;
+const RELIABLE_CONTROL_BYTES: usize = 64 << 10;
+const RELIABLE_DATA_BYTES: usize = 256 << 10;
+const RELIABLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_DATAGRAM_RETRIES: usize = 4;
 static ICMP_IDENTIFICATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -557,7 +565,7 @@ where
             datagram_sender,
             datagram_reader,
             &session,
-            &server,
+            &server.config,
             mtu,
             &mut diagnostics,
         )
@@ -580,7 +588,7 @@ async fn run_tunnel<S, B, SendHandler, RecvHandler>(
     mut datagram_sender: h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
     mut datagram_reader: h3_datagram::datagram_handler::DatagramReader<RecvHandler>,
     session: &Session,
-    server: &Http3Server,
+    config: &Http3Config,
     mut mtu: Option<MtuResponder>,
     diagnostics: &mut Http3Diagnostics,
 ) -> Result<&'static str>
@@ -591,12 +599,12 @@ where
     RecvHandler: h3_datagram::quic_traits::RecvDatagram + Send + 'static,
     RecvHandler::Buffer: Send + 'static,
 {
-    let response = success_response(&server.config, mtu.as_ref());
+    let response = success_response(config, mtu.as_ref(), &session.lease);
     let response_sent = tokio::select! {
         biased;
         _ = session.cancellation.cancelled() => false,
-        result = stream.send_response(response) => {
-            result?;
+        result = tokio::time::timeout(RELIABLE_TIMEOUT, stream.send_response(response)) => {
+            result.map_err(|_| ReliableWriteError::Timeout)??;
             true
         }
     };
@@ -639,15 +647,35 @@ where
         })
     });
     let mut capsules = BytesMut::with_capacity(256);
-    let assigned = AtomicBool::new(false);
+    let mut assigned = false;
     let mut downlink_ready = false;
-    let mut icmp_after = Instant::now();
+    let mut assignment_ack: Option<oneshot::Receiver<()>> = None;
+    let (writer, commands) = ReliableQueue::new();
+    let writer_cancellation = CancellationToken::new();
+    let connection = diagnostics.connection.clone();
 
-    let mut result: Result<&'static str> = async {
+    let mut result: Result<&'static str> = {
+        // Poll writes independently: receive handlers only try_enqueue, even while
+        // this future is waiting for peer stream credit.
+        let writing =
+            run_reliable_writer(&mut send_stream, commands, session, &writer_cancellation);
+        tokio::pin!(writing);
+        let mut writer_finished = false;
+        let mut result = async {
         'tunnel: loop {
             tokio::select! {
             biased;
             _ = session.cancellation.cancelled() => break Ok("cancelled"),
+            result = &mut writing => {
+                writer_finished = true;
+                result?;
+                break Err(ReliableWriteError::Closed.into());
+            }
+            result = async { assignment_ack.as_mut().unwrap().await }, if assignment_ack.is_some() => {
+                result.map_err(|_| ReliableWriteError::Closed)?;
+                assignment_ack = None;
+                downlink_ready = true;
+            }
             incoming = receive_stream.recv_data() => {
                 let Some(mut incoming) = incoming? else {
                     break Ok("client_eof");
@@ -659,22 +687,17 @@ where
                             let responder = mtu.as_mut().ok_or(MasqueError::InvalidMtuMessage)?;
                             let first_selection = !responder.committed;
                             let selected = responder.commit(&value)?;
-                            diagnostics.selected_mtu = responder.selected;
+                            diagnostics.select_mtu(responder.selected)?;
                             let mut control = BytesMut::with_capacity(selected.len() + 16);
                             append_capsule(&mut control, CAPSULE_MTU_SELECTED, &selected)?;
-                            send_h3_data(
-                                &mut send_stream,
-                                control.freeze().into(),
-                                &session.cancellation,
-                            )
-                            .await?;
+                            writer.control(control.freeze(), None)?;
                             if first_selection {
                                 tracing::info!(
                                     account_id = %session.identity.account_id,
                                     device_id = %session.proof.device_id,
                                     address = %session.lease.address,
                                     mtu = responder.selected,
-                                    ceiling = server.config.mtu,
+                                    ceiling = config.mtu,
                                     "tunnel MTU selected"
                                 );
                             }
@@ -683,30 +706,24 @@ where
                             if mtu.as_ref().is_some_and(|responder| !responder.committed) {
                                 break 'tunnel Err(MasqueError::InvalidMtuMessage.into());
                             }
-                            let previous = assigned.load(Ordering::Acquire);
                             let (control, becomes_assigned) =
-                                address_response(&session.lease, previous, &value)?;
+                                address_response(&session.lease, assigned, &value)?;
+                            let ack = if becomes_assigned && !assigned {
+                                let (tx, rx) = oneshot::channel();
+                                assignment_ack = Some(rx);
+                                Some(tx)
+                            } else {
+                                None
+                            };
+                            writer.control(control, ack)?;
                             if becomes_assigned {
-                                assigned.store(true, Ordering::Release);
-                            }
-                            if let Err(error) = send_h3_data(
-                                &mut send_stream,
-                                control.into(),
-                                &session.cancellation,
-                            )
-                            .await
-                            {
-                                assigned.store(previous, Ordering::Release);
-                                break 'tunnel Err(error);
-                            }
-                            if assigned.load(Ordering::Acquire) {
-                                downlink_ready = true;
+                                assigned = true;
                             }
                         }
                         CAPSULE_DATAGRAM => {
-                            if assigned.load(Ordering::Acquire) {
+                            if assigned {
                                 if let Ok(packet) = decode_ip_bytes(value) {
-                                    inject_packet(session, packet, selected_mtu(&mtu, server.config.mtu)).await?;
+                                    inject_packet(session, packet, selected_mtu(&mtu, config.mtu)).await?;
                                 } else {
                                     session.services().metrics.dropped_from_client();
                                 }
@@ -749,13 +766,13 @@ where
                         continue;
                     }
                 }
-                if !assigned.load(Ordering::Acquire) {
+                if !assigned {
                     session.services().metrics.dropped_from_client();
                     continue;
                 }
                 match decode_ip_bytes(value) {
                     Ok(packet) => {
-                        inject_packet(session, packet, selected_mtu(&mtu, server.config.mtu)).await?;
+                        inject_packet(session, packet, selected_mtu(&mtu, config.mtu)).await?;
                     }
                     Err(_) => session.services().metrics.dropped_from_client(),
                 }
@@ -767,17 +784,40 @@ where
                 send_downlink(
                     session,
                     packet,
-                    selected_mtu(&mtu, server.config.mtu),
-                    &mut datagram_sender,
-                    &mut send_stream,
-                    &mut icmp_after,
+                    selected_mtu(&mtu, config.mtu),
+                    &mut H3Datagrams {
+                        sender: &mut datagram_sender,
+                        connection: &connection,
+                        stream_id: stream_id.into_inner(),
+                    },
+                    &writer,
                     diagnostics,
+                    Instant::now(),
                 ).await?;
             }
             }
         }
-    }
-    .await;
+        }
+        .await;
+        drop(writer);
+        if result.is_err() || session.cancellation.is_cancelled() {
+            writer_cancellation.cancel();
+        }
+        if !writer_finished {
+            let write_result = tokio::time::timeout(RELIABLE_TIMEOUT, &mut writing)
+                .await
+                .map_err(|_| ReliableWriteError::Timeout.into())
+                .and_then(|result| result);
+            if result.is_ok() {
+                if session.cancellation.is_cancelled() {
+                    result = Ok("cancelled");
+                } else if let Err(error) = write_result {
+                    result = Err(error);
+                }
+            }
+        }
+        result
+    };
     datagram_cancellation.cancel();
     if let Some(datagram_task) = datagram_task {
         if let Err(error) = datagram_task.await {
@@ -788,22 +828,7 @@ where
         }
     }
     receive_stream.stop_sending(h3::error::Code::H3_NO_ERROR);
-    if result.is_ok() && !session.cancellation.is_cancelled() {
-        let finished = tokio::select! {
-            biased;
-            _ = session.cancellation.cancelled() => false,
-            finished = send_stream.finish() => {
-                if let Err(error) = finished {
-                    result = Err(error.into());
-                }
-                true
-            },
-        };
-        if !finished {
-            result = Ok("cancelled");
-            send_stream.stop_stream(h3::error::Code::H3_NO_ERROR);
-        }
-    } else {
+    if result.is_err() || session.cancellation.is_cancelled() {
         send_stream.stop_stream(h3::error::Code::H3_NO_ERROR);
     }
     result
@@ -838,6 +863,175 @@ impl TunnelTermination {
 #[error("session cancelled")]
 struct SessionCancelled;
 
+#[derive(Debug, thiserror::Error)]
+enum ReliableWriteError {
+    #[error("HTTP/3 reliable writer queue overloaded")]
+    Overloaded,
+    #[error("HTTP/3 reliable writer deadline exceeded")]
+    Timeout,
+    #[error("HTTP/3 reliable writer closed")]
+    Closed,
+}
+
+struct ReliableCommand {
+    data: Bytes,
+    ip_bytes: usize,
+    ip_packets: u64,
+    deadline: tokio::time::Instant,
+    acknowledgement: Option<oneshot::Sender<()>>,
+    _bytes: OwnedSemaphorePermit,
+}
+
+struct ReliableQueue {
+    control: mpsc::Sender<ReliableCommand>,
+    data: mpsc::Sender<ReliableCommand>,
+    control_bytes: Arc<Semaphore>,
+    data_bytes: Arc<Semaphore>,
+}
+
+struct ReliableCommands {
+    control: mpsc::Receiver<ReliableCommand>,
+    data: mpsc::Receiver<ReliableCommand>,
+}
+
+impl ReliableQueue {
+    fn new() -> (Self, ReliableCommands) {
+        let (control, control_rx) = mpsc::channel(RELIABLE_CONTROL_COMMANDS);
+        let (data, data_rx) = mpsc::channel(RELIABLE_DATA_COMMANDS);
+        (
+            Self {
+                control,
+                data,
+                control_bytes: Arc::new(Semaphore::new(RELIABLE_CONTROL_BYTES)),
+                data_bytes: Arc::new(Semaphore::new(RELIABLE_DATA_BYTES)),
+            },
+            ReliableCommands {
+                control: control_rx,
+                data: data_rx,
+            },
+        )
+    }
+
+    fn control(&self, data: Bytes, acknowledgement: Option<oneshot::Sender<()>>) -> Result<()> {
+        Self::enqueue(
+            &self.control,
+            &self.control_bytes,
+            data,
+            0,
+            0,
+            acknowledgement,
+        )
+    }
+
+    fn packet(&self, packet: &Bytes) -> Result<()> {
+        let mut data = BytesMut::with_capacity(packet.len() + 16);
+        append_ip_capsule(&mut data, packet)?;
+        Self::enqueue(
+            &self.data,
+            &self.data_bytes,
+            data.freeze(),
+            packet.len(),
+            1,
+            None,
+        )
+    }
+
+    fn enqueue(
+        queue: &mpsc::Sender<ReliableCommand>,
+        budget: &Arc<Semaphore>,
+        data: Bytes,
+        ip_bytes: usize,
+        ip_packets: u64,
+        acknowledgement: Option<oneshot::Sender<()>>,
+    ) -> Result<()> {
+        let size = u32::try_from(data.len()).map_err(|_| ReliableWriteError::Overloaded)?;
+        let permit = budget
+            .clone()
+            .try_acquire_many_owned(size)
+            .map_err(|_| ReliableWriteError::Overloaded)?;
+        queue
+            .try_send(ReliableCommand {
+                data,
+                ip_bytes,
+                ip_packets,
+                deadline: tokio::time::Instant::now() + RELIABLE_TIMEOUT,
+                acknowledgement,
+                _bytes: permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ReliableWriteError::Overloaded,
+                mpsc::error::TrySendError::Closed(_) => ReliableWriteError::Closed,
+            })?;
+        Ok(())
+    }
+}
+
+async fn run_reliable_writer<S, B>(
+    stream: &mut h3::server::RequestStream<S, B>,
+    mut commands: ReliableCommands,
+    session: &Session,
+    cancellation: &CancellationToken,
+) -> Result<()>
+where
+    S: h3::quic::SendStream<B>,
+    B: Buf + From<Bytes>,
+{
+    let mut control_open = true;
+    let mut data_open = true;
+    loop {
+        if !control_open && !data_open {
+            break;
+        }
+        let command = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(SessionCancelled.into()),
+            _ = session.cancellation.cancelled() => return Err(SessionCancelled.into()),
+            command = commands.control.recv(), if control_open => {
+                control_open = command.is_some();
+                command
+            }
+            command = commands.data.recv(), if data_open => {
+                data_open = command.is_some();
+                command
+            }
+        };
+        let Some(command) = command else { continue };
+        if tokio::time::Instant::now() >= command.deadline {
+            return Err(ReliableWriteError::Timeout.into());
+        }
+        // Expiry includes queue residence and the in-flight write. A partially written
+        // capsule cannot be preempted by control data without corrupting the stream.
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(SessionCancelled.into()),
+            _ = session.cancellation.cancelled() => return Err(SessionCancelled.into()),
+            result = tokio::time::timeout_at(command.deadline, stream.send_data(command.data.into())) => {
+                result.map_err(|_| ReliableWriteError::Timeout)??;
+            }
+        }
+        if command.ip_packets != 0 {
+            for _ in 0..command.ip_packets {
+                session.services().metrics.sent_to_client();
+            }
+            session
+                .usage
+                .downloaded(command.ip_bytes as u64, command.ip_packets);
+        }
+        if let Some(acknowledgement) = command.acknowledgement {
+            let _ = acknowledgement.send(());
+        }
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(SessionCancelled.into()),
+        _ = session.cancellation.cancelled() => Err(SessionCancelled.into()),
+        result = tokio::time::timeout(RELIABLE_TIMEOUT, stream.finish()) => {
+            result.map_err(|_| ReliableWriteError::Timeout)??;
+            Ok(())
+        }
+    }
+}
+
 fn tunnel_termination(
     result: &Result<&'static str>,
     cancelled: bool,
@@ -850,6 +1044,16 @@ fn tunnel_termination(
     };
     if error.is::<SessionCancelled>() || (cancelled && error.is::<RouteError>()) {
         return TunnelTermination::normal("cancelled");
+    }
+    if let Some(error) = error.downcast_ref::<ReliableWriteError>() {
+        return TunnelTermination::failure(
+            match error {
+                ReliableWriteError::Overloaded => "capsule_writer_overloaded",
+                ReliableWriteError::Timeout => "capsule_writer_timeout",
+                ReliableWriteError::Closed => "capsule_writer_closed",
+            },
+            None,
+        );
     }
     if let Some(error) = error.downcast_ref::<StreamError>() {
         if error.is_h3_no_error() {
@@ -880,6 +1084,9 @@ fn tunnel_termination(
     }
     if error.is::<MasqueError>() {
         return TunnelTermination::failure("capsule_protocol_error", None);
+    }
+    if error.is::<MtuError>() {
+        return TunnelTermination::failure("datagram_mtu_invalid", None);
     }
     if error.is::<RouteError>() {
         return TunnelTermination::failure("router_error", None);
@@ -999,6 +1206,10 @@ struct Http3Diagnostics {
     datagrams_disabled_reason: &'static str,
     datagram_reader_failed: bool,
     min_oversize_ip_capacity: Option<usize>,
+    packet_mtu: DatagramMtu,
+    mtu_reductions: u64,
+    too_large_retries: u64,
+    feedback: FeedbackPolicy,
     sends: Http3SendCounters,
 }
 
@@ -1026,6 +1237,10 @@ impl Http3Diagnostics {
             datagrams_disabled_reason: if datagrams { "none" } else { "not_negotiated" },
             datagram_reader_failed: false,
             min_oversize_ip_capacity: None,
+            packet_mtu: DatagramMtu::new(mtu),
+            mtu_reductions: 0,
+            too_large_retries: 0,
+            feedback: FeedbackPolicy::default(),
             sends: Http3SendCounters::default(),
         }
     }
@@ -1043,8 +1258,9 @@ impl Http3Diagnostics {
         }
         if self.sends.fallback(kind, ip_bytes) {
             tracing::info!(
-                reason = if kind == DatagramErrorKind::TooLarge { "too_large" } else { "not_available" },
+                reason = if kind == DatagramErrorKind::TooLarge { "nonconverging_df" } else { "not_available" },
                 ip_bytes,
+                packet_mtu = self.packet_mtu.limit(),
                 quic_datagram_capacity = ?capacity,
                 ip_datagram_capacity = ?ip_capacity,
                 "HTTP/3 downlink capsule fallback started"
@@ -1058,6 +1274,36 @@ impl Http3Diagnostics {
             self.datagrams_disabled_reason = reason;
             tracing::info!(reason, "HTTP/3 tunnel switched to capsules");
         }
+    }
+
+    fn select_mtu(&mut self, mtu: u16) -> Result<()> {
+        // Selection is a ceiling, not a live path measurement. Idempotent
+        // selections must not restore a limit reduced by subsequent sends.
+        self.packet_mtu.update(usize::from(mtu))?;
+        self.selected_mtu = mtu;
+        Ok(())
+    }
+
+    fn refresh_packet_mtu(&mut self, capacity: Option<usize>, session: &Session) -> Result<()> {
+        if let Some(capacity) = capacity {
+            let previous = self.packet_mtu.limit();
+            if self.packet_mtu.update(capacity)? {
+                self.mtu_reductions += 1;
+                session.services().metrics.datagram_mtu_reduced();
+                // At most four events per authenticated tunnel, then the final summary.
+                if self.mtu_reductions <= 4 {
+                    tracing::info!(
+                        previous_packet_mtu = previous,
+                        packet_mtu = self.packet_mtu.limit(),
+                        selected_mtu = self.selected_mtu,
+                        "HTTP/3 downlink packet MTU reduced"
+                    );
+                }
+            }
+        } else {
+            self.disable_datagrams("not_available");
+        }
+        Ok(())
     }
 
     fn finish(&self, termination: TunnelTermination, session: &Session) {
@@ -1077,6 +1323,9 @@ impl Http3Diagnostics {
             reason = termination.reason,
             error_code = ?termination.code,
             selected_mtu = self.selected_mtu,
+            packet_mtu = self.packet_mtu.limit(),
+            packet_mtu_reductions = self.mtu_reductions,
+            too_large_retries = self.too_large_retries,
             datagrams_enabled = self.datagrams_enabled,
             datagrams_disabled_reason = self.datagrams_disabled_reason,
             quic_datagram_capacity = ?self.connection.max_datagram_size(),
@@ -1101,24 +1350,17 @@ impl Http3Diagnostics {
     }
 }
 
-fn ip_datagram_capacity(quic_capacity: Option<usize>, stream_id: u64) -> Option<usize> {
-    // QUIC's payload limit includes the HTTP/3 quarter stream ID and CONNECT-IP context ID.
-    let stream_id_bytes = match stream_id / 4 {
-        0..=63 => 1,
-        64..=16_383 => 2,
-        16_384..=1_073_741_823 => 4,
-        _ => 8,
-    };
-    quic_capacity.map(|capacity| capacity.saturating_sub(stream_id_bytes + 1))
-}
-
 fn is_connect_ip(request: &http::Request<()>) -> bool {
     request.method() == http::Method::CONNECT
         && request.uri().path().eq_ignore_ascii_case(MASQUE_PATH)
         && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP)
 }
 
-fn success_response(config: &Http3Config, mtu: Option<&MtuResponder>) -> http::Response<()> {
+fn success_response(
+    config: &Http3Config,
+    mtu: Option<&MtuResponder>,
+    lease: &Lease,
+) -> http::Response<()> {
     let mut response = http::Response::new(());
     *response.status_mut() = http::StatusCode::OK;
     let headers = response.headers_mut();
@@ -1130,6 +1372,10 @@ fn success_response(config: &Http3Config, mtu: Option<&MtuResponder>) -> http::R
     set_security_headers(headers);
     set_version_headers(headers);
     headers.insert("X-Porta-MTU", config.mtu.to_string().parse().unwrap());
+    headers.insert(
+        "X-Porta-Gateway",
+        lease.gateway.to_string().parse().unwrap(),
+    );
     if let Some(dns) = config.dns {
         headers.insert("X-Porta-DNS", dns.to_string().parse().unwrap());
     }
@@ -1386,148 +1632,167 @@ pub(crate) async fn inject_packet(session: &Session, packet: Bytes, mtu: u16) ->
     Ok(())
 }
 
-async fn send_downlink<S, B, SendHandler>(
+trait DownlinkDatagrams {
+    fn capacity(&self) -> Option<usize>;
+    fn send(&mut self, packet: &Bytes) -> std::result::Result<(), DatagramFailure>;
+}
+
+struct DatagramFailure {
+    kind: DatagramErrorKind,
+    error: anyhow::Error,
+}
+
+struct H3Datagrams<'a, SendHandler, B>
+where
+    SendHandler: h3_datagram::quic_traits::SendDatagram<B>,
+    B: Buf,
+{
+    sender: &'a mut h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
+    connection: &'a quinn::Connection,
+    stream_id: u64,
+}
+
+impl<SendHandler, B> DownlinkDatagrams for H3Datagrams<'_, SendHandler, B>
+where
+    SendHandler: h3_datagram::quic_traits::SendDatagram<B>,
+    B: Buf + From<Bytes>,
+{
+    fn capacity(&self) -> Option<usize> {
+        ip_datagram_capacity(self.connection.max_datagram_size(), self.stream_id)
+    }
+
+    fn send(&mut self, packet: &Bytes) -> std::result::Result<(), DatagramFailure> {
+        let mut value = BytesMut::with_capacity(packet.len() + 1);
+        value.extend_from_slice(&[0]);
+        value.extend_from_slice(packet);
+        self.sender
+            .send_datagram(value.freeze().into())
+            .map_err(|error| DatagramFailure {
+                kind: datagram_error_kind(&error),
+                error: error.into(),
+            })
+    }
+}
+
+async fn send_downlink(
     session: &Session,
     packet: Bytes,
     mtu: u16,
-    datagram_sender: &mut h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
-    send_stream: &mut h3::server::RequestStream<S, B>,
-    icmp_after: &mut Instant,
+    datagrams: &mut impl DownlinkDatagrams,
+    writer: &ReliableQueue,
     diagnostics: &mut Http3Diagnostics,
-) -> Result<()>
-where
-    S: h3::quic::SendStream<B>,
-    B: Buf + From<Bytes>,
-    SendHandler: h3_datagram::quic_traits::SendDatagram<B>,
-{
-    if packet.len() > usize::from(mtu) {
-        match fragment_ipv4(&packet, usize::from(mtu)) {
-            Ok(fragments) => {
-                session.services().metrics.mtu_fragmented();
-                for fragment in fragments {
-                    send_one(session, fragment, datagram_sender, send_stream, diagnostics).await?;
-                }
-                return Ok(());
-            }
-            Err(MtuError::FragmentationNeeded) => {
-                let now = Instant::now();
-                if now < *icmp_after {
-                    session.services().metrics.mtu_icmp_rate_limited();
-                    return Ok(());
-                }
-                match icmp_fragmentation_needed(
-                    &packet,
-                    &session.lease,
-                    usize::from(mtu),
-                    ICMP_IDENTIFICATION.fetch_add(1, Ordering::Relaxed) as u16,
-                ) {
-                    Ok(reply) => {
-                        session
-                            .services()
-                            .router
-                            .inject_validated(session.cancellation.clone(), reply)
-                            .await
-                            .map_err(anyhow::Error::new)?;
-                        *icmp_after = now + Duration::from_millis(100);
-                        session.services().metrics.mtu_icmp_sent();
+    now: Instant,
+) -> Result<()> {
+    let mut initial = Some(packet);
+    let mut pending = VecDeque::new();
+    let mut retries = 0;
+    while let Some(packet) = initial.take().or_else(|| pending.pop_front()) {
+        if session.cancellation.is_cancelled() {
+            return Err(SessionCancelled.into());
+        }
+        if diagnostics.datagrams_enabled {
+            diagnostics.refresh_packet_mtu(datagrams.capacity(), session)?;
+        }
+        let limit = if diagnostics.datagrams_enabled {
+            diagnostics.packet_mtu.limit()
+        } else {
+            usize::from(mtu)
+        };
+        if packet.len() > limit {
+            match fragment_ipv4(&packet, limit) {
+                Ok(fragments) => {
+                    session.services().metrics.mtu_fragmented();
+                    // Only unsent data is re-fragmented when the path shrinks mid-packet.
+                    for fragment in fragments.into_iter().rev() {
+                        pending.push_front(fragment);
                     }
-                    Err(MtuError::IcmpSuppressed) => {
-                        session.services().metrics.mtu_icmp_suppressed();
-                    }
-                    Err(_) => session.services().metrics.invalid_tun_packet(),
+                    continue;
                 }
-                return Ok(());
-            }
-            Err(_) => {
-                session.services().metrics.invalid_tun_packet();
-                return Ok(());
+                Err(MtuError::FragmentationNeeded) => {
+                    match icmp_fragmentation_needed(
+                        &packet,
+                        &session.lease,
+                        limit,
+                        ICMP_IDENTIFICATION.fetch_add(1, Ordering::Relaxed) as u16,
+                    ) {
+                        Ok(reply) => {
+                            let decision = diagnostics.feedback.on_oversized(
+                                &packet,
+                                limit,
+                                usize::from(mtu),
+                                now,
+                                diagnostics.connection.rtt(),
+                            );
+                            if decision.send_icmp {
+                                session
+                                    .services()
+                                    .router
+                                    .inject_validated(session.cancellation.clone(), reply)
+                                    .await
+                                    .map_err(anyhow::Error::new)?;
+                                session.services().metrics.mtu_icmp_sent();
+                            } else if !decision.use_capsule {
+                                session.services().metrics.mtu_icmp_rate_limited();
+                            }
+                            if decision.use_capsule && diagnostics.datagrams_enabled {
+                                writer.packet(&packet)?;
+                                session.services().metrics.datagram_oversize();
+                                diagnostics.fallback(DatagramErrorKind::TooLarge, packet.len());
+                                diagnostics.sends.capsule_submitted(packet.len(), 1);
+                            }
+                        }
+                        Err(MtuError::IcmpSuppressed) => {
+                            session.services().metrics.mtu_icmp_suppressed()
+                        }
+                        Err(MtuError::InvalidMtu) => return Err(MtuError::InvalidMtu.into()),
+                        Err(_) => session.services().metrics.invalid_tun_packet(),
+                    }
+                    continue;
+                }
+                Err(MtuError::InvalidMtu) => return Err(MtuError::InvalidMtu.into()),
+                Err(_) => {
+                    session.services().metrics.invalid_tun_packet();
+                    continue;
+                }
             }
         }
-    }
-    if !diagnostics.datagrams_enabled {
-        let mut control = BytesMut::with_capacity(packet.len() + 16);
-        append_ip_capsule(&mut control, &packet)?;
-        let mut count = 1;
-        let mut bytes = packet.len();
-        session.services().metrics.sent_to_client();
-        session.usage.downloaded(packet.len() as u64, 1);
-        while count < PACKET_BATCH && bytes < BATCH_BYTES {
-            let Some(packet) = session.downlink.try_packet() else {
-                break;
-            };
-            append_ip_capsule(&mut control, &packet)?;
-            count += 1;
-            bytes += packet.len();
-            session.services().metrics.sent_to_client();
-            session.usage.downloaded(packet.len() as u64, 1);
+        if !diagnostics.datagrams_enabled {
+            writer.packet(&packet)?;
+            diagnostics.sends.capsule_submitted(packet.len(), 1);
+            continue;
         }
-        diagnostics.sends.capsule_submitted(bytes, count as u64);
-        send_h3_data(send_stream, control.freeze().into(), &session.cancellation).await?;
-        return Ok(());
-    }
-    send_one(session, packet, datagram_sender, send_stream, diagnostics).await
-}
-
-async fn send_one<S, B, SendHandler>(
-    session: &Session,
-    packet: Bytes,
-    datagram_sender: &mut h3_datagram::datagram_handler::DatagramSender<SendHandler, B>,
-    send_stream: &mut h3::server::RequestStream<S, B>,
-    diagnostics: &mut Http3Diagnostics,
-) -> Result<()>
-where
-    S: h3::quic::SendStream<B>,
-    B: Buf + From<Bytes>,
-    SendHandler: h3_datagram::quic_traits::SendDatagram<B>,
-{
-    let mut value = BytesMut::with_capacity(packet.len() + 1);
-    value.extend_from_slice(&[0]);
-    value.extend_from_slice(&packet);
-    match datagram_sender.send_datagram(value.freeze().into()) {
-        Ok(()) => diagnostics.sends.datagram_queued(packet.len()),
-        Err(error) => match datagram_error_kind(&error) {
-            DatagramErrorKind::TooLarge => {
-                session.services().metrics.datagram_oversize();
-                diagnostics.fallback(DatagramErrorKind::TooLarge, packet.len());
-                let mut control = BytesMut::with_capacity(packet.len() + 16);
-                append_ip_capsule(&mut control, &packet)?;
-                diagnostics.sends.capsule_submitted(packet.len(), 1);
-                send_h3_data(send_stream, control.freeze().into(), &session.cancellation).await?;
+        match datagrams.send(&packet) {
+            Ok(()) => {
+                diagnostics.sends.datagram_queued(packet.len());
+                session.services().metrics.sent_to_client();
+                session.usage.downloaded(packet.len() as u64, 1);
             }
-            DatagramErrorKind::NotAvailable => {
-                diagnostics.fallback(DatagramErrorKind::NotAvailable, packet.len());
-                diagnostics.disable_datagrams("not_available");
-                let mut control = BytesMut::with_capacity(packet.len() + 16);
-                append_ip_capsule(&mut control, &packet)?;
-                diagnostics.sends.capsule_submitted(packet.len(), 1);
-                send_h3_data(send_stream, control.freeze().into(), &session.cancellation).await?;
-            }
-            DatagramErrorKind::Connection => return Err(error.into()),
-        },
+            Err(failure) => match failure.kind {
+                DatagramErrorKind::TooLarge => {
+                    retries += 1;
+                    let previous = diagnostics.packet_mtu.limit();
+                    diagnostics.refresh_packet_mtu(datagrams.capacity(), session)?;
+                    if retries > MAX_DATAGRAM_RETRIES
+                        || (diagnostics.datagrams_enabled
+                            && diagnostics.packet_mtu.limit() >= previous)
+                    {
+                        return Err(failure
+                            .error
+                            .context("HTTP/3 datagram capacity did not converge"));
+                    }
+                    diagnostics.too_large_retries += 1;
+                    pending.push_front(packet);
+                }
+                DatagramErrorKind::NotAvailable => {
+                    diagnostics.fallback(DatagramErrorKind::NotAvailable, packet.len());
+                    diagnostics.disable_datagrams("not_available");
+                    pending.push_front(packet);
+                }
+                DatagramErrorKind::Connection => return Err(failure.error),
+            },
+        }
     }
-    session.services().metrics.sent_to_client();
-    session.usage.downloaded(packet.len() as u64, 1);
     Ok(())
-}
-
-async fn send_h3_data<S, B>(
-    stream: &mut h3::server::RequestStream<S, B>,
-    data: B,
-    cancellation: &CancellationToken,
-) -> Result<()>
-where
-    S: h3::quic::SendStream<B>,
-    B: Buf,
-{
-    tokio::select! {
-        result = stream.send_data(data) => {
-            result?;
-            Ok(())
-        }
-        _ = cancellation.cancelled() => {
-            Err(SessionCancelled.into())
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1694,7 +1959,1082 @@ mod tests {
         RouteRequest, RouteSession, TokenCancellation,
     };
     use futures_util::future::BoxFuture;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct TestMetrics {
+        sent: AtomicUsize,
+        uploaded: AtomicUsize,
+        reductions: AtomicUsize,
+        fragmented: AtomicUsize,
+        icmp: AtomicUsize,
+        limited: AtomicUsize,
+        suppressed: AtomicUsize,
+        compatibility: AtomicUsize,
+        closed: AtomicUsize,
+    }
+
+    impl crate::transport::session::Metrics for TestMetrics {
+        fn sent_to_client(&self) {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+        fn received_from_client(&self) {
+            self.uploaded.fetch_add(1, Ordering::Relaxed);
+        }
+        fn datagram_mtu_reduced(&self) {
+            self.reductions.fetch_add(1, Ordering::Relaxed);
+        }
+        fn mtu_fragmented(&self) {
+            self.fragmented.fetch_add(1, Ordering::Relaxed);
+        }
+        fn mtu_icmp_sent(&self) {
+            self.icmp.fetch_add(1, Ordering::Relaxed);
+        }
+        fn mtu_icmp_rate_limited(&self) {
+            self.limited.fetch_add(1, Ordering::Relaxed);
+        }
+        fn mtu_icmp_suppressed(&self) {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+        }
+        fn datagram_oversize(&self) {
+            self.compatibility.fetch_add(1, Ordering::Relaxed);
+        }
+        fn disconnected(&self) {
+            self.closed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn test_session() -> (Arc<Session>, Arc<FakeRouter>, Arc<TestMetrics>) {
+        let metrics = Arc::new(TestMetrics::default());
+        let router = Arc::new(FakeRouter {
+            packets: Arc::new(Mutex::new(Vec::new())),
+            downlink: PacketQueue::new(QueueConfig::MASQUE, -1, metrics.clone()),
+        });
+        let services = Arc::new(Services {
+            authenticator: Arc::new(FakeAuthenticator),
+            leases: Arc::new(FakeLeases),
+            router: router.clone(),
+            usage: Arc::new(NoopUsage),
+            metrics: metrics.clone(),
+        });
+        let session = services
+            .open(OpenSessionRequest {
+                authentication: AuthenticationRequest {
+                    bearer_token: "test-token".into(),
+                    proof: DeviceProof::default(),
+                    method: http::Method::CONNECT,
+                    path: MASQUE_PATH.into(),
+                    peer: "127.0.0.1:1234".parse().unwrap(),
+                },
+                group_id: None,
+                route: RouteKind::ConnectIp,
+                transport: "masque-h3-test".into(),
+            })
+            .await
+            .unwrap();
+        (Arc::new(session), router, metrics)
+    }
+
+    struct QuicPair {
+        server_endpoint: quinn::Endpoint,
+        client_endpoint: quinn::Endpoint,
+        server: quinn::Connection,
+        client: quinn::Connection,
+    }
+
+    impl Drop for QuicPair {
+        fn drop(&mut self) {
+            self.client_endpoint.close(0_u32.into(), b"test complete");
+            self.server_endpoint.close(0_u32.into(), b"test complete");
+        }
+    }
+
+    async fn quic_pair(receive_window: u32) -> QuicPair {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.der().clone();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .initial_mtu(1200)
+            .min_mtu(1200)
+            .mtu_discovery_config(None);
+        server_config.transport_config(Arc::new(transport));
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        ));
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(receive_window.into());
+        client_config.transport_config(Arc::new(transport));
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_config);
+        let connecting = client_endpoint
+            .connect(server_endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let (client, server) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(connecting, async {
+                server_endpoint.accept().await.unwrap().await
+            })
+        })
+        .await
+        .unwrap();
+        QuicPair {
+            server_endpoint,
+            client_endpoint,
+            server: server.unwrap(),
+            client: client.unwrap(),
+        }
+    }
+
+    fn ip_packet(length: usize, df: bool) -> Bytes {
+        let mut packet: Vec<u8> = (0..length).map(|i| i as u8).collect();
+        packet[..20].fill(0);
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+        packet[4..6].copy_from_slice(&123_u16.to_be_bytes());
+        packet[6] = if df { 0x40 } else { 0 };
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&lease().address.octets());
+        crate::wire::ip::set_ipv4_header_checksum(&mut packet[..20]).unwrap();
+        Bytes::from(packet)
+    }
+
+    fn assert_reassembled(packets: &[Bytes], original: &Bytes, limit: usize) {
+        let mut body = Vec::new();
+        for packet in packets {
+            assert!(packet.len() <= limit);
+            assert_eq!(crate::wire::ip::internet_checksum(&packet[..20]), 0);
+            let flags = u16::from_be_bytes([packet[6], packet[7]]);
+            assert_eq!(usize::from(flags & 0x1fff) * 8, body.len());
+            body.extend_from_slice(&packet[20..]);
+            assert_eq!(flags & 0x2000 != 0, body.len() < original.len() - 20);
+        }
+        assert_eq!(body, original[20..]);
+    }
+
+    struct FakeDatagrams {
+        capacity: Option<usize>,
+        packets: Vec<Bytes>,
+        calls: usize,
+        race: Option<(usize, usize)>,
+        failure: Option<DatagramErrorKind>,
+    }
+
+    impl FakeDatagrams {
+        fn new(capacity: Option<usize>) -> Self {
+            Self {
+                capacity,
+                packets: Vec::new(),
+                calls: 0,
+                race: None,
+                failure: None,
+            }
+        }
+    }
+
+    impl DownlinkDatagrams for FakeDatagrams {
+        fn capacity(&self) -> Option<usize> {
+            self.capacity
+        }
+        fn send(&mut self, packet: &Bytes) -> std::result::Result<(), DatagramFailure> {
+            self.calls += 1;
+            if let Some((call, limit)) = self.race {
+                if call == self.calls {
+                    self.capacity = Some(limit);
+                }
+            }
+            let failure = self.failure.or_else(|| {
+                (packet.len() > self.capacity.unwrap_or(0)).then_some(DatagramErrorKind::TooLarge)
+            });
+            if let Some(kind) = failure {
+                return Err(DatagramFailure {
+                    kind,
+                    error: anyhow::anyhow!("injected datagram failure"),
+                });
+            }
+            self.packets.push(packet.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_packet_mtu_reduction_fragments_without_changing_inbound_ceiling() {
+        let pair = quic_pair(64 << 10).await;
+        let (session, router, metrics) = test_session().await;
+        let mut diagnostics = Http3Diagnostics::new(pair.server.clone(), 0, true, 1400);
+        let mut responder = MtuResponder::new(1400);
+        let probe = crate::wire::masque::encode_mtu_probe(MtuProbe {
+            token: responder.token,
+            sequence: 1,
+            size: 1400,
+        })
+        .unwrap();
+        responder.accept_probe(&probe).unwrap();
+        responder.probe_echoed(&probe).unwrap();
+        let selection = encode_mtu_selection(responder.token, 1400);
+        responder.commit(&selection).unwrap();
+        diagnostics.select_mtu(responder.selected).unwrap();
+        let (writer, mut commands) = ReliableQueue::new();
+        let mut datagrams = FakeDatagrams::new(Some(1400));
+        send_downlink(
+            &session,
+            ip_packet(100, false),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(diagnostics.packet_mtu.limit(), 1400);
+        datagrams.packets.clear();
+        datagrams.capacity = Some(1160);
+        let packet = ip_packet(1400, false);
+        send_downlink(
+            &session,
+            packet.clone(),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_reassembled(&datagrams.packets, &packet, 1160);
+        assert_eq!(diagnostics.selected_mtu, 1400);
+        assert_eq!(metrics.reductions.load(Ordering::Relaxed), 1);
+        responder.commit(&selection).unwrap();
+        diagnostics.select_mtu(responder.selected).unwrap();
+        assert_eq!(diagnostics.packet_mtu.limit(), 1160);
+        datagrams.capacity = Some(1400);
+        datagrams.packets.clear();
+        send_downlink(
+            &session,
+            packet.clone(),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_reassembled(&datagrams.packets, &packet, 1160);
+        assert_eq!(metrics.reductions.load(Ordering::Relaxed), 1);
+        assert!(commands.data.try_recv().is_err());
+        let mut inbound = packet.to_vec();
+        inbound[12..16].copy_from_slice(&lease().address.octets());
+        inject_packet(&session, Bytes::from(inbound), diagnostics.selected_mtu)
+            .await
+            .unwrap();
+        assert_eq!(router.packets.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn too_large_races_retry_only_unsent_fragments_and_fail_without_progress() {
+        let pair = quic_pair(64 << 10).await;
+        let (session, _, _) = test_session().await;
+        let mut diagnostics = Http3Diagnostics::new(pair.server.clone(), 0, true, 1400);
+        let (writer, mut commands) = ReliableQueue::new();
+        let mut datagrams = FakeDatagrams::new(Some(1400));
+        datagrams.race = Some((2, 600));
+        let packet = ip_packet(3000, false);
+        send_downlink(
+            &session,
+            packet.clone(),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_reassembled(&datagrams.packets, &packet, 1400);
+        assert!(datagrams.packets[1..]
+            .iter()
+            .all(|fragment| fragment.len() <= 600));
+        assert_eq!(diagnostics.too_large_retries, 1);
+        assert!(commands.data.try_recv().is_err());
+        datagrams.failure = Some(DatagramErrorKind::TooLarge);
+        let before = datagrams.calls;
+        let error = send_downlink(
+            &session,
+            ip_packet(100, false),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("did not converge"));
+        assert_eq!(datagrams.calls, before + 1);
+        datagrams.failure = Some(DatagramErrorKind::Connection);
+        assert!(send_downlink(
+            &session,
+            ip_packet(100, false),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now()
+        )
+        .await
+        .is_err());
+        datagrams.capacity = Some(67);
+        assert!(send_downlink(
+            &session,
+            ip_packet(100, false),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            Instant::now()
+        )
+        .await
+        .unwrap_err()
+        .is::<MtuError>());
+    }
+
+    #[tokio::test]
+    async fn df_feedback_precedes_bounded_exceptional_compatibility() {
+        let pair = quic_pair(64 << 10).await;
+        let (session, router, metrics) = test_session().await;
+        let mut diagnostics = Http3Diagnostics::new(pair.server.clone(), 0, true, 1400);
+        let (writer, mut commands) = ReliableQueue::new();
+        let mut datagrams = FakeDatagrams::new(Some(1160));
+        let packet = ip_packet(1400, true);
+        let now = Instant::now();
+        for _ in 0..1000 {
+            send_downlink(
+                &session,
+                packet.clone(),
+                1400,
+                &mut datagrams,
+                &writer,
+                &mut diagnostics,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(metrics.sent.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.icmp.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.limited.load(Ordering::Relaxed), 999);
+        assert!(commands.data.try_recv().is_err());
+        let reply = router.packets.lock().unwrap()[0].clone();
+        assert_eq!(
+            parse_ipv4(&reply).unwrap().destination,
+            parse_ipv4(&packet).unwrap().source
+        );
+        assert_eq!(&reply[26..28], &1160_u16.to_be_bytes());
+        assert_eq!(&reply[28..], &packet[..28]);
+        assert_eq!(crate::wire::ip::internet_checksum(&reply[20..]), 0);
+        for millis in [100, 200, 2100] {
+            send_downlink(
+                &session,
+                packet.clone(),
+                1400,
+                &mut datagrams,
+                &writer,
+                &mut diagnostics,
+                now + Duration::from_millis(millis),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(metrics.icmp.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.compatibility.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.sent.load(Ordering::Relaxed),
+            0,
+            "queue acceptance is not a write"
+        );
+        let command = commands.data.try_recv().unwrap();
+        let mut capsule = BytesMut::from(command.data.as_ref());
+        let (kind, value) = take_capsule(&mut capsule).unwrap().unwrap();
+        assert_eq!(kind, CAPSULE_DATAGRAM);
+        assert_eq!(decode_ip_bytes(value).unwrap(), packet);
+        assert!(datagrams.packets.is_empty());
+        let mut suppressed = packet.to_vec();
+        suppressed[16] = 224;
+        crate::wire::ip::set_ipv4_header_checksum(&mut suppressed[..20]).unwrap();
+        send_downlink(
+            &session,
+            Bytes::from(suppressed),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            now + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let mut error = packet.to_vec();
+        error[9] = 1;
+        error[20] = 3;
+        crate::wire::ip::set_ipv4_header_checksum(&mut error[..20]).unwrap();
+        send_downlink(
+            &session,
+            Bytes::from(error),
+            1400,
+            &mut datagrams,
+            &writer,
+            &mut diagnostics,
+            now + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.suppressed.load(Ordering::Relaxed), 2);
+        assert!(commands.data.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn datagram_unavailability_is_not_a_small_capacity_or_oversize_fallback() {
+        let pair = quic_pair(64 << 10).await;
+        let (session, _, metrics) = test_session().await;
+        for (capacity, failure) in [
+            (None, None),
+            (Some(1160), Some(DatagramErrorKind::NotAvailable)),
+        ] {
+            let mut diagnostics = Http3Diagnostics::new(pair.server.clone(), 0, true, 1400);
+            let (writer, mut commands) = ReliableQueue::new();
+            let mut datagrams = FakeDatagrams::new(capacity);
+            datagrams.failure = failure;
+            let packet = ip_packet(100, true);
+            send_downlink(
+                &session,
+                packet.clone(),
+                1400,
+                &mut datagrams,
+                &writer,
+                &mut diagnostics,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+            assert!(!diagnostics.datagrams_enabled);
+            assert_eq!(commands.data.try_recv().unwrap().ip_bytes, packet.len());
+        }
+        assert_eq!(metrics.reductions.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.compatibility.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn nonconverging_df_above_final_1100_ceiling_keeps_feedback_without_capsules() {
+        let pair = quic_pair(64 << 10).await;
+        let (session, router, metrics) = test_session().await;
+        let mut diagnostics = Http3Diagnostics::new(pair.server.clone(), 0, true, 1400);
+        diagnostics.select_mtu(1100).unwrap();
+        let (writer, mut commands) = ReliableQueue::new();
+        let mut datagrams = FakeDatagrams::new(Some(1160));
+        let now = Instant::now();
+        for millis in [0, 100, 200, 2100, 2101, 2500] {
+            send_downlink(
+                &session,
+                ip_packet(1380, true),
+                1100,
+                &mut datagrams,
+                &writer,
+                &mut diagnostics,
+                now + Duration::from_millis(millis),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(metrics.icmp.load(Ordering::Relaxed), 5);
+        assert_eq!(metrics.limited.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.reductions.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.compatibility.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.sent.load(Ordering::Relaxed), 0);
+        assert!(router
+            .packets
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|packet| packet[26..28] == 1100_u16.to_be_bytes()));
+        assert!(datagrams.packets.is_empty());
+        assert!(commands.data.try_recv().is_err());
+    }
+
+    #[test]
+    fn reliable_queues_have_independent_byte_and_command_bounds() {
+        let (writer, mut commands) = ReliableQueue::new();
+        for _ in 0..RELIABLE_DATA_COMMANDS {
+            writer.packet(&ip_packet(100, false)).unwrap();
+        }
+        assert!(writer
+            .packet(&ip_packet(100, false))
+            .unwrap_err()
+            .is::<ReliableWriteError>());
+        writer
+            .control(Bytes::from_static(b"control"), None)
+            .unwrap();
+        assert_eq!(commands.control.try_recv().unwrap().data, "control");
+        while commands.data.try_recv().is_ok() {}
+        assert_eq!(writer.data_bytes.available_permits(), RELIABLE_DATA_BYTES);
+        assert!(writer
+            .packet(&Bytes::from(vec![0; RELIABLE_DATA_BYTES]))
+            .is_err());
+        assert!(writer
+            .control(Bytes::from(vec![0; RELIABLE_CONTROL_BYTES + 1]), None)
+            .is_err());
+        for _ in 0..RELIABLE_CONTROL_COMMANDS {
+            writer
+                .control(Bytes::from_static(b"control"), None)
+                .unwrap();
+        }
+        assert!(writer
+            .control(Bytes::from_static(b"control"), None)
+            .is_err());
+    }
+
+    struct LoopbackTunnel {
+        _pair: QuicPair,
+        stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        response: http::Response<()>,
+        driver: tokio::task::JoinHandle<()>,
+        server: tokio::task::JoinHandle<Result<&'static str>>,
+        session: Arc<Session>,
+        router: Arc<FakeRouter>,
+        metrics: Arc<TestMetrics>,
+        capsules: BytesMut,
+    }
+
+    impl Drop for LoopbackTunnel {
+        fn drop(&mut self) {
+            self.session.close();
+            self.server.abort();
+            self.driver.abort();
+        }
+    }
+
+    impl LoopbackTunnel {
+        async fn new(datagrams: bool, receive_window: u32, discovery: bool) -> Self {
+            let pair = quic_pair(receive_window).await;
+            let (session, router, metrics) = test_session().await;
+            let worker_session = session.clone();
+            let remote = pair.server.clone();
+            let server = tokio::spawn(async move {
+                let mut server = h3::server::builder()
+                    .enable_extended_connect(true)
+                    .enable_datagram(datagrams)
+                    .build::<_, Bytes>(h3_quinn::Connection::new(remote.clone()))
+                    .await
+                    .unwrap();
+                let resolver = server.accept().await.unwrap().unwrap();
+                let (_, stream) = resolver.resolve_request().await.unwrap();
+                let id = stream.id();
+                let sender = server.get_datagram_sender(id);
+                let reader = server.get_datagram_reader();
+                let config = Http3Config {
+                    auto_mtu: discovery,
+                    enable_datagrams: datagrams,
+                    ..Http3Config::default()
+                };
+                let mut diagnostics =
+                    Http3Diagnostics::new(remote, id.into_inner(), datagrams, config.mtu);
+                let run = run_tunnel(
+                    stream,
+                    sender,
+                    reader,
+                    &worker_session,
+                    &config,
+                    discovery.then(|| MtuResponder::new(config.mtu)),
+                    &mut diagnostics,
+                );
+                tokio::pin!(run);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut run => break result,
+                        request = server.accept() => {
+                            if request.is_err() || request.unwrap().is_none() {
+                                worker_session.cancellation.cancel();
+                            }
+                        }
+                    }
+                };
+                worker_session.close_with_reason("test_finished");
+                result
+            });
+            let (mut driver, mut requests) = h3::client::builder()
+                .enable_extended_connect(true)
+                .enable_datagram(datagrams)
+                .build::<_, _, Bytes>(h3_quinn::Connection::new(pair.client.clone()))
+                .await
+                .unwrap();
+            let keepalive = requests.clone();
+            let driver = tokio::spawn(async move {
+                let _requests = keepalive;
+                let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !requests.settings_received() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut request = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri(format!("https://localhost{MASQUE_PATH}"))
+                .body(())
+                .unwrap();
+            request.extensions_mut().insert(Protocol::CONNECT_IP);
+            let mut stream = requests.send_request(request).await.unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(2), stream.recv_response())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.headers()["X-Porta-Gateway"],
+                session.lease.gateway.to_string()
+            );
+            Self {
+                _pair: pair,
+                stream,
+                response,
+                driver,
+                server,
+                session,
+                router,
+                metrics,
+                capsules: BytesMut::new(),
+            }
+        }
+
+        async fn next_capsule(&mut self) -> (u64, Bytes) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(capsule) = take_capsule(&mut self.capsules).unwrap() {
+                        return capsule;
+                    }
+                    let mut data = self
+                        .stream
+                        .recv_data()
+                        .await
+                        .unwrap()
+                        .expect("capsule stream ended");
+                    self.capsules
+                        .extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+            })
+            .await
+            .unwrap()
+        }
+
+        async fn request_address(&mut self, selection: bool) {
+            let mut control = BytesMut::new();
+            if selection {
+                let offer = self.response.headers()[MTU_DISCOVERY_HEADER]
+                    .to_str()
+                    .unwrap();
+                let token: MtuToken = hex::decode(offer).unwrap().try_into().unwrap();
+                append_capsule(
+                    &mut control,
+                    CAPSULE_MTU_SELECT,
+                    &encode_mtu_selection(token, SAFE_MTU),
+                )
+                .unwrap();
+            }
+            let request = crate::wire::masque::encode_address_request(&[Address {
+                request_id: 1,
+                prefix: "0.0.0.0/32".parse().unwrap(),
+            }])
+            .unwrap();
+            append_capsule(&mut control, CAPSULE_ADDRESS_REQUEST, &request).unwrap();
+            self.stream.send_data(control.freeze()).await.unwrap();
+            if selection {
+                assert_eq!(self.next_capsule().await.0, CAPSULE_MTU_SELECTED);
+            }
+            assert_eq!(self.next_capsule().await.0, CAPSULE_ADDRESS_ASSIGN);
+            assert_eq!(self.next_capsule().await.0, CAPSULE_ROUTE_ADVERTISEMENT);
+        }
+
+        async fn stop(&mut self) -> Result<&'static str> {
+            self.session.cancellation.cancel();
+            let result = tokio::time::timeout(Duration::from_millis(500), &mut self.server)
+                .await
+                .expect("tunnel did not promptly cancel")
+                .unwrap();
+            self.session.close();
+            assert_eq!(self.metrics.closed.load(Ordering::Relaxed), 1);
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_datagrams_fragment_at_live_capacity_without_capsules() {
+        let mut tunnel = LoopbackTunnel::new(true, 64 << 10, false).await;
+        let original = ip_packet(1400, false);
+        assert!(tunnel.router.downlink.enqueue(original.clone()));
+        // Downlink is gated on a successfully written assignment.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            tunnel._pair.client.read_datagram()
+        )
+        .await
+        .is_err());
+        tunnel.request_address(false).await;
+        let mut packets = Vec::new();
+        while packets.iter().map(|p: &Bytes| p.len() - 20).sum::<usize>() < original.len() - 20 {
+            let datagram =
+                tokio::time::timeout(Duration::from_secs(2), tunnel._pair.client.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (quarter_stream, consumed) = parse_varint(&datagram).unwrap();
+            assert_eq!(quarter_stream * 4, tunnel.stream.id().into_inner());
+            packets.push(decode_ip_bytes(datagram.slice(consumed..)).unwrap());
+        }
+        let limit = ip_datagram_capacity(
+            tunnel._pair.server.max_datagram_size(),
+            tunnel.stream.id().into_inner(),
+        )
+        .unwrap();
+        assert!(limit < 1400);
+        assert_reassembled(&packets, &original, limit);
+        assert_eq!(tunnel.metrics.reductions.load(Ordering::Relaxed), 1);
+        assert_eq!(tunnel.metrics.compatibility.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), packets.len());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), tunnel.stream.recv_data())
+                .await
+                .is_err()
+        );
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn loopback_selection_and_capsule_only_preserve_control_order_and_account_writes() {
+        let mut tunnel = LoopbackTunnel::new(false, 64 << 10, true).await;
+        let packet = ip_packet(100, false);
+        assert!(tunnel.router.downlink.enqueue(packet.clone()));
+        tunnel.request_address(true).await;
+        let (kind, value) = tunnel.next_capsule().await;
+        assert_eq!(kind, CAPSULE_DATAGRAM);
+        assert_eq!(decode_ip_bytes(value).unwrap(), packet);
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(tunnel.metrics.reductions.load(Ordering::Relaxed), 0);
+        tunnel.stream.finish().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut tunnel.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, "client_eof");
+        assert_eq!(tunnel.metrics.closed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_final_selected_ceiling_is_not_a_live_path_reduction() {
+        let mut tunnel = LoopbackTunnel::new(true, 64 << 10, true).await;
+        let original = ip_packet(1400, false);
+        assert!(tunnel.router.downlink.enqueue(original.clone()));
+        tunnel.request_address(true).await;
+        let mut packets = Vec::new();
+        while packets.iter().map(|p: &Bytes| p.len() - 20).sum::<usize>() < original.len() - 20 {
+            let datagram =
+                tokio::time::timeout(Duration::from_secs(2), tunnel._pair.client.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (_, consumed) = parse_varint(&datagram).unwrap();
+            packets.push(decode_ip_bytes(datagram.slice(consumed..)).unwrap());
+        }
+        assert_reassembled(&packets, &original, usize::from(SAFE_MTU));
+        assert_eq!(tunnel.metrics.reductions.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.compatibility.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), packets.len());
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn loopback_blocked_capsule_writer_keeps_receiving_ip_and_control_and_cancels() {
+        let mut tunnel = LoopbackTunnel::new(false, 256, false).await;
+        tunnel.request_address(false).await;
+        for _ in 0..12 {
+            assert!(tunnel.router.downlink.enqueue(ip_packet(1400, false)));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tunnel.metrics.sent.load(Ordering::Relaxed),
+            0,
+            "flow-control-blocked write is not accounted"
+        );
+        let mut packet = ip_packet(1400, false).to_vec();
+        packet[12..16].copy_from_slice(&lease().address.octets());
+        let packet = Bytes::from(packet);
+        let mut incoming = BytesMut::new();
+        append_ip_capsule(&mut incoming, &packet).unwrap();
+        let request = crate::wire::masque::encode_address_request(&[Address {
+            request_id: 2,
+            prefix: "0.0.0.0/32".parse().unwrap(),
+        }])
+        .unwrap();
+        append_capsule(&mut incoming, CAPSULE_ADDRESS_REQUEST, &request).unwrap();
+        append_ip_capsule(&mut incoming, &packet).unwrap();
+        tunnel.stream.send_data(incoming.freeze()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while tunnel.metrics.uploaded.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked writer stopped incoming capsule parsing");
+        assert!(!tunnel.server.is_finished());
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn loopback_control_overtakes_queued_bulk_but_not_a_partial_capsule() {
+        let mut tunnel = LoopbackTunnel::new(false, 256, false).await;
+        tunnel.request_address(false).await;
+        for _ in 0..3 {
+            tunnel.router.downlink.enqueue(ip_packet(1400, false));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let request = crate::wire::masque::encode_address_request(&[Address {
+            request_id: 2,
+            prefix: "0.0.0.0/32".parse().unwrap(),
+        }])
+        .unwrap();
+        let mut incoming = BytesMut::new();
+        append_capsule(&mut incoming, CAPSULE_ADDRESS_REQUEST, &request).unwrap();
+        let mut upload = ip_packet(100, false).to_vec();
+        upload[12..16].copy_from_slice(&lease().address.octets());
+        append_ip_capsule(&mut incoming, &upload).unwrap();
+        tunnel.stream.send_data(incoming.freeze()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while tunnel.metrics.uploaded.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tunnel.next_capsule().await.0, CAPSULE_DATAGRAM);
+        let (kind, assignment) = tunnel.next_capsule().await;
+        assert_eq!(kind, CAPSULE_ADDRESS_ASSIGN);
+        assert_eq!(decode_address_assign(&assignment).unwrap()[0].request_id, 2);
+        assert_eq!(tunnel.next_capsule().await.0, CAPSULE_ROUTE_ADVERTISEMENT);
+        assert_eq!(tunnel.next_capsule().await.0, CAPSULE_DATAGRAM);
+        assert_eq!(tunnel.next_capsule().await.0, CAPSULE_DATAGRAM);
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn loopback_blocked_writer_expires_and_overload_is_explicit() {
+        let mut tunnel = LoopbackTunnel::new(false, 256, false).await;
+        tunnel.request_address(false).await;
+        tunnel.router.downlink.enqueue(ip_packet(1400, false));
+        let result = tokio::time::timeout(Duration::from_secs(3), &mut tunnel.server)
+            .await
+            .expect("blocked writer never timed out")
+            .unwrap();
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<ReliableWriteError>(),
+            Some(ReliableWriteError::Timeout)
+        ));
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.closed.load(Ordering::Relaxed), 1);
+
+        let mut tunnel = LoopbackTunnel::new(false, 256, false).await;
+        tunnel.request_address(false).await;
+        for _ in 0..RELIABLE_DATA_COMMANDS + 2 {
+            tunnel.router.downlink.enqueue(ip_packet(1400, false));
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut tunnel.server)
+            .await
+            .expect("full writer queue blocked receive loop")
+            .unwrap();
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<ReliableWriteError>(),
+            Some(ReliableWriteError::Overloaded)
+        ));
+        assert_eq!(tunnel.metrics.closed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_df_feedback_and_receive_protocol_errors_do_not_write_bulk_capsules() {
+        let mut tunnel = LoopbackTunnel::new(true, 64 << 10, false).await;
+        tunnel.request_address(false).await;
+        tunnel.router.downlink.enqueue(ip_packet(1400, true));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tunnel.metrics.icmp.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), tunnel.stream.recv_data())
+                .await
+                .is_err()
+        );
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+
+        let mut tunnel = LoopbackTunnel::new(false, 256, false).await;
+        tunnel.request_address(false).await;
+        tunnel.router.downlink.enqueue(ip_packet(1400, false));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut invalid = BytesMut::new();
+        append_capsule(&mut invalid, CAPSULE_MTU_SELECT, &[0]).unwrap();
+        tunnel.stream.send_data(invalid.freeze()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), &mut tunnel.server)
+            .await
+            .expect("writer blocked protocol error processing")
+            .unwrap();
+        assert!(result.unwrap_err().is::<MasqueError>());
+        assert_eq!(tunnel.metrics.closed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_nonconverging_df_uses_capsules_only_after_feedback_and_grace() {
+        let mut tunnel = LoopbackTunnel::new(true, 256, false).await;
+        tunnel.request_address(false).await;
+        let original = ip_packet(1400, true);
+        let started = Instant::now();
+        for expected in 1..=3 {
+            assert!(tunnel.router.downlink.enqueue(original.clone()));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while tunnel.metrics.icmp.load(Ordering::Relaxed) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("DF packet did not reach the router feedback path");
+            let reply = tunnel.router.packets.lock().unwrap()[expected - 1].clone();
+            let info = parse_ipv4(&reply).unwrap();
+            assert_eq!(info.source, tunnel.session.lease.gateway);
+            assert_eq!(info.destination, parse_ipv4(&original).unwrap().source);
+            let limit = ip_datagram_capacity(
+                tunnel._pair.server.max_datagram_size(),
+                tunnel.stream.id().into_inner(),
+            )
+            .unwrap();
+            assert_eq!(&reply[26..28], &(limit as u16).to_be_bytes());
+            assert_eq!(&reply[28..], &original[..28]);
+            if expected != 3 {
+                tokio::time::sleep(Duration::from_millis(110)).await;
+            }
+        }
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.compatibility.load(Ordering::Relaxed), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), tunnel.stream.recv_data())
+                .await
+                .is_err()
+        );
+        let grace = tunnel
+            ._pair
+            .server
+            .rtt()
+            .saturating_mul(4)
+            .clamp(Duration::from_secs(2), Duration::from_secs(10));
+        tokio::time::sleep((grace + Duration::from_millis(100)).saturating_sub(started.elapsed()))
+            .await;
+        assert!(tunnel.router.downlink.enqueue(original.clone()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tunnel.metrics.compatibility.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+        let mut upload = ip_packet(100, false).to_vec();
+        upload[12..16].copy_from_slice(&tunnel.session.lease.address.octets());
+        crate::wire::ip::set_ipv4_header_checksum(&mut upload[..20]).unwrap();
+        let mut datagram = BytesMut::new();
+        append_varint(&mut datagram, tunnel.stream.id().into_inner() / 4).unwrap();
+        datagram.extend_from_slice(&[0]);
+        datagram.extend_from_slice(&upload);
+        tunnel
+            ._pair
+            .client
+            .send_datagram(datagram.freeze())
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while tunnel.metrics.uploaded.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked compatibility writer stopped incoming datagrams");
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+        let (kind, value) = tunnel.next_capsule().await;
+        assert_eq!(kind, CAPSULE_DATAGRAM);
+        assert_eq!(decode_ip_bytes(value).unwrap(), original);
+        assert_eq!(tunnel.metrics.icmp.load(Ordering::Relaxed), 3);
+        assert_eq!(tunnel.metrics.compatibility.load(Ordering::Relaxed), 1);
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn loopback_negotiated_1100_never_capsules_df_1380_after_grace() {
+        let mut tunnel = LoopbackTunnel::new(true, 64 << 10, true).await;
+        tunnel.request_address(true).await;
+        assert_eq!(SAFE_MTU, 1100);
+        let packet = ip_packet(1380, true);
+        let started = Instant::now();
+        for expected in 1..=5 {
+            if expected == 4 {
+                tokio::time::sleep(Duration::from_millis(2200).saturating_sub(started.elapsed()))
+                    .await;
+            } else if expected != 1 {
+                tokio::time::sleep(Duration::from_millis(110)).await;
+            }
+            assert!(tunnel.router.downlink.enqueue(packet.clone()));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while tunnel.metrics.icmp.load(Ordering::Relaxed) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("over-ceiling DF stopped requesting feedback after grace");
+            let reply = tunnel.router.packets.lock().unwrap()[expected - 1].clone();
+            assert_eq!(&reply[26..28], &1100_u16.to_be_bytes());
+            assert_eq!(&reply[28..], &packet[..28]);
+        }
+        assert_eq!(tunnel.metrics.sent.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.compatibility.load(Ordering::Relaxed), 0);
+        assert_eq!(tunnel.metrics.reductions.load(Ordering::Relaxed), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), tunnel.stream.recv_data())
+                .await
+                .is_err()
+        );
+        assert_eq!(tunnel.stop().await.unwrap(), "cancelled");
+    }
 
     #[test]
     fn tunnel_termination_distinguishes_normal_closes_from_failures() {

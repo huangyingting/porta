@@ -150,36 +150,40 @@ discovery and use a fixed 1100 MTU; another fixed MTU can be specified with
 the same override. The daemon accepts the same options when started directly.
 The deployment script accepts MTUs from 576 through 1400.
 
-Automatic MTU also requires Linux to accept gateway-sourced ICMP injected
-through TUN. Deployment passes the chosen `--auto-mtu=true` or
-`--auto-mtu=false` mode to both the daemon and
-`server-up.sh`; the helper sets `accept_local=1` and loose `rp_filter=2` only
-on the owned TUN. It does not change global or physical-interface reverse-path
+MTU feedback requires Linux to accept gateway-sourced ICMP injected through
+TUN, in both automatic and fixed interface-MTU modes. Deployment passes
+`--auto-mtu` to the daemon; `server-up.sh` now takes only its five positional
+arguments and always sets `accept_local=1` and loose `rp_filter=2` only on the
+owned TUN. It does not change global or physical-interface reverse-path
 filtering. These interface-local settings disappear with the TUN. The helper
 records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
 restores it during normal cleanup when no administrator or other service has
 changed the setting in the meantime.
 
-The network helper also defaults to automatic mode:
+The network helper invocation is independent of startup discovery:
 
 ```sh
 sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443
 ```
 
 Use the actual interface/address/pool values. When selecting fixed mode in a
-manually edited service unit, pass `--auto-mtu=false` to both the daemon and
-network helper. Upgrade the daemon and helper together.
+manually edited service unit, pass `--auto-mtu=false` only to the daemon and
+remove the obsolete MTU-mode argument from `server-up.sh`. Upgrade the daemon,
+unit and helper together.
 The required `mtu_feedback` readiness component detects missing local-source
 acceptance or effective strict reverse-path filtering instead of reporting
-automatic MTU ready with unusable DF feedback.
+tunnel forwarding ready with unusable DF feedback.
 
 Clients need no additional setting. They increase above 1100 only after
 bidirectional datagram confirmation, agree with the server before configuring
 the interface, and keep that MTU until reconnect. Inconclusive discovery keeps
 the conservative value; HTTP/2 and capsule-only HTTP/3 retain the configured
-MTU. QUIC size reductions still trigger per-packet capsule fallback instead of
-live interface resizing. See [MTU selection](architecture.md#stable-per-connection-mtu-selection)
-for protocol details and oversized IPv4 handling.
+MTU. HTTP/3 Datagram sends additionally follow Quinn's current payload capacity
+without resizing the live interface. Oversized IPv4 packets use fragmentation
+or rate-limited ICMP feedback first; non-adapting DF flows have a bounded,
+observable reliable compatibility escape. See
+[MTU selection](architecture.md#stable-per-connection-mtu-selection) for
+protocol details and oversized IPv4 handling.
 
 ### Upgrade behavior
 
@@ -497,7 +501,7 @@ Unexpected failures also emit a WARN with a bounded reason and, where available,
 a numeric error code, without logging peer-supplied close text. Normal EOF,
 cancellation, and graceful peer closes remain INFO.
 
-The summary records the selected MTU, current QUIC and IP datagram capacities,
+The summary records the selected interface MTU, current QUIC and IP datagram capacities,
 RTT, path loss/congestion/black-hole counters, and per-tunnel datagram/capsule
 counts. QUIC path counters are connection snapshots, not tunnel-only deltas;
 compare the start and end records. `datagram_queued_*` counts successful enqueue
@@ -512,6 +516,23 @@ summary. A switch to capsule-only operation is logged once. These records help
 distinguish QUIC failures from frequent reliable-capsule fallback without
 per-packet logs or global DEBUG logging. Fallback counters alone do not prove a
 path-MTU black hole or explain every stall.
+
+`porta_datagram_mtu_reductions_total` counts live reductions of the effective
+HTTP/3 IP packet budget, not interface changes or dropped packets.
+`porta_datagram_oversize_total` continues to count oversized IP packets accepted
+for capsule compatibility, rather than all fragmentation/ICMP outcomes.
+Compatibility after non-converging DF feedback is reported explicitly and can
+still incur reliable-stream head-of-line blocking. It never permits an IP
+packet larger than the negotiated client interface MTU.
+
+The server reliable writer has separate queues for eight control commands and
+32 data commands, with 64 KiB and 256 KiB byte budgets respectively. The byte
+budgets include in-flight writes. A two-second deadline includes queue residence
+and stream writing; exhausted queues and deadlines end the tunnel with explicit
+`capsule_writer_overloaded` or `capsule_writer_timeout` reasons. Native-client
+writes use the shorter of their configured timeout and ten seconds. These
+bounds preserve receive/cancellation progress rather than guaranteeing delivery
+when a peer stops granting stream credit.
 
 ## Android
 

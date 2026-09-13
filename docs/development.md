@@ -49,6 +49,13 @@ cargo test --manifest-path rust/Cargo.toml --locked \
   --package porta-client-rust --test quic_datagrams
 ```
 
+`make test` also covers shared IPv4 fragmentation/ICMP rules, changing HTTP/3
+packet budgets, unsent-only retries, bounded DF compatibility and negotiated
+receive ceilings. Transport loopbacks exercise real QUIC capacity limits,
+client-local ICMP delivery, control ordering, blocked reliable writers,
+deadlines and cancellation. Deterministic capacity changes cover reductions
+after setup; these regressions do not claim to reproduce every WAN loss pattern.
+
 The server and desktop suites also use Node.js, when available, to syntax-check
 the embedded browser JavaScript:
 

@@ -264,10 +264,20 @@ Wintun, and Android passes it to `VpnService.Builder.setMtu`. Manual Windows
 setup must use the MTU printed by the connected CLI, not the server ceiling.
 No client-facing MTU toggle is necessary.
 
-The value stays fixed for the connection. Reconnects can choose another MTU;
-a change can recreate the desktop TUN and interrupt existing flows. A later
-QUIC size-limit reduction uses reliable capsules for affected packets rather
-than resizing the live interface. HTTP/2, the native multi-lane fallback, and
+The interface value stays fixed for the connection. A separate per-direction
+packet budget follows reductions in QUIC's live datagram capacity. Both native
+client and server fragment DF-clear IPv4 packets or return rate-limited
+fragmentation-needed feedback for DF-set packets; the client delivers feedback
+to its local IP stack through the existing TUN receive path. These changes do
+not rebuild Android's VPN interface or alter desktop routes mid-session.
+Non-adapting DF flows can use a bounded, reported reliable compatibility path,
+which can still incur head-of-line blocking and never exceeds the negotiated
+interface ceiling. Peers omitting the optional authenticated gateway metadata
+use a reported capsule exception for affected DF packets, without inventing
+an ICMP source address.
+
+Reconnects can choose another interface MTU; a change can recreate the desktop
+TUN and interrupt existing flows. HTTP/2, the native multi-lane fallback, and
 HTTP/3 without Datagrams retain the configured server MTU. This setting does
 not apply to the HTTPS forward proxy, which has no VPN TUN interface.
 
@@ -377,11 +387,12 @@ an active or reconnecting profile before editing or deleting it. Deleting a
 local profile does not revoke its token or free its server-side device slot;
 an administrator must forget the enrollment separately when needed.
 
-The connection summary shows the effective tunnel MTU. **Log** updates while
+The connection summary shows the negotiated interface MTU. **Log** updates while
 open and includes connection setup details, MTU selection, assigned address,
 DNS, transport, and fallback/retry information. Automatic selection is
-distinguished from a server-configured MTU; the value stays fixed until the
-next connection. When an HTTP/2 fallback attempt ends, per-lane diagnostics
+distinguished from a server-configured MTU; the interface value stays fixed until
+the next connection. A lower live datagram packet budget is reported separately
+in transport diagnostics. When an HTTP/2 fallback attempt ends, per-lane diagnostics
 record drop totals, queue high-water marks, oldest queued-packet age, and
 reconnect counts. The log retains the latest 200 events, includes millisecond
 timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but

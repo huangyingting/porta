@@ -65,8 +65,9 @@ using an optional Porta protocol extension. The default ceiling is 1400;
 `--mtu` bounds the selected value, and 1100 is the conservative discovery
 baseline. Clients require no extra setting. The shared gateway TUN keeps the
 configured ceiling. Use `--auto-mtu=false --mtu 1100` to select a fixed MTU
-instead; the daemon, deployment script, and network helper support the same
-boolean MTU-mode override.
+instead; the daemon and deployment script support the same boolean MTU-mode
+override. The network helper always enables scoped ICMP feedback, since a fixed
+interface MTU does not prevent the QUIC packet budget from shrinking.
 
 An eligible client sends `X-Porta-MTU-Discovery: 1`. When enabled, the server
 responds with the same header containing a random, session-specific
@@ -103,13 +104,24 @@ IP downlink delivery is withheld until address assignment completes. The final
 lease MTU reaches Linux, Windows, and the Android native bridge before network
 configuration.
 
-Each MASQUE session enforces its own MTU. Oversized packets from the shared
-TUN are fragmented when IPv4 DF is clear, including correct copied options,
-fragment offsets and checksums. With DF set, the gateway sends ICMP
-Destination Unreachable / Fragmentation Needed back through TUN toward the
-original sender, quoting the original header and advertising the selected
-MTU. Forbidden ICMP replies are suppressed; permitted replies are limited to
-one per 100 ms per session. The `porta_mtu_packets_total` metric reports
+Each MASQUE session enforces its negotiated MTU as the interface ceiling.
+Datagram sends additionally use the smaller of that ceiling and Quinn's current
+datagram capacity, minus the HTTP/3 quarter-stream-ID and CONNECT-IP context
+headers. Quinn has already subtracted its own packet overhead. Reductions are
+retained for that connection; only reconnecting reruns the upward probe.
+
+Client and server share IPv4 fragmentation and ICMP handling. Oversized packets
+are fragmented when DF is clear, including correct copied options, existing
+fragment offsets and checksums. With DF set, ICMP Destination Unreachable /
+Fragmentation Needed is returned toward the original sender, quoting its header
+and advertising the effective packet budget. The server injects feedback through
+its TUN toward the remote sender; the client returns feedback through its normal
+receive/TUN path toward the local application. No live interface resize or
+additional fragmentation protocol is needed. A capacity race refreshes the
+budget and retries only unsent data with a bounded attempt count.
+
+Forbidden ICMP replies are suppressed; permitted replies are limited to
+one per 100 ms per connection. The `porta_mtu_packets_total` metric reports
 `fragmented`, `icmp_sent`, `icmp_suppressed`, and `icmp_rate_limited` actions;
 selected MTUs appear in server logs.
 
@@ -120,11 +132,11 @@ requires local-source acceptance and rejects effective strict reverse-path
 filtering. Global and physical-interface source-validation settings remain
 unchanged; no production raw-socket capability is added.
 
-This is conservative setup-time selection, not a measurement of the absolute
-maximum path MTU or continuous tunnel resizing. QUIC manages its own outer
-path MTU independently. If its datagram limit later shrinks, ordinary packets
-still use the reliable capsule fallback described below. Selection runs again
-on reconnect; a changed lease MTU can recreate the client TUN. HTTP/2,
+Startup probing is not a measurement of the absolute maximum path MTU or a
+promise of future delivery. QUIC manages its own outer path MTU independently;
+the per-direction IP packet budget follows decreases without changing the
+interface ceiling. Selection runs again on reconnect; a changed lease MTU can
+recreate the client TUN. HTTP/2,
 native private HTTP/2 lanes, and HTTP/3 without Datagrams keep the configured
 MTU because their streams can segment data without UDP-sized inner packets.
 
@@ -203,12 +215,27 @@ IP packets are therefore unreliable, independently delivered Datagrams, as
 required for the efficient RFC 9484 mode. Control capsules remain on the
 reliable Extended CONNECT request stream.
 
-If an IP packet exceeds the current QUIC datagram payload limit, Porta sends
-that packet in a DATAGRAM capsule on the same connection instead of
-disconnecting the tunnel. Smaller packets continue using datagrams. This
-preserves the selected inner MTU without inventing an MTU from outer-packet
-overhead; oversized packets temporarily inherit reliable-stream head-of-line
-blocking.
+An oversized datagram first uses the adaptive fragmentation/ICMP handling above,
+not immediate reliable fallback. DF flows that continue sending oversized packets
+after at least three feedback attempts and a grace period of four RTTs (bounded
+to 2-10 seconds) may use an explicitly reported capsule compatibility path,
+but only for packets within the negotiated interface ceiling. Larger packets
+continue to receive rate-limited feedback; capsules cannot bypass the receiver's
+packet-size validation.
+Feedback tracking is limited to 128 flows per connection and expires after
+60 seconds without oversized packets; a further budget reduction starts a new
+feedback grace period. This is a bounded convergence heuristic, not proof that
+the peer blocks ICMP. Fitting packets remain datagrams.
+
+Reliable writing has bounded queues and write waits, separate from active receive
+processing. Queue exhaustion, writer errors and deadlines are surfaced rather
+than silently hanging. Initial MTU and address-assignment ordering is preserved.
+Compatibility capsules still have reliable-stream head-of-line blocking: this
+escape helps non-adapting peers within the interface ceiling, but cannot promise
+connectivity or datagram performance on every network. Peers that negotiate
+capsule-only HTTP/3 remain supported. A native client whose authenticated peer
+omits the optional gateway address uses an explicitly logged, bounded capsule
+exception for affected DF packets rather than fabricating an ICMP source.
 
 HTTP/2 has no unreliable Datagram frame. It carries the Context ID 0 payload in
 DATAGRAM capsules on the reliable CONNECT stream. This is interoperable but

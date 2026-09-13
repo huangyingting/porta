@@ -116,7 +116,6 @@ async fn run() -> Result<()> {
         } else {
             public_address.port()
         },
-        auto_mtu: config.auto_mtu,
         timeout: config.readiness_timeout,
         egress_url: (!config.readiness_egress_url.is_empty())
             .then(|| config.readiness_egress_url.clone()),

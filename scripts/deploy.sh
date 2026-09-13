@@ -645,7 +645,7 @@ Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
 ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
-ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port $auto_mtu_argument; sleep 0.1; done; exit 1'
+ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
 RestartSec=2
