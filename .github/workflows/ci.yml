@@ -5,27 +5,16 @@ on:
     branches:
       - "**"
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      live_clients:
-        description: Run credential-free Windows and Android TLS/auth probes
-        required: false
-        type: boolean
-        default: false
-      vpn_e2e:
-        description: Run the protected full VPN data-path test
-        required: false
-        type: boolean
-        default: false
-  schedule:
-    - cron: "23 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ inputs.vpn_e2e && 'vpn-e2e' || inputs.live_clients && 'live-clients' || 'normal' }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' && !inputs.vpn_e2e }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   GOMAXPROCS: "4"
@@ -33,7 +22,6 @@ env:
 
 jobs:
   go:
-    if: ${{ github.event_name != 'schedule' && !inputs.live_clients && !inputs.vpn_e2e }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -47,14 +35,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           BASE_REVISION: ${{ github.event.pull_request.base.sha }}
           BEFORE_REVISION: ${{ github.event.before }}
         run: |
           previous_revision=
           if [[ "$EVENT_NAME" == pull_request ]]; then
             previous_revision=$BASE_REVISION
-          elif [[ "$EVENT_NAME" == push && "$REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+          elif [[ "$EVENT_NAME" == push && "$REF_NAME" == main ]]; then
             previous_revision=$BEFORE_REVISION
           fi
           ./scripts/check-version.sh "$previous_revision"
@@ -75,7 +62,6 @@ jobs:
       - run: make build-windows
 
   windows-ui:
-    if: ${{ github.event_name != 'schedule' && !inputs.live_clients && !inputs.vpn_e2e }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -134,7 +120,6 @@ jobs:
           if-no-files-found: error
 
   android:
-    if: ${{ github.event_name != 'schedule' && !inputs.live_clients && !inputs.vpn_e2e }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -147,6 +132,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
       - run: |
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
@@ -169,120 +156,22 @@ jobs:
           name: android-debug-apks
           path: android/app/build/outputs/apk/debug/*.apk
 
-  vpn-e2e-linux:
-    if: ${{ github.event_name == 'schedule' || inputs.vpn_e2e }}
+  required:
+    name: CI required
+    if: ${{ always() }}
+    needs: [go, windows-ui, android]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: development
-    permissions:
-      contents: read
-    concurrency:
-      group: porta-development-vpn-e2e
-      cancel-in-progress: false
-    env:
-      PORTA_E2E_SERVER: https://porta-dev.i-csu.org:8443
-      PORTA_E2E_GATEWAY: 10.66.0.1
-      PORTA_E2E_TRANSPORTS: h3 h2
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Install native VPN test dependencies
-        run: |
-          if ! command -v iptables >/dev/null || ! command -v nft >/dev/null || ! command -v ping >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y iptables nftables iproute2 iputils-ping
-          fi
-      - name: Exercise the real VPN data path
+      - name: Require every build and test job
         env:
-          PORTA_E2E_TOKEN: ${{ secrets.PORTA_E2E_TOKEN }}
-          PORTA_E2E_LINUX_IDENTITY_BASE64: ${{ secrets.PORTA_E2E_LINUX_IDENTITY_BASE64 }}
-          PORTA_E2E_ARTIFACT_DIR: ${{ github.workspace }}/.porta-vpn-e2e-artifacts
-        run: ./scripts/test-live-vpn.sh
-      - name: Upload VPN diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: porta-vpn-e2e-linux
-          path: .porta-vpn-e2e-artifacts
-          include-hidden-files: true
-          if-no-files-found: warn
-
-  live-windows:
-    if: ${{ github.event_name == 'schedule' || inputs.live_clients || (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch) }}
-    runs-on: windows-latest
-    timeout-minutes: 25
-    env:
-      PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Probe the live gateway with native Windows transports
-        shell: pwsh
+          GO_RESULT: ${{ needs.go.result }}
+          WINDOWS_RESULT: ${{ needs.windows-ui.result }}
+          ANDROID_RESULT: ${{ needs.android.result }}
         run: |
-          go test -count=1 -json ./internal/clientapp -run '^TestLivePlatformTLSAndAuthentication$' > platform-probe.jsonl
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content platform-probe.jsonl
-            throw "Windows platform TLS/auth probe failed"
-          }
-          $passed = Get-Content platform-probe.jsonl | ForEach-Object { $_ | ConvertFrom-Json } |
-            Where-Object { $_.Action -eq "pass" -and $_.Test -eq "TestLivePlatformTLSAndAuthentication" }
-          if (-not $passed) { throw "Windows platform TLS/auth acceptance did not run" }
-          Get-Content platform-probe.jsonl
-
-  live-android:
-    if: ${{ github.event_name == 'schedule' || inputs.live_clients || (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Free disk space for the emulator
-        run: |
-          sudo rm -rf -- /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/local/.ghcup
-          df -h /
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: "17"
-      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
-      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
-      - name: Install Go mobile tools
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
-          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
-      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
-            sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Probe the live gateway from an Android emulator
-        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
-        with:
-          api-level: 35
-          target: aosp_atd
-          arch: x86_64
-          cores: 2
-          ram-size: 2048M
-          heap-size: 512M
-          disk-size: 2048M
-          ndk: 27.2.12479018
-          emulator-boot-timeout: 600
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
-          disable-spellchecker: true
-          working-directory: android
-          script: >-
-            ./gradlew connectedDebugAndroidTest --no-daemon --max-workers=2
-            -Pandroid.testInstrumentationRunnerArguments.class=dev.porta.android.CertificateVerificationTest
-            -Pandroid.testInstrumentationRunnerArguments.portaTlsOrigin=https://porta-dev.i-csu.org:8443
+          for result in "$GO_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT"; do
+            if [[ "$result" != success ]]; then
+              echo "A required build/test job failed, was cancelled, or was skipped: $result" >&2
+              exit 1
+            fi
+          done

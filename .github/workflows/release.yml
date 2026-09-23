@@ -1,23 +1,30 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-main
   cancel-in-progress: false
 
 env:
   GOMAXPROCS: "4"
   GOFLAGS: "-p=2"
+  PORTA_RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
 
 jobs:
   windows:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
     permissions:
       contents: read
     runs-on: windows-latest
@@ -25,6 +32,8 @@ jobs:
       CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
@@ -65,21 +74,46 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
     needs: windows
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
       - name: Verify release version
         run: |
           ./scripts/check-version.sh
           version=$(<internal/buildinfo/VERSION)
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "release tag $GITHUB_REF_NAME does not match application version v$version" >&2
+          tag="v$version"
+          if [[ $(git rev-parse HEAD) != "$PORTA_RELEASE_SHA" ]]; then
+            echo "checkout does not match the successful CI commit" >&2
             exit 1
           fi
+          if ! git merge-base --is-ancestor "$PORTA_RELEASE_SHA" refs/remotes/origin/main; then
+            echo "successful CI commit is not on main" >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            tag_commit=$(git rev-parse --verify "refs/tags/$tag^{commit}")
+            if [[ "$tag_commit" != "$PORTA_RELEASE_SHA" ]]; then
+              echo "release tag $tag already belongs to a different commit" >&2
+              exit 1
+            fi
+          fi
           patch=${version##*.}
-          echo "PORTA_ANDROID_VERSION_NAME=$version" >> "$GITHUB_ENV"
-          echo "PORTA_ANDROID_VERSION_CODE=$((1000 + 10#$patch))" >> "$GITHUB_ENV"
+          {
+            echo "PORTA_RELEASE_TAG=$tag"
+            echo "PORTA_ANDROID_VERSION_NAME=$version"
+            echo "PORTA_ANDROID_VERSION_CODE=$((1000 + 10#$patch))"
+          } >> "$GITHUB_ENV"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
@@ -104,6 +138,8 @@ jobs:
           test -s "$RUNNER_TEMP/porta-release.p12"
           echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.p12" >> "$GITHUB_ENV"
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
       - name: Install Go mobile tools
         run: |
@@ -181,15 +217,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft); then
+          : "${PORTA_RELEASE_TAG:?release version has not been verified}"
+          : "${PORTA_RELEASE_SHA:?successful CI commit has not been verified}"
+          if draft=$(gh release view "$PORTA_RELEASE_TAG" --json isDraft --jq .isDraft); then
             if [[ "$draft" != true ]]; then
-              echo "release $GITHUB_REF_NAME is already published; refusing to replace live artifacts" >&2
+              echo "release $PORTA_RELEASE_TAG is already published; refusing to replace live artifacts" >&2
               exit 1
             fi
           else
-            gh release create "$GITHUB_REF_NAME" --draft --generate-notes --verify-tag
+            if ! git show-ref --verify --quiet "refs/tags/$PORTA_RELEASE_TAG"; then
+              git tag "$PORTA_RELEASE_TAG" "$PORTA_RELEASE_SHA"
+              git push origin "refs/tags/$PORTA_RELEASE_TAG"
+            fi
+            gh release create "$PORTA_RELEASE_TAG" --draft --generate-notes --verify-tag
           fi
-          gh release upload "$GITHUB_REF_NAME" --clobber \
+          gh release upload "$PORTA_RELEASE_TAG" --clobber \
             dist/porta-server-* \
             dist/porta-client-* \
             dist/porta-keygen-* \
@@ -198,7 +240,7 @@ jobs:
             dist/SHA256SUMS \
             dist/SHA256SUMS.sig \
             dist/release-signing-cert.der
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$PORTA_RELEASE_TAG" --draft=false
       - name: Remove temporary Android signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/porta-release.p12"
