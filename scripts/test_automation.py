@@ -910,7 +910,8 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("tags:", triggers)
         self.assertNotIn("secrets.", workflow)
         self.assertNotIn("schedule:", triggers)
-        self.assertIn("name: CI required\n    if: ${{ always() }}", workflow)
+        self.assertIn("name: ${{ github.event_name == 'pull_request' && 'PR required' || 'CI required' }}\n"
+                      "    if: ${{ always() }}", workflow)
         self.assertIn("needs: [go, windows-ui, android]", workflow)
         script = self.workflow_script("ci.yml", "Require every build and test job")
         success = {"GO_RESULT": "success", "WINDOWS_RESULT": "success",

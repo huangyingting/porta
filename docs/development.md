@@ -228,13 +228,15 @@ independent and changes only for compatibility-breaking protocol changes.
 
 `CI` runs on every branch push (including `golang`), PRs targeting `main`, and
 manual dispatches. Linux/Go, Windows and Android builds/tests must all pass.
-The stable **CI required** check fails if any prerequisite fails, is cancelled,
+The **PR required** check fails if any prerequisite fails, is cancelled,
 or is skipped; it cannot turn a partial run into a passing merge check.
+Branch, main-push and manual runs use a different **CI required** name, so
+their results cannot substitute for the PR's merge validation.
 PR and branch runs have separate cancellation groups, so a branch push cannot
 cancel the PR's merge validation. Branch/PR CI has read-only repository
 permissions and receives no release signing or VPN credentials.
 
-`main` is protected: changes must arrive through a PR, the **CI required**
+`main` is protected: changes must arrive through a PR, the **PR required**
 check from GitHub Actions must pass against an up-to-date base, and review
 conversations must be resolved. Administrator bypass, force pushes and branch
 deletion are disabled. A second human approval is not required for the

@@ -48,6 +48,19 @@ func run() error {
 	networkState := flag.String("network-state", "", "network recovery state file (default: platform-specific Porta state)")
 	flag.Parse()
 
+	token := os.Getenv("PORTA_TOKEN")
+	if !*cleanupNetwork {
+		if *serverURL == "" {
+			return errors.New("server URL is required")
+		}
+		if token == "" {
+			return errors.New("PORTA_TOKEN is required; do not pass tokens as command-line arguments")
+		}
+		if err := prepareTunnel(); err != nil {
+			return err
+		}
+	}
+
 	var network clientapp.NetworkConfigurator
 	if *cleanupNetwork || !*manualNetwork {
 		var err error
@@ -60,13 +73,6 @@ func run() error {
 		cleanupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 		return network.Down(cleanupCtx)
-	}
-	if *serverURL == "" {
-		return errors.New("server URL is required")
-	}
-	token := os.Getenv("PORTA_TOKEN")
-	if token == "" {
-		return errors.New("PORTA_TOKEN is required; do not pass tokens as command-line arguments")
 	}
 	return clientapp.Run(ctx, clientapp.Config{
 		ServerURL:         *serverURL,

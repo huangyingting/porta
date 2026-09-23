@@ -1,27 +1,27 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
-func TestWintunBoundaryCannotBeBypassedWithFlagLikeValues(t *testing.T) {
-	for _, test := range []struct {
-		args []string
-		want bool
-	}{
-		{nil, true},
-		{[]string{"--manual-network"}, true},
-		{[]string{"--cleanup-network"}, false},
-		{[]string{"--cleanup-network=false"}, true},
-		{[]string{"--cleanup-network", "--cleanup-network=false"}, true},
-		{[]string{"--cleanup-network", "--identity", `C:\unused-during-cleanup`}, false},
-		{[]string{"--identity", "--cleanup-network"}, true},
-		{[]string{"--token", "--cleanup-network"}, true},
-		{[]string{"--server", "--help"}, true},
-		{[]string{"--help"}, false},
-		{[]string{"--new-option"}, true},
-		{[]string{"--cleanup-network", "--new-option"}, true},
+func TestNetworkHelperDefersClientArgumentsToMainParser(t *testing.T) {
+	for _, args := range [][]string{
+		nil,
+		{"--manual-network"},
+		{"--cleanup-network"},
+		{"--cleanup-network=false"},
+		{"--cleanup-network", "--cleanup-network=false"},
+		{"--cleanup-network", "--identity", `C:\unused-during-cleanup`},
+		{"--identity", "--cleanup-network"},
+		{"--token", "--cleanup-network"},
+		{"--server", "--help"},
+		{"--help"},
+		{"--new-option"},
+		{"--cleanup-network", "--new-option"},
 	} {
-		if got := requiresWintun(test.args); got != test.want {
-			t.Errorf("requiresWintun(%q) = %v, want %v", test.args, got, test.want)
+		if handled, err := runNetworkHelper(context.Background(), args); handled || err != nil {
+			t.Errorf("client arguments %q triggered a helper or DLL load: handled=%t err=%v", args, handled, err)
 		}
 	}
 }

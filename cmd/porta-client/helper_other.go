@@ -7,3 +7,5 @@ import "context"
 func runNetworkHelper(context.Context, []string) (bool, error) {
 	return false, nil
 }
+
+func prepareTunnel() error { return nil }

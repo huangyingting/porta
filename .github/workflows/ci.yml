@@ -157,7 +157,7 @@ jobs:
           path: android/app/build/outputs/apk/debug/*.apk
 
   required:
-    name: CI required
+    name: ${{ github.event_name == 'pull_request' && 'PR required' || 'CI required' }}
     if: ${{ always() }}
     needs: [go, windows-ui, android]
     runs-on: ubuntu-latest
