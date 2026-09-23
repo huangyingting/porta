@@ -304,12 +304,25 @@ elif name == "git":
     if args[0] == "rev-parse":
         if state.get("missing_revision"):
             code = 128
+        elif args[-1] == "HEAD":
+            print(state.get("head_commit", "b" * 40))
+        elif args[-1].startswith("refs/tags/"):
+            tag = args[-1].removeprefix("refs/tags/").removesuffix("^{commit}")
+            print(state.get("tag_commits", {}).get(tag, "c" * 40))
         else:
             print("a" * 40)
     elif args[0] == "cat-file":
         code = 1 if state.get("missing_previous_file") else 0
     elif args[0] == "show":
         print(state.get("previous_version", "0.1.3"))
+    elif args[:2] == ["tag", "--list"]:
+        print("\n".join(state.get("release_tags", [])))
+    elif args[:2] == ["show-ref", "--verify"]:
+        code = 0 if state.get("release_tag_exists") else 1
+    elif args[0] == "tag":
+        state["release_tag_exists"] = True
+    elif args[0] == "push":
+        pass
     else:
         raise RuntimeError(f"unexpected git invocation: {args}")
 elif name == "adb":

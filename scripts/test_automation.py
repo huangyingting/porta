@@ -435,6 +435,21 @@ class AutomationTests(unittest.TestCase):
             self.assertIsNotNone(match, manifest)
             self.assertEqual(match.group(1), version, manifest)
 
+    def test_version_advances_above_global_tags_and_allows_release_reruns(self):
+        self.update_state(previous_version="0.1.29",
+                          release_tags=["v0.1.27", "v0.1.38", "v0.1.099"])
+        self.version_file("0.1.30")
+        self.run_script("check-version.sh", "base", success=False)
+        self.version_file("0.1.39")
+        self.run_script("check-version.sh", "base")
+        self.update_state(release_tags=["v0.1.38", "v0.1.39"])
+        self.run_script("check-version.sh", "base", success=False)
+        self.update_state(tag_commits={"v0.1.39": "b" * 40})
+        self.run_script("check-version.sh", "base")
+        self.version_file("0.1.40")
+        self.update_state(previous_version="0.1.39")
+        self.run_script("check-version.sh", "base")
+
     def prepare_android_rust_build(self):
         ndk = self.root / "ndk"
         tools = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -929,13 +944,125 @@ class AutomationTests(unittest.TestCase):
         self.assertFalse(list((self.root / "system/var/lib/porta").glob("downloads.new.*")))
 
     def release_script(self, name):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        return self.workflow_script("release.yml", name)
+
+    def workflow_script(self, filename, name):
+        workflow = (ROOT / ".github/workflows" / filename).read_text()
         step = workflow.split(f"      - name: {name}\n", 1)[1]
         step = step.split("\n      - ", 1)[0]
         script = step.split("        run: ", 1)[1]
         if script.startswith("|\n"):
             return "\n".join(line[10:] for line in script[2:].splitlines())
         return script.strip()
+
+    def test_main_requires_rust_promotion_and_all_platform_results(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn('  push:\n    branches:\n      - "**"', triggers)
+        self.assertIn("  pull_request:\n    branches:\n      - main", triggers)
+        self.assertNotIn("tags:", triggers)
+        self.assertNotIn("schedule:", triggers)
+        self.assertNotIn("secrets.", workflow)
+        self.assertIn("name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}\n"
+                      "    if: ${{ always() }}", workflow)
+        self.assertIn("needs: [rust, windows, android]", workflow)
+        script = self.workflow_script("ci.yml", "Require Rust promotion and every build")
+        good = {
+            "EVENT_NAME": "pull_request", "HEAD_BRANCH": "rust",
+            "HEAD_REPOSITORY": "huangyingting/porta", "REPOSITORY": "huangyingting/porta",
+            "RUST_RESULT": "success", "WINDOWS_RESULT": "success", "ANDROID_RESULT": "success",
+        }
+        cases = [(good, True), (good | {"EVENT_NAME": "push", "HEAD_BRANCH": ""}, True)]
+        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT"):
+            for outcome in ("failure", "cancelled", "skipped"):
+                cases.append((good | {job: outcome}, False))
+        cases.extend([
+            (good | {"HEAD_BRANCH": "golang"}, False),
+            (good | {"HEAD_BRANCH": "feature"}, False),
+            (good | {"HEAD_REPOSITORY": "other/porta"}, False),
+        ])
+        for values, accepted in cases:
+            with self.subTest(values=values):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script],
+                    cwd=self.root, env=self.env | values,
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, accepted,
+                                 result.stdout + result.stderr)
+
+    def test_release_only_builds_the_successful_trusted_main_push(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        for value in ("workflow_run:", "workflows: [CI]", "types: [completed]", "branches: [main]"):
+            self.assertIn(value, triggers)
+        self.assertNotIn("push:", triggers)
+        self.assertNotIn("workflow_dispatch:", triggers)
+        for guard in (
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.event == 'push'",
+            "github.event.workflow_run.head_branch == 'main'",
+            "github.event.workflow_run.head_repository.full_name == github.repository",
+        ):
+            self.assertEqual(workflow.count(guard), 2)
+        self.assertEqual(workflow.count("ref: ${{ github.event.workflow_run.head_sha }}"), 2)
+        self.assertIn("group: release-main\n  cancel-in-progress: false", workflow)
+        self.assertLess(workflow.index("- name: Verify release version"),
+                        workflow.index("- name: Prepare persistent Android signing key"))
+
+    def test_release_version_checks_real_commit_ancestry_and_tag_identity(self):
+        repository = self.root / "repository"
+        git = shutil.which("git")
+        environment = self.env | {"PATH": os.environ["PATH"],
+                                  "GITHUB_ENV": str(self.root / "github.env")}
+
+        def run_git(*args):
+            result = subprocess.run([git, "-C", str(repository), *args],
+                                    env=environment, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+
+        repository.mkdir()
+        run_git("init", "--quiet", "--initial-branch=main")
+        run_git("config", "user.name", "Workflow Test")
+        run_git("config", "user.email", "workflow-test@example.invalid")
+        run_git("commit", "--quiet", "--allow-empty", "-m", "base")
+        base = run_git("rev-parse", "HEAD")
+        run_git("commit", "--quiet", "--allow-empty", "-m", "tested main")
+        head = run_git("rev-parse", "HEAD")
+        run_git("update-ref", "refs/remotes/origin/main", head)
+        (repository / "scripts").mkdir()
+        shutil.copy(ROOT / "scripts/check-version.sh", repository / "scripts/check-version.sh")
+        version = repository / "internal/buildinfo/VERSION"
+        version.parent.mkdir(parents=True)
+        version.write_text("0.1.39\n")
+
+        def verify(sha, accepted):
+            output = self.root / "github.env"
+            output.unlink(missing_ok=True)
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", self.release_script("Verify release version")],
+                cwd=repository, env=environment | {"PORTA_RELEASE_SHA": sha},
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode == 0, accepted,
+                             result.stdout + result.stderr)
+            if accepted:
+                self.assertIn("PORTA_RELEASE_TAG=v0.1.39\n", output.read_text())
+                self.assertIn("PORTA_ANDROID_VERSION_CODE=1039\n", output.read_text())
+            else:
+                self.assertFalse(output.exists())
+
+        verify(head, True)
+        verify(base, False)
+        run_git("update-ref", "refs/remotes/origin/main", base)
+        verify(head, False)
+        run_git("update-ref", "refs/remotes/origin/main", head)
+        run_git("tag", "-a", "v0.1.39", "-m", "matching release", head)
+        verify(head, True)
+        run_git("tag", "-d", "v0.1.39")
+        run_git("tag", "v0.1.39", base)
+        verify(head, False)
 
     def deployment_bundle_script(self, path):
         blocks = re.findall(
@@ -973,7 +1100,7 @@ class AutomationTests(unittest.TestCase):
         build_sources = "\n".join(
             (ROOT / path).read_text()
             for path in ("Makefile", ".github/workflows/ci.yml",
-                         ".github/workflows/release.yml")
+                         ".github/workflows/release.yml", ".github/workflows/live.yml")
         )
         for obsolete in ("setup-go", "gomobile", "gobind"):
             self.assertNotIn(obsolete, build_sources)
@@ -992,6 +1119,16 @@ class AutomationTests(unittest.TestCase):
             "scripts/windows-down.ps1",
         ):
             self.assertFalse((ROOT / obsolete).exists(), obsolete)
+
+    def test_android_workflows_do_not_request_removed_sdk_tools(self):
+        for filename in ("ci.yml", "release.yml", "live.yml"):
+            workflow = (ROOT / ".github/workflows" / filename).read_text()
+            self.assertRegex(
+                workflow,
+                r"uses: android-actions/setup-android@[0-9a-f]{40}[^\n]*\n"
+                r"        with:\n          packages: platform-tools\n",
+                filename,
+            )
 
     def test_android_rust_build_tracks_patched_transport_sources(self):
         gradle = (ROOT / "android/app/build.gradle.kts").read_text()
@@ -1065,7 +1202,7 @@ class AutomationTests(unittest.TestCase):
         )
 
     def test_live_client_ci_is_credential_free_and_non_enrolling(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        workflow = (ROOT / ".github/workflows/live.yml").read_text()
         live = workflow[workflow.index("  live-windows:"):]
         self.assertNotIn("secrets.", live)
         self.assertIn("PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443", live)
@@ -1084,9 +1221,10 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("HTTP 401", probe)
         self.assertNotIn("NetworkManager", probe)
         self.assertNotIn("Tun::open", probe)
+        self.assertEqual(workflow.count("github.ref == 'refs/heads/main'"), 3)
 
     def test_full_vpn_ci_is_protected_isolated_and_credentialed(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        workflow = (ROOT / ".github/workflows/live.yml").read_text()
         workflow_settings = workflow[:workflow.index("jobs:")]
         self.assertIn(
             "cancel-in-progress: ${{ github.event_name != 'schedule' && !inputs.vpn_e2e }}",
@@ -1501,7 +1639,8 @@ mkdir porta
         result = subprocess.run(
             ["bash", "-euo", "pipefail", "-c", self.release_script("Publish GitHub release")],
             cwd=self.root,
-            env=self.env | {"GITHUB_REF_NAME": "v0.1.4"},
+            env=self.env | {"GITHUB_REF_NAME": "main", "PORTA_RELEASE_TAG": "v0.1.4",
+                            "PORTA_RELEASE_SHA": "a" * 40},
             text=True, capture_output=True, timeout=10,
         )
         if success:
@@ -1519,6 +1658,8 @@ mkdir porta
         self.publish_release()
         self.assertFalse(self.state()["release_draft"])
         self.assertTrue(self.state()["assets_uploaded"])
+        self.assertIn(["git", "tag", "v0.1.4", "a" * 40], self.commands())
+        self.assertIn(["git", "push", "origin", "refs/tags/v0.1.4"], self.commands())
 
     def test_published_release_is_not_overwritten_on_rerun(self):
         self.update_state(release_draft=False)

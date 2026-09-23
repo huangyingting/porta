@@ -110,16 +110,17 @@ This probe does not create a TUN, modify routes, or enroll a device. Execute it
 natively on Windows to exercise Windows certificate APIs; cross-compilation alone
 does not validate the Windows trust store.
 
-CI runs the same credential-free native Windows and Android emulator probes
-against `https://porta-dev.i-csu.org:8443` every day and after default-branch
-pushes. Use the **Run workflow** action with `live_clients` enabled to
-test another branch. The live jobs validate platform trust, HTTP/2 and HTTP/3
+The separate **Live diagnostics** workflow runs the same credential-free native
+Windows and Android emulator probes against `https://porta-dev.i-csu.org:8443`
+every day and after `main` pushes. Use its **Run workflow** action with
+`--ref main` for an additional run. Every live job rejects other refs.
+The live jobs validate platform trust, HTTP/2 and HTTP/3
 negotiation, and rejection of an invalid account before enrollment. They do not
 establish a VPN, modify runner routes, consume a device slot, or replace physical
 device testing of the full VPN data path.
 
-CI also runs a separate credentialed Linux full-tunnel test every day. Use the
-**Run workflow** action with `vpn_e2e` enabled to run it for an allowed branch.
+Live diagnostics also runs a credentialed Linux full-tunnel test every day.
+Use its **Run workflow** action on `main` with `vpn_e2e` enabled for another run.
 The `vpn-e2e-linux` job is attached to the branch-restricted `development`
 environment and reads two environment secrets:
 
@@ -276,7 +277,7 @@ public distribution needs a deliberate signing/migration plan.
 
 Ordinary PR CI builds only debug APKs, named `android-debug-apks`; it receives
 no release signing secrets. These developer artifacts are not release updates
-and must not be copied into the download portal. Tag-triggered releases use
+and must not be copied into the download portal. Post-merge releases use
 the persistent key and are the distributable update artifacts.
 
 ## Version policy
@@ -286,22 +287,55 @@ starts at `0.1.0`. The server, command-line clients, Windows desktop client,
 Android application, native Rust libraries, release metadata, and download portal all
 use this application version.
 
-During the current development series, every merged change increments exactly
-the patch component:
+During the current development series, each promoted change uses the next patch
+above both its base revision and existing canonical release tags:
 
 ```text
 0.1.0 -> 0.1.1 -> 0.1.2
 ```
 
-Keep major and minor fixed at `0.1`. CI checks the version against the pull
-request base or previous pushed revision. The wire-protocol version remains
+Keep major and minor fixed at `0.1`. PR CI compares the PR base and all release
+tags; `main` push CI compares the previous main revision and all release tags.
+This lets a lagging main promote Rust without reusing an already published
+version: base `0.1.29` and tag `v0.1.38` require `0.1.39`. The tested commit's
+own matching tag is excluded to permit CI reruns after publication.
+Feature-branch pushes and manual CI validate version format only.
+Run `./scripts/check-version.sh origin/main` before promoting Rust and keep all
+Porta Cargo package versions synchronized with `internal/buildinfo/VERSION`.
+The wire-protocol version remains
 independent and changes only for compatibility-breaking protocol changes.
 
 ## Continuous integration and releases
 
-CI runs automatically for pushes and pull requests and can also be started
-manually. A tag matching the source version, such as `v0.1.0`, runs the release
-workflow and publishes:
+The promotion path is **`rust` -> `main`**. `main` is downstream of Rust and
+retains its Cargo, Tauri, Rust Android/JNI, native WFP, and Linux glibc-baseline
+workflows. `golang` is a separate implementation branch; do not merge its Go
+build/release workflows into `main`.
+
+**CI** builds and tests branch pushes, PRs targeting `main`, and manual runs.
+Linux/Rust, native Windows, and Android must all pass. The stable
+**Rust PR required** check rejects failed, cancelled or skipped jobs and rejects
+promotion PRs whose source is not this repository's `rust` branch. Branch/main
+and manual runs use **Rust CI required**, so they cannot substitute for the
+PR merge check. Branch and PR runs have separate cancellation groups.
+
+`main` requires an up-to-date **Rust PR required** result from GitHub Actions,
+a PR, and resolved conversations. Administrator bypass, force pushes and
+deletion are disabled. A second human approval is not required for this
+single-maintainer workflow. After promotion, sync the main merge commit back
+into `rust` before its next promotion, without replacing Rust-specific tooling.
+
+After merging the promotion PR, successful **push CI on `main`** triggers
+**Release** through `workflow_run`. Feature-branch, PR, failed, cancelled, and
+manual CI runs cannot publish. Release validates the triggering repository,
+event, branch and result and checks out the exact successful CI SHA, not the
+latest main head. Before signing, it checks main ancestry and rejects an
+existing version tag pointing elsewhere. After builds succeed, it creates the
+tag if needed, uploads a draft and publishes only after all uploads succeed.
+Release runs are serialized without cancellation; tag pushes do not trigger
+workflows. **Live diagnostics** remains separate and main-only.
+
+The release workflow publishes:
 
 - Linux AMD64 and ARM64 servers, clients, and key generators;
 - the Windows desktop and CLI ZIP;

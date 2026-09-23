@@ -26,7 +26,20 @@ if [[ ! $previous =~ ^0\.1\.(0|[1-9][0-9]{0,2})$ ]]; then
   exit 1
 fi
 previous_patch=$((10#${BASH_REMATCH[1]}))
-if ((patch != previous_patch + 1)); then
-  echo "application version must increment exactly one patch: $previous -> $version" >&2
+baseline_patch=$previous_patch
+head_commit=$(git rev-parse --verify HEAD)
+release_tags=$(git tag --list 'v0.1.*')
+while IFS= read -r tag; do
+  [[ $tag =~ ^v0\.1\.(0|[1-9][0-9]{0,2})$ ]] || continue
+  tag_patch=$((10#${BASH_REMATCH[1]}))
+  ((tag_patch > baseline_patch)) || continue
+  tag_commit=$(git rev-parse --verify "refs/tags/$tag^{commit}")
+  if [[ "$tag_commit" == "$head_commit" && "$tag_patch" == "$patch" ]]; then
+    continue
+  fi
+  baseline_patch=$tag_patch
+done <<< "$release_tags"
+if ((patch != baseline_patch + 1)); then
+  echo "application version must be the next patch above the base and release tags: 0.1.$baseline_patch -> $version" >&2
   exit 1
 fi
