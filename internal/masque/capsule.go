@@ -74,10 +74,15 @@ func (e *Encoder) Flush() {
 }
 
 type Decoder struct {
-	r *bufio.Reader
+	r       *bufio.Reader
+	maximum uint64
 }
 
-func NewDecoder(r io.Reader) *Decoder { return &Decoder{r: bufio.NewReader(r)} }
+func NewDecoder(r io.Reader) *Decoder { return NewBoundedDecoder(r, MaxCapsuleSize) }
+
+func NewBoundedDecoder(r io.Reader, maximum uint64) *Decoder {
+	return &Decoder{r: bufio.NewReader(r), maximum: min(maximum, MaxCapsuleSize)}
+}
 
 func (d *Decoder) Read() (Capsule, error) {
 	return d.ReadInto(nil)
@@ -94,7 +99,7 @@ func (d *Decoder) ReadInto(buffer []byte) (Capsule, error) {
 	if err != nil {
 		return Capsule{}, fmt.Errorf("read capsule length: %w", err)
 	}
-	if length > MaxCapsuleSize {
+	if length > d.maximum {
 		return Capsule{}, ErrCapsuleTooLarge
 	}
 	var value []byte

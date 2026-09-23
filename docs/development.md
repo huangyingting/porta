@@ -14,6 +14,7 @@ Node.js or an npm build.
 ```sh
 make check-version
 make test-automation
+make test-browser
 make test
 make test-race
 make vet
@@ -53,11 +54,14 @@ firewall rules, or sysctls are changed. Ordinary
 Go runs skip this opt-in test; Linux CI runs the isolated target explicitly.
 Do not enable the environment variable directly against host networking.
 
-`make test-native-firewall` runs the production `server-up.sh` and
-`server-down.sh` inside a disposable network namespace. It validates native
+`make test-native-firewall` runs the production `server-up.sh`,
+`server-down.sh`, and a Go client setup/cleanup cycle inside disposable network
+namespaces. It validates native
 nftables parsing, atomic replacement, the IPv4/IPv6 TCP and UDP source meters,
 and complete cleanup without changing the host firewall or interfaces. It
 requires `ip`, `nft`, `sysctl`, `unshare`, and passwordless `sudo`.
+Use `make test-native-client-network` to run only the client cycle. Its
+resolver fixture also lives in an isolated mount namespace.
 Both native targets set `PORTA_RUNTIME_DIRECTORY` to a private, per-test
 temporary directory and clean it afterward. Network namespaces alone do not
 isolate files, so the tests never use the installed service's `/run/porta`
@@ -75,7 +79,13 @@ the Go test result cache. Run the same acceptance locally from elevated Windows:
 
 ```powershell
 $env:PORTA_WFP_NATIVE_TEST = "1"
-go test ./internal/winnetwork -run '^TestNativeWFP' -count=1 -v
+$env:PORTA_WFP_NATIVE_TEST_MARKER = Join-Path $env:TEMP ("porta-wfp-" + [guid]::NewGuid())
+go test ./internal/winnetwork -run '^TestNativeWFPTransactionRollback$' -count=1 -v
+if ($LASTEXITCODE -ne 0 -or !(Test-Path $env:PORTA_WFP_NATIVE_TEST_MARKER)) {
+  throw "Native WFP acceptance did not complete"
+}
+Remove-Item $env:PORTA_WFP_NATIVE_TEST_MARKER
+Remove-Item Env:PORTA_WFP_NATIVE_TEST, Env:PORTA_WFP_NATIVE_TEST_MARKER
 ```
 
 The native acceptance path stages the production IPv4/IPv6 filters, reads back
@@ -84,6 +94,8 @@ and checks for residual objects. It never commits a live blocking policy or
 changes routes. It requires Windows/BFE and administrator access; Linux
 cross-compilation cannot execute it. This is native API acceptance, not an
 end-to-end packet-leak or reboot-persistence certification.
+The marker is created exclusively after rollback and residual-object checks;
+an existing marker or a skipped test cannot satisfy CI.
 
 Linux binaries are written to `bin/`. The Windows target creates
 `bin/porta-client-windows-amd64.zip`. Optimized per-architecture Android APKs
@@ -202,20 +214,53 @@ the patch component:
 ```
 
 Keep major and minor fixed at `0.1`. CI checks the version against the pull
-request base or previous pushed revision. The wire-protocol version remains
+request base or previous default-branch revision. Feature-branch pushes
+validate the version format without requiring a second increment.
+Run `./scripts/check-version.sh HEAD` before committing an increment.
+The wire-protocol version remains
 independent and changes only for compatibility-breaking protocol changes.
 
 ## Continuous integration and releases
 
 CI runs automatically for pushes and pull requests and can also be started
-manually. A tag matching the source version, such as `v0.1.0`, runs the release
+manually. Daily runs and the `live_clients` manual input exercise credential-free
+Windows and Android TLS/authentication probes against the development gateway.
+Default-branch pushes also run those probes. Normal, scheduled, live-client
+and protected VPN runs have separate cancellation groups.
+
+The Go probe can also run locally without an account or enrolled identity:
+
+```sh
+PORTA_TLS_TEST_URL=https://porta-dev.i-csu.org:8443 \
+  go test ./internal/clientapp -run '^TestLivePlatformTLSAndAuthentication$' -count=1 -v
+```
+
+It requires trusted TLS, rejects a deliberately invalid token over HTTP/3 and
+HTTP/2, and checks hostname failures without downgrading. It does not establish
+a VPN. Android CI uses `connectedDebugAndroidTest` with
+`dev.porta.android.CertificateVerificationTest` and a nonempty
+`portaTlsOrigin`; Gradle checks instrumentation results. Release trust-policy
+acceptance additionally requires a signed release instrumentation build
+(`-Pporta.testBuildType=release`).
+
+The daily/manual `vpn_e2e` job instead uses the protected `development`
+environment. Configure `PORTA_E2E_TOKEN` and
+`PORTA_E2E_LINUX_IDENTITY_BASE64` for a dedicated test enrollment. It runs
+`scripts/test-live-vpn.sh` (`make test-live-vpn`) with both transports and
+collects sanitized diagnostics. Use a disposable runner: the harness creates
+temporary host veth/NAT connectivity for its isolated namespace and restores
+it afterward. Do not use personal identities or production credentials.
+Missing secrets fail explicitly rather than silently skipping VPN acceptance.
+
+A tag matching the source version, such as `v0.1.0`, runs the release
 workflow and publishes:
 
 - Linux AMD64 and ARM64 servers, clients, and key generators;
 - the Windows desktop and CLI ZIP;
 - per-architecture Android APKs;
 - the deployment bundle;
-- `SHA256SUMS`.
+- `SHA256SUMS`, its detached `SHA256SUMS.sig`, and
+  `release-signing-cert.der`.
 
 Artifacts are uploaded to a draft release before it becomes visible as a
 published release. A failed upload leaves the draft unpublished and can be
@@ -238,3 +283,28 @@ the keystore must not change the certificate pin or signing identity.
 Client and server application release numbers are independent from the Porta
 wire-protocol version. See [architecture.md](architecture.md#protocol-compatibility)
 for the compatibility policy.
+
+## Go/Rust behavioral parity
+
+The Go 0.1.30 port was audited against immutable Rust revision
+`b6e7885e0205fa81dadbc725d4fca3d5cdb0ebfb` (Rust 0.1.38).
+Parity means the same supported behavior, not matching language runtimes or
+application version numbers.
+
+| Area | Go implementation |
+| --- | --- |
+| HTTP/3 MTU | Immutable negotiated MTU; decreasing packet budget, IPv4 fragmentation, bounded ICMP convergence and compatibility capsules |
+| Backpressure/lifecycle | Independent bounded reliable queues, cancellable datagram writes, terminal-error priority and drained close |
+| Diagnostics | Process-local tunnel IDs, bounded activity logs, queue/submission counters and connection-wide QUIC snapshots |
+| Persistent state | Identity-specific lease reservations, committed-but-not-durable fencing, existing serialized enrollment workers and compatible state schemas |
+| Linux | Explicit private identity paths, environment-only tokens, owned firewall/route recovery and ICMP feedback in both MTU modes |
+| Windows | Wails localization/traffic/recovery, bounded profile storage, protected ProgramData paths and Wintun loading, native WFP, stale-packet filtering and full-ring drop accounting |
+| Android | gomobile platform trust-before-proof, English/Chinese resources, certificate revocation policy, synchronized replacement and retained fail-closed recovery |
+| Web/operations | Existing Go portal/admin/proxy behavior retained; signed release metadata and ticket links, isolated native/browser acceptance and live CI probes |
+
+Go retains quic-go, Wails and gomobile, and its existing Kotlin HTTP/2 lanes.
+Rust/Cargo, Quinn-specific fixes, Tauri and Rust JNI build machinery are not
+ported as parallel implementations. Linux Go release binaries remain static.
+Native Windows execution and authenticated Android VPN/network-switch behavior
+require their platform acceptance environments; cross-builds and
+credential-free TLS probes are not substitutes for those checks.

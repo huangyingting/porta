@@ -244,9 +244,15 @@ func TestClearActivityRemovesCurrentAndRotatedLogs(t *testing.T) {
 	controller, _, _ := newTestDesktopController(t)
 	controller.activity = []string{"12:00:00  Connected"}
 	for _, path := range []string{controller.logPath, controller.logPath + ".1"} {
-		if err := os.WriteFile(path, []byte("old log"), 0o600); err != nil {
+		file, err := winnetwork.CreateProtectedFile(path)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := file.WriteString("old log"); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		file.Close()
 	}
 	if err := controller.ClearActivity(); err != nil {
 		t.Fatal(err)
@@ -262,6 +268,128 @@ func TestClearActivityRemovesCurrentAndRotatedLogs(t *testing.T) {
 	}
 }
 
+func TestDesktopProfileRequiresHTTPSOrigin(t *testing.T) {
+	for _, value := range []string{"http://gateway", "https://user:password@gateway", "https://gateway/path",
+		"https://gateway?query", "https://gateway?", "https://gateway#fragment", "https://gateway#", "not a URL"} {
+		if err := validateDesktopOrigin(value); err == nil {
+			t.Errorf("accepted non-origin %q", value)
+		}
+	}
+	for _, value := range []string{"https://gateway", "https://gateway/", "https://[2001:db8::1]:8443"} {
+		if err := validateDesktopOrigin(value); err != nil {
+			t.Errorf("rejected valid origin %q: %v", value, err)
+		}
+	}
+}
+
+func TestStartupBlockedDisablesPrivilegedActions(t *testing.T) {
+	controller, _, profile := newTestDesktopController(t)
+	errBlocked := errors.New("restore legacy recovery state before upgrading")
+	controller.blockStartup(errBlocked)
+	if snapshot := controller.Snapshot(); !snapshot.StartupBlocked || snapshot.Status != "Action required" {
+		t.Fatalf("startup error was not visible: %+v", snapshot)
+	}
+	if _, err := controller.SelectProfile(profile.ID); !errors.Is(err, errBlocked) {
+		t.Fatal("blocked selection was allowed")
+	}
+	if _, err := controller.SaveProfile(ProfileInput{}); !errors.Is(err, errBlocked) {
+		t.Fatal("blocked save was allowed")
+	}
+	if _, err := controller.DeleteProfile(profile.ID); !errors.Is(err, errBlocked) {
+		t.Fatal("blocked delete was allowed")
+	}
+	if err := controller.Connect(profile.ID); !errors.Is(err, errBlocked) {
+		t.Fatal("blocked connection was allowed")
+	}
+	if err := controller.RestoreNetwork(); !errors.Is(err, errBlocked) {
+		t.Fatal("blocked recovery was allowed")
+	}
+}
+
+func TestActivityRejectsRecordInjectionAndHardLinks(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	if controller.appendActivityLocked("\r\n\t\000") {
+		t.Fatal("empty control record was appended")
+	}
+	controller.appendActivityLocked("profile\r\nforged\t\x1b\u0085\u2028\u2029é")
+	line := controller.activityRecordLocked().line
+	if strings.ContainsAny(line, "\r\n\t\x1b\u0085\u2028\u2029") || !strings.HasSuffix(line, "é") {
+		t.Fatalf("unsafe activity record: %q", line)
+	}
+	target := filepath.Join(filepath.Dir(controller.logPath), "target")
+	if err := os.WriteFile(target, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, controller.logPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.writeActivityFile("append"); err == nil {
+		t.Fatal("appended to a linked log")
+	}
+	if err := controller.ClearActivity(); err == nil {
+		t.Fatal("deleted a linked log")
+	}
+	if err := exportActivity(controller.logPath, []string{"overwrite"}); err == nil {
+		t.Fatal("export overwrote a linked target")
+	}
+	data, _ := os.ReadFile(target)
+	if string(data) != "unchanged" {
+		t.Fatalf("linked target changed: %q", data)
+	}
+}
+
+func TestTrafficProgressDoesNotOverrideDisconnectOrLogEverySample(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	at := time.Now().Add(-time.Second)
+	controller.connected = true
+	controller.connectedAt = at
+	controller.lastSampleAt = at
+	controller.lastUploaded, controller.lastDownloaded = 100, 200
+	controller.handleConnectionEvent(clientapp.Event{State: clientapp.StateConnected, Message: "Connected",
+		ConnectedAt: at, BytesUploaded: 10, BytesDownloaded: 20})
+	if controller.uploadRate != 0 || controller.downloadRate != 0 {
+		t.Fatal("counter reset retained stale rates")
+	}
+	if len(controller.activity) != 0 {
+		t.Fatal("progress sample polluted activity history")
+	}
+	controller.disconnecting = true
+	controller.status = "Disconnecting"
+	controller.handleConnectionEvent(clientapp.Event{State: clientapp.StateConnected, Message: "Connected", ConnectedAt: at})
+	if controller.status != "Disconnecting" {
+		t.Fatal("in-flight traffic reverted intentional disconnect")
+	}
+}
+
+func TestProtectedActivityFileCanRotateAndReload(t *testing.T) {
+	controller, _, _ := newTestDesktopController(t)
+	if err := controller.writeActivityFile("first"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := winnetwork.OpenProtectedFile(controller.logPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(1 << 20); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	if err := controller.writeActivityFile("after rotation"); err != nil {
+		t.Fatal(err)
+	}
+	lines := loadActivity(controller.logPath)
+	if len(lines) != 1 || !strings.HasSuffix(lines[0], "after rotation") {
+		t.Fatalf("rotated log unreadable: %v", lines)
+	}
+}
+
+func TestTrayUsesWindowsLocaleAndFallsBackForUnknownStatus(t *testing.T) {
+	if trayTextForLocale("Connected", true) != "已连接" || trayTextForLocale("Connected", false) != "Connected" ||
+		trayTextForLocale("new state", true) != "new state" {
+		t.Fatal("tray localization changed")
+	}
+}
 func TestClearActivityFencesQueuedLogWrites(t *testing.T) {
 	controller, _, _ := newTestDesktopController(t)
 	controller.mu.Lock()

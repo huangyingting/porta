@@ -2,8 +2,10 @@ package clientprofile
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/huangyingting/porta/internal/tunnel"
@@ -147,6 +149,59 @@ func TestStoreAutomaticDefaultPreservesExplicitTransport(t *testing.T) {
 	}
 	if len(reopened.List()) != 4 {
 		t.Fatal("profiles missing after reopen")
+	}
+}
+
+func TestStoreRejectsOversizeWithoutChangingSavedProfiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	store, err := Open(path, testProtector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := store.Save(Profile{Name: "Work", ServerURL: "https://gateway"}, "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, editExisting := range []bool{false, true} {
+		profile := original
+		if !editExisting {
+			profile.ID = ""
+		}
+		if _, err := store.Save(profile, strings.Repeat("x", maxStoreSize)); !errors.Is(err, ErrStoreTooLarge) {
+			t.Fatalf("oversize token mutation: %v", err)
+		}
+		profile.ServerURL = strings.Repeat("x", maxStoreSize+1)
+		if _, err := store.Save(profile, "replacement"); !errors.Is(err, ErrStoreTooLarge) {
+			t.Fatalf("oversize field mutation: %v", err)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, before) || len(store.List()) != 1 {
+		t.Fatal("rejected oversized update changed disk or memory")
+	}
+	if token, err := store.Token(original.ID); err != nil || token != "original" {
+		t.Fatal("rejected update replaced protected token")
+	}
+	if err := os.WriteFile(path, bytes.Repeat([]byte{' '}, maxStoreSize+1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, testProtector{}); !errors.Is(err, ErrStoreTooLarge) {
+		t.Fatalf("oversized store opened: %v", err)
+	}
+}
+
+func TestProfileNamesCountUnicodeCharacters(t *testing.T) {
+	profile := Profile{ID: "profile", Name: strings.Repeat("\u4e2d", 80), ServerURL: "https://gateway", Transport: tunnel.TransportAuto}
+	if err := validate(profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Name += "\u4e2d"
+	if err := validate(profile); err == nil {
+		t.Fatal("profile name exceeded 80 characters")
 	}
 }
 

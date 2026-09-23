@@ -5,10 +5,41 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestClientCLIRequiresEnvironmentToken(t *testing.T) {
+	if mode := os.Getenv("PORTA_CLI_TOKEN_TEST"); mode != "" {
+		os.Args = []string{"porta-client", "--server", "https://example.invalid", "--manual-network=true"}
+		if mode == "argument" {
+			os.Args = append(os.Args, "--token", "private-test-token")
+		}
+		main()
+		return
+	}
+	for _, test := range []struct{ mode, message string }{
+		{"argument", "flag provided but not defined: -token"},
+		{"missing", "PORTA_TOKEN is required"},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=^TestClientCLIRequiresEnvironmentToken$")
+			for _, entry := range os.Environ() {
+				if !strings.HasPrefix(entry, "PORTA_TOKEN=") && !strings.HasPrefix(entry, "PORTA_CLI_TOKEN_TEST=") {
+					command.Env = append(command.Env, entry)
+				}
+			}
+			command.Env = append(command.Env, "PORTA_CLI_TOKEN_TEST="+test.mode)
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), test.message) || strings.Contains(string(output), "private-test-token") {
+				t.Fatalf("CLI did not reject token input safely: %s (%v)", output, err)
+			}
+		})
+	}
+}
 
 func TestClientTLSConfigThumbprint(t *testing.T) {
 	rawCertificate := []byte("gateway certificate")

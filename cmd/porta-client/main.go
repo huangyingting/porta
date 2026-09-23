@@ -37,10 +37,10 @@ func run() error {
 	serverURL := flag.String("server", "", "gateway origin, for example https://vpn.example.com:8443")
 	transportName := flag.String("transport", "auto", "tunnel transport: auto (HTTP/3 with safe HTTP/2 fallback), h3, or h2")
 	interfaceName := flag.String("interface", defaultInterfaceName(), "TUN interface name")
+	identityPath := flag.String("identity", "", "optional absolute private device identity path (Linux only)")
 	caPath := flag.String("ca", "", "optional PEM CA certificate")
 	thumbprint := flag.String("thumbprint", "", "optional SHA-256 gateway certificate thumbprint")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (development only)")
-	tokenFlag := flag.String("token", "", "bearer token (prefer PORTA_TOKEN environment variable)")
 	reconnect := flag.Bool("reconnect", true, "retry transient startup failures and interrupted tunnels")
 	reconnectMaxDelay := flag.Duration("reconnect-max-delay", 30*time.Second, "maximum reconnect delay")
 	manualNetwork := flag.Bool("manual-network", runtime.GOOS != "linux", "manage routes, DNS, and leak protection yourself (Linux defaults to automatic)")
@@ -48,10 +48,6 @@ func run() error {
 	networkState := flag.String("network-state", "", "network recovery state file (default: platform-specific Porta state)")
 	flag.Parse()
 
-	token := os.Getenv("PORTA_TOKEN")
-	if token == "" {
-		token = *tokenFlag
-	}
 	var network clientapp.NetworkConfigurator
 	if *cleanupNetwork || !*manualNetwork {
 		var err error
@@ -65,11 +61,19 @@ func run() error {
 		defer cancel()
 		return network.Down(cleanupCtx)
 	}
+	if *serverURL == "" {
+		return errors.New("server URL is required")
+	}
+	token := os.Getenv("PORTA_TOKEN")
+	if token == "" {
+		return errors.New("PORTA_TOKEN is required; do not pass tokens as command-line arguments")
+	}
 	return clientapp.Run(ctx, clientapp.Config{
 		ServerURL:         *serverURL,
 		Token:             token,
 		Transport:         tunnel.Transport(*transportName),
 		InterfaceName:     *interfaceName,
+		IdentityPath:      *identityPath,
 		CAPath:            *caPath,
 		Thumbprint:        *thumbprint,
 		Insecure:          *insecure,

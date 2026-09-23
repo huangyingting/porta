@@ -19,6 +19,8 @@ var clientDownloadTypes = map[string]string{
 	"porta-android-armeabi-v7a.apk":  "application/vnd.android.package-archive",
 	"porta-android-x86_64.apk":       "application/vnd.android.package-archive",
 	"SHA256SUMS":                     "text/plain; charset=utf-8",
+	"SHA256SUMS.sig":                 "application/octet-stream",
+	"release-signing-cert.der":       "application/pkix-cert",
 }
 
 func clientDownloadHandler(next http.Handler, directory string) http.Handler {

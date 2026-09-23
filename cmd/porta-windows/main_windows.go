@@ -53,20 +53,41 @@ func run() error {
 	if len(os.Args) > 1 && !cleanup {
 		return errors.New("unsupported arguments; use --version or --cleanup-network")
 	}
-	dataDir, err := os.UserConfigDir()
+	dataDir, err := windows.KnownFolderPath(windows.FOLDERID_RoamingAppData, 0)
 	if err != nil {
 		return fmt.Errorf("locate profile directory: %w", err)
 	}
 	dataDir = filepath.Join(dataDir, "Porta")
-	network, err := winnetwork.NewRunner(filepath.Join(dataDir, "network-state.json"))
-	if err != nil {
-		return err
+	statePath, startupErr := winnetwork.DefaultStatePath()
+	if startupErr != nil {
+		statePath, err = winnetwork.CurrentStatePath()
+		if err != nil {
+			return err
+		}
+	}
+	var network *winnetwork.Runner
+	if startupErr == nil {
+		network, startupErr = winnetwork.NewRunner(statePath)
 	}
 	if cleanup {
+		if startupErr != nil {
+			return startupErr
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), networkActionTimeout)
 		defer cancel()
 		return network.Down(ctx)
 	}
+	root, err := winnetwork.PrepareProtectedDirectory(filepath.Dir(statePath))
+	if err != nil {
+		return fmt.Errorf("initialize protected activity log: %w", err)
+	}
+	defer root.Close()
+	logDir := filepath.Join(filepath.Dir(statePath), "logs")
+	logPin, err := winnetwork.PrepareProtectedDirectory(logDir)
+	if err != nil {
+		return fmt.Errorf("initialize protected activity log: %w", err)
+	}
+	defer logPin.Close()
 	store, err := clientprofile.Open(filepath.Join(dataDir, "profiles.json"), clientprofile.DPAPIProtector{})
 	if err != nil {
 		return err
@@ -75,7 +96,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load desktop assets: %w", err)
 	}
-	controller := newDesktopController(store, network, filepath.Join(dataDir, "porta.log"))
+	controller := newDesktopController(store, network, filepath.Join(logDir, "porta.log"))
+	if startupErr != nil {
+		controller.blockStartup(startupErr)
+	}
 	app := application.New(application.Options{
 		Name:        "Porta",
 		Description: "Private network access",
@@ -98,14 +122,24 @@ func run() error {
 
 	tray := app.SystemTray.New()
 	tray.SetIcon(portaIcon)
-	tray.SetTooltip("Porta - Disconnected")
+	tray.SetTooltip("Porta - " + trayText("Disconnected"))
 	menu := app.NewMenu()
-	menu.Add("Open Porta").OnClick(func(*application.Context) { controller.Show() })
-	connectItem := menu.Add("Connect").OnClick(func(*application.Context) { _ = controller.ToggleConnection() })
-	activityItem := menu.Add("Activity").OnClick(func(*application.Context) { controller.ShowActivity() })
-	restoreItem := menu.Add("Restore network").OnClick(func(*application.Context) { _ = controller.RestoreNetwork() })
+	menu.Add(trayText("Open Porta")).OnClick(func(*application.Context) { controller.Show() })
+	connectItem := menu.Add(trayText("Connect")).OnClick(func(*application.Context) {
+		if err := controller.ToggleConnection(); err != nil {
+			controller.recordError("Connection action failed", err)
+			controller.Show()
+		}
+	})
+	activityItem := menu.Add(trayText("Activity")).OnClick(func(*application.Context) { controller.ShowActivity() })
+	restoreItem := menu.Add(trayText("Restore network")).OnClick(func(*application.Context) {
+		if err := controller.RestoreNetwork(); err != nil {
+			controller.recordError("Network recovery failed", err)
+			controller.Show()
+		}
+	})
 	menu.AddSeparator()
-	menu.Add("Quit Porta").OnClick(func(*application.Context) { controller.Quit() })
+	menu.Add(trayText("Quit Porta")).OnClick(func(*application.Context) { controller.Quit() })
 	tray.SetMenu(menu)
 	tray.OnClick(controller.Show)
 	tray.OnDoubleClick(controller.Show)

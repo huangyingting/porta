@@ -76,7 +76,12 @@ func readyTestDependencies() readinessDependencies {
 		Addresses: func(*net.Interface) ([]net.Addr, error) {
 			return []net.Addr{&net.IPNet{IP: net.ParseIP("10.66.0.1"), Mask: net.CIDRMask(24, 32)}}, nil
 		},
-		ReadFile: func(string) ([]byte, error) { return []byte("1\n"), nil },
+		ReadFile: func(path string) ([]byte, error) {
+			if strings.HasSuffix(path, "/rp_filter") {
+				return []byte("2\n"), nil
+			}
+			return []byte("1\n"), nil
+		},
 		Command: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			if name == "nft" {
 				if strings.Contains(strings.Join(args, " "), "inet porta_guard") {
@@ -362,12 +367,14 @@ func TestProxyBackendReadinessDoesNotRequirePublicInputGuard(t *testing.T) {
 	}
 }
 
-func TestAutomaticMTURequiresWorkingICMPIngress(t *testing.T) {
+func TestMTURequiresWorkingICMPIngress(t *testing.T) {
 	for _, test := range []struct {
 		name, accept, allRPF, tunRPF string
 		auto, ready                  bool
 	}{
-		{"fixed", "0", "1", "1", false, true},
+		{"fixed-local-source-blocked", "0", "1", "1", false, false},
+		{"fixed-strict-interface", "1", "0", "1", false, false},
+		{"fixed-scoped-loose-overrides-strict", "1", "1", "2", false, true},
 		{"local-source-blocked", "0", "0", "0", true, false},
 		{"strict-interface", "1", "0", "1", true, false},
 		{"strict-global", "1", "1", "0", true, false},
@@ -403,11 +410,11 @@ func TestAutomaticMTURequiresWorkingICMPIngress(t *testing.T) {
 				t.Fatalf("incorrect MTU feedback readiness: %+v", report)
 			}
 			component := report.Components["mtu_feedback"]
-			if test.auto && component.Required != true {
+			if !component.Required {
 				t.Fatal("MTU feedback prerequisite is not required")
 			}
-			if !test.auto && component.Status != "disabled" {
-				t.Fatal("fixed mode acquired an MTU discovery requirement")
+			if component.Status == "disabled" {
+				t.Fatal("MTU feedback is required even with fixed interface MTU")
 			}
 		})
 	}

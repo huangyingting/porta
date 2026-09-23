@@ -7,17 +7,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/huangyingting/porta/internal/tunnel"
 )
 
 const stateVersion = 2
+const maxStoreSize = 1 << 20
+
+var ErrStoreTooLarge = errors.New("profile store exceeds maximum size")
 
 type Profile struct {
 	ID                string           `json:"id"`
@@ -66,12 +71,20 @@ func Open(path string, protector Protector) (*Store, error) {
 		protector: protector,
 		state:     state{Version: stateVersion, Profiles: []record{}},
 	}
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return store, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read profile store: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxStoreSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read profile store: %w", err)
+	}
+	if len(data) > maxStoreSize {
+		return nil, ErrStoreTooLarge
 	}
 	if err := json.Unmarshal(data, &store.state); err != nil {
 		return nil, fmt.Errorf("decode profile store: %w", err)
@@ -101,6 +114,9 @@ func (s *Store) List() []Profile {
 }
 
 func (s *Store) Save(profile Profile, token string) (Profile, error) {
+	if len(token) > maxStoreSize {
+		return Profile{}, ErrStoreTooLarge
+	}
 	now := time.Now().UTC()
 	if profile.ID == "" {
 		id, err := randomID()
@@ -204,6 +220,9 @@ func (s *Store) persistLocked() error {
 		return fmt.Errorf("encode profile store: %w", err)
 	}
 	data = append(data, '\n')
+	if len(data) > maxStoreSize {
+		return ErrStoreTooLarge
+	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("create profile directory: %w", err)
 	}
@@ -238,11 +257,14 @@ func validate(profile Profile) error {
 	if profile.ID == "" || len(profile.ID) > 64 {
 		return errors.New("profile ID is invalid")
 	}
-	if profile.Name == "" || len(profile.Name) > 80 {
+	if profile.Name == "" || !utf8.ValidString(profile.Name) || utf8.RuneCountInString(profile.Name) > 80 {
 		return errors.New("profile name must contain 1 to 80 characters")
 	}
 	if profile.ServerURL == "" {
 		return errors.New("server URL is required")
+	}
+	if len(profile.ServerURL)+len(profile.CAPath)+len(profile.Thumbprint) > maxStoreSize {
+		return ErrStoreTooLarge
 	}
 	if profile.Transport != tunnel.TransportAuto && profile.Transport != tunnel.TransportHTTP2 && profile.Transport != tunnel.TransportHTTP3 {
 		return errors.New("transport must be auto, h2, or h3")

@@ -21,8 +21,10 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	directory := t.TempDir()
-	if err := os.WriteFile(filepath.Join(directory, "SHA256SUMS"), []byte("checksums"), 0o600); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"SHA256SUMS", "SHA256SUMS.sig", "release-signing-cert.der"} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte("checksums"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(directory, "CLIENT_VERSION"), []byte("v1.2.3\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -81,6 +83,22 @@ func TestPortalRoutesAdminAndClientTokens(t *testing.T) {
 	tamperedDownload := portalRequest(handler, http.MethodGet, ticketURL[1]+"x", nil)
 	if tamperedDownload.Code != http.StatusNotFound {
 		t.Fatalf("tampered ticket status = %d, want 404", tamperedDownload.Code)
+	}
+	for _, name := range []string{"SHA256SUMS.sig", "release-signing-cert.der"} {
+		link := regexp.MustCompile(`href="(/download/` + regexp.QuoteMeta(name) + `\?ticket=[^"]+)"`).FindStringSubmatch(downloads.Body.String())
+		if len(link) != 2 {
+			t.Fatalf("missing signed %s link", name)
+		}
+		if response := portalRequest(handler, http.MethodGet, link[1], nil); response.Code != http.StatusOK {
+			t.Fatalf("%s ticket download status = %d", name, response.Code)
+		}
+		crossFile := strings.Replace(ticketURL[1], "/SHA256SUMS?", "/"+name+"?", 1)
+		expired := "/download/" + name + "?ticket=" + handler.(*portalHandler).issueDownloadTicket(name, time.Now().Add(-time.Minute))
+		for _, invalid := range []string{"/download/" + name, link[1] + "x", crossFile, expired} {
+			if response := portalRequest(handler, http.MethodGet, invalid, nil); response.Code != http.StatusNotFound {
+				t.Fatalf("invalid %s ticket accepted: %d", name, response.Code)
+			}
+		}
 	}
 	artifact := portalRequest(handler, http.MethodGet, "/download/SHA256SUMS", clientCookie)
 	if artifact.Code != http.StatusOK || artifact.Body.String() != "checksums" {

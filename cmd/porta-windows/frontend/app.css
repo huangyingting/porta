@@ -393,3 +393,8 @@ footer { padding: 14px 8px 0; color: var(--muted); text-align: center; font-size
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+:root:lang(zh-CN) { font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif; }
+.traffic-badges { display: flex; gap: 8px; }
+#transport-badge { color: #6ee7b7; }
+#language-action { min-width: 28px; }
+#editor-error { margin: 0; }

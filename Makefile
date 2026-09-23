@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: check-version test test-automation test-race test-native-mtu test-native-firewall vet build build-windows android clean
+.PHONY: check-version test test-automation test-race test-native-mtu test-native-firewall test-native-client-network test-live-vpn test-browser vet build build-windows android clean
 
 check-version:
 	./scripts/check-version.sh
@@ -11,12 +11,13 @@ test:
 test-automation:
 	python3 scripts/test_automation.py
 	$(GO) test ./scripts/package-windows.go ./scripts/package-windows_test.go
+	$(GO) test ./scripts/native-client-network
 
 test-race:
 	GODEBUG=http2xconnect=1 $(GO) test -race ./...
 
 test-native-mtu:
-	@set -eu; directory=$$(mktemp -d); \
+	@set -eu; directory="$$PWD/.native-mtu-$$$$"; mkdir -m 0700 "$$directory"; \
 	trap 'rm -f "$$directory/gateway.test"; rmdir "$$directory"' EXIT; \
 	$(GO) test -c -o "$$directory/gateway.test" ./internal/gateway; \
 	cd internal/gateway; \
@@ -25,6 +26,19 @@ test-native-mtu:
 
 test-native-firewall:
 	./scripts/test-server-firewall.sh
+	./scripts/test-client-network.sh
+
+test-native-client-network:
+	./scripts/test-client-network.sh
+
+test-live-vpn:
+	./scripts/test-live-vpn.sh
+
+test-browser:
+	node scripts/tests/profile_qr_ui.cjs cmd/porta-server/admin_page.go
+	node scripts/tests/portal_onboarding_ui.cjs
+	node scripts/tests/onboarding_layout.cjs
+	node --test cmd/porta-windows/frontend_test.cjs
 
 vet:
 	$(GO) vet ./...

@@ -239,7 +239,7 @@ class AutomationTests(unittest.TestCase):
                 )
         self.assertFalse((self.root / "commands.jsonl").exists())
 
-    def test_automatic_mtu_scopes_icmp_acceptance_to_owned_tun(self):
+    def test_mtu_feedback_scopes_icmp_acceptance_to_owned_tun(self):
         self.run_script("server-up.sh", "porta.0", "10.66.0.1/24",
                         "10.66.0.0/24", "eth0", "8443")
         calls = self.commands()
@@ -250,11 +250,10 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(ipv4_changes), 2)
         self.assertTrue(all("/porta.0/" in value for value in ipv4_changes))
 
-    def test_fixed_mtu_does_not_change_source_validation(self):
+    def test_network_setup_rejects_obsolete_mtu_mode_argument(self):
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
-                        "eth0", "8443", "--auto-mtu=false")
-        self.assertFalse(any("accept_local" in " ".join(call) or "rp_filter" in " ".join(call)
-                             for call in self.commands()))
+                        "eth0", "8443", "--auto-mtu=false", success=False)
+        self.assertFalse((self.root / "commands.jsonl").exists())
 
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
@@ -601,7 +600,7 @@ class AutomationTests(unittest.TestCase):
             (self.root / "system/etc/porta/landing/custom.html").read_text(),
             "<h1>custom landing</h1>",
         )
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443;", unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", unit)
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
@@ -612,16 +611,16 @@ class AutomationTests(unittest.TestCase):
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1280", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
-    def test_deploy_fixed_mtu_disables_discovery_and_helper_settings(self):
+    def test_deploy_fixed_mtu_disables_discovery_but_preserves_feedback_setup(self):
         deploy = self.prepare_deploy(timer=False)
         self.run_deploy(deploy, "--build-local", "--auto-mtu=false", "--mtu", "1100")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=false", unit)
         self.assertNotIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1100", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=false", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
     def test_bundled_service_uses_automatic_mtu_defaults(self):
         unit = (ROOT / "deploy/porta.service").read_text()
@@ -630,8 +629,8 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--auto-mtu=true", start)
         self.assertIn("--mtu 1400", unit)
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
-        self.assertIn("--auto-mtu=true", setup)
-        self.assertIn("eth0 8443 --auto-mtu=true", setup)
+        self.assertNotIn("--auto-mtu", setup)
+        self.assertIn("eth0 8443;", setup)
         self.assertIn("RuntimeDirectoryPreserve=yes", unit)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
@@ -771,11 +770,14 @@ class AutomationTests(unittest.TestCase):
             (release / name).write_bytes(data)
             checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
         (release / "SHA256SUMS").write_text("".join(checksums))
-        assets.append("SHA256SUMS")
+        (release / "SHA256SUMS.sig").write_bytes(b"manifest signature")
+        (release / "release-signing-cert.der").write_bytes(b"signer certificate")
+        assets.extend(["SHA256SUMS", "SHA256SUMS.sig", "release-signing-cert.der"])
         (release / "release.json").write_text(json.dumps({
             "tag_name": "v0.1.4",
-            "assets": [{"name": name, "url": f"https://api.github.com/mock-assets/{name}"}
-                       for name in assets],
+            "assets": [{"name": name, "url":
+                        f"https://api.github.com/repos/huangyingting/porta/releases/assets/{index}"}
+                       for index, name in enumerate(assets, start=1)],
         }))
 
     def test_release_upgrade_publishes_complete_download_set(self):
@@ -785,6 +787,8 @@ class AutomationTests(unittest.TestCase):
         downloads = self.root / "system/var/lib/porta/downloads"
         self.assertEqual((downloads / "CLIENT_VERSION").read_text(), "v0.1.4\n")
         self.assertTrue((downloads / "porta-client-windows-amd64.zip").is_file())
+        self.assertTrue((downloads / "SHA256SUMS.sig").is_file())
+        self.assertTrue((downloads / "release-signing-cert.der").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
@@ -796,6 +800,31 @@ class AutomationTests(unittest.TestCase):
         curl_calls = [call for call in self.commands() if call[0] == "curl"]
         self.assertTrue(curl_calls)
         self.assertNotIn("secret-test-token", json.dumps(curl_calls))
+        for call in curl_calls:
+            if any("api.github.com" in arg for arg in call):
+                self.assertIn("@", "".join(call))
+                self.assertIn("--proto-redir", call)
+                self.assertNotIn("--location-trusted", call)
+        self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_release_rejects_untrusted_asset_urls_before_sending_credentials(self):
+        deploy = self.prepare_deploy()
+        self.release_assets()
+        self.env["GH_TOKEN"] = "secret-test-token"
+        metadata_path = self.root / "release/release.json"
+        metadata = json.loads(metadata_path.read_text())
+        for url in ("https://evil.example/asset", "http://api.github.com/asset",
+                    "https://api.github.com@evil.example/asset",
+                    "https://api.github.com/repos/other/repo/releases/assets/1"):
+            with self.subTest(url=url):
+                metadata["assets"][0]["url"] = url
+                metadata_path.write_text(json.dumps(metadata))
+                self.run_deploy(deploy, success=False)
+                self.assertNotIn("stopped_helpers", self.state())
+        calls = [call for call in self.commands() if call[0] == "curl"]
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(any(arg.endswith("/releases/latest") for arg in call)
+                            for call in calls))
 
     def test_release_without_landing_templates_fails_before_stopping_service(self):
         deploy = self.prepare_deploy()
@@ -833,6 +862,19 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
         self.assertFalse(list((self.root / "system/var/lib/porta").glob("downloads.new.*")))
 
+    def test_release_signature_and_certificate_fail_before_mutation(self):
+        deploy = self.prepare_deploy()
+        before = self.snapshot()
+        self.release_assets()
+        for state in ({"fail_release_signature": True},
+                      {"fail_release_signature": False, "release_fingerprint": "0" * 64}):
+            with self.subTest(state=state):
+                self.update_state(**state)
+                self.run_deploy(deploy, success=False)
+                self.assertEqual(self.snapshot(), before)
+                self.assertNotIn("stopped_helpers", self.state())
+                self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
     def release_script(self, name):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         step = workflow.split(f"      - name: {name}\n", 1)[1]
@@ -862,6 +904,299 @@ class AutomationTests(unittest.TestCase):
             "KEY_ALIAS": "porta",
             "KEY_PASSWORD": "test-only",
         }
+
+    def test_release_manifest_pin_and_publication_contract(self):
+        pin = (ROOT / "android/signing-certificate.sha256").read_text().strip()
+        self.assertRegex(pin, r"^[0-9a-f]{64}$")
+        deploy = (ROOT / "scripts/deploy.sh").read_text()
+        self.assertIn("release_signing_fingerprint=" + pin, deploy)
+        self.assertLess(deploy.index("openssl dgst -sha256"),
+                        deploy.index('actual_checksum=$(sha256sum'))
+        signing = self.release_script("Sign release manifest")
+        self.assertIn("java scripts/SignReleaseManifest.java", signing)
+        self.assertIn("android/signing-certificate.sha256", signing)
+        publishing = self.release_script("Publish GitHub release")
+        for artifact in ("SHA256SUMS", "SHA256SUMS.sig", "release-signing-cert.der"):
+            self.assertIn("dist/" + artifact, signing)
+            self.assertIn("dist/" + artifact, publishing)
+
+    def test_release_manifest_real_signatures_and_tamper_rejection(self):
+        tools = {name: shutil.which(name) for name in ("java", "keytool", "openssl")}
+        if not all(tools.values()):
+            self.skipTest("Java 17, keytool and OpenSSL are required for signing integration")
+        environment = self.env | {
+            "PATH": os.environ["PATH"],
+            "PORTA_ANDROID_KEYSTORE_PASSWORD": "test-password",
+            "PORTA_ANDROID_KEY_PASSWORD": "test-password",
+            "PORTA_ANDROID_KEY_ALIAS": "porta",
+        }
+
+        def run(*arguments, success=True):
+            result = subprocess.run(
+                arguments, cwd=self.root, env=environment, text=True,
+                capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+            return result.stdout
+
+        manifest = self.root / "SHA256SUMS"
+        manifest.write_text("fixture release manifest\n")
+        for algorithm in ("EC", "RSA"):
+            with self.subTest(algorithm=algorithm):
+                store = self.root / (algorithm + ".p12")
+                certificate = self.root / (algorithm + ".der")
+                signature = self.root / (algorithm + ".sig")
+                public_key = self.root / (algorithm + ".pem")
+                run(tools["keytool"], "-J-Djava.io.tmpdir=" + str(self.root / "scratch"),
+                    "-genkeypair", "-noprompt", "-keystore", str(store),
+                    "-storetype", "PKCS12", "-storepass", "test-password",
+                    "-keypass", "test-password", "-alias", "porta",
+                    "-dname", "CN=Porta Test", "-keyalg", algorithm, "-validity", "1")
+                run(tools["keytool"], "-exportcert", "-keystore", str(store),
+                    "-storepass", "test-password", "-alias", "porta",
+                    "-file", str(certificate))
+                fingerprint = hashlib.sha256(certificate.read_bytes()).hexdigest()
+                signer = (
+                    tools["java"], "-Djava.io.tmpdir=" + str(self.root / "scratch"),
+                    str(ROOT / "scripts/SignReleaseManifest.java"), str(store),
+                    str(manifest), str(signature), str(certificate),
+                )
+                run(*signer, "0" * 64, success=False)
+                self.assertFalse(signature.exists())
+                manifest.write_text("fixture release manifest\n")
+                run(*signer, fingerprint)
+                public_key.write_text(run(tools["openssl"], "x509", "-inform", "DER",
+                                          "-in", str(certificate), "-pubkey", "-noout"))
+                verify = (
+                    tools["openssl"], "dgst", "-sha256", "-verify", str(public_key),
+                    "-signature", str(signature), str(manifest),
+                )
+                run(*verify)
+                manifest.write_text("tampered manifest\n")
+                run(*verify, success=False)
+
+    def test_live_ci_is_credential_free_and_full_vpn_is_protected(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        live = workflow[workflow.index("  live-windows:"):]
+        self.assertNotIn("secrets.", live)
+        self.assertIn('cron: "23 3 * * *"', workflow)
+        self.assertIn("PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443", live)
+        self.assertIn("TestLivePlatformTLSAndAuthentication", live)
+        self.assertIn("connectedDebugAndroidTest", live)
+        self.assertIn("CertificateVerificationTest", live)
+        self.assertIn("portaTlsOrigin=https://porta-dev.i-csu.org:8443", live)
+        vpn = workflow.split("  vpn-e2e-linux:\n", 1)[1].split("  live-windows:\n", 1)[0]
+        self.assertIn("environment: development", vpn)
+        self.assertIn("group: porta-development-vpn-e2e", vpn)
+        self.assertIn("cancel-in-progress: false", vpn)
+        self.assertIn("secrets.PORTA_E2E_TOKEN", vpn)
+        self.assertIn("secrets.PORTA_E2E_LINUX_IDENTITY_BASE64", vpn)
+        self.assertNotIn("secrets.", vpn.split("- name: Exercise", 1)[0])
+        self.assertIn("inputs.vpn_e2e && 'vpn-e2e'", workflow)
+        self.assertIn("inputs.live_clients && 'live-clients'", workflow)
+
+    def test_native_windows_packaging_and_static_go_release_contract(self):
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn('PORTA_WFP_NATIVE_TEST: "1"', ci)
+        self.assertIn("PORTA_WFP_NATIVE_TEST_MARKER", ci)
+        self.assertIn("native WFP rollback acceptance did not run", ci)
+        self.assertRegex(release, r"(?ms)^  windows:\n.*?runs-on: windows-latest")
+        self.assertIn("needs: windows", release)
+        self.assertIn("name: porta-windows-release", release)
+        self.assertIn("actions/download-artifact@", release)
+        for workflow in (ci, release):
+            self.assertIn("scripts/package-windows.go", workflow)
+            self.assertRegex(workflow, r"go test -count=1[^\n]+ ./internal/device ")
+            self.assertIn("node --test cmd/porta-windows/frontend_test.cjs", workflow)
+            self.assertIn("go-version-file: go.mod", workflow)
+            self.assertIn("golang.org/x/mobile/cmd/gomobile@", workflow)
+            self.assertIn("go build -tags production", workflow)
+            self.assertNotRegex(workflow, r"\b(cargo|rustup)\b")
+        self.assertIn("CGO_ENABLED=0 GOOS=linux", release)
+        self.assertIn("is not a static Go binary", release)
+        self.assertNotIn("GLIBC_", release)
+        checksum = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+        for content in (ci, release, (ROOT / "Makefile").read_text()):
+            self.assertIn(checksum, content.lower())
+
+    def test_native_client_networking_isolated_from_host_network_and_resolver(self):
+        harness = (ROOT / "scripts/test-client-network.sh").read_text()
+        helper = (ROOT / "scripts/native-client-network/main_linux.go").read_text()
+        makefile = (ROOT / "Makefile").read_text()
+        self.assertIn("sudo -n unshare --net --mount --propagation private --", harness)
+        self.assertIn('mount --bind "$runtime_directory/etc" /etc', harness)
+        self.assertIn('mount --bind "$runtime_directory/run" /run', harness)
+        self.assertIn('CGO_ENABLED=0 "${GO:-go}" build', harness)
+        self.assertIn("PORTA_NATIVE_CLIENT_NETWORK_TEST=1", harness)
+        self.assertIn('"PORTA_NATIVE_CLIENT_NETWORK_TEST"', helper)
+        self.assertIn('os.Readlink("/proc/self/ns/net")', helper)
+        self.assertIn('os.Readlink("/proc/1/ns/net")', helper)
+        self.assertIn("current == host", helper)
+        self.assertIn("network.Prepare(ctx, endpoint)", helper)
+        self.assertIn("network.Up(ctx, tun.Name(), endpoint, lease)", helper)
+        self.assertIn("network.Down(ctx)", helper)
+        self.assertIn("./scripts/test-client-network.sh", makefile)
+        self.assertNotIn("cargo", harness)
+
+    def test_full_vpn_harness_uses_real_go_client_and_checks_cleanup(self):
+        harness = (ROOT / "scripts/test-live-vpn.sh").read_text()
+        for fragment in (
+            'CGO_ENABLED=0 "$go" build', "./cmd/porta-client",
+            "ip netns add", "type veth", "masquerade",
+            'ip daddr "$gateway" drop', '--identity "$identity_path"',
+            '--transport "$transport"', '--network-state "$state_path"',
+            "connected address=.* transport=$transport",
+            "ip -4 route show proto 186", 'ip -4 route get "$gateway"',
+            "ping -n -c 3", 'ping -n -c 1 -W 5 -M do -s "$df_payload"',
+            "Porta-owned routes remain", "Porta leak-protection table remains",
+            "private Porta gateway remains reachable",
+            'install -o "$(id -u)" -g "$(id -g)" -m 0600',
+            "PORTA_E2E_ARTIFACT_DIR must not already exist",
+            'kill -KILL "$client_pid"',
+        ):
+            self.assertIn(fragment, harness)
+        self.assertNotIn("--token", harness)
+        self.assertNotIn("cargo", harness)
+        self.assertNotIn("mktemp", harness)
+
+    def test_full_vpn_invalid_configuration_never_runs_network_commands(self):
+        self.env.update(PORTA_E2E_TOKEN="", PORTA_E2E_LINUX_IDENTITY_BASE64="")
+        cases = (
+            {"PORTA_E2E_SERVER": "http://vpn.example"},
+            {"PORTA_E2E_SERVER": "https://user:password@vpn.example"},
+            {"PORTA_E2E_GATEWAY": "bad"},
+            {"PORTA_E2E_SERVER_ADDRESS": "::1"},
+            {"PORTA_E2E_TRANSPORTS": "h3 invalid"},
+            {},
+            {"PORTA_E2E_TOKEN": "test-token-at-least-16"},
+        )
+        for values in cases:
+            with self.subTest(values=values):
+                result = subprocess.run(
+                    ["bash", str(ROOT / "scripts/test-live-vpn.sh")],
+                    cwd=self.root, env=self.env | values, text=True,
+                    capture_output=True, timeout=10,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "commands.jsonl").exists())
+
+    def test_browser_layout_reports_startup_failure_without_hanging(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for browser harness tests")
+        chrome = self.root / "failing-chrome"
+        chrome.write_text("#!/bin/sh\necho fixture-chrome-failure >&2\nexit 7\n")
+        chrome.chmod(0o755)
+        for binary, message in ((chrome, "fixture-chrome-failure"),
+                                (self.root / "missing-chrome", "Chrome failed to start")):
+            with self.subTest(binary=binary):
+                result = subprocess.run(
+                    [node, str(ROOT / "scripts/tests/onboarding_layout.cjs")],
+                    cwd=self.root, env=self.env | {"CHROME_BIN": str(binary)},
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_full_vpn_namespace_checks_routes_packets_and_cleanup(self):
+        work = self.root / "vpn-work"
+        work.mkdir()
+        (work / "client-token").write_text("fixture-token-not-a-real-credential")
+        (work / "client-identity.json").write_text("{}")
+        interface = self.root / "sys/class/net/porta-ci0"
+        interface.mkdir(parents=True)
+        (interface / "mtu").write_text("1400\n")
+        harness = self.root / "vpn-harness.sh"
+        harness.write_text((ROOT / "scripts/test-live-vpn.sh").read_text()
+                           .replace("/sys/class/net/", str(self.root / "sys/class/net") + "/")
+                           .replace("$fake_bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                                    "$fake_bin:$PATH"))
+        harness.chmod(0o755)
+        stub = """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+work = Path(os.environ["VPN_WORK"])
+program = Path(sys.argv[0]).name
+args = sys.argv[1:]
+active = work / "active"
+state = work / "network-state.json"
+with (work / "calls.jsonl").open("a") as log:
+    log.write(json.dumps([program, *args]) + "\\n")
+if program == "client":
+    if "--token" in args or os.environ.get("PORTA_TOKEN") != "fixture-token-not-a-real-credential":
+        raise SystemExit("client automation must provide tokens only through PORTA_TOKEN")
+    if "--cleanup-network" in args:
+        state.unlink(missing_ok=True)
+        raise SystemExit(0)
+    def stop(*_):
+        active.unlink(missing_ok=True)
+        if os.environ.get("VPN_STALE_STATE") != "1":
+            state.unlink(missing_ok=True)
+        raise SystemExit(0)
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    active.touch()
+    state.write_text("{}")
+    transport = args[args.index("--transport") + 1]
+    print("connected address=10.66.0.2/24 transport=" + transport + " uploaded=0", flush=True)
+    while True:
+        time.sleep(0.01)
+elif program == "ip":
+    if args[:4] == ["link", "show", "dev", "porta-ci0"]:
+        raise SystemExit(0 if active.exists() else 1)
+    if args[:3] == ["-4", "route", "get"]:
+        print("10.66.0.1 dev porta-ci0")
+    elif args[:3] == ["-4", "route", "show"]:
+        if active.exists():
+            print("0.0.0.0/1 dev porta-ci0 proto 186\\n128.0.0.0/1 dev porta-ci0 proto 186")
+    else:
+        raise SystemExit("unexpected mock ip command")
+elif program == "nft" and args == ["list", "tables"]:
+    if active.exists():
+        print("table inet porta_fixture")
+elif program == "ping":
+    raise SystemExit(0 if active.exists() else 1)
+else:
+    raise SystemExit("unexpected mock command")
+"""
+        client = self.root / "client"
+        client.write_text(stub)
+        client.chmod(0o755)
+        for name in ("ip", "nft", "ping"):
+            command = self.bin / name
+            command.unlink(missing_ok=True)
+            command.write_text(stub)
+            command.chmod(0o755)
+        (self.bin / "sleep").unlink()
+        for stale in ("0", "1"):
+            with self.subTest(stale=stale):
+                result = subprocess.run(
+                    ["bash", str(harness), "--namespace", str(ROOT), str(work),
+                     "https://vpn.example", "10.66.0.1", "h3 h2", str(client)],
+                    cwd=self.root, env=self.env | {"VPN_WORK": str(work),
+                                                 "VPN_STALE_STATE": stale},
+                    text=True, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode == 0, stale == "0",
+                                 result.stdout + result.stderr)
+                self.assertFalse((work / "active").exists())
+                self.assertFalse((work / "network-state.json").exists(), result.stderr)
+                if stale == "1":
+                    self.assertIn("network recovery state remains", result.stderr)
+        calls = [json.loads(line) for line in (work / "calls.jsonl").read_text().splitlines()]
+        connections = [call for call in calls if call[0] == "client" and "--transport" in call]
+        self.assertEqual([call[call.index("--transport") + 1] for call in connections],
+                         ["h3", "h2", "h3"])
+        self.assertTrue(all("--identity" in call and "--reconnect=false" in call
+                            for call in connections))
+        self.assertTrue(any("--cleanup-network" in call for call in calls))
+        self.assertTrue(any(call[0] == "ping" and "-M" in call for call in calls))
+        self.assertNotIn("fixture-token-not-a-real-credential", json.dumps(calls))
 
     def test_release_requires_complete_signing_secrets(self):
         for name in ("KEYSTORE_BASE64", "KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD"):

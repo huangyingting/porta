@@ -12,8 +12,60 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  GOMAXPROCS: "4"
+  GOFLAGS: "-p=2"
+
 jobs:
+  windows:
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test Windows release source
+        shell: pwsh
+        run: |
+          go test -count=1 ./internal/clientapp ./internal/clientid ./internal/clientprofile ./internal/device ./internal/winnetwork ./cmd/porta-client ./cmd/porta-windows
+          if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
+          go test ./scripts/package-windows.go ./scripts/package-windows_test.go
+          if ($LASTEXITCODE -ne 0) { throw "Windows packaging tests failed" }
+      - name: Test Windows release frontend
+        run: node --test cmd/porta-windows/frontend_test.cjs
+      - name: Build Windows release applications
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package -Force | Out-Null
+          go build -tags production -trimpath -ldflags="-s -w -H=windowsgui" -o package/porta.exe ./cmd/porta-windows
+          if ($LASTEXITCODE -ne 0) { throw "Windows desktop build failed" }
+          go build -trimpath -ldflags="-s -w" -o package/porta-cli.exe ./cmd/porta-client
+          if ($LASTEXITCODE -ne 0) { throw "Windows CLI build failed" }
+      - name: Package Windows release applications
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $expected = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+          if ((Get-FileHash wintun.zip -Algorithm SHA256).Hash -ne $expected) {
+            throw "Wintun archive checksum mismatch"
+          }
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll package\wintun.dll
+          go run ./scripts/package-windows.go porta-client-windows-amd64.zip package
+          if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: porta-windows-release
+          path: porta-client-windows-amd64.zip
+          if-no-files-found: error
+
   release:
+    needs: windows
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -71,8 +123,17 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-client-linux-$arch" ./cmd/porta-client
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/porta-keygen-linux-$arch" ./cmd/porta-keygen
           done
-          make build-windows
-          cp bin/porta-client-windows-amd64.zip dist/
+          for binary in dist/porta-{server,client,keygen}-linux-*; do
+            headers=$(readelf -l "$binary")
+            if grep -q 'INTERP' <<<"$headers"; then
+              echo "$binary is not a static Go binary" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: porta-windows-release
+          path: dist
       - name: Package deployment tools
         run: |
           mkdir -p dist/deploy-bundle/porta/scripts dist/deploy-bundle/porta/deploy
@@ -104,6 +165,18 @@ jobs:
           cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/porta-android-x86_64.apk
           cd dist
           sha256sum porta-server-* porta-client-* porta-keygen-* porta-android-* porta-deploy.tar.gz > SHA256SUMS
+      - name: Sign release manifest
+        env:
+          PORTA_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
+          PORTA_ANDROID_KEY_ALIAS: ${{ secrets.PORTA_ANDROID_KEY_ALIAS }}
+          PORTA_ANDROID_KEY_PASSWORD: ${{ secrets.PORTA_ANDROID_KEY_PASSWORD }}
+        run: |
+          java scripts/SignReleaseManifest.java \
+            "$PORTA_ANDROID_KEYSTORE" \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sig \
+            dist/release-signing-cert.der \
+            "$(tr -d '\r\n' < android/signing-certificate.sha256)"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,7 +195,9 @@ jobs:
             dist/porta-keygen-* \
             dist/porta-android-* \
             dist/porta-deploy.tar.gz \
-            dist/SHA256SUMS
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sig \
+            dist/release-signing-cert.der
           gh release edit "$GITHUB_REF_NAME" --draft=false
       - name: Remove temporary Android signing key
         if: always()

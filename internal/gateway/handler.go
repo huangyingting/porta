@@ -164,6 +164,7 @@ func (c HandlerConfig) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(sessionParent)
 	lease, err := c.Pool.AcquireGroup(identity.LeaseID, lanes.sessionID)
 	if err != nil {
+		c.Logger.Error("acquire tunnel lease", "error", err)
 		http.Error(w, "no tunnel addresses available", http.StatusServiceUnavailable)
 		return
 	}

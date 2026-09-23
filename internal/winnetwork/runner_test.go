@@ -75,17 +75,6 @@ func testRemote() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}
 }
 
-func TestNetworkHelperUsesCompleteScriptFile(t *testing.T) {
-	path, err := writeNetworkScript(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || string(data) != "\xef\xbb\xbf"+networkScript {
-		t.Fatalf("network script content or Windows UTF-8 BOM is missing: %v", err)
-	}
-}
-
 func TestActivationBeforeNetworkMutationAndNoUpdateGap(t *testing.T) {
 	runner := testRunner(t)
 	var calls []string
@@ -180,9 +169,15 @@ func TestCancellationRetainsJournalAndProtectionUntilExplicitDown(t *testing.T) 
 	if err := runner.releaseLocked(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(runner.statePath+".pending", []byte("interrupted journal"), 0o600); err != nil {
+	pending, err := CreateProtectedFile(runner.statePath + ".pending")
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pending.WriteString("interrupted journal"); err != nil {
+		pending.Close()
+		t.Fatal(err)
+	}
+	pending.Close()
 	if err := reopened.Down(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -395,6 +390,8 @@ func TestRecreatedTunnelIsReboundWithoutGuardRemoval(t *testing.T) {
 		calls = append(calls, args[0])
 		if args[0] == "retire-interface" {
 			runner.state.InterfaceLUID = 0
+			runner.state.InterfaceGUID = ""
+			runner.state.MTU = nil
 			return "", runner.persistLocked()
 		}
 		return "", nil
@@ -501,7 +498,8 @@ func TestHelperContainsNoBroadFirewallOrAddressCleanup(t *testing.T) {
 			t.Fatalf("helper contains unsafe/unreliable command %s", forbidden)
 		}
 	}
-	if !strings.Contains(networkScript, "$file.Flush($true)") || !strings.Contains(networkScript, "[IO.File]::Replace") {
+	if !strings.Contains(networkScript, "$file.Flush($true)") || !strings.Contains(networkScript, "[Porta.Journal]::MoveFileEx($pending, $StatePath, 9)") ||
+		strings.Contains(networkScript, "[IO.File]::Replace") || !strings.Contains(networkScript, "[IO.FileMode]::CreateNew") {
 		t.Fatal("helper journal is not flushed and atomically replaced")
 	}
 }

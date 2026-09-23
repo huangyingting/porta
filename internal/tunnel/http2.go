@@ -516,6 +516,12 @@ func (g *http2Group) receive() ([]byte, error) {
 	g.receiveMu.Lock()
 	defer g.receiveMu.Unlock()
 	for {
+		if err := g.failure(); err != nil {
+			return nil, err
+		}
+		if err := g.ctx.Err(); err != nil {
+			return nil, err
+		}
 		if g.controlBudget > 0 {
 			if packet, ok := tryHTTP2Packet(g.lanes[0].downstream); ok {
 				g.controlBudget--

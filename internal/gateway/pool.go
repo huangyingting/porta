@@ -12,6 +12,7 @@ import (
 )
 
 var ErrPoolExhausted = errors.New("address pool is exhausted")
+var ErrLeaseDurability = errors.New("lease state replaced but directory synchronization failed")
 
 type Lease struct {
 	Address    netip.Addr
@@ -98,6 +99,10 @@ func (p *Pool) AcquireGroup(clientID, groupID string) (Lease, error) {
 }
 
 func (p *Pool) acquire(clientID, groupID string) (Lease, error) {
+	return p.acquireWithSync(clientID, groupID, syncLeaseDirectory)
+}
+
+func (p *Pool) acquireWithSync(clientID, groupID string, syncDirectory func(string) error) (Lease, error) {
 	if !ValidClientID(clientID) {
 		return Lease{}, errors.New("invalid client ID")
 	}
@@ -113,6 +118,9 @@ func (p *Pool) acquire(clientID, groupID string) (Lease, error) {
 		}
 	}
 
+	if p.nextGen == ^uint64(0) {
+		return Lease{}, errors.New("lease generation exhausted")
+	}
 	p.nextGen++
 	if existing, ok := p.byClient[clientID]; ok {
 		previous := existing
@@ -120,10 +128,14 @@ func (p *Pool) acquire(clientID, groupID string) (Lease, error) {
 		existing.generation = p.nextGen
 		existing.active = true
 		p.byClient[clientID] = existing
-		if err := p.persistStateLocked(); err != nil {
-			p.byClient[clientID] = previous
-			if hadPreviousGroup {
-				p.groups[clientID] = previousGroup
+		if err := p.persistStateLocked(syncDirectory); err != nil {
+			if errors.Is(err, ErrLeaseDurability) {
+				p.abandonCommitted(clientID)
+			} else {
+				p.byClient[clientID] = previous
+				if hadPreviousGroup {
+					p.groups[clientID] = previousGroup
+				}
 			}
 			return Lease{}, err
 		}
@@ -139,40 +151,28 @@ func (p *Pool) acquire(clientID, groupID string) (Lease, error) {
 		record := leaseRecord{address: candidate, generation: p.nextGen, active: true}
 		p.byClient[clientID] = record
 		p.byAddr[candidate] = clientID
-		if err := p.persistStateLocked(); err != nil {
-			delete(p.byClient, clientID)
-			delete(p.byAddr, candidate)
+		if err := p.persistStateLocked(syncDirectory); err != nil {
+			if errors.Is(err, ErrLeaseDurability) {
+				p.abandonCommitted(clientID)
+			} else {
+				delete(p.byClient, clientID)
+				delete(p.byAddr, candidate)
+			}
 			return Lease{}, err
 		}
 		p.activateGroup(clientID, groupID, record.generation)
 		return p.lease(clientID, record), nil
 	}
-	var (
-		reclaimClient string
-		reclaimRecord leaseRecord
-	)
-	for existingClient, record := range p.byClient {
-		if record.active || (reclaimClient != "" && record.generation >= reclaimRecord.generation) {
-			continue
-		}
-		reclaimClient = existingClient
-		reclaimRecord = record
-	}
-	if reclaimClient != "" {
-		delete(p.byClient, reclaimClient)
-		record := leaseRecord{address: reclaimRecord.address, generation: p.nextGen, active: true}
-		p.byClient[clientID] = record
-		p.byAddr[record.address] = clientID
-		if err := p.persistStateLocked(); err != nil {
-			delete(p.byClient, clientID)
-			p.byClient[reclaimClient] = reclaimRecord
-			p.byAddr[reclaimRecord.address] = reclaimClient
-			return Lease{}, err
-		}
-		p.activateGroup(clientID, groupID, record.generation)
-		return p.lease(clientID, record), nil
-	}
+	// Inactive addresses remain identity-specific until old conntrack state can
+	// be retired fail-closed. Disconnecting never transfers that reservation.
 	return Lease{}, ErrPoolExhausted
+}
+
+func (p *Pool) abandonCommitted(clientID string) {
+	record := p.byClient[clientID]
+	record.active = false
+	p.byClient[clientID] = record
+	delete(p.groups, clientID)
 }
 
 func (p *Pool) Release(lease Lease) {
@@ -287,7 +287,7 @@ func (p *Pool) restoreLease(clientID, value string, generation uint64) error {
 	return nil
 }
 
-func (p *Pool) persistStateLocked() error {
+func (p *Pool) persistStateLocked(syncDirectory func(string) error) error {
 	if p.statePath == "" {
 		return nil
 	}
@@ -330,8 +330,15 @@ func (p *Pool) persistStateLocked() error {
 	if err := os.Rename(tempName, p.statePath); err != nil {
 		return fmt.Errorf("replace lease state: %w", err)
 	}
+	if err := syncDirectory(filepath.Dir(p.statePath)); err != nil {
+		return fmt.Errorf("%w: %w", ErrLeaseDurability, err)
+	}
+	return nil
+}
+
+func syncLeaseDirectory(path string) error {
 	if runtime.GOOS != "windows" {
-		directory, err := os.Open(filepath.Dir(p.statePath))
+		directory, err := os.Open(path)
 		if err != nil {
 			return fmt.Errorf("open lease state directory: %w", err)
 		}

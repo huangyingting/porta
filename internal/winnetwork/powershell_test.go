@@ -80,6 +80,14 @@ func TestExplicitHelperScriptsUsePackagedCLI(t *testing.T) {
 		if !strings.Contains(string(data), `[string]$ClientExecutable = "porta-cli.exe"`) {
 			t.Fatalf("%s does not default to the packaged CLI", script)
 		}
+		if !strings.Contains(string(data), `[string]$StatePath = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData"))`) ||
+			strings.Contains(string(data), "$env:LOCALAPPDATA") || strings.Contains(string(data), "$env:ProgramData") {
+			t.Fatalf("%s does not use the trusted ProgramData known folder", script)
+		}
+		if !strings.Contains(string(data), `if (-not $PSBoundParameters.ContainsKey("StatePath"))`) ||
+			!strings.Contains(string(data), "restore it with the previous Porta client before upgrading") {
+			t.Fatalf("%s silently abandons legacy manual recovery state", script)
+		}
 	}
 }
 

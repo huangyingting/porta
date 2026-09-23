@@ -18,6 +18,8 @@ type PacketDevice interface {
 	Close() error
 }
 
+var ErrPacketDropped = errors.New("TUN packet dropped because the receive ring is full")
+
 type readResult struct {
 	packets [][]byte
 	err     error
@@ -49,7 +51,7 @@ func OpenNative(name string, mtu int) (*Native, error) {
 	if mtu < 576 || mtu > 9000 {
 		return nil, fmt.Errorf("MTU %d is outside 576..9000", mtu)
 	}
-	dev, err := tun.CreateTUN(name, mtu)
+	dev, err := createNativeTUN(name, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("create TUN %q: %w", name, err)
 	}

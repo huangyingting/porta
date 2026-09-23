@@ -5,6 +5,10 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
+    <!-- Android's verifier fetches these public, issuer-signed CRLs over HTTP. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">c.lencr.org</domain>
+    </domain-config>
     <debug-overrides>
         <trust-anchors>
             <certificates src="user" />

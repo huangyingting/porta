@@ -44,6 +44,7 @@ type Config struct {
 	Token             string
 	Transport         tunnel.Transport
 	InterfaceName     string
+	IdentityPath      string
 	CAPath            string
 	Thumbprint        string
 	Insecure          bool
@@ -103,7 +104,7 @@ type counters struct {
 }
 
 func Run(ctx context.Context, config Config, observer Observer) error {
-	return run(ctx, clientid.Current, config, observer, func(ctx context.Context, config tunnel.Config) (*clientConnection, error) {
+	return run(ctx, func() (*clientid.Identity, error) { return clientid.CurrentAt(config.IdentityPath) }, config, observer, func(ctx context.Context, config tunnel.Config) (*clientConnection, error) {
 		connection, err := tunnel.Dial(ctx, config)
 		if err != nil {
 			return nil, err
@@ -161,6 +162,7 @@ func run(ctx context.Context, resolveIdentity func() (*clientid.Identity, error)
 		Transport: config.Transport,
 		TLSConfig: tlsConfig,
 		Timeout:   15 * time.Second,
+		Logger:    config.Logger,
 		DeviceProof: func(method, path string) (deviceauth.Proof, error) {
 			return identity.Proof(config.Token, method, path)
 		},
@@ -350,7 +352,7 @@ func run(ctx context.Context, resolveIdentity func() (*clientid.Identity, error)
 		progress := func() { emitSnapshot(observer, StateConnected, "Connected", lease, transport, connectedAt, &totals) }
 		progress()
 		connectionStarted := time.Now()
-		retryErr = runConnection(ctx, tunDevice, connection, outbound, deviceErrors, &totals, progress)
+		retryErr = runConnection(ctx, tunDevice, connection, lease, config.Logger, outbound, deviceErrors, &totals, progress)
 		connection = nil
 		if time.Since(connectionStarted) >= 30*time.Second {
 			failures = 0
@@ -535,11 +537,16 @@ func runConnection(
 	ctx context.Context,
 	tunDevice device.PacketDevice,
 	connection packetConnection,
+	lease tunnel.Lease,
+	logger *slog.Logger,
 	outbound <-chan []byte,
 	deviceErrors <-chan error,
 	totals *counters,
 	progress func(),
 ) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	connectionCtx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	defer func() {
@@ -551,11 +558,24 @@ func runConnection(
 	workers.Add(2)
 	go func() {
 		defer workers.Done()
+		dropped := uint64(0)
+		defer func() {
+			if dropped != 0 {
+				logger.Warn("stale TUN packet summary", "packets_dropped", dropped)
+			}
+		}()
 		for {
 			select {
 			case packet := <-outbound:
 				if connectionCtx.Err() != nil {
 					return
+				}
+				if !packetMatchesLease(packet, lease) {
+					dropped++
+					if dropped == 1 {
+						logger.Warn("dropping TUN packets that no longer match the active lease")
+					}
+					continue
 				}
 				if err := connection.Send(packet); err != nil {
 					errCh <- err
@@ -570,6 +590,12 @@ func runConnection(
 	}()
 	go func() {
 		defer workers.Done()
+		dropped := uint64(0)
+		defer func() {
+			if dropped != 0 {
+				logger.Warn("TUN receive ring summary", "packets_dropped", dropped)
+			}
+		}()
 		for {
 			packet, err := connection.Receive()
 			if err != nil {
@@ -577,6 +603,13 @@ func runConnection(
 				return
 			}
 			if err := tunDevice.WritePacket(connectionCtx, packet); err != nil {
+				if errors.Is(err, device.ErrPacketDropped) {
+					dropped++
+					if dropped == 1 {
+						logger.Warn("TUN receive ring is full; dropping without counting download acceptance")
+					}
+					continue
+				}
 				errCh <- clientDeviceError{err}
 				return
 			}
@@ -600,6 +633,14 @@ func runConnection(
 			}
 		}
 	}
+}
+
+func packetMatchesLease(packet []byte, lease tunnel.Lease) bool {
+	if len(packet) > lease.MTU {
+		return false
+	}
+	info, err := protocol.ParseIPv4(packet)
+	return err == nil && info.Source == lease.Address.Addr()
 }
 
 func emitSnapshot(observer Observer, state State, message string, lease tunnel.Lease, transport tunnel.Transport, connectedAt time.Time, totals *counters) {

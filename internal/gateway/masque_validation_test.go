@@ -11,34 +11,7 @@ import (
 
 	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/usage"
-	"github.com/quic-go/quic-go"
 )
-
-func TestMasqueOversizeCountsFallbackWithoutDroppingPacket(t *testing.T) {
-	metrics := &Metrics{}
-	config := HandlerConfig{Metrics: metrics}
-	var wire bytes.Buffer
-	packet := testIPv4UDP()
-	err := config.sendMasqueIPPacket(packet, func([]byte) error {
-		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 20}
-	}, masque.NewEncoder(&wire))
-	if err != nil {
-		t.Fatal(err)
-	}
-	capsule, err := masque.NewDecoder(&wire).Read()
-	if err != nil || !bytes.Equal(capsule.Value, masque.EncodeIPPacket(packet)) {
-		t.Fatalf("fallback changed the packet: %+v, %v", capsule, err)
-	}
-	for _, sendErr := range []error{nil, io.ErrClosedPipe} {
-		err := config.sendMasqueIPPacket(packet, func([]byte) error { return sendErr }, masque.NewEncoder(&wire))
-		if err != sendErr {
-			t.Fatalf("send error = %v, want %v", err, sendErr)
-		}
-	}
-	if metrics.datagramOversize.Load() != 1 || metrics.droppedPacketsFromClient.Load() != 0 {
-		t.Fatal("oversize fallback was counted as a packet drop or unrelated sends incremented the counter")
-	}
-}
 
 func TestMasqueDropsInvalidPacketsWithoutEndingSessionOrCountingUsage(t *testing.T) {
 	var wire bytes.Buffer

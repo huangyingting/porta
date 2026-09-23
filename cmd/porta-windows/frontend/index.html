@@ -17,19 +17,20 @@
         </div>
         <div>
           <div class="brand-row"><h1>Porta</h1><span id="version" class="version"></span></div>
-          <p>Private network access</p>
+          <p data-i18n>Private network access</p>
         </div>
       </div>
-      <nav class="header-actions" aria-label="Primary">
-        <button id="home-action" class="text-action hidden" type="button">Home</button>
-        <button id="activity-action" class="text-action" type="button">Activity</button>
-        <button id="add-action" class="icon-action" type="button" aria-label="Add profile">+</button>
+      <nav class="header-actions" aria-label="Primary" data-i18n-aria>
+        <button id="home-action" class="text-action hidden" type="button" data-i18n>Home</button>
+        <button id="language-action" class="text-action" type="button" aria-label="切换到简体中文">中</button>
+        <button id="activity-action" class="text-action" type="button" data-i18n>Activity</button>
+        <button id="add-action" class="icon-action" type="button" aria-label="Add profile" data-i18n-aria>+</button>
       </nav>
     </header>
 
     <section id="error-banner" class="error-banner hidden" role="alert">
       <span id="error-message"></span>
-      <button id="dismiss-error" type="button" aria-label="Dismiss error">×</button>
+      <button id="dismiss-error" type="button" aria-label="Dismiss error" data-i18n-aria>×</button>
     </section>
 
     <section id="home-view">
@@ -42,18 +43,18 @@
         <button id="primary-connect" class="primary compact" type="button" disabled>Connect</button>
       </section>
 
-      <section class="traffic-card card">
+      <section id="traffic-card" class="traffic-card card">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">TRAFFIC</p>
-            <h2>Private tunnel</h2>
+            <p class="eyebrow" data-i18n>TRAFFIC</p>
+            <h2 data-i18n>Private tunnel</h2>
           </div>
-          <span id="traffic-state" class="live-label">IDLE</span>
+          <div class="traffic-badges"><span id="transport-badge" class="live-label hidden"></span><span id="traffic-state" class="live-label">IDLE</span></div>
         </div>
-        <canvas id="traffic-chart" height="84" aria-label="Recent upload and download rates"></canvas>
+        <canvas id="traffic-chart" height="84" aria-label="Recent upload and download rates" data-i18n-aria></canvas>
         <div class="traffic-values">
-          <div><span class="traffic-swatch download"></span><span>Download</span><strong id="download-rate">0 B/s</strong></div>
-          <div><span class="traffic-swatch upload"></span><span>Upload</span><strong id="upload-rate">0 B/s</strong></div>
+          <div><span class="traffic-swatch download"></span><span data-i18n>Download</span><strong id="download-rate">0 B/s</strong></div>
+          <div><span class="traffic-swatch upload"></span><span data-i18n>Upload</span><strong id="upload-rate">0 B/s</strong></div>
         </div>
         <div class="connection-meta">
           <span id="connection-address">No address</span>
@@ -62,24 +63,24 @@
         </div>
       </section>
 
-      <section class="profiles-section">
+      <section id="profiles-section" class="profiles-section">
         <div class="section-heading profiles-heading">
           <div>
-            <p class="eyebrow">VPN PROFILES</p>
-            <h2>Your gateways</h2>
+            <p class="eyebrow" data-i18n>VPN PROFILES</p>
+            <h2 data-i18n>Your gateways</h2>
           </div>
-          <p>Choose a card, then connect.</p>
+          <p data-i18n>Choose a card, then connect.</p>
         </div>
         <div id="profiles" class="profile-list"></div>
         <section id="empty-state" class="empty-state card hidden">
           <div class="empty-icon" aria-hidden="true">+</div>
-          <h2>Add your first profile</h2>
-          <p>Use the gateway URL and client token from your Porta access page.</p>
-          <button id="empty-add" class="primary" type="button">Add profile</button>
+          <h2 data-i18n>Add your first profile</h2>
+          <p data-i18n>Use the gateway URL and client token from your Porta access page.</p>
+          <button id="empty-add" class="primary" type="button" data-i18n>Add profile</button>
         </section>
       </section>
 
-      <footer>
+      <footer data-i18n>
         Tokens stay protected by Windows DPAPI. Closing or minimizing keeps Porta available in the notification area.
       </footer>
     </section>
@@ -88,48 +89,49 @@
       <section class="activity-card card">
         <div class="section-heading activity-heading">
           <div>
-            <p class="eyebrow">ACTIVITY</p>
-            <h2>Connection timeline</h2>
+            <p class="eyebrow" data-i18n>ACTIVITY</p>
+            <h2 data-i18n>Connection timeline</h2>
           </div>
           <div class="activity-actions">
-            <button id="open-log-action" class="secondary" type="button">Open folder</button>
-            <button id="save-log-action" class="secondary" type="button">Save log...</button>
-            <button id="clear-log-action" class="quiet-danger" type="button">Clear</button>
-            <button id="restore-action" class="secondary" type="button" disabled>Restore network</button>
+            <button id="open-log-action" class="secondary" type="button" data-i18n>Open folder</button>
+            <button id="save-log-action" class="secondary" type="button" data-i18n>Save log...</button>
+            <button id="clear-log-action" class="quiet-danger" type="button" data-i18n>Clear</button>
+            <button id="restore-action" class="secondary" type="button" disabled data-i18n>Restore network</button>
           </div>
         </div>
         <p id="activity-message" class="activity-message hidden" role="status"></p>
-        <pre id="activity-log" tabindex="0" aria-label="Porta connection activity"></pre>
+        <pre id="activity-log" tabindex="0" aria-label="Porta connection activity" data-i18n-aria></pre>
       </section>
     </section>
 
     <section id="editor" class="editor-panel hidden" aria-labelledby="editor-title">
-      <form id="profile-form" class="editor-card card" autocomplete="off">
+      <form id="profile-form" class="editor-card card" autocomplete="off" novalidate>
         <div class="editor-header">
           <div>
-            <p class="eyebrow">PROFILE</p>
+            <p class="eyebrow" data-i18n>PROFILE</p>
             <h2 id="editor-title">Add profile</h2>
           </div>
-          <button id="editor-close" class="text-action" type="button">Cancel</button>
+          <button id="editor-close" class="text-action" type="button" data-i18n>Cancel</button>
         </div>
         <input id="profile-id" type="hidden">
-        <label>Profile name<input id="profile-name" maxlength="80" required placeholder="Home"></label>
-        <label>Gateway URL<input id="profile-server" type="url" required value="https://" spellcheck="false"></label>
-        <label>Transport
+        <label><span data-i18n>Profile name</span><input id="profile-name" maxlength="80" required placeholder="Home, work, travel…" data-i18n-placeholder></label>
+        <label><span data-i18n>Gateway URL</span><input id="profile-server" type="url" required value="https://" spellcheck="false" autocapitalize="off"></label>
+        <label><span data-i18n>Transport</span>
           <select id="profile-transport">
-            <option value="auto">Automatic (recommended)</option>
-            <option value="h3">HTTP/3 only</option>
-            <option value="h2">HTTP/2 only</option>
+            <option value="auto" data-i18n>Automatic (recommended)</option>
+            <option value="h3" data-i18n>HTTP/3 only</option>
+            <option value="h2" data-i18n>HTTP/2 only</option>
           </select>
         </label>
-        <label>Client token <span id="token-hint">Required for a new profile</span>
+        <label><span data-i18n>Client token</span> <span id="token-hint">Required for a new profile</span>
           <input id="profile-token" type="password" autocomplete="new-password" spellcheck="false">
         </label>
+        <p id="editor-error" class="error-banner hidden" role="alert"></p>
         <div class="editor-actions">
           <button id="delete-profile" class="danger-action hidden" type="button">Delete</button>
           <span class="action-spacer"></span>
-          <button id="cancel-edit" class="secondary" type="button">Cancel</button>
-          <button class="primary" type="submit">Save profile</button>
+          <button id="cancel-edit" class="secondary" type="button" data-i18n>Cancel</button>
+          <button class="primary" type="submit" data-i18n>Save profile</button>
         </div>
       </form>
     </section>

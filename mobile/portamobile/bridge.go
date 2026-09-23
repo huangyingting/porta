@@ -5,8 +5,8 @@ package portamobile
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -48,6 +48,13 @@ type Protector interface {
 	Prepare(fd int32) string
 }
 
+// ProofProvider signs the requested HTTP method and path after TLS succeeds.
+// Proof returns JSON with publicKey, timestamp, nonce, signature and deviceName,
+// or returns an error. The key must remain stable throughout a connection.
+type ProofProvider interface {
+	Proof(method, path string) (string, error)
+}
+
 // Session is an active native HTTP/3 CONNECT-IP tunnel.
 type Session struct {
 	conn       *tunnel.Conn
@@ -83,6 +90,66 @@ func (d *Dialer) Dial(serverURL, token, deviceName, publicKey, timestamp, nonce,
 	return dial(d.ctx, serverURL, token, deviceName, publicKey, timestamp, nonce, signature, remoteIP, protector)
 }
 
+// DialWithPlatform uses Android's trust policy and requests fresh device proofs
+// only after the gateway's TLS identity has been verified.
+func (d *Dialer) DialWithPlatform(serverURL, token, remoteIP string, protector Protector, verifier CertificateVerifier, provider ProofProvider) (*Session, error) {
+	if d == nil || d.ctx == nil {
+		return nil, errors.New("configuration: dialer is closed")
+	}
+	if err := d.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if provider == nil || verifier == nil {
+		return nil, errors.New("configuration: platform verifier and proof provider are required")
+	}
+	return dialWithProof(d.ctx, serverURL, token, remoteIP, protector, verifier, platformProof(provider))
+}
+
+func platformProof(provider ProofProvider) func(string, string) (deviceauth.Proof, error) {
+	var identity string
+	var mu sync.Mutex
+	return func(method, path string) (deviceauth.Proof, error) {
+		if method != http.MethodConnect || path != gateway.MasquePath {
+			return deviceauth.Proof{}, errors.New("unexpected native device proof target")
+		}
+		encoded, err := provider.Proof(method, path)
+		if err != nil {
+			return deviceauth.Proof{}, fmt.Errorf("Android device proof: %w", err)
+		}
+		var value struct {
+			PublicKey  string `json:"publicKey"`
+			Timestamp  string `json:"timestamp"`
+			Nonce      string `json:"nonce"`
+			Signature  string `json:"signature"`
+			DeviceName string `json:"deviceName"`
+		}
+		if err := json.Unmarshal([]byte(encoded), &value); err != nil {
+			return deviceauth.Proof{}, errors.New("invalid Android device proof")
+		}
+		key, err := base64.RawURLEncoding.DecodeString(value.PublicKey)
+		if err != nil {
+			return deviceauth.Proof{}, errors.New("invalid Android device public key")
+		}
+		deviceID, err := deviceauth.DeviceIDFromEncoded(key)
+		if err != nil {
+			return deviceauth.Proof{}, err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if identity != "" && identity != deviceID {
+			return deviceauth.Proof{}, errors.New("Android device proof key changed during connection")
+		}
+		identity = deviceID
+		if value.Timestamp == "" || value.Nonce == "" || value.Signature == "" || value.DeviceName == "" {
+			return deviceauth.Proof{}, errors.New("incomplete Android device proof")
+		}
+		return deviceauth.Proof{
+			DeviceID: deviceID, Name: value.DeviceName, PublicKey: value.PublicKey,
+			Timestamp: value.Timestamp, Nonce: value.Nonce, Signature: value.Signature,
+		}, nil
+	}
+}
+
 // Close cancels a pending Dial call.
 func (d *Dialer) Close() {
 	if d == nil || d.cancel == nil {
@@ -107,12 +174,28 @@ func dial(ctx context.Context, serverURL, token, deviceName, publicKey, timestam
 		DeviceID: clientID, Name: deviceName, PublicKey: publicKey,
 		Timestamp: timestamp, Nonce: nonce, Signature: signature,
 	}
+	return dialWithProof(ctx, serverURL, token, remoteIP, protector, nil, func(method, path string) (deviceauth.Proof, error) {
+		if method != http.MethodConnect || path != gateway.MasquePath {
+			return deviceauth.Proof{}, errors.New("unexpected native device proof target")
+		}
+		return proof, nil
+	})
+}
+
+func dialWithProof(ctx context.Context, serverURL, token, remoteIP string, protector Protector, verifier CertificateVerifier, proof func(string, string) (deviceauth.Proof, error)) (*Session, error) {
 	endpoint, address, err := endpointAddress(serverURL, remoteIP)
 	if err != nil {
 		return nil, err
 	}
 	if protector == nil {
 		return nil, errors.New("configuration: socket protector is required")
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: endpoint.Hostname()}
+	if verifier != nil {
+		tlsConfig, err = platformTLSConfig(endpoint.Hostname(), verifier)
+		if err != nil {
+			return nil, err
+		}
 	}
 	packetConn, err := protectedPacketConn(address.Addr(), protector)
 	if err != nil {
@@ -124,19 +207,14 @@ func dial(ctx context.Context, serverURL, token, deviceName, publicKey, timestam
 	}
 
 	conn, err := tunnel.Dial(ctx, tunnel.Config{
-		URL:   endpoint.String(),
-		Token: token,
-		DeviceProof: func(method, path string) (deviceauth.Proof, error) {
-			if method != http.MethodConnect || path != gateway.MasquePath {
-				return deviceauth.Proof{}, errors.New("unexpected native device proof target")
-			}
-			return proof, nil
-		},
-		Transport:  tunnel.TransportHTTP3,
-		TLSConfig:  &tls.Config{MinVersion: tls.VersionTLS12, ServerName: endpoint.Hostname()},
-		Timeout:    15 * time.Second,
-		PacketConn: packetConn,
-		RemoteAddr: net.UDPAddrFromAddrPort(address),
+		URL:         endpoint.String(),
+		Token:       token,
+		DeviceProof: proof,
+		Transport:   tunnel.TransportHTTP3,
+		TLSConfig:   tlsConfig,
+		Timeout:     15 * time.Second,
+		PacketConn:  packetConn,
+		RemoteAddr:  net.UDPAddrFromAddrPort(address),
 	})
 	if err != nil {
 		_ = packetConn.Close()
@@ -191,14 +269,15 @@ func (s *Session) Send(packet []byte) error {
 	if s == nil || s.conn == nil {
 		return errors.New("tunnel is closed")
 	}
-	return s.conn.Send(packet)
+	return classifySessionError(s.conn.Send(packet))
 }
 
 func (s *Session) Receive() ([]byte, error) {
 	if s == nil || s.conn == nil {
 		return nil, errors.New("tunnel is closed")
 	}
-	return s.conn.Receive()
+	packet, err := s.conn.Receive()
+	return packet, classifySessionError(err)
 }
 
 func (s *Session) Close() error {
@@ -224,10 +303,10 @@ func IsTransportUnavailable(message string) bool {
 	return strings.HasPrefix(message, transportUnavailablePrefix)
 }
 
-// IsRetryable reports a transient native failure that should be retried
-// without falling back to another protocol.
+// IsRetryable reports a transient native failure. Check IsTransportUnavailable
+// first to decide whether the attempt may fall back to another protocol.
 func IsRetryable(message string) bool {
-	return strings.HasPrefix(message, retryablePrefix)
+	return IsTransportUnavailable(message) || strings.HasPrefix(message, retryablePrefix) || message == "tunnel is closed"
 }
 
 func endpointAddress(serverURL, remoteIP string) (*url.URL, netip.AddrPort, error) {
@@ -290,63 +369,25 @@ func protectedPacketConn(remote netip.Addr, protector Protector) (*net.UDPConn, 
 }
 
 func classifyDialError(err error) error {
-	message := err.Error()
-	if errors.Is(err, context.Canceled) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return err
+	}
+	if tunnel.IsTransportUnavailable(err) {
+		return fmt.Errorf("%s%w", transportUnavailablePrefix, err)
+	}
+	return classifySessionError(err)
+}
+
+func classifySessionError(err error) error {
+	if err == nil {
 		return err
 	}
 	var permanent tunnel.PermanentError
 	var permanentPointer *tunnel.PermanentError
-	if errors.As(err, &permanent) || errors.As(err, &permanentPointer) {
-		return err
-	}
-	var responseError *tunnel.GatewayResponseError
-	if errors.As(err, &responseError) {
-		if responseError.StatusCode == 426 && (responseError.ServerMinVersion != "" || responseError.ServerMaxVersion != "") {
-			return err
-		}
-		switch responseError.StatusCode {
-		case 404, 405, 421, 426, 501, 505:
-			return fmt.Errorf("%s%w", transportUnavailablePrefix, err)
-		case 408, 425, 429, 500, 502, 503, 504:
-			return fmt.Errorf("%s%w", retryablePrefix, err)
-		default:
-			return err
-		}
-	}
-	var verificationError *tls.CertificateVerificationError
-	if errors.As(err, &verificationError) {
-		return err
-	}
-	var unknownAuthorityError x509.UnknownAuthorityError
-	var hostnameError x509.HostnameError
-	var invalidCertificateError x509.CertificateInvalidError
-	if errors.As(err, &unknownAuthorityError) ||
-		errors.As(err, &hostnameError) ||
-		errors.As(err, &invalidCertificateError) {
-		return err
-	}
-	if strings.Contains(message, "ADDRESS_ASSIGN") {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("%s%w", retryablePrefix, err)
-		}
-		return err
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%s%w", transportUnavailablePrefix, err)
-	}
-	var networkError net.Error
-	if errors.As(err, &networkError) {
-		return fmt.Errorf("%s%w", transportUnavailablePrefix, err)
-	}
-	lowerMessage := strings.ToLower(message)
-	if strings.Contains(lowerMessage, "certificate") ||
-		strings.Contains(lowerMessage, "unknown authority") {
-		return err
-	}
-	if strings.Contains(message, "Extended CONNECT") ||
-		strings.Contains(message, "Capsule Protocol") ||
-		strings.Contains(message, "dial QUIC") {
-		return fmt.Errorf("%s%w", transportUnavailablePrefix, err)
+	canceled := errors.Is(err, context.Canceled) &&
+		!errors.As(err, &permanent) && !errors.As(err, &permanentPointer)
+	if tunnel.IsRetryable(err) || canceled {
+		return fmt.Errorf("%s%w", retryablePrefix, err)
 	}
 	return err
 }

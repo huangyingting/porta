@@ -14,7 +14,6 @@ import (
 
 	"github.com/huangyingting/porta/internal/certutil"
 	"github.com/huangyingting/porta/internal/masque"
-	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -95,34 +94,20 @@ func TestHTTP3AutomaticMTUEndToEnd(t *testing.T) {
 			if err := connection.Send(clientPacket); err != nil {
 				t.Fatal(err)
 			}
-			select {
-			case got := <-dev.writes:
-				if !bytes.Equal(got, clientPacket) {
-					t.Fatal("selected-MTU upload changed")
+			assertPacketReassembled(t, clientPacket, func() []byte {
+				select {
+				case got := <-dev.writes:
+					return got
+				case <-time.After(packetRoundTripTimeout):
+					t.Fatal("selected-MTU upload did not reach TUN")
+					return nil
 				}
-			case <-time.After(packetRoundTripTimeout):
-				t.Fatal("selected-MTU upload did not reach TUN")
-			}
+			})
 			serverPacket := sizedIPv4Packet([4]byte{8, 8, 8, 8}, connection.Lease.Address.Addr().As4(), test.ceiling)
 			serverPacket[8], serverPacket[9] = 64, 17
 			setMTUIntegrationChecksum(serverPacket)
-			fragments, err := protocol.FragmentIPv4(serverPacket, mtu)
-			if err != nil {
-				t.Fatal(err)
-			}
 			dev.reads <- serverPacket
-			expected := make(map[uint16][]byte)
-			for _, fragment := range fragments {
-				expected[binary.BigEndian.Uint16(fragment[6:8])] = fragment
-			}
-			for range fragments {
-				got := receiveMTUPacket(t, connection)
-				key := binary.BigEndian.Uint16(got[6:8])
-				if !bytes.Equal(got, expected[key]) {
-					t.Fatalf("invalid downlink fragment: size=%d flags=%x", len(got), key)
-				}
-				delete(expected, key)
-			}
+			assertPacketReassembled(t, serverPacket, func() []byte { return receiveMTUPacket(t, connection) })
 			if test.offer && len(serverPacket) > mtu {
 				dfPacket := bytes.Clone(serverPacket)
 				dfPacket[6] = 0x40
@@ -229,7 +214,7 @@ func startMTUTestHTTP3(t *testing.T, handler http.Handler, datagrams bool) tunne
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &http3.Server{Handler: handler, EnableDatagrams: datagrams, TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}}
+	server := &http3.Server{ConnContext: masque.ConnContext, Handler: handler, EnableDatagrams: datagrams, TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(conn) }()
 	t.Cleanup(func() {

@@ -71,3 +71,37 @@ func TestClientDownloadHandlerRejectsSymlinks(t *testing.T) {
 		t.Fatalf("symlink status = %d, want 404", response.Code)
 	}
 }
+
+func TestClientDownloadHandlerReleaseMetadata(t *testing.T) {
+	directory := t.TempDir()
+	for _, artifact := range []struct{ name, contentType string }{
+		{"SHA256SUMS", "text/plain; charset=utf-8"},
+		{"SHA256SUMS.sig", "application/octet-stream"},
+		{"release-signing-cert.der", "application/pkix-cert"},
+	} {
+		t.Run(artifact.name, func(t *testing.T) {
+			if err := os.WriteFile(filepath.Join(directory, artifact.name), []byte("metadata"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			handler := clientDownloadHandler(http.NotFoundHandler(), directory)
+			for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, httptest.NewRequest(method, clientDownloadPrefix+artifact.name, nil))
+				if method == http.MethodPost {
+					if response.Code != http.StatusNotFound {
+						t.Fatalf("POST status = %d", response.Code)
+					}
+					continue
+				}
+				if response.Code != http.StatusOK || response.Header().Get("Content-Type") != artifact.contentType ||
+					response.Header().Get("Cache-Control") != "private, no-store" ||
+					response.Header().Get("X-Content-Type-Options") != "nosniff" {
+					t.Fatalf("%s metadata response = %d %v", method, response.Code, response.Header())
+				}
+				if method == http.MethodHead && response.Body.Len() != 0 {
+					t.Fatal("HEAD returned a body")
+				}
+			}
+		})
+	}
+}

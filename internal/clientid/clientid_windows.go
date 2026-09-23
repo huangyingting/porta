@@ -3,15 +3,26 @@
 package clientid
 
 import (
+	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
+	"github.com/huangyingting/porta/internal/deviceauth"
+	"github.com/huangyingting/porta/internal/winnetwork"
 	"golang.org/x/sys/windows"
 )
+
+const maxWindowsIdentitySize = 64 << 10
 
 func Current() (*Identity, error) {
 	name, err := fromHostname(os.Hostname)
@@ -22,7 +33,7 @@ func Current() (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := loadOrCreate(path, protectMachine, unprotectMachine)
+	key, err := loadOrCreateWindows(path, protectMachine, unprotectMachine)
 	if err != nil {
 		return nil, err
 	}
@@ -41,114 +52,133 @@ func identityPath() (string, error) {
 }
 
 func prepareIdentityStorage(path string) error {
-	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("create device identity directory: %w", err)
-	}
-	handle, err := openIdentityPath(directory, true, 0, windows.OPEN_EXISTING)
+	directory, err := winnetwork.OpenOrCreateProtectedDirectory(filepath.Dir(path))
 	if err != nil {
-		return fmt.Errorf("secure device identity directory: %w", err)
+		return fmt.Errorf("validate device identity directory: %w", err)
 	}
-	return windows.CloseHandle(handle)
+	return directory.Close()
 }
 
 func secureIdentityFile(path string) error {
-	handle, err := openIdentityPath(path, false, 0, windows.OPEN_EXISTING)
+	file, err := openPrivateIdentityFile(path)
 	if err != nil {
 		return err
 	}
-	return windows.CloseHandle(handle)
+	return file.Close()
 }
 
 func readIdentityFile(path string) ([]byte, error) {
-	handle, err := openIdentityPath(path, false, windows.GENERIC_READ, windows.OPEN_EXISTING)
+	file, err := openPrivateIdentityFile(path)
 	if err != nil {
 		return nil, err
 	}
-	file := os.NewFile(uintptr(handle), path)
 	defer file.Close()
-	return io.ReadAll(file)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxWindowsIdentitySize {
+		return nil, errors.New("device identity file exceeds 64 KiB")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxWindowsIdentitySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxWindowsIdentitySize {
+		return nil, errors.New("device identity file exceeds 64 KiB")
+	}
+	return data, nil
 }
 
-func openIdentityPath(path string, directory bool, access, creation uint32) (windows.Handle, error) {
-	name, err := windows.UTF16PtrFromString(path)
+func openPrivateIdentityFile(path string) (*os.File, error) {
+	file, err := winnetwork.OpenRegularFile(path, windows.GENERIC_READ, windows.FILE_SHARE_READ)
 	if err != nil {
-		return windows.InvalidHandle, err
+		return nil, err
 	}
-	handle, err := windows.CreateFile(
-		name, access|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.WRITE_DAC,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, creation,
-		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0,
-	)
-	if err != nil {
-		return windows.InvalidHandle, err
+	if err := winnetwork.ValidateProtectedFile(file); err != nil {
+		file.Close()
+		return nil, err
 	}
-	var info windows.ByHandleFileInformation
-	err = windows.GetFileInformationByHandle(handle, &info)
-	if err == nil {
-		err = validateIdentityFileInfo(info, directory)
-	}
-	if err == nil {
-		err = restrictIdentityHandle(handle)
-	}
-	if err != nil {
-		_ = windows.CloseHandle(handle)
-		return windows.InvalidHandle, err
-	}
-	return handle, nil
+	return file, nil
 }
 
-func validateIdentityFileInfo(info windows.ByHandleFileInformation, directory bool) error {
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return errors.New("device identity path must not be a reparse point")
+func loadOrCreateWindows(path string, protect, unprotect func([]byte) ([]byte, error)) (*ecdsa.PrivateKey, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("device identity path is required")
 	}
-	if (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
-		return errors.New("device identity path has an unexpected file type")
+	var key *ecdsa.PrivateKey
+	err := withFileLock(path+".lock", func() error {
+		data, err := readIdentityFile(path)
+		if err == nil {
+			key, err = decodeState(data, unprotect)
+			return err
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("read device identity: %w", err)
+		}
+		key, err = deviceauth.GenerateKey()
+		if err != nil {
+			return err
+		}
+		return persistWindowsIdentity(path, key, protect)
+	})
+	if err != nil {
+		return nil, err
 	}
-	if !directory && info.NumberOfLinks != 1 {
-		return errors.New("device identity files must not have hard links")
-	}
-	return nil
+	return key, nil
 }
 
-func restrictIdentityHandle(handle windows.Handle) error {
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+func persistWindowsIdentity(path string, key *ecdsa.PrivateKey, protect func([]byte) ([]byte, error)) (result error) {
+	encoded, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		return err
 	}
-	current, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	defer clear(encoded)
+	protected, err := protect(encoded)
+	if err != nil {
+		return fmt.Errorf("protect device identity key: %w", err)
+	}
+	defer clear(protected)
+	data, err := json.MarshalIndent(state{Version: stateVersion, PrivateKey: base64.RawStdEncoding.EncodeToString(protected)}, "", "  ")
 	if err != nil {
 		return err
 	}
-	owner, _, err := current.Owner()
+	data = append(data, '\n')
+	defer clear(data)
+	if len(data) > maxWindowsIdentitySize {
+		return errors.New("device identity file exceeds 64 KiB")
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	pending := filepath.Join(filepath.Dir(path), ".device-identity-"+hex.EncodeToString(nonce[:])+".pending")
+	file, err := winnetwork.CreateProtectedFile(pending)
+	if err != nil {
+		return fmt.Errorf("create private device identity temporary file: %w", err)
+	}
+	defer func() {
+		if err := winnetwork.RemoveProtectedFile(pending); err != nil {
+			result = errors.Join(result, fmt.Errorf("remove device identity temporary file: %w", err))
+		}
+	}()
+	_, writeErr := file.Write(data)
+	if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
+		return fmt.Errorf("flush device identity: %w", err)
+	}
+	source, err := windows.UTF16PtrFromString(pending)
 	if err != nil {
 		return err
 	}
-	// Replacing a DACL does not revoke the owner's right to replace it again.
-	if owner == nil || (!owner.Equals(user.User.Sid) &&
-		!owner.IsWellKnown(windows.WinLocalSystemSid) &&
-		!owner.IsWellKnown(windows.WinBuiltinAdministratorsSid)) {
-		return errors.New("device identity path is owned by another user")
-	}
-	descriptor, err := windows.SecurityDescriptorFromString(
-		"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + user.User.Sid.String() + ")",
-	)
+	destination, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return err
 	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		return err
+	// A new identity must never replace an object that appeared after the read.
+	if err := windows.MoveFileEx(source, destination, windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		return fmt.Errorf("publish device identity: %w", err)
 	}
-	return windows.SetSecurityInfo(
-		handle,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil,
-		nil,
-		dacl,
-		nil,
-	)
+	return secureIdentityFile(path)
 }
 
 func protectMachine(plain []byte) ([]byte, error) {
@@ -191,18 +221,21 @@ func cryptMachineData(data []byte, protect bool) ([]byte, error) {
 func withFileLock(path string, action func() error) error {
 	// Keep the verified directory pinned without delete sharing until all reads
 	// and writes finish; a pathname check alone races directory replacement.
-	directory, err := openIdentityPath(filepath.Dir(path), true, 0, windows.OPEN_EXISTING)
+	directory, err := winnetwork.OpenOrCreateProtectedDirectory(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	defer windows.CloseHandle(directory)
-	handle, err := openIdentityPath(path, false, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.OPEN_ALWAYS)
+	defer directory.Close()
+	file, err := winnetwork.CreateProtectedFile(path)
+	if errors.Is(err, os.ErrExist) {
+		file, err = winnetwork.OpenProtectedFile(path, true)
+	}
 	if err != nil {
 		return fmt.Errorf("open device identity lock: %w", err)
 	}
-	defer windows.CloseHandle(handle)
+	defer file.Close()
 	var overlap windows.Overlapped
-	if err := windows.LockFileEx(handle, windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlap); err != nil {
+	if err := windows.LockFileEx(windows.Handle(file.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlap); err != nil {
 		return fmt.Errorf("lock device identity: %w", err)
 	}
 	return action()

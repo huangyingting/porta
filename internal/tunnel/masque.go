@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -43,6 +44,17 @@ type masqueClient struct {
 	receiveDatagram func(context.Context) ([]byte, error)
 	closeTransport  func() error
 	closeOnce       sync.Once
+	closeErr        error
+	workers         sync.WaitGroup
+	failureMu       sync.Mutex
+	failureErr      error
+	sendMu          sync.Mutex
+	packetWriter    *masque.PacketWriter
+	reliable        *masque.ReliableWriter
+	writeTimeout    time.Duration
+	streamID        uint64
+	rtt             func() time.Duration
+	logger          *slog.Logger
 }
 
 func dialMasque(ctx context.Context, config Config) (*Conn, error) {
@@ -145,7 +157,7 @@ func establishMasque(ctx context.Context, config Config) (*Conn, error) {
 		_ = client.close()
 		return nil, err
 	}
-	if err := client.encoder.Write(masque.CapsuleAddressRequest, request); err != nil {
+	if err := client.writeControl(masque.CapsuleAddressRequest, request); err != nil {
 		_ = client.close()
 		return nil, fmt.Errorf("send ADDRESS_REQUEST: %w", err)
 	}
@@ -165,6 +177,11 @@ func establishMasque(ctx context.Context, config Config) (*Conn, error) {
 		_ = client.close()
 		return nil, fmt.Errorf("wait for ADDRESS_ASSIGN: %w", ctx.Err())
 	}
+	if err := client.failure(); err != nil {
+		_ = client.close()
+		return nil, sessionFailure(err)
+	}
+	client.initializePacketWriter()
 
 	return &Conn{
 		Lease:         client.lease,
@@ -308,10 +325,22 @@ func dialMasqueHTTP3(
 		return nil, err
 	}
 
-	client := newMasqueClient(ctx, cancel, masque.NewEncoder(stream), masque.NewDecoder(stream), response.Header)
+	client := newMasqueClient(ctx, cancel, masque.NewEncoder(stream), masque.NewBoundedDecoder(stream, 16<<10), response.Header)
 	client.remoteAddr = connection.RemoteAddr()
+	client.writeTimeout = min(config.Timeout, 10*time.Second)
+	client.streamID = uint64(stream.StreamID())
+	client.rtt = func() time.Duration { return connection.ConnectionStats().SmoothedRTT }
+	client.logger = config.Logger
+	if client.logger == nil {
+		client.logger = slog.Default()
+	}
+	client.reliable = masque.NewReliableWriter(ctx, client.encoder, stream.SetWriteDeadline, func() {
+		stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	}, client.writeTimeout)
 	if settings.EnableDatagrams {
-		client.sendDatagram = stream.SendDatagram
+		client.sendDatagram = masque.BoundedDatagramSend(ctx, stream.SendDatagram, func() {
+			_ = connection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "datagram send timeout")
+		}, client.writeTimeout)
 		client.receiveDatagram = stream.ReceiveDatagram
 		client.deliveryMode = DeliveryModeDatagram
 	} else {
@@ -500,6 +529,9 @@ func newMasqueClient(
 	if value := header.Get("X-Porta-DNS"); value != "" {
 		lease.DNS, _ = netip.ParseAddr(value)
 	}
+	if value := header.Get("X-Porta-Gateway"); value != "" {
+		lease.Gateway, _ = netip.ParseAddr(value)
+	}
 	return &masqueClient{
 		ctx:        ctx,
 		cancel:     cancel,
@@ -513,9 +545,20 @@ func newMasqueClient(
 }
 
 func (m *masqueClient) start() {
-	go m.readCapsules()
+	m.workers.Go(m.readCapsules)
 	if m.receiveDatagram != nil {
-		go m.readDatagrams()
+		m.workers.Go(m.readDatagrams)
+	}
+	if m.reliable != nil {
+		m.workers.Go(func() {
+			select {
+			case <-m.reliable.Done():
+				if err := m.reliable.Err(); err != nil {
+					m.report(err)
+				}
+			case <-m.ctx.Done():
+			}
+		})
 	}
 }
 
@@ -618,6 +661,11 @@ func (m *masqueClient) deliver(packet []byte) {
 }
 
 func (m *masqueClient) send(packet []byte) error {
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	if err := m.failure(); err != nil {
+		return err
+	}
 	if len(packet) > m.lease.MTU {
 		return fmt.Errorf("packet length %d exceeds tunnel MTU %d", len(packet), m.lease.MTU)
 	}
@@ -628,14 +676,21 @@ func (m *masqueClient) send(packet []byte) error {
 	if info.Source != m.lease.Address.Addr() {
 		return fmt.Errorf("packet source %s does not match lease %s", info.Source, m.lease.Address)
 	}
-	if m.sendDatagram != nil {
-		return masque.SendIPPacket(packet, m.sendDatagram, m.encoder)
+	if m.packetWriter == nil {
+		m.initializePacketWriter()
 	}
-	return m.encoder.WriteIPPacket(packet)
+	if err := m.packetWriter.Send(m.ctx, packet); err != nil {
+		m.report(err)
+		return err
+	}
+	return nil
 }
 
 func (m *masqueClient) receive() ([]byte, error) {
 	for {
+		if err := m.failure(); err != nil {
+			return nil, err
+		}
 		select {
 		case packet := <-m.packets:
 			if len(packet) > m.lease.MTU {
@@ -645,31 +700,129 @@ func (m *masqueClient) receive() ([]byte, error) {
 			if err != nil || info.Destination != m.lease.Address.Addr() {
 				continue
 			}
+			if err := m.failure(); err != nil {
+				return nil, err
+			}
 			return packet, nil
 		case err := <-m.errors:
 			return nil, err
 		case <-m.ctx.Done():
-			return nil, m.ctx.Err()
+			return nil, m.failure()
 		}
 	}
 }
 
 func (m *masqueClient) report(err error) {
+	if err == nil {
+		return
+	}
+	m.failureMu.Lock()
+	if m.failureErr != nil {
+		m.failureMu.Unlock()
+		return
+	}
+	m.failureErr = err
+	m.failureMu.Unlock()
 	select {
 	case m.errors <- err:
 	default:
 	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+}
+
+func (m *masqueClient) failure() error {
+	m.failureMu.Lock()
+	defer m.failureMu.Unlock()
+	if m.failureErr != nil {
+		return m.failureErr
+	}
+	return m.ctx.Err()
 }
 
 func (m *masqueClient) close() error {
-	var result error
 	m.closeOnce.Do(func() {
-		m.cancel()
+		if m.cancel != nil {
+			m.cancel()
+		}
 		if m.closeTransport != nil {
-			result = m.closeTransport()
+			m.closeErr = m.closeTransport()
 		}
 	})
-	return result
+	if m.reliable != nil {
+		_ = m.reliable.Close()
+	}
+	m.workers.Wait()
+	// Serialize with a caller already in Send before returning from any Close.
+	m.sendMu.Lock()
+	m.sendMu.Unlock()
+	return m.closeErr
+}
+
+func (m *masqueClient) writeControl(kind uint64, value []byte) error {
+	if m.reliable == nil {
+		return m.encoder.Write(kind, value)
+	}
+	done := make(chan struct{})
+	if err := m.reliable.Control(kind, value, func() { close(done) }); err != nil {
+		return err
+	}
+	return m.waitWritten(done)
+}
+
+func (m *masqueClient) waitWritten(done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-m.reliable.Done():
+		return m.reliable.Err()
+	case <-m.ctx.Done():
+		return m.failure()
+	}
+}
+
+func (m *masqueClient) initializePacketWriter() {
+	m.packetWriter = &masque.PacketWriter{
+		Ceiling: m.lease.MTU, StreamID: m.streamID, Gateway: m.lease.Gateway,
+		Datagram: m.sendDatagram, RTT: m.rtt,
+		Capsule: func(packet []byte) error {
+			if m.reliable == nil {
+				return m.encoder.WriteIPPacket(packet)
+			}
+			done := make(chan struct{})
+			if err := m.reliable.Packet(packet, func() { close(done) }); err != nil {
+				return err
+			}
+			return m.waitWritten(done)
+		},
+		ICMP: func(reply []byte) error {
+			timeout := m.writeTimeout
+			if timeout <= 0 {
+				timeout = 10 * time.Second
+			}
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case m.packets <- reply:
+				return nil
+			case <-timer.C:
+				return fmt.Errorf("deliver MTU feedback: %w", context.DeadlineExceeded)
+			case <-m.ctx.Done():
+				return m.failure()
+			}
+		},
+		Reduced: func(previous, current int) {
+			if m.logger != nil {
+				m.logger.Warn("HTTP/3 live packet budget reduced", "previous", previous, "packet_budget", current, "mtu", m.lease.MTU)
+			}
+		},
+		Fallback: func(reason string) {
+			if m.logger != nil {
+				m.logger.Warn("HTTP/3 compatibility capsules enabled", "reason", reason)
+			}
+		},
+	}
 }
 
 func setMasqueHeaders(request *http.Request, config Config) error {
@@ -728,6 +881,11 @@ func validateMasqueResponse(response *http.Response) error {
 	if value := response.Header.Get("X-Porta-DNS"); value != "" {
 		if address, err := netip.ParseAddr(value); err != nil || !address.Is4() || !address.IsGlobalUnicast() {
 			return PermanentError{Err: errors.New("gateway returned an invalid IPv4 DNS address")}
+		}
+	}
+	if value := response.Header.Get("X-Porta-Gateway"); value != "" {
+		if address, err := netip.ParseAddr(value); err != nil || !address.Is4() || !address.IsGlobalUnicast() {
+			return PermanentError{Err: errors.New("gateway returned an invalid IPv4 gateway address")}
 		}
 	}
 	return nil

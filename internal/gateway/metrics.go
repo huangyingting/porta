@@ -34,6 +34,8 @@ type Metrics struct {
 	mtuICMPSent              atomic.Uint64
 	mtuICMPSuppressed        atomic.Uint64
 	mtuICMPRateLimited       atomic.Uint64
+	mtuCompatibility         atomic.Uint64
+	mtuLiveReductions        atomic.Uint64
 }
 
 func (m *Metrics) PublicConnectionOpened(transport string) {
@@ -92,8 +94,7 @@ func publicTransportIndex(transport string) int {
 	}
 }
 
-// DatagramOversize records a datagram payload-limit error requiring capsule
-// fallback. It does not count a packet drop.
+// DatagramOversize counts payload-limit rejections, not packet loss.
 func (m *Metrics) DatagramOversize() {
 	m.datagramOversize.Add(1)
 }
@@ -152,9 +153,10 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		{"porta_connections_total", "counter", "Authenticated tunnel connections accepted.", m.connectionsTotal.Load()},
 		{"porta_auth_failures_total", "counter", "Rejected tunnel authentication attempts.", m.authFailures.Load()},
 		{"porta_packets_from_client_total", "counter", "IPv4 packets accepted from tunnel clients.", m.packetsFromClient.Load()},
-		{"porta_packets_to_client_total", "counter", "IPv4 packets sent to tunnel clients.", m.packetsToClient.Load()},
+		{"porta_packets_to_client_total", "counter", "IPv4 packets accounted after transport submission, not confirmed delivery.", m.packetsToClient.Load()},
 		{"porta_dropped_packets_from_client_total", "counter", "Invalid or source-mismatched packets dropped from tunnel clients.", m.droppedPacketsFromClient.Load()},
-		{"porta_datagram_oversize_total", "counter", "Outgoing datagram payload-limit errors requiring capsule fallback.", m.datagramOversize.Load()},
+		{"porta_datagram_oversize_total", "counter", "Outgoing datagram payload-limit rejections.", m.datagramOversize.Load()},
+		{"porta_mtu_live_reductions_total", "counter", "HTTP/3 live packet budget reductions.", m.mtuLiveReductions.Load()},
 	}
 	for _, metric := range metrics {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", metric.name, metric.help, metric.name, metric.kind, metric.name, metric.value)
@@ -232,6 +234,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		count uint64
 	}{
 		{"fragmented", m.mtuFragmented.Load()},
+		{"compatibility", m.mtuCompatibility.Load()},
 		{"icmp_sent", m.mtuICMPSent.Load()},
 		{"icmp_suppressed", m.mtuICMPSuppressed.Load()},
 		{"icmp_rate_limited", m.mtuICMPRateLimited.Load()},

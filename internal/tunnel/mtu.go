@@ -43,10 +43,9 @@ func (m *masqueClient) selectMTU(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := m.encoder.Write(masque.CapsuleMTUSelect, masque.EncodeMTUSelection(p.token, mtu)); err != nil {
+	if err := m.writeControl(masque.CapsuleMTUSelect, masque.EncodeMTUSelection(p.token, mtu)); err != nil {
 		return err
 	}
-	m.encoder.Flush()
 	select {
 	case selected := <-p.selected:
 		if selected != mtu {

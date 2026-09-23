@@ -6,12 +6,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/huangyingting/porta/internal/buildinfo"
 	"github.com/huangyingting/porta/internal/clientapp"
@@ -19,6 +22,7 @@ import (
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/huangyingting/porta/internal/winnetwork"
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -57,6 +61,7 @@ type DesktopSnapshot struct {
 	Restoring         bool             `json:"restoring"`
 	Disconnecting     bool             `json:"disconnecting"`
 	RecoveryAvailable bool             `json:"recoveryAvailable"`
+	StartupBlocked    bool             `json:"startupBlocked"`
 	Address           string           `json:"address"`
 	Transport         string           `json:"transport"`
 	MTU               int              `json:"mtu"`
@@ -72,6 +77,13 @@ type connectionDisplay struct {
 	title  string
 	detail string
 	tone   string
+}
+
+type DesktopTraffic struct {
+	BytesUploaded   uint64 `json:"bytesUploaded"`
+	BytesDownloaded uint64 `json:"bytesDownloaded"`
+	UploadRate      uint64 `json:"uploadRate"`
+	DownloadRate    uint64 `json:"downloadRate"`
 }
 
 type activityRecord struct {
@@ -119,6 +131,7 @@ type DesktopController struct {
 	activity        []string
 	activityEpoch   uint64
 	logFailure      bool
+	startupError    error
 }
 
 func newDesktopController(store *clientprofile.Store, network *winnetwork.Runner, logPath string) *DesktopController {
@@ -129,9 +142,10 @@ func newDesktopController(store *clientprofile.Store, network *winnetwork.Runner
 	profiles := store.List()
 	if len(profiles) > 0 {
 		controller.selectedID = profiles[0].ID
+		controller.status = "Ready"
 	}
 	controller.activity = loadActivity(logPath)
-	controller.recovery = network.NeedsCleanup()
+	controller.recovery = network != nil && network.NeedsCleanup()
 	if controller.recovery {
 		controller.status = "Network recovery available"
 		controller.detail = "Reconnect to resume, or restore normal connectivity."
@@ -139,6 +153,14 @@ func newDesktopController(store *clientprofile.Store, network *winnetwork.Runner
 		controller.appendActivityLocked("Retained network protection is ready for recovery.")
 	}
 	return controller
+}
+
+func (d *DesktopController) blockStartup(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.startupError = err
+	d.status, d.detail, d.tone = "Action required", err.Error(), "danger"
+	d.appendActivityLocked("Startup blocked: " + err.Error())
 }
 
 func (d *DesktopController) attach(
@@ -165,6 +187,11 @@ func (d *DesktopController) Snapshot() DesktopSnapshot {
 
 func (d *DesktopController) SelectProfile(id string) (DesktopSnapshot, error) {
 	d.mu.Lock()
+	if d.startupError != nil {
+		snapshot, err := d.snapshotLocked(), d.startupError
+		d.mu.Unlock()
+		return snapshot, err
+	}
 	if d.running && id != d.activeID {
 		snapshot := d.snapshotLocked()
 		d.mu.Unlock()
@@ -191,6 +218,11 @@ func (d *DesktopController) SelectProfile(id string) (DesktopSnapshot, error) {
 
 func (d *DesktopController) SaveProfile(input ProfileInput) (DesktopSnapshot, error) {
 	d.mu.Lock()
+	if d.startupError != nil {
+		snapshot, err := d.snapshotLocked(), d.startupError
+		d.mu.Unlock()
+		return snapshot, err
+	}
 	if d.running || d.restoring {
 		snapshot := d.snapshotLocked()
 		d.mu.Unlock()
@@ -212,6 +244,11 @@ func (d *DesktopController) SaveProfile(input ProfileInput) (DesktopSnapshot, er
 		ServerURL: strings.TrimSpace(input.ServerURL),
 		Transport: tunnel.Transport(strings.TrimSpace(input.Transport)),
 	})
+	if err := validateDesktopOrigin(profile.ServerURL); err != nil {
+		snapshot := d.snapshotLocked()
+		d.mu.Unlock()
+		return snapshot, err
+	}
 	saved, err := d.store.Save(profile, strings.TrimSpace(input.Token))
 	if err != nil {
 		d.status = "Save profile failed"
@@ -240,6 +277,11 @@ func (d *DesktopController) SaveProfile(input ProfileInput) (DesktopSnapshot, er
 
 func (d *DesktopController) DeleteProfile(id string) (DesktopSnapshot, error) {
 	d.mu.Lock()
+	if d.startupError != nil {
+		snapshot, err := d.snapshotLocked(), d.startupError
+		d.mu.Unlock()
+		return snapshot, err
+	}
 	if d.running || d.restoring {
 		snapshot := d.snapshotLocked()
 		d.mu.Unlock()
@@ -285,6 +327,11 @@ func (d *DesktopController) DeleteProfile(id string) (DesktopSnapshot, error) {
 
 func (d *DesktopController) Connect(id string) error {
 	d.mu.Lock()
+	if d.startupError != nil {
+		err := d.startupError
+		d.mu.Unlock()
+		return err
+	}
 	if d.running || d.restoring {
 		d.mu.Unlock()
 		return errors.New("Porta is already connecting or restoring the network")
@@ -297,10 +344,19 @@ func (d *DesktopController) Connect(id string) error {
 		d.mu.Unlock()
 		return errors.New("select a profile first")
 	}
+	if err := validateDesktopOrigin(profile.ServerURL); err != nil {
+		d.mu.Unlock()
+		return err
+	}
 	token, err := d.store.Token(profile.ID)
 	if err != nil {
 		d.mu.Unlock()
 		d.recordError("Read protected token failed", err)
+		return err
+	}
+	if err := winnetwork.PrepareWintun(); err != nil {
+		d.mu.Unlock()
+		d.recordError("Wintun unavailable", err)
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,6 +368,10 @@ func (d *DesktopController) Connect(id string) error {
 	d.disconnecting = false
 	d.status = "Connecting"
 	d.detail = "Establishing a secure tunnel..."
+	if d.recovery {
+		d.status = "Recovering network"
+		d.detail = "Resuming retained fail-closed protection..."
+	}
 	d.tone = "warning"
 	d.resetConnectionLocked()
 	d.appendActivityLocked("Connecting " + profile.Name + " to " + profile.ServerURL)
@@ -415,10 +475,16 @@ func (d *DesktopController) SaveActivityLog() (string, error) {
 
 func (d *DesktopController) OpenLogFolder() (string, error) {
 	directory := filepath.Dir(d.logPath)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	pin, err := winnetwork.PrepareProtectedDirectory(directory)
+	if err != nil {
 		return "", fmt.Errorf("create activity log directory: %w", err)
 	}
-	if err := startDetachedProcess("explorer.exe", directory); err != nil {
+	defer pin.Close()
+	system, err := windows.GetSystemDirectory()
+	if err != nil {
+		return "", err
+	}
+	if err := startDetachedProcess(filepath.Join(filepath.Dir(system), "explorer.exe"), directory); err != nil {
 		return "", fmt.Errorf("open activity log directory: %w", err)
 	}
 	return directory, nil
@@ -596,6 +662,26 @@ func (d *DesktopController) handleConnectionEvent(event clientapp.Event) {
 	display := connectionPresentation(event)
 	var activity activityRecord
 	d.mu.Lock()
+	progress := d.connected && !d.disconnecting && event.State == clientapp.StateConnected &&
+		event.Message == "Connected" && event.ConnectedAt.Equal(d.connectedAt) &&
+		(event.Lease.MTU == 0 || event.Lease.MTU == d.mtu) &&
+		(event.Transport == "" || string(event.Transport) == d.transport) &&
+		(!event.Lease.Address.IsValid() || event.Lease.Address.String() == d.address)
+	if progress {
+		d.updateRatesLocked(event)
+		traffic := DesktopTraffic{d.bytesUploaded, d.bytesDownloaded, d.uploadRate, d.downloadRate}
+		window := d.window
+		d.mu.Unlock()
+		if window != nil {
+			window.EmitEvent("porta:traffic", traffic)
+		}
+		return
+	}
+	if d.disconnecting && event.State != clientapp.StateDisconnected && event.State != clientapp.StateError {
+		d.mu.Unlock()
+		return
+	}
+	wasConnected := d.connected
 	d.status = display.title
 	d.detail = display.detail
 	d.tone = display.tone
@@ -612,8 +698,16 @@ func (d *DesktopController) handleConnectionEvent(event clientapp.Event) {
 	if !event.ConnectedAt.IsZero() {
 		d.connectedAt = event.ConnectedAt
 	}
-	d.updateRatesLocked(event)
-	if event.State != clientapp.StateConnected || (event.Message != "" && event.Message != "Connected") {
+	if d.connected {
+		d.updateRatesLocked(event)
+	} else {
+		d.uploadRate, d.downloadRate = 0, 0
+		d.lastSampleAt = time.Time{}
+	}
+	if d.connected && !wasConnected {
+		d.appendActivityLocked("Connected over " + d.transport)
+		activity = d.activityRecordLocked()
+	} else if event.State != clientapp.StateConnected || (event.Message != "" && event.Message != "Connected") {
 		if d.appendActivityLocked(event.Message) {
 			activity = d.activityRecordLocked()
 		}
@@ -627,6 +721,11 @@ func (d *DesktopController) handleConnectionEvent(event clientapp.Event) {
 
 func (d *DesktopController) beginRestore(exitAfter bool) error {
 	d.mu.Lock()
+	if d.startupError != nil {
+		err := d.startupError
+		d.mu.Unlock()
+		return err
+	}
 	if exitAfter && !d.quitting {
 		d.mu.Unlock()
 		return nil
@@ -707,6 +806,7 @@ func (d *DesktopController) quitApplication(app *application.App) {
 
 func (d *DesktopController) updateRatesLocked(event clientapp.Event) {
 	now := time.Now()
+	d.uploadRate, d.downloadRate = 0, 0
 	if !d.lastSampleAt.IsZero() && now.After(d.lastSampleAt) {
 		elapsed := now.Sub(d.lastSampleAt).Seconds()
 		if event.BytesUploaded >= d.lastUploaded {
@@ -761,6 +861,7 @@ func (d *DesktopController) snapshotLocked() DesktopSnapshot {
 		Restoring:         d.restoring,
 		Disconnecting:     d.disconnecting,
 		RecoveryAvailable: d.recovery,
+		StartupBlocked:    d.startupError != nil,
 		Address:           d.address,
 		Transport:         d.transport,
 		MTU:               d.mtu,
@@ -804,20 +905,20 @@ func (d *DesktopController) publish() {
 		window.EmitEvent("porta:snapshot", snapshot)
 	}
 	if tray != nil {
-		tray.SetTooltip("Porta - " + snapshot.Status)
+		tray.SetTooltip("Porta - " + trayText(snapshot.Status))
 	}
 	if connectItem != nil {
 		label := "Connect"
 		if snapshot.Running {
 			label = "Disconnect"
 		}
-		connectItem.SetLabel(label).SetEnabled(
-			(snapshot.Running && !snapshot.Restoring) ||
-				(!snapshot.Running && !snapshot.Restoring && snapshot.SelectedProfileID != ""),
+		connectItem.SetLabel(trayText(label)).SetEnabled(
+			!snapshot.StartupBlocked && !snapshot.Disconnecting && !snapshot.Restoring &&
+				(snapshot.Running || snapshot.SelectedProfileID != ""),
 		)
 	}
 	if restoreItem != nil {
-		restoreItem.SetEnabled(snapshot.RecoveryAvailable && !snapshot.Running && !snapshot.Restoring)
+		restoreItem.SetEnabled(!snapshot.StartupBlocked && snapshot.RecoveryAvailable && !snapshot.Running && !snapshot.Restoring)
 	}
 	if activityItem != nil {
 		activityItem.SetEnabled(true)
@@ -825,7 +926,7 @@ func (d *DesktopController) publish() {
 }
 
 func (d *DesktopController) appendActivityLocked(message string) bool {
-	message = strings.TrimSpace(message)
+	message = strings.TrimSpace(sanitizeActivity(message))
 	if message == "" {
 		return false
 	}
@@ -863,19 +964,37 @@ func (d *DesktopController) writeActivity(record activityRecord) {
 }
 
 func (d *DesktopController) writeActivityFile(line string) error {
-	if err := os.MkdirAll(filepath.Dir(d.logPath), 0o700); err != nil {
+	pin, err := winnetwork.PrepareProtectedDirectory(filepath.Dir(d.logPath))
+	if err != nil {
 		return err
 	}
-	if info, err := os.Stat(d.logPath); err == nil && info.Size() >= 1<<20 {
-		if err := os.Remove(d.logPath + ".1"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	defer pin.Close()
+	file, err := openActivityFile(d.logPath)
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return err
+	}
+	if info.Size() >= 1<<20 {
+		if err := file.Close(); err != nil {
+			return err
+		}
+		if err := winnetwork.RemoveProtectedFile(d.logPath + ".1"); err != nil {
 			return err
 		}
 		if err := os.Rename(d.logPath, d.logPath+".1"); err != nil {
 			return err
 		}
+		file, err = openActivityFile(d.logPath)
+		if err != nil {
+			return err
+		}
 	}
-	file, err := os.OpenFile(d.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		file.Close()
 		return err
 	}
 	_, writeErr := fmt.Fprintln(file, time.Now().Format(time.RFC3339), line)
@@ -914,7 +1033,12 @@ func (d *DesktopController) reportFrameworkError(err error) {
 }
 
 func loadActivity(path string) []string {
-	data, err := os.ReadFile(path)
+	file, err := winnetwork.OpenProtectedFile(path, false)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20))
 	if err != nil {
 		return nil
 	}
@@ -922,7 +1046,7 @@ func loadActivity(path string) []string {
 	filtered := lines[:0]
 	for _, line := range lines {
 		if strings.TrimSpace(line) != "" {
-			filtered = append(filtered, line)
+			filtered = append(filtered, sanitizeActivity(line))
 		}
 	}
 	if len(filtered) > maxActivityLines {
@@ -937,7 +1061,7 @@ func removeActivityFiles(path string) error {
 	}
 	var result error
 	for _, candidate := range []string{path, path + ".1"} {
-		if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := winnetwork.RemoveProtectedFile(candidate); err != nil {
 			result = errors.Join(result, fmt.Errorf("remove %s: %w", filepath.Base(candidate), err))
 		}
 	}
@@ -949,12 +1073,50 @@ func exportActivity(path string, lines []string) error {
 	if content != "" {
 		content += "\r\n"
 	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	file, err := winnetwork.CreateProtectedFile(path)
+	if errors.Is(err, os.ErrExist) {
+		file, err = winnetwork.OpenRegularFile(path, windows.GENERIC_WRITE, windows.FILE_SHARE_READ)
+	}
+	if err != nil {
 		return fmt.Errorf("save activity log: %w", err)
+	}
+	defer file.Close()
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	_, err = file.WriteString(content)
+	return errors.Join(err, file.Sync())
+}
+
+func openActivityFile(path string) (*os.File, error) {
+	file, err := winnetwork.CreateProtectedFile(path)
+	if errors.Is(err, os.ErrExist) {
+		return winnetwork.OpenProtectedFile(path, true)
+	}
+	return file, err
+}
+
+func sanitizeActivity(message string) string {
+	return strings.Map(func(character rune) rune {
+		if unicode.IsControl(character) || character == '\u2028' || character == '\u2029' {
+			return ' '
+		}
+		return character
+	}, message)
+}
+
+func validateDesktopOrigin(value string) error {
+	origin, err := url.ParseRequestURI(value)
+	if err != nil {
+		return fmt.Errorf("invalid server URL: %w", err)
+	}
+	if origin.Scheme != "https" || origin.Hostname() == "" || origin.User != nil ||
+		(origin.Path != "" && origin.Path != "/") || origin.RawQuery != "" || origin.ForceQuery ||
+		strings.Contains(value, "#") {
+		return errors.New("server URL must be an HTTPS origin")
 	}
 	return nil
 }
-
 func isDialogCancellation(err error) bool {
 	return err != nil && err.Error() == "cancelled by user"
 }

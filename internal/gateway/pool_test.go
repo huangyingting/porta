@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -159,7 +161,10 @@ func TestPoolGroupStaysActiveUntilLastLaneReleases(t *testing.T) {
 	}
 
 	pool.Release(second)
-	reused, err := pool.Acquire("client-b")
+	if _, err := pool.Acquire("client-b"); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("disconnected identity reservation was transferred: %v", err)
+	}
+	reused, err := pool.Acquire("client-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +195,7 @@ func TestPoolReconnectAfterDisconnectKeepsAddress(t *testing.T) {
 	}
 }
 
-func TestPoolReclaimsOldestInactiveLeaseWhenFull(t *testing.T) {
+func TestPoolKeepsInactiveLeaseIdentitySpecificWhenFull(t *testing.T) {
 	pool, err := NewPool("10.66.0.0/30")
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +205,10 @@ func TestPoolReclaimsOldestInactiveLeaseWhenFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool.Release(first)
-	second, err := pool.Acquire("client-b")
+	if _, err := pool.Acquire("client-b"); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("full pool transferred an inactive reservation: %v", err)
+	}
+	second, err := pool.Acquire("client-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +261,7 @@ func TestPersistentPoolRejectsInvalidClientBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestPersistentPoolPreservesReclamationOrder(t *testing.T) {
+func TestPersistentPoolPreservesIdentityReservations(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "leases.json")
 	firstPool, err := NewPersistentPool("10.66.0.0/29", statePath)
 	if err != nil {
@@ -286,11 +294,112 @@ func TestPersistentPoolPreservesReclamationOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reclaimed, err := restarted.Acquire("client-f")
+	if _, err := restarted.Acquire("client-f"); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("restarted pool transferred an inactive reservation: %v", err)
+	}
+	reclaimed, err := restarted.Acquire("client-b")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reclaimed.Address != second.Address {
-		t.Fatalf("reclaimed address = %s, want oldest inactive address %s", reclaimed.Address, second.Address)
+		t.Fatalf("restored address = %s, want %s", reclaimed.Address, second.Address)
+	}
+}
+
+func TestPoolCommittedReservationSurvivesDirectorySyncFailure(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new", true: "replacement"}[replacement], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "leases.json")
+			pool, err := NewPersistentPool("10.66.0.0/30", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var old []Lease
+			if replacement {
+				for range 2 {
+					lease, err := pool.AcquireGroup("a", "old")
+					if err != nil {
+						t.Fatal(err)
+					}
+					old = append(old, lease)
+				}
+			}
+			_, err = pool.acquireWithSync("a", "new", func(string) error { return os.ErrPermission })
+			if !errors.Is(err, ErrLeaseDurability) || !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("post-commit error = %v", err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var disk poolState
+			if err := json.Unmarshal(data, &disk); err != nil {
+				t.Fatal(err)
+			}
+			record := pool.byClient["a"]
+			if record.active || record.address.String() != disk.Leases["a"].Address || record.generation != disk.Leases["a"].Generation || len(pool.groups) != 0 {
+				t.Fatal("committed disk state was rolled back or activated")
+			}
+			for _, lease := range old {
+				if pool.registerLease(lease, func() { t.Error("stale lease registered") }) {
+					t.Fatal("post-commit failure revived a stale group")
+				}
+				pool.Release(lease)
+			}
+			if _, err := pool.Acquire("b"); !errors.Is(err, ErrPoolExhausted) {
+				t.Fatalf("committed reservation was reused: %v", err)
+			}
+			recovered, err := pool.AcquireGroup("a", "new")
+			if err != nil || recovered.generation <= record.generation || recovered.Address != record.address {
+				t.Fatalf("reservation could not recover: %+v %v", recovered, err)
+			}
+			for _, lease := range old {
+				pool.Release(lease)
+			}
+			if !pool.registerLease(recovered, func() {}) {
+				t.Fatal("stale release disabled recovered generation")
+			}
+			reopened, err := NewPersistentPool("10.66.0.0/30", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reopened.Acquire("b"); !errors.Is(err, ErrPoolExhausted) {
+				t.Fatal("reservation lost on restart")
+			}
+		})
+	}
+}
+
+func TestPoolPrecommitFailurePreservesGroup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "leases.json")
+	pool, err := NewPersistentPool("10.66.0.0/29", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := pool.AcquireGroup("a", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := pool.AcquireGroup("a", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".previous"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range []string{"a", "b"} {
+		if _, err := pool.AcquireGroup(client, "new"); err == nil || errors.Is(err, ErrLeaseDurability) {
+			t.Fatalf("rename failure misclassified: %v", err)
+		}
+		if len(pool.byClient) != 1 || len(pool.byAddr) != 1 || pool.groups["a"].references != 2 {
+			t.Fatal("precommit failure corrupted old group")
+		}
+	}
+	pool.Release(first)
+	if !pool.registerLease(second, func() {}) {
+		t.Fatal("precommit failure did not preserve old generation")
 	}
 }

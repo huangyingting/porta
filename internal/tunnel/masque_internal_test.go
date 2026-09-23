@@ -138,6 +138,8 @@ func TestInvalidLeaseHeadersArePermanent(t *testing.T) {
 		{"X-Porta-MTU", "invalid"}, {"X-Porta-MTU", "575"}, {"X-Porta-MTU", "9001"},
 		{"X-Porta-DNS", "not-an-address"}, {"X-Porta-DNS", "0.0.0.0"}, {"X-Porta-DNS", "ff02::1"},
 		{"X-Porta-DNS", "127.0.0.53"}, {"X-Porta-DNS", "169.254.1.1"},
+		{"X-Porta-Gateway", "invalid"}, {"X-Porta-Gateway", "0.0.0.0"}, {"X-Porta-Gateway", "127.0.0.1"},
+		{"X-Porta-Gateway", "169.254.1.1"}, {"X-Porta-Gateway", "::1"},
 	} {
 		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}
 		response.Header.Set(http3.CapsuleProtocolHeader, "?1")

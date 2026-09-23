@@ -45,12 +45,14 @@ payload in RFC 9297 DATAGRAM capsules.
 
 The gateway enables assigned-source uplink processing before writing
 ADDRESS_ASSIGN: a QUIC peer can receive the lease and send its first datagram
-before the control write returns. Failed control writes restore the prior
-assignment state. Downlink delivery remains gated until the assignment and
+before the control write returns. Failed queued control writes terminate the
+session; synchronous failures restore prior assignment state. Downlink delivery remains gated until the assignment and
 route response have been written and flushed.
 
 RFC 9484 does not define DNS or link-MTU negotiation, so the gateway provides
-optional `X-Porta-DNS` and `X-Porta-MTU` response extensions. Authentication uses
+optional `X-Porta-DNS`, `X-Porta-MTU`, and `X-Porta-Gateway` response extensions.
+The gateway must be a valid unicast IPv4 address and supplies the source for
+client-side ICMP feedback; a missing gateway is never invented. Authentication uses
 `Authorization: Bearer <token>`, and `X-Porta-Client-ID` provides stable lease
 selection and reconnect replacement. The token identifies a client account,
 while the client ID identifies one enrolled device. Their combined identity
@@ -63,8 +65,8 @@ using an optional Porta protocol extension. The default ceiling is 1400;
 `--mtu` bounds the selected value, and 1100 is the conservative discovery
 baseline. Clients require no extra setting. The shared gateway TUN keeps the
 configured ceiling. Use `--auto-mtu=false --mtu 1100` to select a fixed MTU
-instead; the daemon, deployment script, and network helper support the same
-boolean MTU-mode override.
+instead; the daemon and deployment script support the same boolean MTU-mode
+override. The network helper always enables scoped MTU feedback.
 
 An eligible client sends `X-Porta-MTU-Discovery: 1`. When enabled, the server
 responds with the same header containing a random, session-specific
@@ -108,11 +110,12 @@ Destination Unreachable / Fragmentation Needed back through TUN toward the
 original sender, quoting the original header and advertising the selected
 MTU. Forbidden ICMP replies are suppressed; permitted replies are limited to
 one per 100 ms per session. The `porta_mtu_packets_total` metric reports
-`fragmented`, `icmp_sent`, `icmp_suppressed`, and `icmp_rate_limited` actions;
+`fragmented`, `icmp_sent`, `icmp_suppressed`, `icmp_rate_limited`, and
+`compatibility` actions;
 selected MTUs appear in server logs.
 
 Linux ordinarily rejects TUN ingress sourced from its own gateway address.
-Automatic deployment therefore enables `accept_local=1` and loose
+Deployment in both fixed and automatic MTU modes therefore enables `accept_local=1` and loose
 `rp_filter=2` on the owned TUN only. The `mtu_feedback` readiness component
 requires local-source acceptance and rejects effective strict reverse-path
 filtering. Global and physical-interface source-validation settings remain
@@ -120,8 +123,8 @@ unchanged; no production raw-socket capability is added.
 
 This is conservative setup-time selection, not a measurement of the absolute
 maximum path MTU or continuous tunnel resizing. QUIC manages its own outer
-path MTU independently. If its datagram limit later shrinks, ordinary packets
-still use the reliable capsule fallback described below. Selection runs again
+path MTU independently. If its datagram limit later shrinks, a separate
+monotonically decreasing packet budget adapts traffic as described below. Selection runs again
 on reconnect; a changed lease MTU can recreate the client TUN. HTTP/2,
 native private HTTP/2 lanes, and HTTP/3 without Datagrams keep the configured
 MTU because their streams can segment data without UDP-sized inner packets.
@@ -163,6 +166,13 @@ lease before writing that packet to TUN. Packets read from TUN are dispatched
 by destination address. Duplicate client IDs replace the older session so that
 reconnects converge quickly.
 
+Persistent addresses remain reserved to their account/device identity after
+disconnect and restart. A full pool does not recycle an inactive address into
+another identity while old conntrack state could still exist. A lease-state
+rename is the logical commit: a later directory-sync failure preserves that
+reservation, fences older generations, and reports an error without granting
+the new lease. Failures before rename preserve the previous lease/group.
+
 Linux forwarding and NAT are deliberately outside the daemon. The supplied
 setup script makes these changes explicit and reversible. The daemon itself can
 run with only access to `/dev/net/tun` plus the configured TCP/UDP port.
@@ -194,12 +204,40 @@ IP packets are therefore unreliable, independently delivered Datagrams, as
 required for the efficient RFC 9484 mode. Control capsules remain on the
 reliable Extended CONNECT request stream.
 
-If an IP packet exceeds the current QUIC datagram payload limit, Porta sends
-that packet in a DATAGRAM capsule on the same connection instead of
-disconnecting the tunnel. Smaller packets continue using datagrams. This
-preserves the selected inner MTU without inventing an MTU from outer-packet
-overhead; oversized packets temporarily inherit reliable-stream head-of-line
-blocking.
+After final lease negotiation, each direction starts with that receive ceiling
+as its packet budget. quic-go's typed `DatagramTooLargeError` reports the raw
+QUIC DATAGRAM payload limit even through its HTTP/3 wrapper. Porta subtracts
+the actual quarter-stream-ID varint and one CONNECT-IP context byte, not
+IP/UDP/QUIC overhead again. The budget can only shrink until reconnect.
+quic-go has no public live-capacity getter, so capacity reductions are learned
+from rejected submissions, not fabricated probes or claimed continuous PMTU
+measurements. A present budget below IPv4's 68-byte minimum is an explicit
+transport failure, not equivalent to unavailable datagrams.
+
+DF-clear packets are fragmented for the current budget. If a later fragment
+is rejected, only unsent fragments are refragmented; already submitted data
+is never replayed. DF-set packets receive ICMP Fragmentation Needed toward
+their original sender. Feedback uses a 128-flow bounded table, 60-second idle
+expiry, and a connection-wide 100 ms gate. Compatibility capsules require
+three prior granted feedback attempts and a grace period of four RTTs clamped
+to 2-10 seconds. Fitting ACKs do not reset convergence; a further budget
+reduction does. This is a nonconvergence heuristic, not proof that ICMP is
+blocked. A compatibility packet must still fit the negotiated receive ceiling;
+packets above it remain subject to ICMP/rate-limited dropping. A client lacking
+the optional authenticated gateway explicitly logs capsule compatibility for
+affected DF packets rather than fabricating an ICMP source.
+
+Server reliable writes run independently of reception, with separate control
+(8 commands/64 KiB) and data (32 commands/256 KiB) queues. Byte limits include
+in-flight data; a two-second deadline includes queue residence and writing.
+Queue exhaustion and write failures terminate explicitly. Control responses
+remain ordered and downlink waits for the address/route write barrier.
+Client reliable writes are bounded by the smaller of its configured timeout
+and ten seconds. quic-go datagram submission can also wait for connection queue
+space; these waits have the same respective send deadlines and abort the owned
+QUIC connection on timeout or cancellation. Every close drains tracked workers.
+Terminal failures survive full receive queues and are reported before packets.
+Incoming control capsules are capped at 16 KiB before allocating their values.
 
 HTTP/2 has no unreliable Datagram frame. It carries the Context ID 0 payload in
 DATAGRAM capsules on the reliable CONNECT stream. This is interoperable but

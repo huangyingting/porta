@@ -5,7 +5,7 @@ param(
     [string]$InterfaceAlias = "Porta",
     [string]$DnsServer = "1.1.1.1",
     [ValidateRange(576, 9000)][int]$Mtu = 1100,
-    [string]$StatePath = (Join-Path $env:LOCALAPPDATA "Porta\manual-network-state.json"),
+    [string]$StatePath = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "Porta\manual-network-state.json"),
     [string]$ClientExecutable = "porta-cli.exe"
 )
 $ErrorActionPreference = "Stop"
@@ -13,6 +13,12 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run this script from an elevated PowerShell session."
+}
+if (-not $PSBoundParameters.ContainsKey("StatePath")) {
+    $legacyPath = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Porta\manual-network-state.json"
+    if (Test-Path -LiteralPath $legacyPath) {
+        throw "Legacy network recovery state exists at $legacyPath; restore it with the previous Porta client before upgrading."
+    }
 }
 $server = [Net.IPAddress]::Parse($ServerIp)
 $endpoint = "$($server.ToString()):$ServerPort"

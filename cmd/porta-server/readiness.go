@@ -187,13 +187,11 @@ func newForwardingReadiness(config forwardingReadinessConfig, deps readinessDepe
 		}
 	}
 	checks = append(checks, gateway.ReadinessCheck{
-		Name: "mtu_feedback", Required: config.AutoMTU,
-	})
-	if config.AutoMTU {
-		checks[len(checks)-1].Probe = func(context.Context) error {
+		Name: "mtu_feedback", Required: true,
+		Probe: func(context.Context) error {
 			return checkMTUFeedback(config.Interface, deps.ReadFile)
-		}
-	}
+		},
+	})
 	return &gateway.Readiness{Checks: checks, Timeout: config.Timeout}, nil
 }
 
@@ -203,7 +201,7 @@ func checkMTUFeedback(iface string, readFile func(string) ([]byte, error)) error
 		return err
 	}
 	if strings.TrimSpace(string(value)) != "1" {
-		return fmt.Errorf("automatic MTU requires net/ipv4/conf/%s/accept_local=1 for ICMP feedback", iface)
+		return fmt.Errorf("MTU feedback requires net/ipv4/conf/%s/accept_local=1", iface)
 	}
 	effectiveRPF := 0
 	for _, name := range []string{"all", iface} {

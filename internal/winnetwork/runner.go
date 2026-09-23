@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -33,6 +32,7 @@ type Runner struct {
 	state              networkState
 	protected          bool
 	lock               *os.File
+	directory          *os.File
 	guard              guardEngine
 	readInterfaceMTU   func(uint64) (uint32, error)
 	updateInterfaceMTU func(uint64, uint32) error
@@ -93,6 +93,11 @@ func NewRunner(statePath string) (*Runner, error) {
 		readInterfaceMTU:   nativeInterfaceMTU,
 		updateInterfaceMTU: setNativeInterfaceMTU,
 	}
+	directory, err := PrepareProtectedDirectory(filepath.Dir(runner.statePath))
+	if err != nil {
+		return nil, fmt.Errorf("secure network state directory: %w", err)
+	}
+	defer directory.Close()
 	if err := runner.reloadLocked(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -271,7 +276,7 @@ func (r *Runner) Down(ctx context.Context) error {
 		return err
 	}
 	if r.state.Interface == "" && r.state.GuardKey == "" {
-		if err := os.Remove(r.statePath + ".pending"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := RemoveProtectedFile(r.statePath + ".pending"); err != nil {
 			return errors.Join(fmt.Errorf("remove pending network state: %w", err), r.releaseLocked())
 		}
 		return r.releaseLocked()
@@ -292,10 +297,10 @@ func (r *Runner) Down(ctx context.Context) error {
 		}
 		r.protected = false
 	}
-	if err := os.Remove(r.statePath + ".pending"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := RemoveProtectedFile(r.statePath + ".pending"); err != nil {
 		return fmt.Errorf("remove pending network state: %w", err)
 	}
-	if err := os.Remove(r.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := RemoveProtectedFile(r.statePath); err != nil {
 		return fmt.Errorf("remove network state: %w", err)
 	}
 	r.state = networkState{}
@@ -365,16 +370,29 @@ func (r *Runner) restoreMTULocked() error {
 
 func (r *Runner) acquireLocked() error {
 	if r.lock != nil {
-		return nil
+		if err := ValidateProtectedDirectory(r.directory); err == nil {
+			return nil
+		}
+		// Older identity writers share the Porta root and can replace its ACL.
+		// Re-run the strict writer-excluding probe before adopting that change;
+		// the original no-delete pin continues to bind this ownership lock.
+		directory, err := PrepareProtectedDirectory(filepath.Dir(r.statePath))
+		if err != nil {
+			return err
+		}
+		return directory.Close()
 	}
-	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o700); err != nil {
+	directory, err := PrepareProtectedDirectory(filepath.Dir(r.statePath))
+	if err != nil {
 		return fmt.Errorf("create network ownership directory: %w", err)
 	}
 	lock, err := lockJournal(r.statePath + ".lock")
 	if err != nil {
+		directory.Close()
 		return err
 	}
 	r.lock = lock
+	r.directory = directory
 	if err := r.reloadLocked(); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			r.state = networkState{}
@@ -391,6 +409,10 @@ func (r *Runner) releaseLocked() error {
 	}
 	err := r.lock.Close()
 	r.lock = nil
+	if r.directory != nil {
+		err = errors.Join(err, r.directory.Close())
+		r.directory = nil
+	}
 	// Never delete the sidecar: unlink/recreate would allow locks on different
 	// files for the same journal. Process death closes this handle, not WFP.
 	return err
@@ -403,24 +425,12 @@ func (r *Runner) invoke(ctx context.Context, arguments ...string) (result string
 	if runtime.GOOS != "windows" {
 		return "", errors.New("Windows network configuration is unavailable on this platform")
 	}
-	systemRoot := os.Getenv("SystemRoot")
-	if systemRoot == "" {
-		return "", errors.New("SystemRoot is unavailable")
-	}
-	powerShell := filepath.Join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-	scriptPath, err := writeNetworkScript(filepath.Dir(r.statePath))
+	commandCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	command, err := networkCommand(commandCtx, r.statePath, arguments)
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		if err := os.Remove(scriptPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			runErr = errors.Join(runErr, fmt.Errorf("remove network helper: %w", err))
-		}
-	}()
-	commandCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	args := append([]string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath}, arguments...)
-	command := exec.CommandContext(commandCtx, powerShell, args...)
 	hideNetworkCommand(command)
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -432,25 +442,11 @@ func (r *Runner) invoke(ctx context.Context, arguments ...string) (result string
 	return string(output), nil
 }
 
-func writeNetworkScript(directory string) (path string, err error) {
-	file, err := os.CreateTemp(directory, ".porta-network-*.ps1")
-	if err != nil {
-		return "", fmt.Errorf("create network helper: %w", err)
-	}
-	path = file.Name()
-	_, writeErr := file.WriteString("\xef\xbb\xbf" + networkScript)
-	if err := errors.Join(writeErr, file.Close()); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("write network helper: %w", err)
-	}
-	return path, nil
-}
-
 //go:embed network.ps1
 var networkScript string
 
 func (r *Runner) reloadLocked() error {
-	file, err := os.Open(r.statePath)
+	file, err := OpenProtectedFile(r.statePath, false)
 	if err != nil {
 		return fmt.Errorf("read network helper state: %w", err)
 	}
@@ -478,15 +474,27 @@ func (r *Runner) persistLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o700); err != nil {
-		return fmt.Errorf("create network state directory: %w", err)
+	var directory *os.File
+	if r.directory != nil {
+		if err := ValidateProtectedDirectory(r.directory); err != nil {
+			return err
+		}
+	} else {
+		directory, err = PrepareProtectedDirectory(filepath.Dir(r.statePath))
+		if err != nil {
+			return fmt.Errorf("create network state directory: %w", err)
+		}
+		defer directory.Close()
 	}
 	pending := r.statePath + ".pending"
-	defer os.Remove(pending)
-	file, err := os.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err := RemoveProtectedFile(pending); err != nil {
+		return fmt.Errorf("remove previous pending network state: %w", err)
+	}
+	file, err := CreateProtectedFile(pending)
 	if err != nil {
 		return fmt.Errorf("write network state: %w", err)
 	}
+	defer os.Remove(pending)
 	_, writeErr := file.Write(data)
 	syncErr := file.Sync()
 	closeErr := file.Close()

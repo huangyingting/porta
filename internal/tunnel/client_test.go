@@ -22,6 +22,8 @@ import (
 	"github.com/huangyingting/porta/internal/certutil"
 	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/masque"
+	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -128,6 +130,7 @@ func testHTTP3MasqueRoundTrip(t *testing.T, enableDatagrams, supplyPacketConn bo
 		t.Fatal(err)
 	}
 	server := &http3.Server{
+		ConnContext:     masque.ConnContext,
 		Handler:         handler,
 		TLSConfig:       &tls.Config{Certificates: []tls.Certificate{certificate}},
 		EnableDatagrams: enableDatagrams,
@@ -251,37 +254,19 @@ func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, 
 		if err := connection.Send(clientPacket); err != nil {
 			t.Fatal(err)
 		}
-		select {
-		case got := <-dev.writes:
-			if !bytes.Equal(got, clientPacket) {
-				t.Fatalf("gateway TUN got %x, want %x", got, clientPacket)
+		assertPacketReassembled(t, clientPacket, func() []byte {
+			select {
+			case got := <-dev.writes:
+				return got
+			case <-time.After(packetRoundTripTimeout):
+				t.Fatal("timed out waiting for client-to-gateway packet")
+				return nil
 			}
-		case <-time.After(packetRoundTripTimeout):
-			t.Fatal("timed out waiting for client-to-gateway packet")
-		}
+		})
 
 		serverPacket := sizedIPv4Packet([4]byte{8, 8, 8, 8}, connection.Lease.Address.Addr().As4(), size)
 		dev.reads <- serverPacket
-		received := make(chan []byte, 1)
-		errs := make(chan error, 1)
-		go func() {
-			packet, receiveErr := connection.Receive()
-			if receiveErr != nil {
-				errs <- receiveErr
-				return
-			}
-			received <- packet
-		}()
-		select {
-		case got := <-received:
-			if !bytes.Equal(got, serverPacket) {
-				t.Fatalf("client got %x, want %x", got, serverPacket)
-			}
-		case receiveErr := <-errs:
-			t.Fatal(receiveErr)
-		case <-time.After(packetRoundTripTimeout):
-			t.Fatal("timed out waiting for gateway-to-client packet")
-		}
+		assertPacketReassembled(t, serverPacket, func() []byte { return receiveMTUPacket(t, connection) })
 	}
 	return connection.Transport
 }
@@ -289,7 +274,52 @@ func testPacketRoundTrip(t *testing.T, router *gateway.Router, dev *fakeDevice, 
 func sizedIPv4Packet(source, destination [4]byte, size int) []byte {
 	packet := append(ipv4Packet(source, destination), make([]byte, size-20)...)
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	packet[8], packet[9] = 64, 17
+	setMTUIntegrationChecksum(packet)
 	return packet
+}
+
+func assertPacketReassembled(t *testing.T, want []byte, receive func() []byte) {
+	t.Helper()
+	first := receive()
+	if bytes.Equal(first, want) {
+		return
+	}
+	payload := make([]byte, len(want)-20)
+	covered := make([]bool, len(payload))
+	total, terminal := 0, false
+	for fragment := first; ; fragment = receive() {
+		if _, err := protocol.FragmentIPv4(fragment, max(68, len(fragment))); err != nil || len(fragment) < 20 ||
+			!bytes.Equal(fragment[12:20], want[12:20]) {
+			t.Fatalf("invalid received fragment: %x (%v)", fragment, err)
+		}
+		flags := binary.BigEndian.Uint16(fragment[6:8])
+		offset := int(flags&0x1fff) * 8
+		body := fragment[20:]
+		if len(body) == 0 || offset+len(body) > len(payload) {
+			t.Fatal("fragment exceeds original datagram")
+		}
+		for i := range body {
+			if covered[offset+i] {
+				t.Fatal("submitted fragment was replayed or overlaps")
+			}
+			covered[offset+i] = true
+		}
+		copy(payload[offset:], body)
+		total += len(body)
+		if flags&0x2000 == 0 {
+			if offset+len(body) != len(payload) {
+				t.Fatal("terminal fragment has incorrect length")
+			}
+			terminal = true
+		}
+		if total == len(payload) {
+			break
+		}
+	}
+	if !terminal || !bytes.Equal(payload, want[20:]) {
+		t.Fatal("fragmented packet changed its payload")
+	}
 }
 
 type fakeDevice struct {

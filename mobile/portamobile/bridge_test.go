@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"testing"
 
@@ -110,18 +111,25 @@ func TestDialErrorClassification(t *testing.T) {
 		fallback bool
 		retry    bool
 	}{
-		{"missing endpoint", &tunnel.GatewayResponseError{StatusCode: 404, Status: "404 Not Found"}, true, false},
+		{"missing endpoint", tunnel.TransportUnavailableError{Err: &tunnel.GatewayResponseError{StatusCode: 404, Status: "404 Not Found"}}, true, true},
 		{"authentication", &tunnel.GatewayResponseError{StatusCode: 401, Status: "401 Unauthorized"}, false, false},
 		{"wire protocol mismatch", &tunnel.GatewayResponseError{StatusCode: 426, ServerMinVersion: "3", ServerMaxVersion: "3"}, false, false},
 		{"permanent protocol error", tunnel.PermanentError{Err: errors.New("gateway response did not enable the Capsule Protocol")}, false, false},
-		{"transport upgrade", &tunnel.GatewayResponseError{StatusCode: 426, Status: "426 Upgrade Required"}, true, false},
+		{"transport upgrade", tunnel.TransportUnavailableError{Err: &tunnel.GatewayResponseError{StatusCode: 426, Status: "426 Upgrade Required"}}, true, true},
 		{"server failure", &tunnel.GatewayResponseError{StatusCode: 500, Status: "500 Internal Server Error"}, false, true},
-		{"extended connect", errors.New("gateway did not enable HTTP/3 Extended CONNECT"), true, false},
+		{"extended connect", tunnel.TransportUnavailableError{Err: errors.New("gateway did not enable HTTP/3 Extended CONNECT")}, true, true},
+		{"unclassified QUIC failure", errors.New("dial QUIC: malformed TLS response"), false, false},
+		{"certificate wording in protocol error", tunnel.PermanentError{Err: errors.New("dial QUIC: retryable: invalid certificate")}, false, false},
+		{"established timeout", context.DeadlineExceeded, false, true},
+		{"pre-session timeout", tunnel.TransportUnavailableError{Err: context.DeadlineExceeded}, true, true},
 		{"lease failure", errors.New("invalid ADDRESS_ASSIGN"), false, false},
 		{"lease timeout", fmt.Errorf("wait for ADDRESS_ASSIGN: %w", context.DeadlineExceeded), false, true},
 		{"lease canceled", fmt.Errorf("wait for ADDRESS_ASSIGN: %w", context.Canceled), false, false},
 		{"dial canceled", fmt.Errorf("dial QUIC: %w", context.Canceled), false, false},
 		{"certificate", fmt.Errorf("dial QUIC: %w", x509.UnknownAuthorityError{}), false, false},
+		{"wrapped certificate", tunnel.TransportUnavailableError{Err: x509.UnknownAuthorityError{}}, false, false},
+		{"wrapped permanent timeout", tunnel.TransportUnavailableError{Err: tunnel.PermanentError{Err: context.DeadlineExceeded}}, false, false},
+		{"session endpoint rejection", &tunnel.GatewayResponseError{StatusCode: 404, Status: "404 Not Found"}, false, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -134,6 +142,30 @@ func TestDialErrorClassification(t *testing.T) {
 				t.Fatalf("retry = %v, want %v", got, test.retry)
 			}
 		})
+	}
+}
+
+func TestSessionFailureClassification(t *testing.T) {
+	for _, cause := range []error{io.EOF, context.DeadlineExceeded, context.Canceled} {
+		if err := classifySessionError(cause); !IsRetryable(err.Error()) || IsTransportUnavailable(err.Error()) {
+			t.Fatalf("established interruption %v was not retryable: %v", cause, err)
+		}
+	}
+	for _, cause := range []error{
+		tunnel.PermanentError{Err: context.DeadlineExceeded},
+		tunnel.PermanentError{Err: context.Canceled},
+		tunnel.PermanentError{Err: errors.New("invalid packet")},
+		x509.UnknownAuthorityError{},
+	} {
+		if err := classifySessionError(cause); IsRetryable(err.Error()) || IsTransportUnavailable(err.Error()) {
+			t.Fatalf("permanent session failure lost classification: %v", err)
+		}
+	}
+	if classifySessionError(nil) != nil {
+		t.Fatal("successful operation became an error")
+	}
+	if !IsRetryable("tunnel is closed") {
+		t.Fatal("closed session must permit retry")
 	}
 }
 

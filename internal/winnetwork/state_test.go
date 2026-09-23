@@ -24,6 +24,18 @@ func TestRecoveryJournalRejectsIncompleteOwnership(t *testing.T) {
 		},
 		"MTU snapshot": func(s *networkState) { s.MTU = &mtuState{Applied: 1100} },
 		"DNS snapshot": func(s *networkState) { s.DNS = &dnsState{Pending: "invalid"} },
+		"unbound address": func(s *networkState) {
+			s.InterfaceLUID = 0
+			s.Addresses = []string{"10.0.0.2/24"}
+		},
+		"unbound MTU": func(s *networkState) { s.InterfaceLUID = 0 },
+		"DNS original": func(s *networkState) {
+			s.DNS = &dnsState{Interface: 77, Original: []string{"arbitrary administrator input"}}
+		},
+		"DNS interface": func(s *networkState) { s.DNS = &dnsState{Original: []string{"1.1.1.1"}} },
+		"DNS multicast": func(s *networkState) {
+			s.DNS = &dnsState{Interface: 77, Original: []string{"224.0.0.1"}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runner := testRunner(t)

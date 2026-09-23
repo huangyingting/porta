@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -176,9 +177,14 @@ func persist(path string, key *ecdsa.PrivateKey, protect func([]byte) ([]byte, e
 	if err := secureIdentityFile(path); err != nil {
 		return fmt.Errorf("secure device identity: %w", err)
 	}
-	if directory, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = directory.Sync()
-		_ = directory.Close()
+	if runtime.GOOS != "windows" {
+		directory, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return fmt.Errorf("open device identity directory: %w", err)
+		}
+		if err := errors.Join(directory.Sync(), directory.Close()); err != nil {
+			return fmt.Errorf("sync device identity directory: %w", err)
+		}
 	}
 	return nil
 }

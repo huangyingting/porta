@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command in sudo unshare ip nft sysctl grep mktemp; do
+for command in sudo unshare ip nft sysctl grep; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 1
@@ -11,7 +11,8 @@ done
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sudo -n unshare --net -- bash -euo pipefail -c '
 repository_root=$1
-runtime_directory=$(mktemp -d)
+runtime_directory="$PWD/.native-firewall-$$"
+mkdir -m 0700 "$runtime_directory"
 export PORTA_RUNTIME_DIRECTORY="$runtime_directory"
 cleanup() {
   status=$?
@@ -26,6 +27,12 @@ trap cleanup EXIT
 ip link add porta0 type dummy
 ip link add eth0 type dummy
 ip link set dev eth0 up
+sysctl -q -w net.ipv4.conf.all.rp_filter=1
+sysctl -q -w net.ipv4.conf.default.rp_filter=1
+sysctl -q -w net.ipv4.conf.eth0.rp_filter=1
+sysctl -q -w net.ipv4.conf.all.accept_local=0
+sysctl -q -w net.ipv4.conf.default.accept_local=0
+sysctl -q -w net.ipv4.conf.eth0.accept_local=0
 
 "$repository_root/scripts/server-up.sh" \
   porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443
@@ -39,6 +46,14 @@ grep -Fq "meter tcp4 size 65535" <<<"$guard_rules"
 grep -Fq "limit rate over 200/second burst 400 packets" <<<"$guard_rules"
 grep -Fq "meter udp6 size 65535" <<<"$guard_rules"
 grep -Fq "limit rate over 500/second burst 1000 packets" <<<"$guard_rules"
+[[ $(sysctl -n net.ipv4.conf.porta0.accept_local) == 1 ]]
+[[ $(sysctl -n net.ipv4.conf.porta0.rp_filter) == 2 ]]
+[[ $(sysctl -n net.ipv4.conf.all.accept_local) == 0 ]]
+[[ $(sysctl -n net.ipv4.conf.default.accept_local) == 0 ]]
+[[ $(sysctl -n net.ipv4.conf.eth0.accept_local) == 0 ]]
+[[ $(sysctl -n net.ipv4.conf.all.rp_filter) == 1 ]]
+[[ $(sysctl -n net.ipv4.conf.default.rp_filter) == 1 ]]
+[[ $(sysctl -n net.ipv4.conf.eth0.rp_filter) == 1 ]]
 
 "$repository_root/scripts/server-up.sh" \
   porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443

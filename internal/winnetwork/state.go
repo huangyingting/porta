@@ -35,6 +35,7 @@ func (s networkState) validate() error {
 	if s.InterfaceLUID != 0 && !validJournalGUID(s.InterfaceGUID) {
 		return errors.New("missing tunnel adapter identity")
 	}
+	ownsInterface := len(s.Addresses) != 0 || s.DNS != nil || s.MTU != nil
 	for _, route := range s.Routes {
 		prefix, err := netip.ParsePrefix(route.Prefix)
 		nextHop, hopErr := netip.ParseAddr(route.NextHop)
@@ -43,16 +44,21 @@ func (s networkState) validate() error {
 		}
 		switch route.Kind {
 		case "tunnel":
+			ownsInterface = true
 			if route.Prefix != "0.0.0.0/1" && route.Prefix != "128.0.0.0/1" {
 				return errors.New("invalid tunnel route")
 			}
 		case "dns", "escape":
+			ownsInterface = ownsInterface || route.Kind == "dns"
 			if prefix.Bits() != prefix.Addr().BitLen() || (route.Kind == "dns" && !prefix.Addr().Is4()) {
 				return errors.New("invalid owned host route")
 			}
 		default:
 			return errors.New("missing route kind")
 		}
+	}
+	if ownsInterface && (s.InterfaceLUID == 0 || !validJournalGUID(s.InterfaceGUID)) {
+		return errors.New("network recovery ownership is not bound to a tunnel adapter")
 	}
 	for _, address := range s.Addresses {
 		prefix, err := netip.ParsePrefix(address)
@@ -66,6 +72,18 @@ func (s networkState) validate() error {
 		}
 	}
 	if s.DNS != nil {
+		if s.DNS.Interface <= 0 || len(s.DNS.Original) > 16 {
+			return errors.New("invalid DNS recovery state")
+		}
+		for _, value := range s.DNS.Original {
+			if value == "" {
+				continue
+			}
+			address, err := netip.ParseAddr(value)
+			if err != nil || address.IsUnspecified() || address.IsMulticast() {
+				return errors.New("invalid DNS recovery state")
+			}
+		}
 		for _, value := range []string{s.DNS.Applied, s.DNS.Pending} {
 			if value == "" {
 				continue

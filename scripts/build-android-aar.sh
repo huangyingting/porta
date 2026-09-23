@@ -24,8 +24,11 @@ fi
 mkdir -p "$(dirname "${OUTPUT}")"
 OUTPUT="$(cd "$(dirname "${OUTPUT}")" && pwd)/$(basename "${OUTPUT}")"
 cd "${ROOT}"
+# Go's ./... discovery must not traverse gomobile's generated Go/C packages.
+mkdir -p android/build/.work/native
 PATH="$(dirname "${GOMOBILE}"):${PATH}" \
     ANDROID_HOME="${ANDROID_HOME}" ANDROID_NDK_HOME="${ANDROID_NDK_HOME}" \
+    TMPDIR="${ROOT}/android/build/.work/native" GOTMPDIR="${ROOT}/android/build/.work/native" \
     "${GOMOBILE}" bind \
     -target=android/arm,android/arm64,android/amd64 \
     -androidapi=26 -trimpath -ldflags="-s -w" \

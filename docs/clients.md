@@ -8,7 +8,11 @@ release artifacts so end users do not need GitHub access.
 
 Open the deployed Porta URL and enter an active client token. The protected
 downloads page shows the server address, client release version, package sizes,
-and SHA-256 checksums.
+SHA-256 checksums, the detached release signature, and its signing certificate.
+Verify the certificate against Porta's independently trusted certificate pin
+before trusting the signed checksums; a certificate downloaded alongside a
+package is not itself a trust anchor. See
+[release verification](deployment.md#release-artifact-verification).
 
 Available packages:
 
@@ -71,11 +75,24 @@ policy-routing rules are rejected rather than silently left unprotected.
 
 Make the downloaded binary executable, then run:
 
-```sh
+```bash
 chmod +x porta-client-linux-amd64
-sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
+read -rsp "Client token: " PORTA_TOKEN && echo
+export PORTA_TOKEN
+sudo --preserve-env=PORTA_TOKEN ./porta-client-linux-amd64 \
   --server https://vpn.example.com:8443
+unset PORTA_TOKEN
 ```
+
+Tokens are accepted only through `PORTA_TOKEN`, not command-line arguments.
+The shell example above reads the token without echoing or recording it in
+shell history. Do not put a token assignment after `sudo`, where it becomes a
+process argument visible to other users.
+
+For an isolated Linux identity, use `--identity /private/path/identity.json`.
+The path must be absolute, its directory owned by the current user and not
+writable by others, and existing identity/lock files private, singly linked
+regular files. Symlinks and shared keys with loose permissions are rejected.
 
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
 full-tunnel routes, and per-link DNS automatically. Its owned nftables OUTPUT
@@ -119,7 +136,8 @@ DPAPI, configures routes, DNS, and the negotiated Windows IP-interface MTU,
 and restores Porta-owned network state on
 intentional disconnect. An interrupted run keeps the guard active; a reconnect
 resumes the protected tunnel, while explicit cleanup removes the guard.
-The desktop uses an Android-inspired dashboard with profile cards, live
+The desktop supports English and Simplified Chinese and uses an
+Android-inspired dashboard with profile cards, live
 connection state, tunnel traffic and an on-device activity timeline. Profile
 editing stays within the main window rather than opening another dialog.
 The compact Activity view can clear its local history, export the visible log
@@ -131,6 +149,20 @@ Activity, restore retained network state, or quit safely. Porta snapshots,
 applies, and restores the Wintun IPv4 MTU through the native Windows IP Helper
 API. This avoids depending on PowerShell's `NlMtuBytes` projection, which can be
 empty for otherwise usable Wintun adapters.
+
+Profile storage is bounded to 1 MiB, including protected tokens and JSON
+overhead. Rejected oversized updates leave the previous profiles and tokens
+unchanged. Profile names accept up to 80 Unicode characters. Traffic statistics
+count successful transport submission and local TUN acceptance, not peer
+delivery; a full Wintun receive ring drops packets without inflating download
+totals or forcing a reconnect.
+
+Before creating an adapter, Porta verifies the packaged Wintun DLL against its
+pinned SHA-256 hash, stages a verified copy in hash-named storage beneath
+`%ProgramData%\Porta`, and retains protected directory/file handles while the
+library is loaded. A previously loaded or changed DLL is rejected. Privileged
+identity, journal and log paths reject unsafe ownership, reparse points,
+hard links and permissive access rather than silently repairing them.
 
 The desktop interface is rendered by the pinned Wails v3 runtime and requires
 the Microsoft Edge WebView2 Runtime. It is included with Windows 11 and current
@@ -148,7 +180,8 @@ $env:PORTA_TOKEN = "CLIENT_TOKEN"
 ```
 
 The desktop and automatic CLI journal is
-`%APPDATA%\Porta\network-state.json`. After a terminal failure, use **Restore
+`%ProgramData%\Porta\network-state.json`; protected logs also live beneath
+`%ProgramData%\Porta`. After a terminal failure, use **Restore
 network** in the desktop client. **Quit** also restores this client's owned
 settings and stays open if restoration fails. Alternatively, cleanup can be run
 from an elevated terminal:
@@ -162,8 +195,9 @@ Only one process can own a journal. If the GUI still owns it after an error,
 use its Restore network action instead of a competing CLI command. A second
 GUI can quit without disrupting another process's active connection.
 Disconnect with the
-previous client before upgrading an existing connection; old journals that lack
-exact ownership information must be restored by the client that created them.
+previous client before upgrading an existing connection. Old roaming/local-app
+data journals are not imported into privileged ProgramData storage and must be
+restored by the client that created them.
 
 Unlike Linux, the Windows CLI defaults to manual networking for operator
 automation; omit `--manual-network=false` only when managing setup yourself.
@@ -190,7 +224,7 @@ Remove those settings with:
 
 The helpers use the client's shared native protection implementation and journal
 owned networking in
-`%LOCALAPPDATA%\Porta\manual-network-state.json`. Keep this file until cleanup
+`%ProgramData%\Porta\manual-network-state.json`. Keep this file until cleanup
 succeeds; it lets the down helper remove the gateway escape route without
 deleting an existing route owned by another application. If a cleanup command
 fails, its state is retained for retry. An alternate `-StatePath` must be
@@ -277,8 +311,11 @@ No client-facing MTU toggle is necessary.
 
 The value stays fixed for the connection. Reconnects can choose another MTU;
 a change can recreate the desktop TUN and interrupt existing flows. A later
-QUIC size-limit reduction uses reliable capsules for affected packets rather
-than resizing the live interface. HTTP/2, the native multi-lane fallback, and
+QUIC size-limit reduction lowers a separate packet budget: fragmentable packets
+remain datagrams, and oversized DF packets generate rate-limited ICMP feedback.
+Only nonconverging DF flows within the negotiated receive ceiling can use
+bounded compatibility capsules after the feedback grace period. This never
+resizes the live interface. HTTP/2, the native multi-lane fallback, and
 HTTP/3 without Datagrams retain the configured server MTU. This setting does
 not apply to the HTTPS forward proxy, which has no VPN TUN interface.
 
@@ -366,6 +403,20 @@ Profiles are stored locally, tokens are encrypted with Android Keystore, and
 only one profile can be active. The app supports bounded reconnects, optional
 reconnect after device restart, live traffic statistics, and a local diagnostic
 log that excludes tokens and authorization headers.
+
+The interface, connection states and notifications support English and
+Simplified Chinese. Replacing a VPN cancels and drains the old connection
+before activating its replacement. A retained fail-closed interface is shown
+as blocked/recovering, not disconnected; explicit disconnect releases it.
+Android's system always-on/lockdown VPN mode is not supported.
+
+Native HTTP/3 uses Android's platform trust manager before requesting a
+device proof, together with Go hostname, validity, EKU and key-usage checks.
+Release builds trust system roots; only debug builds additionally trust user
+roots. Cleartext traffic is allowed solely for `c.lencr.org` certificate
+revocation checks. Porta excludes its own process from the VPN so platform
+certificate validation and reconnect traffic can run while the VPN is retained.
+This exception does not exempt other apps from the tunnel.
 
 If saved profiles cannot be read, healthy profiles remain available while saves
 and deletions are paused. Use **Retry reading profiles** first. Explicit,

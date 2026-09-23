@@ -1,34 +1,62 @@
 package masque
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
 var ErrUnknownContext = errors.New("unknown MASQUE context ID")
+var ErrDatagramTimeout = errors.New("HTTP/3 datagram send deadline exceeded")
+
+// quic-go can wait for space in its connection-level datagram queue. Only
+// closing that connection can interrupt the wait; stream cancellation cannot.
+func BoundedDatagramSend(ctx context.Context, send func([]byte) error, abort func(), timeout time.Duration) func([]byte) error {
+	var mu sync.Mutex
+	active := 0
+	context.AfterFunc(ctx, func() {
+		mu.Lock()
+		blocked := active != 0
+		mu.Unlock()
+		if blocked {
+			abort()
+		}
+	})
+	return func(value []byte) error {
+		mu.Lock()
+		if err := ctx.Err(); err != nil {
+			mu.Unlock()
+			return err
+		}
+		active++
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			active--
+			mu.Unlock()
+		}()
+		expired := make(chan struct{})
+		timer := time.AfterFunc(timeout, func() {
+			abort()
+			close(expired)
+		})
+		err := send(value)
+		if !timer.Stop() {
+			<-expired
+			return fmt.Errorf("%w: %w", ErrDatagramTimeout, context.DeadlineExceeded)
+		}
+		return err
+	}
+}
 
 func EncodeIPPacket(packet []byte) []byte {
 	value := make([]byte, 1+len(packet))
 	copy(value[1:], packet)
 	return value
-}
-
-// SendIPPacket uses a reliable DATAGRAM capsule only when a packet exceeds the
-// current QUIC path limit. Both forms can coexist on the same CONNECT-IP tunnel.
-func SendIPPacket(packet []byte, sendDatagram func([]byte) error, encoder *Encoder) error {
-	err := sendDatagram(EncodeIPPacket(packet))
-	var tooLarge *quic.DatagramTooLargeError
-	if !errors.As(err, &tooLarge) {
-		return err
-	}
-	if err := encoder.WriteIPPacket(packet); err != nil {
-		return err
-	}
-	encoder.Flush()
-	return nil
 }
 
 func DecodeIPPacket(value []byte) ([]byte, error) {

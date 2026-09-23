@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/certutil"
+	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -180,6 +181,7 @@ func testTransportTunnel(t testing.TB, transport tunnel.Transport) (*tunnel.Conn
 			t.Fatal(err)
 		}
 		server := &http3.Server{
+			ConnContext:     masque.ConnContext,
 			Handler:         handler,
 			TLSConfig:       &tls.Config{Certificates: []tls.Certificate{certificate}},
 			EnableDatagrams: true,

@@ -84,9 +84,9 @@ func TestNativeMTUFeedback(t *testing.T) {
 	network.run("ip", "neigh", "add", "198.18.0.2", "lladdr", peer.HardwareAddr.String(),
 		"nud", "permanent", "dev", outName)
 	helperArgs := []string{"../../scripts/server-up.sh", tunName, "10.66.0.1/24", "10.66.0.0/24", outName, "8443"}
-	network.run("bash", append(append([]string(nil), helperArgs...), "--auto-mtu=false")...)
-	network.check(tunName+"/accept_local", "0")
-	network.check(tunName+"/rp_filter", "1")
+	network.run("bash", helperArgs...)
+	network.check(tunName+"/accept_local", "1")
+	network.check(tunName+"/rp_filter", "2")
 	// Pin the gateway's local reverse route to loopback. A local route owned by
 	// TUN can pass strict RPF on some kernels even though route-get reports lo.
 	// This fixture exercises the loopback reverse-route case deterministically.
@@ -113,15 +113,15 @@ func TestNativeMTUFeedback(t *testing.T) {
 		name        string
 		acceptLocal string
 		rpf         string
-		auto        bool
+		helper      bool
 	}{
 		{"local_source_rejected_even_with_loose_rpf", "0", "2", false},
 		{"accepted_local_source_rejected_by_strict_rpf", "1", "1", false},
-		{"automatic_mtu_helper_allows_nat_icmp_egress", "1", "2", true},
+		{"all_mtu_modes_helper_allows_nat_icmp_egress", "1", "2", true},
 	} {
 		if !t.Run(phase.name, func(t *testing.T) {
 			network := mtuNativeNetwork{t: t, ctx: ctx}
-			if phase.auto {
+			if phase.helper {
 				network.set(tunName+"/accept_local", "0")
 				network.set(tunName+"/rp_filter", "1")
 				network.run("bash", helperArgs...)
@@ -209,13 +209,13 @@ func TestNativeMTUFeedback(t *testing.T) {
 				t.Fatal("ICMP was not successfully written to the native TUN")
 			}
 			wait := 500 * time.Millisecond
-			if phase.auto {
+			if phase.helper {
 				wait = 2 * time.Second
 			}
 			captureCtx, stop = context.WithTimeout(ctx, wait)
 			icmp, err := mtuNativeCapture(captureCtx, fd, out.HardwareAddr, peer.HardwareAddr, 1)
 			stop()
-			if !phase.auto {
+			if !phase.helper {
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("expected kernel to suppress ICMP despite successful TUN write; packet=%x error=%v", icmp, err)
 				}

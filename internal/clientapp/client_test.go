@@ -1,10 +1,14 @@
 package clientapp
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +25,7 @@ type testDevice struct {
 	readExited  atomic.Bool
 	closed      atomic.Bool
 	read        func(context.Context) ([]byte, error)
+	write       func(context.Context, []byte) error
 }
 
 func (d *testDevice) ReadPacket(ctx context.Context) ([]byte, error) {
@@ -32,9 +37,14 @@ func (d *testDevice) ReadPacket(ctx context.Context) ([]byte, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (*testDevice) WritePacket(ctx context.Context, packet []byte) error { return ctx.Err() }
-func (*testDevice) Name() string                                         { return "actual-device" }
-func (d *testDevice) Close() error                                       { d.closed.Store(true); return nil }
+func (d *testDevice) WritePacket(ctx context.Context, packet []byte) error {
+	if d.write != nil {
+		return d.write(ctx, packet)
+	}
+	return ctx.Err()
+}
+func (*testDevice) Name() string   { return "actual-device" }
+func (d *testDevice) Close() error { d.closed.Store(true); return nil }
 
 type testConnection struct {
 	closed    chan struct{}
@@ -179,11 +189,19 @@ func TestRunConnectionJoinsBlockedPumps(t *testing.T) {
 		return nil, io.EOF
 	}
 	outbound := make(chan []byte, 1)
-	outbound <- []byte{1}
+	lease := tunnel.Lease{Address: netip.MustParsePrefix("10.0.0.2/24"), MTU: 1280}
+	outbound <- clientTestPacket(lease.Address.Addr(), 64)
 	result := make(chan error, 1)
-	go func() { result <- runConnection(ctx, &testDevice{}, connection, outbound, nil, &counters{}, nil) }()
-	<-sendStarted
-	<-receiveStarted
+	go func() {
+		result <- runConnection(ctx, &testDevice{}, connection, lease, nil, outbound, nil, &counters{}, nil)
+	}()
+	for _, started := range []<-chan struct{}{sendStarted, receiveStarted} {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("connection pump did not start")
+		}
+	}
 	cancel()
 	select {
 	case err := <-result:
@@ -196,6 +214,85 @@ func TestRunConnectionJoinsBlockedPumps(t *testing.T) {
 	if !sendExited.Load() || !receiveExited.Load() {
 		t.Fatal("returned before both connection pumps stopped")
 	}
+}
+
+func TestRunConnectionDropsStalePacketsAndFullRingWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lease := tunnel.Lease{Address: netip.MustParsePrefix("10.0.0.2/24"), MTU: 1280}
+	valid := clientTestPacket(lease.Address.Addr(), 64)
+	outbound := make(chan []byte, 4)
+	outbound <- []byte{1}
+	outbound <- clientTestPacket(netip.MustParseAddr("10.0.0.3"), 64)
+	outbound <- clientTestPacket(lease.Address.Addr(), lease.MTU+1)
+	outbound <- valid
+	sent, written := make(chan struct{}), make(chan struct{})
+	connection := &testConnection{closed: make(chan struct{})}
+	connection.send = func(packet []byte) error {
+		if !bytes.Equal(packet, valid) {
+			t.Error("stale or malformed packet reached the transport")
+		}
+		close(sent)
+		return nil
+	}
+	received := 0
+	connection.receive = func() ([]byte, error) {
+		received++
+		if received <= 2 {
+			return valid, nil
+		}
+		<-connection.closed
+		return nil, io.EOF
+	}
+	writes := 0
+	tunDevice := &testDevice{write: func(context.Context, []byte) error {
+		writes++
+		if writes == 1 {
+			return device.ErrPacketDropped
+		}
+		close(written)
+		return nil
+	}}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	totals := &counters{}
+	result := make(chan error, 1)
+	go func() {
+		result <- runConnection(ctx, tunDevice, connection, lease, logger, outbound, nil, totals, nil)
+	}()
+	for _, ready := range []<-chan struct{}{sent, written} {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			t.Fatal("packet drop interrupted the active connection")
+		}
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("session error = %v", err)
+	}
+	if totals.packetsUploaded.Load() != 1 || totals.bytesUploaded.Load() != uint64(len(valid)) ||
+		totals.packetsDownloaded.Load() != 1 || totals.bytesDownloaded.Load() != uint64(len(valid)) {
+		t.Fatal("dropped packets were counted as accepted traffic")
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("packets_dropped=3")) || !bytes.Contains(logs.Bytes(), []byte("packets_dropped=1")) {
+		t.Fatal("packet drop summaries missing")
+	}
+}
+
+func clientTestPacket(source netip.Addr, size int) []byte {
+	packet := make([]byte, size)
+	packet[0], packet[8] = 0x45, 64
+	binary.BigEndian.PutUint16(packet[2:4], uint16(size))
+	copy(packet[12:16], source.AsSlice())
+	copy(packet[16:20], netip.MustParseAddr("10.0.0.1").AsSlice())
+	var sum uint32
+	for index := 0; index < 20; index += 2 {
+		sum += uint32(binary.BigEndian.Uint16(packet[index : index+2]))
+	}
+	sum = sum&0xffff + sum>>16
+	binary.BigEndian.PutUint16(packet[10:12], ^uint16(sum))
+	return packet
 }
 
 func TestRunTrafficEventsFinishBeforeReturn(t *testing.T) {

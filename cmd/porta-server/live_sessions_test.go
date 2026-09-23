@@ -19,6 +19,7 @@ import (
 
 	"github.com/huangyingting/porta/internal/deviceauth"
 	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/masque"
 	"github.com/huangyingting/porta/internal/protocol"
 	"github.com/huangyingting/porta/internal/tunnel"
 	"github.com/huangyingting/porta/internal/usage"
@@ -356,7 +357,7 @@ func sessionTestServer(t *testing.T, handler http.Handler, h3 bool) (string, *ht
 	if err != nil {
 		t.Fatal(err)
 	}
-	quicServer := &http3.Server{Handler: handler, TLSConfig: server.TLS, EnableDatagrams: true}
+	quicServer := &http3.Server{ConnContext: masque.ConnContext, Handler: handler, TLSConfig: server.TLS, EnableDatagrams: true}
 	go func() { _ = quicServer.Serve(packetConn) }()
 	transport := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, EnableDatagrams: true}
 	t.Cleanup(func() { _ = transport.Close(); _ = quicServer.Close(); _ = packetConn.Close() })

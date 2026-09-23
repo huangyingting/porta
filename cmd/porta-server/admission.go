@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/huangyingting/porta/internal/gateway"
+	"github.com/huangyingting/porta/internal/masque"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -328,6 +329,7 @@ func newOwnedHTTP3Server(
 	}
 	return &ownedHTTP3Server{
 		server: &http3.Server{
+			ConnContext:     masque.ConnContext,
 			Addr:            address,
 			Handler:         handler,
 			EnableDatagrams: true,

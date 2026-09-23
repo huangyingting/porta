@@ -13,7 +13,11 @@
   session and redirects to `/portal/downloads`, without access-key entry.
 - `/portal/admin` and public `/api/*` require an administrator session.
 - `/portal/downloads` and `/download/*` require an administrator or active
-  client session.
+  client session. Individual downloads also accept a short-lived,
+  filename-bound signed `ticket` issued by that page. This includes
+  `SHA256SUMS`, `SHA256SUMS.sig`, and `release-signing-cert.der`.
+  A download ticket does not grant portal access and cannot be reused for
+  another filename. Raw client bearer tokens do not authenticate these routes.
 
 ## Tunnel and proxy routes
 
@@ -49,8 +53,10 @@ nonce. The nonce cache is intentionally in-memory; a restart forgets it, so TLS
 and the short timestamp window remain part of replay protection. Forward-proxy
 requests do not use this protocol.
 
-Porta sends optional `X-Porta-DNS` and `X-Porta-MTU` response extensions because
-RFC 9484 does not define DNS or link-MTU configuration.
+Porta sends optional `X-Porta-DNS`, `X-Porta-MTU`, and `X-Porta-Gateway`
+response extensions because RFC 9484 does not define DNS or link-MTU
+configuration. `X-Porta-Gateway` is a validated unicast IPv4 address used as
+the source of client-side ICMP feedback when the live datagram budget shrinks.
 
 HTTP/3 clients additionally request the optional
 `X-Porta-MTU-Discovery: 1` capability. Server-side `--auto-mtu` is enabled by

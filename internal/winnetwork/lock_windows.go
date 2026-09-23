@@ -11,7 +11,10 @@ import (
 )
 
 func lockJournal(path string) (*os.File, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := CreateProtectedFile(path)
+	if errors.Is(err, os.ErrExist) {
+		file, err = OpenProtectedFile(path, true)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open network ownership lock: %w", err)
 	}

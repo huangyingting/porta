@@ -45,10 +45,37 @@ can read it. Preserve `GH_TOKEN` through `sudo` when using release deployment;
 the token is not written to Porta's configuration.
 
 By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
-`porta-server` from that release and verifies it with `SHA256SUMS`. Pass
+`porta-server` from that release, verifies the pinned release signer and
+detached `SHA256SUMS.sig`, then checks the artifact against `SHA256SUMS`. Pass
 `--release vX.Y.Z` to pin a release that includes the client download portal.
 Developers working from a full source checkout can pass `--build-local`
 instead.
+
+### Release artifact verification
+
+Release assets include `SHA256SUMS`, `SHA256SUMS.sig`, and
+`release-signing-cert.der`. The manifest is signed using the persistent Android
+release identity. Deployment rejects missing metadata, a different signer,
+an invalid signature, and a mismatched artifact checksum before installation.
+GitHub API asset URLs are validated before authenticated downloads.
+
+For manual verification, obtain the expected certificate fingerprint from an
+independently trusted Porta checkout (`android/signing-certificate.sha256`),
+not from the same untrusted download:
+
+```sh
+expected=$(tr -d '\r\n' < /trusted/porta/android/signing-certificate.sha256)
+printf '%s  release-signing-cert.der\n' "$expected" | sha256sum --check -
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout > release-public-key.pem
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS
+sha256sum --check SHA256SUMS
+```
+
+Run each step only after the preceding step succeeds; the final command expects
+all manifest-listed assets locally. `--build-local` trusts the local source
+build instead of release metadata and still updates only the server. Publishing
+a matching local client directory and its metadata remains a separate action.
 
 ## One-command installation with Let's Encrypt
 
@@ -136,35 +163,36 @@ discovery and use a fixed 1100 MTU; another fixed MTU can be specified with
 the same override. The daemon accepts the same options when started directly.
 The deployment script accepts MTUs from 576 through 1400.
 
-Automatic MTU also requires Linux to accept gateway-sourced ICMP injected
-through TUN. Deployment passes the chosen `--auto-mtu=true` or
-`--auto-mtu=false` mode to both the daemon and
-`server-up.sh`; the helper sets `accept_local=1` and loose `rp_filter=2` only
+Fixed and automatic MTU modes both require Linux to accept gateway-sourced
+ICMP injected through TUN. Deployment passes the MTU mode to the daemon;
+`server-up.sh` always sets `accept_local=1` and loose `rp_filter=2` only
 on the owned TUN. It does not change global or physical-interface reverse-path
 filtering. These interface-local settings disappear with the TUN. The helper
 records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
 restores it during normal cleanup when no administrator or other service has
 changed the setting in the meantime.
 
-The network helper also defaults to automatic mode:
+The network helper takes five network arguments, without an MTU-mode flag:
 
 ```sh
 sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443
 ```
 
 Use the actual interface/address/pool values. When selecting fixed mode in a
-manually edited service unit, pass `--auto-mtu=false` to both the daemon and
-network helper. Upgrade the daemon and helper together.
+manually edited service unit, pass `--auto-mtu=false` only to the daemon.
+Upgrade the daemon and helper together.
 The required `mtu_feedback` readiness component detects missing local-source
 acceptance or effective strict reverse-path filtering instead of reporting
-automatic MTU ready with unusable DF feedback.
+either MTU mode ready with unusable DF feedback.
 
 Clients need no additional setting. They increase above 1100 only after
 bidirectional datagram confirmation, agree with the server before configuring
 the interface, and keep that MTU until reconnect. Inconclusive discovery keeps
 the conservative value; HTTP/2 and capsule-only HTTP/3 retain the configured
-MTU. QUIC size reductions still trigger per-packet capsule fallback instead of
-live interface resizing. See [MTU selection](architecture.md#stable-per-connection-mtu-selection)
+MTU. QUIC size reductions lower a separate live packet budget, using IPv4
+fragmentation, ICMP feedback, and bounded compatibility capsules only after
+nonconvergence and within the negotiated receive ceiling. See
+[MTU selection](architecture.md#stable-per-connection-mtu-selection)
 for protocol details and oversized IPv4 handling.
 
 ### Upgrade behavior
@@ -448,8 +476,11 @@ third-party firewall rules are not interpreted by the Porta rule checker.
 
 Metrics include `porta_router_dropped_packets_total{reason="..."}` for queue
 overflow, closed/missing sessions and invalid TUN packets, plus
-`porta_datagram_oversize_total` for datagrams carried by capsule fallback. The
-latter is not a dropped-packet counter. HTTP/2 queue diagnostics include
+`porta_datagram_oversize_total` for datagram payload-limit rejections and
+`porta_mtu_live_reductions_total` for packet budget decreases. Neither is a
+delivery or loss counter. `porta_mtu_packets_total{action="compatibility"}`
+counts nonconverging DF packets queued for bounded capsule compatibility.
+HTTP/2 queue diagnostics include
 `porta_router_queue_bytes{lane="..."}`,
 `porta_router_queue_bytes_high_water{lane="..."}`, and drop reasons
 `queue_tail`, `queue_oldest`, and `queue_expired`. A sustained queue or frequent
@@ -462,6 +493,14 @@ Public admission metrics are
 `porta_quic_retries_total`. Authentication pressure is reported by
 `porta_abuse_rejections_total{surface="native|proxy|portal|invitation"}`.
 Source addresses are never metric labels.
+
+HTTP/3 logs correlate startup, final negotiated MTU, live budget changes,
+two-minute activity snapshots, and shutdown summaries by process-local
+`tunnel_id`. Datagram/capsule counters mean queued or submitted, not confirmed
+delivery; normal packet accounting also cannot establish peer receipt.
+QUIC RTT and packet/loss counters are whole-connection snapshots rather than
+tunnel deltas. quic-go loss estimates may decrease when previously lost
+packets are later acknowledged. Payloads and tokens are never included.
 
 ## Android
 

@@ -130,16 +130,17 @@ elif name == "systemctl":
         raise RuntimeError(f"unexpected systemctl call: {args}")
 elif name == "sysctl":
     values = state.setdefault("sysctl", {})
-    if args[0] == "-n":
-        print(values[args[1]])
-    elif args[0] == "-w":
-        key, value = args[1].split("=", 1)
-        values[key] = value
-    elif args[0] == "-p":
-        for line in safe(args[1]).read_text().splitlines():
+    operation = [arg for arg in args if arg != "-q"]
+    if operation[0] == "-n":
+        print(values[operation[1].replace("/", ".")])
+    elif operation[0] == "-w":
+        key, value = operation[1].split("=", 1)
+        values[key.replace("/", ".")] = value
+    elif operation[0] == "-p":
+        for line in safe(operation[1]).read_text().splitlines():
             if line and not line.startswith("#"):
                 key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
+                values[key.strip().replace("/", ".")] = value.strip()
 elif name == "ip":
     if "show" in args and state.get("fail_ip_list"):
         code = 2
@@ -225,6 +226,16 @@ elif name == "openssl":
         print("a" * 64)
     elif "-checkhost" in args:
         pass
+    elif args and args[0] == "x509" and "-fingerprint" in args:
+        fingerprint = state.get(
+            "release_fingerprint",
+            "763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8",
+        )
+        print("sha256 Fingerprint=" + fingerprint)
+    elif args and args[0] == "x509" and "-pubkey" in args and "-inform" in args:
+        print("mock release public key")
+    elif args and args[0] == "dgst":
+        code = 1 if state.get("fail_release_signature") else 0
     else:
         path = safe(args[args.index("-in") + 1])
         if state.get("slow_openssl"):
@@ -246,7 +257,10 @@ elif name == "curl":
             print(output, end="")
     elif "--output" in args:
         output = safe(args[args.index("--output") + 1])
-        asset = "release.json" if "/releases/" in url else url.rsplit("/", 1)[1]
+        asset = "release.json"
+        if "/releases/assets/" in url:
+            metadata = json.loads((root / "release/release.json").read_text())
+            asset = next(item["name"] for item in metadata["assets"] if item["url"] == url)
         if asset == state.get("fail_download"):
             code = 22
         else:

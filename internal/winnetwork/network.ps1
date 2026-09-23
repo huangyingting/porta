@@ -6,6 +6,18 @@ param(
     [ValidateRange(576, 9000)][int]$Mtu = 1100
 )
 $ErrorActionPreference = "Stop"
+if ($env:OS -eq "Windows_NT" -and -not ("Porta.Journal" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Porta {
+    public static class Journal {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool MoveFileEx(string source, string destination, uint flags);
+    }
+}
+'@
+}
 $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($state.version -notin @(2, 3)) {
     throw "Restore legacy journals with their original client; exact address/DNS ownership is unavailable."
@@ -16,12 +28,33 @@ function Set-StateField($name, $value) {
 }
 function Save-State {
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($state | ConvertTo-Json -Depth 10 -Compress))
-    $file = [IO.File]::Open("$StatePath.pending", [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $pending = "$StatePath.$([guid]::NewGuid().ToString('N')).pending"
+    $file = [IO.File]::Open($pending, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
-        $file.Write($bytes, 0, $bytes.Length)
-        $file.Flush($true)
-    } finally { $file.Dispose() }
-    [IO.File]::Replace("$StatePath.pending", $StatePath, [NullString]::Value)
+        try {
+            $file.Write($bytes, 0, $bytes.Length)
+            $file.Flush($true)
+        } finally { $file.Dispose() }
+        if ($env:OS -eq "Windows_NT") {
+            $icacls = Join-Path ([Environment]::SystemDirectory) "icacls.exe"
+            & $icacls $pending /setowner "*S-1-5-32-544" /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Cannot set recovery journal owner." }
+            & $icacls $pending /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Cannot secure recovery journal permissions." }
+            & $icacls $pending /setintegritylevel H /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Cannot set recovery journal integrity." }
+            # One rename preserves the old journal on a sharing denial. ReplaceFile
+            # has partial-failure modes that can remove the recovery destination.
+            if (-not [Porta.Journal]::MoveFileEx($pending, $StatePath, 9)) {
+                $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw (New-Object ComponentModel.Win32Exception -ArgumentList $errorCode)
+            }
+        } else {
+            [IO.File]::Move($pending, $StatePath, $true)
+        }
+    } finally {
+        if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) }
+    }
 }
 function Get-Routes {
     @(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop)
@@ -80,6 +113,9 @@ if ($Operation -eq "retire-interface") {
         ([guid]$_.InterfaceGuid).ToString("B") -eq $state.interface_guid
     }).Count -gt 0) {
         throw "The previous tunnel adapter still exists or its identity is unknown; explicit Disconnect is required."
+    }
+    foreach ($owned in @($state.routes | Where-Object { $_.kind -in @("tunnel", "dns") })) {
+        Retire-OwnedRoute $owned
     }
     Set-StateField "interface_luid" 0
     Set-StateField "interface_index" 0

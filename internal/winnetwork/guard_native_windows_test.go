@@ -4,9 +4,11 @@ package winnetwork
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unsafe"
@@ -80,6 +82,34 @@ func TestNativeWFPTransactionRollback(t *testing.T) {
 				nativeGuardRollback(t, spec)
 			})
 		}
+	}
+	if marker := os.Getenv("PORTA_WFP_NATIVE_TEST_MARKER"); marker != "" && !t.Failed() {
+		if err := writeNativeAcceptanceMarker(marker); err != nil {
+			t.Fatalf("write fresh native WFP acceptance marker: %v", err)
+		}
+	}
+}
+
+func writeNativeAcceptanceMarker(path string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString("TestNativeWFPTransactionRollback passed\n")
+	return errors.Join(writeErr, file.Sync(), file.Close())
+}
+
+func TestNativeAcceptanceMarkerRequiresFreshPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "native-wfp.ok")
+	if err := writeNativeAcceptanceMarker(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNativeAcceptanceMarker(path); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("stale acceptance marker was not rejected: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "TestNativeWFPTransactionRollback passed\n" {
+		t.Fatalf("acceptance marker contents: %q, %v", data, err)
 	}
 }
 

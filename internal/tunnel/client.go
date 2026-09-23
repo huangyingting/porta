@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -34,6 +35,7 @@ type Config struct {
 	TLSConfig   *tls.Config
 	Timeout     time.Duration
 	DeviceProof func(method, path string) (deviceauth.Proof, error)
+	Logger      *slog.Logger
 	// DialAddress pins the physical endpoint while retaining URL's authority
 	// and TLS server name. When set it must contain a literal IP and port.
 	DialAddress string
@@ -74,6 +76,7 @@ type Conn struct {
 	receivePacket func() ([]byte, error)
 	closePacket   func() error
 	close         sync.Once
+	closeErr      error
 }
 
 func Dial(ctx context.Context, config Config) (*Conn, error) {
@@ -248,9 +251,8 @@ func (c *Conn) Receive() ([]byte, error) {
 }
 
 func (c *Conn) Close() error {
-	var result error
 	c.close.Do(func() {
-		result = c.closePacket()
+		c.closeErr = c.closePacket()
 	})
-	return result
+	return c.closeErr
 }
