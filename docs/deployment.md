@@ -31,13 +31,23 @@ not 443.
 Each tagged GitHub release contains a deployment bundle plus standalone server
 and client binaries. Download and verify the latest bundle:
 
-```sh
+```bash
+set -o pipefail
 gh release download --repo huangyingting/porta \
-  --pattern porta-deploy.tar.gz --pattern SHA256SUMS
-grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
-tar -xzf porta-deploy.tar.gz
-cd porta
-export GH_TOKEN=$(gh auth token)
+  --pattern porta-deploy.tar.gz --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sig --pattern release-signing-cert.der &&
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8 &&
+actual=$(openssl x509 -inform DER -in release-signing-cert.der \
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]') &&
+test "$actual" = "$expected" &&
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout > release-public-key.pem &&
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS &&
+grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c - &&
+tar -xzf porta-deploy.tar.gz &&
+cd porta &&
+GH_TOKEN=$(gh auth token) &&
+export GH_TOKEN
 ```
 
 The repository is private, so `gh` must be authenticated with an account that
@@ -45,10 +55,14 @@ can read it. Preserve `GH_TOKEN` through `sudo` when using release deployment;
 the token is not written to Porta's configuration.
 
 By default, `scripts/deploy.sh` downloads the matching Linux AMD64 or ARM64
-`porta-server` from that release and verifies it with `SHA256SUMS`. Pass
+`porta-server` from that release, verifies it with `SHA256SUMS`, and requires
+a detached signature from Porta's pinned release certificate before executing it.
+The signing key is isolated in GitHub Actions and is also the persistent key
+whose certificate pins official Android builds. Pass
 `--release vX.Y.Z` to pin a release that includes the client download portal.
 Developers working from a full source checkout can pass `--build-local`
-instead.
+instead. Local builds require a stable Rust toolchain with Cargo; the deployed
+server binary is built from the Rust workspace.
 
 ## One-command installation with Let's Encrypt
 
@@ -136,36 +150,40 @@ discovery and use a fixed 1100 MTU; another fixed MTU can be specified with
 the same override. The daemon accepts the same options when started directly.
 The deployment script accepts MTUs from 576 through 1400.
 
-Automatic MTU also requires Linux to accept gateway-sourced ICMP injected
-through TUN. Deployment passes the chosen `--auto-mtu=true` or
-`--auto-mtu=false` mode to both the daemon and
-`server-up.sh`; the helper sets `accept_local=1` and loose `rp_filter=2` only
-on the owned TUN. It does not change global or physical-interface reverse-path
+MTU feedback requires Linux to accept gateway-sourced ICMP injected through
+TUN, in both automatic and fixed interface-MTU modes. Deployment passes
+`--auto-mtu` to the daemon; `server-up.sh` now takes only its five positional
+arguments and always sets `accept_local=1` and loose `rp_filter=2` only on the
+owned TUN. It does not change global or physical-interface reverse-path
 filtering. These interface-local settings disappear with the TUN. The helper
 records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
 restores it during normal cleanup when no administrator or other service has
 changed the setting in the meantime.
 
-The network helper also defaults to automatic mode:
+The network helper invocation is independent of startup discovery:
 
 ```sh
 sudo ./scripts/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443
 ```
 
 Use the actual interface/address/pool values. When selecting fixed mode in a
-manually edited service unit, pass `--auto-mtu=false` to both the daemon and
-network helper. Upgrade the daemon and helper together.
+manually edited service unit, pass `--auto-mtu=false` only to the daemon and
+remove the obsolete MTU-mode argument from `server-up.sh`. Upgrade the daemon,
+unit and helper together.
 The required `mtu_feedback` readiness component detects missing local-source
 acceptance or effective strict reverse-path filtering instead of reporting
-automatic MTU ready with unusable DF feedback.
+tunnel forwarding ready with unusable DF feedback.
 
 Clients need no additional setting. They increase above 1100 only after
 bidirectional datagram confirmation, agree with the server before configuring
 the interface, and keep that MTU until reconnect. Inconclusive discovery keeps
 the conservative value; HTTP/2 and capsule-only HTTP/3 retain the configured
-MTU. QUIC size reductions still trigger per-packet capsule fallback instead of
-live interface resizing. See [MTU selection](architecture.md#stable-per-connection-mtu-selection)
-for protocol details and oversized IPv4 handling.
+MTU. HTTP/3 Datagram sends additionally follow Quinn's current payload capacity
+without resizing the live interface. Oversized IPv4 packets use fragmentation
+or rate-limited ICMP feedback first; non-adapting DF flows have a bounded,
+observable reliable compatibility escape. See
+[MTU selection](architecture.md#stable-per-connection-mtu-selection) for
+protocol details and oversized IPv4 handling.
 
 ### Upgrade behavior
 
@@ -211,6 +229,18 @@ curl -fsSLO -b porta.cookies \
   https://vpn.example.com:8443/download/porta-android-arm64-v8a.apk
 curl -fsSLO -b porta.cookies \
   https://vpn.example.com:8443/download/SHA256SUMS
+curl -fsSLO -b porta.cookies \
+  https://vpn.example.com:8443/download/SHA256SUMS.sig
+curl -fsSLO -b porta.cookies \
+  https://vpn.example.com:8443/download/release-signing-cert.der
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8
+actual=$(openssl x509 -inform DER -in release-signing-cert.der \
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
+test "$actual" = "$expected"
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout \
+  > release-public-key.pem
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS
 grep ' porta-android-arm64-v8a.apk$' SHA256SUMS | sha256sum -c -
 ```
 
@@ -237,9 +267,10 @@ curl --proxy https://vpn.example.com:8443 \
   https://example.com/
 ```
 
-Porta supports HTTPS `CONNECT`, including CONNECT over HTTP/2. Ordinary HTTP
-proxy requests are rejected, and only public destinations on port 443 are
-permitted.
+Porta supports HTTPS `CONNECT` over HTTP/1.1 and HTTP/2. HTTP/3 is reserved for
+the native MASQUE CONNECT-IP tunnel and rejects ordinary forward-proxy
+CONNECT requests. Ordinary HTTP proxy requests are rejected, and only public
+destinations on port 443 are permitted.
 DNS results are checked before dialing, and any private, loopback, link-local,
 metadata, multicast, documentation, or benchmark address rejects the request.
 Only complete, validated public address sets enter the bounded 30-second DNS
@@ -463,6 +494,46 @@ Public admission metrics are
 `porta_abuse_rejections_total{surface="native|proxy|portal|invitation"}`.
 Source addresses are never metric labels.
 
+Authenticated HTTP/3 tunnels emit an INFO transport-start event and final
+transport summary, correlated with connection/disconnection events by the
+process-local `tunnel_id` (in the `http3_tunnel` span for transport events).
+Unexpected failures also emit a WARN with a bounded reason and, where available,
+a numeric error code, without logging peer-supplied close text. Normal EOF,
+cancellation, and graceful peer closes remain INFO.
+
+The summary records the selected interface MTU, current QUIC and IP datagram capacities,
+RTT, path loss/congestion/black-hole counters, and per-tunnel datagram/capsule
+counts. QUIC path counters are connection snapshots, not tunnel-only deltas;
+compare the start and end records. `datagram_queued_*` counts successful enqueue
+operations, which may later be evicted. `capsule_submitted_*` counts IP data
+submitted to reliable writes, including writes that later fail or are cancelled.
+The disconnect record's `downlink_accounted_*` fields and
+`porta_packets_to_client_total` likewise do not confirm delivery.
+
+Oversized fallback logs only its first occurrence per tunnel and accumulates
+the total, largest packet, and smallest observed IP datagram capacity in the
+summary. A switch to capsule-only operation is logged once. These records help
+distinguish QUIC failures from frequent reliable-capsule fallback without
+per-packet logs or global DEBUG logging. Fallback counters alone do not prove a
+path-MTU black hole or explain every stall.
+
+`porta_datagram_mtu_reductions_total` counts live reductions of the effective
+HTTP/3 IP packet budget, not interface changes or dropped packets.
+`porta_datagram_oversize_total` continues to count oversized IP packets accepted
+for capsule compatibility, rather than all fragmentation/ICMP outcomes.
+Compatibility after non-converging DF feedback is reported explicitly and can
+still incur reliable-stream head-of-line blocking. It never permits an IP
+packet larger than the negotiated client interface MTU.
+
+The server reliable writer has separate queues for eight control commands and
+32 data commands, with 64 KiB and 256 KiB byte budgets respectively. The byte
+budgets include in-flight writes. A two-second deadline includes queue residence
+and stream writing; exhausted queues and deadlines end the tunnel with explicit
+`capsule_writer_overloaded` or `capsule_writer_timeout` reasons. Native-client
+writes use the shorter of their configured timeout and ten seconds. These
+bounds preserve receive/cancellation progress rather than guaranteeing delivery
+when a peer stops granting stream credit.
+
 ## Android
 
 Install the APK, tap **Add profile**, and enter the direct endpoint:
@@ -493,7 +564,7 @@ Gateway: https://porta-dev.i-csu.org:8443
 The default APK is the optimized ARM64 build used by most current phones. Use
 `porta-android-armeabi-v7a.apk` for older 32-bit ARM devices or
 `porta-android-x86_64.apk` for an emulator. Each APK contains only its
-required native Go runtime instead of bundling every Android CPU architecture.
+required native Rust library instead of bundling every Android CPU architecture.
 
 ## Removal
 

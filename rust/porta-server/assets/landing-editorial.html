@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
+  <meta name="theme-color" content="#f3efe6">
+  <link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml">
+  <title>Porta · Quietly useful</title>
+  <style>
+    @font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-style:normal;font-weight:200 900;font-display:swap}
+    :root{color-scheme:light;font-family:"Mona Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--ink:#1d1b18;--muted:#777168;--paper:#f3efe6;--line:rgba(29,27,24,.16);--red:#e4634d;font-feature-settings:"cv11","ss01","ss03";font-synthesis:none}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--paper);color:var(--ink)}
+    .page{width:min(1180px,calc(100% - 48px));min-height:100vh;margin:auto;display:grid;grid-template-rows:auto 1fr auto}
+    header{height:74px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:11px;font-size:15px;font-weight:800}.brand img{width:31px}.issue{font-size:10px;font-weight:750;letter-spacing:.16em;text-transform:uppercase}
+    main{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(280px,.55fr);gap:clamp(42px,8vw,110px);align-items:center;padding:48px 0}
+    .kicker{font-size:10px;font-weight:800;letter-spacing:.18em;text-transform:uppercase}.kicker span{color:var(--red)}
+    h1{max-width:760px;margin:20px 0 24px;font-size:clamp(58px,8.5vw,110px);font-weight:560;line-height:.82;letter-spacing:-.075em}
+    .lead{max-width:570px;margin:0;color:var(--muted);font-size:clamp(15px,1.5vw,18px);line-height:1.65}
+    .access-link{display:inline-flex;align-items:center;gap:13px;margin-top:30px;color:var(--ink);font-size:12px;font-weight:800;text-decoration:none}.access-link:before{content:"";width:38px;height:38px;border-radius:50%;background:var(--red);box-shadow:inset 0 0 0 10px rgba(255,255,255,.2)}.access-link:after{content:"→";font-size:15px}
+    .folio{position:relative;min-height:430px;border-left:1px solid var(--line);padding-left:32px;display:flex;align-items:flex-end}.folio:before{content:"03";position:absolute;top:0;right:0;color:rgba(29,27,24,.08);font-size:170px;font-weight:800;line-height:.8;letter-spacing:-.08em}.card{position:relative;width:100%;padding:24px;border:1px solid var(--line);background:rgba(255,255,255,.25)}.card small{font-size:9px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}.card strong{display:block;margin-top:70px;font-size:24px;line-height:1.1;letter-spacing:-.04em}.rule{width:44px;height:3px;margin-top:20px;background:var(--red)}
+    footer{min-height:58px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);color:#858077;font-size:10px}
+    @media(max-width:760px){.page{width:min(100% - 28px,1180px)}main{grid-template-columns:1fr;gap:38px;padding:38px 0}h1{font-size:clamp(58px,16vw,84px)}.folio{min-height:260px;border-left:0;border-top:1px solid var(--line);padding:28px 0 0}.folio:before{font-size:120px}.card strong{margin-top:46px}}
+    @media(max-width:430px){header{height:62px}.issue{display:none}h1{font-size:clamp(52px,18vw,70px)}footer{align-items:flex-start;flex-direction:column;justify-content:center;gap:3px}}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><span class="issue">Edition 03</span></header>
+    <main>
+      <section><div class="kicker">A place for <span>considered work</span></div><h1>Ideas need room.</h1><p class="lead">Porta gives approved users a composed starting point for shared work, useful releases, and the next clear step.</p><a class="access-link" href="/access">Get access</a></section>
+      <aside class="folio"><div class="card"><small>Porta / 03</small><strong>Quiet structure.<br>Useful outcomes.</strong><div class="rule"></div></div></aside>
+    </main>
+    <footer><span>Porta</span><span>Made with clarity and care</span></footer>
+  </div>
+</body>
+</html>

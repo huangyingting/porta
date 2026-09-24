@@ -1,3 +1,4 @@
+import groovy.json.JsonSlurper
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -9,23 +10,66 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val nativeMasqueAar = layout.buildDirectory.file("generated/aar/portamobile.aar")
-val buildNativeMasqueAar by tasks.registering(Exec::class) {
+fun rustlsPlatformVerifierAar(): File {
+    val cargo = providers.environmentVariable("CARGO").orNull
+        ?: File(System.getProperty("user.home"), ".cargo/bin/cargo")
+            .takeIf(File::isFile)
+            ?.absolutePath
+        ?: "cargo"
+    val metadataText = providers.exec {
+        workingDir = rootProject.projectDir.parentFile
+        commandLine(
+            cargo,
+            "metadata",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "aarch64-linux-android",
+            "--manifest-path",
+            "rust/porta-android/Cargo.toml",
+        )
+    }.standardOutput.asText.get()
+    @Suppress("UNCHECKED_CAST")
+    val metadata = JsonSlurper().parseText(metadataText) as Map<String, Any?>
+    @Suppress("UNCHECKED_CAST")
+    val packages = metadata.getValue("packages") as List<Map<String, Any?>>
+    val dependency = packages.first { it["name"] == "rustls-platform-verifier-android" }
+    val manifest = File(dependency.getValue("manifest_path") as String)
+    val version = dependency.getValue("version") as String
+    return File(
+        manifest.parentFile,
+        "maven/rustls/rustls-platform-verifier/$version/rustls-platform-verifier-$version.aar",
+    )
+}
+
+val rustJniLibs = layout.buildDirectory.dir("generated/jniLibs")
+val buildRustAndroid by tasks.registering(Exec::class) {
     group = "build"
-    description = "Builds the Go HTTP/3 MASQUE Android bridge"
+    description = "Builds the Rust Android tunnel library"
     workingDir(rootProject.projectDir.parentFile)
     commandLine(
-        rootProject.projectDir.parentFile.resolve("scripts/build-android-aar.sh").absolutePath,
-        nativeMasqueAar.get().asFile.absolutePath,
+        "bash",
+        "scripts/build-android-rust.sh",
+        rustJniLibs.get().asFile.absolutePath,
     )
     inputs.files(
-        rootProject.projectDir.parentFile.resolve("go.mod"),
-        rootProject.projectDir.parentFile.resolve("go.sum"),
-        rootProject.projectDir.parentFile.resolve("scripts/build-android-aar.sh"),
+        rootProject.projectDir.parentFile.resolve("rust/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/Cargo.lock"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-android/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-client/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-wire/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/h3/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/hyper/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/quinn-proto/Cargo.toml"),
+        rootProject.projectDir.parentFile.resolve("scripts/build-android-rust.sh"),
     )
-    inputs.dir(rootProject.projectDir.parentFile.resolve("internal"))
-    inputs.dir(rootProject.projectDir.parentFile.resolve("mobile/portamobile"))
-    outputs.file(nativeMasqueAar)
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-android/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-client/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-wire/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/h3/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/hyper/src"))
+    inputs.dir(rootProject.projectDir.parentFile.resolve("rust/porta-server/vendor/quinn-proto/src"))
+    outputs.dir(rustJniLibs)
 }
 
 val signingEnvironment = mapOf(
@@ -117,6 +161,8 @@ android {
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
 
+    testBuildType = providers.gradleProperty("porta.testBuildType").getOrElse("debug")
+
     signingConfigs {
         create("release") {
             if (hasReleaseSigning) {
@@ -157,21 +203,31 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDir(rustJniLibs)
+        }
+    }
 }
 
 dependencies {
-    implementation(files(nativeMasqueAar))
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation(files(rustlsPlatformVerifierAar()))
+    implementation("com.squareup.okio:okio:3.9.0")
     implementation("com.google.zxing:core:3.5.3")
     implementation("androidx.activity:activity:1.9.3")
     implementation("androidx.camera:camera-camera2:1.4.2")
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")
     testImplementation("junit:junit:4.13.2")
+    androidTestCompileOnly(files(
+        android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.base.jar"),
+        android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.runner.jar"),
+    ))
 }
 
 tasks.named("preBuild").configure {
-    dependsOn(buildNativeMasqueAar)
+    dependsOn(buildRustAndroid)
 }
 
 tasks.configureEach {

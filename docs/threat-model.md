@@ -36,8 +36,18 @@
   limiter. Successful authentication refunds its reservation, so established
   sessions do not consume failure budget. Overflow uses fixed shards rather
   than allocating unbounded attacker-controlled state.
-- Tokens are accepted through environment variables or the admin UI and are
-  never intentionally logged.
+- Tokens are accepted through environment variables or the admin UI, never
+  through client process arguments, and are never intentionally logged.
+- Release hashes are covered by a detached signature. Deployment first verifies
+  the signing certificate against the repository pin, then verifies the
+  manifest signature, and only then trusts artifact hashes. The same pinned
+  certificate identifies official Android release APKs.
+- Windows verifies the exact Wintun DLL hash while retaining a non-writable
+  handle through library loading. Its privileged recovery state lives in
+  administrator-only, high-integrity ProgramData storage that rejects reparse
+  points and hard links. The embedded PowerShell helper is delivered over
+  standard input instead of a replaceable user-writable script and runs with a
+  reconstructed system-only environment.
 - The access invitation travels in a URL fragment, which is removed before
   same-origin POST redemption. Pages use no-store, restrictive CSP, and secure
   HttpOnly session cookies. The join page uses `Referrer-Policy: same-origin`
@@ -108,12 +118,16 @@ not conceal transport fingerprints from network inspection.
   on the CONNECT stream, but Datagrams may be lost or reordered.
 - Default automatic MTU selection is bounded and authenticated, not continuous
   path-MTU discovery or a guarantee that a path will never change. Lost probes
-  cannot raise the MTU. A later QUIC payload-limit reduction uses reliable
-  capsules; this cannot repair a path unable to carry QUIC's minimum UDP packet
-  size. IPv4 DF feedback still depends on remote hosts accepting ICMP, and
-  fragmented packets can be lost like other unreliable IP traffic.
-- Automatic-MTU ICMP feedback permits locally sourced ingress only on the
-  owned server TUN, using `accept_local=1` and loose `rp_filter=2`. Incoming
+  cannot raise the interface MTU. A later QUIC payload-limit reduction lowers
+  the send budget and uses IPv4 fragmentation or rate-limited DF feedback.
+  Non-adapting DF flows have a bounded-state, explicitly reported reliable
+  compatibility escape; it retains stream head-of-line blocking. Independent
+  bounded writers prevent that backpressure from monopolizing active receive
+  processing. None of this repairs a path unable to carry QUIC's minimum UDP
+  packet size. Fragmented packets can still be lost or reordered.
+- MTU ICMP feedback, in fixed and automatic modes, permits locally sourced
+  ingress only on the owned server TUN, using `accept_local=1` and loose
+  `rp_filter=2`. Incoming
   client packet sources must still match their authenticated lease. Physical
   interfaces and global reverse-path filtering are not weakened.
 - Native clients mitigate fallback head-of-line blocking with independent
@@ -121,16 +135,18 @@ not conceal transport fingerprints from network inspection.
   flow-pinned data lanes. Loss can still stall every flow assigned to the
   affected lane, and a reverse proxy can accidentally collapse the lanes onto
   one backend TCP connection.
-- Android prefers native HTTP/3 Extended CONNECT through the bundled Go
-  MASQUE bridge. It falls back to the private adaptive multi-lane HTTP/2
+- Android prefers native HTTP/3 Extended CONNECT through the bundled Rust
+  transport. It falls back to the private adaptive multi-lane HTTP/2
   transport when UDP or HTTP/3 is unavailable.
 - Android relies on the system trust store and does not offer an insecure TLS
   switch.
 - Linux automatic networking uses an owned nftables OUTPUT guard. Windows
-  desktop and opt-in automatic CLI networking use persistent native WFP filters;
-  the explicit Windows helpers use the same implementation. Protection starts
-  after the initial DNS/authenticated handshake, before route installation.
+  desktop and CLI automatic networking use persistent native WFP filters.
+  Protection starts after the initial DNS/authenticated handshake, before route
+  installation.
 - Guards remain active on reconnect, process crash, and terminal failure.
+  Android retains an established VPN in a packet-dropping blocked state after
+  a terminal reconnect failure.
   Intentional disconnect/cleanup restores owned networking and removes the
   guard last. A recovery journal is essential; deleting it is not cleanup.
 - Linux protection covers the host's network namespace, not forwarded/container
@@ -145,3 +161,7 @@ not conceal transport fingerprints from network inspection.
   Linux reboot/external nftables removal and Windows early boot/BFE shutdown
   are outside the guarantee, as is administrator tampering. Mocked policy and
   cross-platform builds are not native packet-level leak certification.
+- The release signing private key is an offline-sensitive trust root shared
+  with Android release signing. Compromise requires rotating the pinned
+  certificate and deliberately migrating installed Android applications;
+  ordinary release assets and checksums cannot authorize that rotation.

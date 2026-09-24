@@ -235,21 +235,25 @@ client_release_assets=(
   porta-android-x86_64.apk
 )
 if $build_local; then
-  go_binary=$(command -v go || true)
-  if [[ -z $go_binary ]]; then
-    for candidate in /usr/local/go/bin/go /usr/local/bin/go /usr/bin/go; do
+  build_user=${SUDO_USER:-$(id -un)}
+  build_home=$(getent passwd "$build_user" | cut -d: -f6)
+  cargo_binary=$(command -v cargo || true)
+  if [[ -x $build_home/.cargo/bin/cargo ]]; then
+    cargo_binary=$build_home/.cargo/bin/cargo
+  elif [[ -z $cargo_binary ]]; then
+    for candidate in /usr/local/bin/cargo /usr/bin/cargo; do
       if [[ -x $candidate ]]; then
-        go_binary=$candidate
+        cargo_binary=$candidate
         break
       fi
     done
   fi
-  [[ -n $go_binary ]] || die "Go is required to build Porta"
+  [[ -n $cargo_binary ]] || die "Cargo with a stable Rust toolchain is required to build Porta"
   if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
-    sudo -u "$SUDO_USER" env "HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)" \
-      make GO="$go_binary" build
+    sudo -u "$SUDO_USER" env "HOME=$build_home" \
+      make CARGO="$cargo_binary" build-rust-server
   else
-    make GO="$go_binary" build
+    make CARGO="$cargo_binary" build-rust-server
   fi
   server_binary=bin/porta-server
 else
@@ -259,11 +263,17 @@ else
     *) die "GitHub releases do not provide a server binary for $(uname -m)" ;;
   esac
   release_asset=porta-server-linux-$release_arch
-  release_artifacts=("$release_asset" SHA256SUMS "${client_release_assets[@]}")
+  release_artifacts=(
+    "$release_asset"
+    SHA256SUMS
+    SHA256SUMS.sig
+    release-signing-cert.der
+    "${client_release_assets[@]}"
+  )
   release_download_directory=$(mktemp -d)
   cleanup_release_download() {
     local artifact
-    for artifact in "${release_artifacts[@]}" release.json github-auth-header; do
+    for artifact in "${release_artifacts[@]}" release.json github-auth-header release-public-key.pem; do
       rm -f "$release_download_directory/$artifact"
     done
     rmdir "$release_download_directory"
@@ -325,6 +335,27 @@ PY
       "${release_asset_urls[$index]}" \
       --output "$release_download_directory/${release_artifacts[$index]}"
   done
+  release_signing_fingerprint=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8
+  actual_signing_fingerprint=$(openssl x509 \
+    -inform DER \
+    -in "$release_download_directory/release-signing-cert.der" \
+    -noout -fingerprint -sha256 |
+    sed -n 's/^sha256 Fingerprint=//Ip' |
+    tr -d ':' |
+    tr '[:upper:]' '[:lower:]')
+  [[ $actual_signing_fingerprint == "$release_signing_fingerprint" ]] ||
+    die "release manifest signer does not match Porta's pinned release certificate"
+  release_public_key="$release_download_directory/release-public-key.pem"
+  openssl x509 \
+    -inform DER \
+    -in "$release_download_directory/release-signing-cert.der" \
+    -pubkey -noout >"$release_public_key" ||
+    die "could not read the release manifest signing key"
+  openssl dgst -sha256 \
+    -verify "$release_public_key" \
+    -signature "$release_download_directory/SHA256SUMS.sig" \
+    "$release_download_directory/SHA256SUMS" >/dev/null ||
+    die "release manifest signature verification failed"
   for artifact in "$release_asset" "${client_release_assets[@]}"; do
     expected_checksum=$(awk -v asset="$artifact" '$2 == asset { print $1; exit }' \
       "$release_download_directory/SHA256SUMS")
@@ -532,7 +563,8 @@ install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
 if ! $build_local; then
   downloads_stage=$(mktemp -d /var/lib/porta/downloads.new.XXXXXX)
   chmod 0755 "$downloads_stage"
-  for artifact in "${client_release_assets[@]}" SHA256SUMS; do
+  for artifact in "${client_release_assets[@]}" \
+    SHA256SUMS SHA256SUMS.sig release-signing-cert.der; do
     install -m 0644 "$release_download_directory/$artifact" \
       "$downloads_stage/$artifact"
   done
@@ -613,7 +645,7 @@ Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
 ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
-ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port $auto_mtu_argument; sleep 0.1; done; exit 1'
+ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
 RestartSec=2

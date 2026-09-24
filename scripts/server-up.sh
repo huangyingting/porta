@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 5 || $# -gt 6 ]]; then
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--auto-mtu=BOOL]" >&2
+if [[ $# -ne 5 ]]; then
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port>" >&2
   echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443" >&2
   exit 2
 fi
@@ -12,13 +12,6 @@ gateway_cidr=$2
 pool_cidr=$3
 external_interface=$4
 public_port=$5
-auto_mtu=true
-case "${6:---auto-mtu=true}" in
-  --auto-mtu|--auto-mtu=true) ;;
-  --auto-mtu=false) auto_mtu=false ;;
-  *) echo "invalid MTU mode; use --auto-mtu=true or --auto-mtu=false" >&2; exit 2 ;;
-esac
-
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $tun_interface != "$external_interface" &&
@@ -97,12 +90,10 @@ fi
   exit 1
 }
 sysctl -w net.ipv4.ip_forward=1
-if $auto_mtu; then
-  # Gateway-sourced ICMP enters through TUN; allow it without weakening
-  # source validation on physical interfaces.
-  sysctl -w "net/ipv4/conf/$tun_interface/accept_local=1"
-  sysctl -w "net/ipv4/conf/$tun_interface/rp_filter=2"
-fi
+# Live datagram limits can shrink even with a fixed interface MTU.
+# Permit gateway ICMP only on the owned TUN, not physical interfaces.
+sysctl -w "net/ipv4/conf/$tun_interface/accept_local=1"
+sysctl -w "net/ipv4/conf/$tun_interface/rp_filter=2"
 if [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
   sysctl -w "net/ipv6/conf/$tun_interface/disable_ipv6=1"
 fi

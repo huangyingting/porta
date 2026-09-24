@@ -28,8 +28,8 @@ key, fingerprint ID, and readable name; the private key is never uploaded.
 
 | Client | Private-key storage | Readable name |
 | --- | --- | --- |
-| Linux | `/var/lib/porta/client-identity.json` for root, or the user's config directory; mode `0600` | OS hostname (`os.Hostname()`) |
-| Windows desktop and CLI | `%ProgramData%\Porta\client-identity.json`, protected with machine-bound Windows DPAPI | OS computer name (`os.Hostname()`) |
+| Linux | `/var/lib/porta/client-identity.json` for root, or the user's config directory; mode `0600` | System hostname |
+| Windows desktop and CLI | `%ProgramData%\Porta\client-identity.json`, protected with machine-bound Windows DPAPI | Windows computer name |
 | Android | Non-exportable Android Keystore alias `porta-device-auth-v1`; StrongBox is preferred when available | `Settings.Global.DEVICE_NAME`, falling back to `Build.MODEL` |
 
 Names keep their case and ASCII letters, digits, dots, underscores, and hyphens.
@@ -71,11 +71,17 @@ policy-routing rules are rejected rather than silently left unprotected.
 
 Make the downloaded binary executable, then run:
 
-```sh
+```bash
 chmod +x porta-client-linux-amd64
-sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
+read -rsp "Client token: " PORTA_TOKEN && echo
+export PORTA_TOKEN
+sudo --preserve-env=PORTA_TOKEN ./porta-client-linux-amd64 \
   --server https://vpn.example.com:8443
+unset PORTA_TOKEN
 ```
+
+Do not place the token assignment after `sudo`; `sudo` treats it as a process
+argument that other local users can read.
 
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
 full-tunnel routes, and per-link DNS automatically. Its owned nftables OUTPUT
@@ -111,28 +117,37 @@ Extract `porta-client-windows-amd64.zip`. It contains:
 
 - `porta.exe`: the desktop client
 - `porta-cli.exe`: the command-line client
-- `wintun.dll`: the signed Wintun driver library
+- `wintun.dll`: the pinned official Wintun driver library, verified by SHA-256
+  before loading
 
 Launch `porta.exe` for normal use. It requests administrator access, stores
 multiple profiles under the current Windows account, protects tokens with
 DPAPI, configures routes, DNS, and the negotiated Windows IP-interface MTU,
-and restores Porta-owned network state on
-intentional disconnect. An interrupted run keeps the guard active; a reconnect
+and restores Porta-owned network state on intentional disconnect. An
+interrupted run keeps the guard active; a reconnect
 resumes the protected tunnel, while explicit cleanup removes the guard.
-The desktop uses an Android-inspired dashboard with profile cards, live
-connection state, tunnel traffic and an on-device activity timeline. Profile
-editing stays within the main window rather than opening another dialog.
-The compact Activity view can clear its local history, export the visible log
-through the native Windows save dialog, or open the log directory in Explorer.
-The desktop stays at a fixed compact width without minimize or maximize
-controls. Closing it hides Porta in the notification area instead of ending the
-tunnel. Its native tray menu can open the window, connect or disconnect, show
-Activity, restore retained network state, or quit safely. Porta snapshots,
-applies, and restores the Wintun IPv4 MTU through the native Windows IP Helper
-API. This avoids depending on PowerShell's `NlMtuBytes` projection, which can be
-empty for otherwise usable Wintun adapters.
+The desktop uses the same task-focused hierarchy as Android: connection
+summary, real-time traffic, and VPN profile cards. A profile's switch is the
+single connection control; Porta chooses HTTP/3 with HTTP/2 fallback
+automatically. Profile editing stays within the main window rather than opening
+another dialog. The compact Log view can clear its local history or export it
+to `%APPDATA%\Porta\exports`; network recovery appears only when retained state
+actually needs attention.
 
-The desktop interface is rendered by the pinned Wails v3 runtime and requires
+The window opens at a comfortable dashboard size, can be resized or minimized,
+and keeps readable spacing at its compact minimum. Closing it hides Porta in
+the notification area instead of ending the tunnel. Its native tray menu can
+open the window, connect or disconnect, show the connection log, restore
+retained network state, or quit safely. The interface supports English and
+Simplified Chinese, initially follows the Windows language, and provides a
+persistent language switch in the header. The tray follows the Windows
+language.
+
+Porta snapshots, applies, and restores the Wintun IPv4 MTU through the native
+Windows IP Helper API. This avoids depending on PowerShell's `NlMtuBytes`
+projection, which can be empty for otherwise usable Wintun adapters.
+
+The desktop interface is rendered by the pinned Tauri 2 runtime and requires
 the Microsoft Edge WebView2 Runtime. It is included with Windows 11 and current
 Windows 10 installations; install the Evergreen WebView2 Runtime if Windows
 reports that it is missing.
@@ -143,15 +158,17 @@ For terminal automation with the same automatic networking and protection:
 $env:PORTA_TOKEN = "CLIENT_TOKEN"
 ./porta-cli.exe `
   --server https://vpn.example.com:8443 `
-  --manual-network=false `
   --interface Porta
 ```
 
 The desktop and automatic CLI journal is
-`%APPDATA%\Porta\network-state.json`. After a terminal failure, use **Restore
-network** in the desktop client. **Quit** also restores this client's owned
-settings and stays open if restoration fails. Alternatively, cleanup can be run
-from an elevated terminal:
+`%ProgramData%\Porta\network-state.json`. The directory and journal reject
+reparse points and hard links and are restricted to Administrators and SYSTEM
+at high integrity. The embedded networking helper is sent directly to the
+system PowerShell process instead of being written to a user-writable script.
+After a terminal failure, use **Restore network** in the desktop client.
+**Quit** also restores this client's owned settings and stays open if
+restoration fails. Alternatively, cleanup can be run from an elevated terminal:
 
 ```powershell
 ./porta-cli.exe --cleanup-network
@@ -164,42 +181,13 @@ GUI can quit without disrupting another process's active connection.
 Disconnect with the
 previous client before upgrading an existing connection; old journals that lack
 exact ownership information must be restored by the client that created them.
+The Rust client refuses to adopt an AppData journal because it is writable by
+the desktop user and therefore cannot safely drive elevated recovery.
 
-Unlike Linux, the Windows CLI defaults to manual networking for operator
-automation; omit `--manual-network=false` only when managing setup yourself.
-While the manual CLI is connected, run the route helper from another elevated
-PowerShell session using the **same executable path as the transport**:
-
-```powershell
-$mtu = [int](Read-Host "MTU printed by the connected porta-cli")
-./scripts/windows-up.ps1 `
-  -AddressCidr 10.66.0.2/32 `
-  -ServerIp 203.0.113.10 `
-  -ServerPort 8443 `
-  -InterfaceAlias Porta `
-  -DnsServer 1.1.1.1 `
-  -Mtu $mtu `
-  -ClientExecutable ./porta-cli.exe
-```
-
-Remove those settings with:
-
-```powershell
-./scripts/windows-down.ps1 -InterfaceAlias Porta -ClientExecutable ./porta-cli.exe
-```
-
-The helpers use the client's shared native protection implementation and journal
-owned networking in
-`%LOCALAPPDATA%\Porta\manual-network-state.json`. Keep this file until cleanup
-succeeds; it lets the down helper remove the gateway escape route without
-deleting an existing route owned by another application. If a cleanup command
-fails, its state is retained for retry. An alternate `-StatePath` must be
-supplied consistently to both helpers.
-
-Use the assigned address, DNS, and MTU printed by the connected CLI when running
-manual setup. Wintun's packet-buffer MTU alone does not configure Windows TCP/IP;
-the helper applies the OS MTU and journals its original value for restoration.
-Partial MTU changes and interrupted cleanup retain retryable ownership.
+The Windows CLI uses the same automatic networking and fail-closed protection
+as the desktop by default. `--manual-network` disables all Porta route, DNS,
+MTU, and WFP changes and is intended only for operators who provide the entire
+network configuration and leak protection themselves.
 
 The advertised DNS resolver gets its own TUN host route, so a more-specific
 physical network prefix cannot divert private DNS. Reconnect preserves that
@@ -226,15 +214,15 @@ thumbprint changes at renewal.
 ## Desktop transport and protection lifecycle
 
 The default `--transport auto` tries HTTP/3 MASQUE and falls back to HTTP/2
-CONNECT-IP when the transport is unavailable. Explicit `--transport h3` and
+packet streams when the transport is unavailable. Explicit `--transport h3` and
 `--transport h2` disable automatic selection. Authentication, certificate,
 wire-version, malformed-control, and invalid-lease failures never justify
 downgrading. A lease-assignment timeout is retryable without downgrading.
 
 Transient startup failures and interrupted sessions use bounded retry delays.
 Reconnects update endpoint escape routes, address, MTU, and DNS while retaining
-protection; address/MTU changes recreate the TUN and discard stale queued
-packets. Windows removes the cached adapter exemption during a guarded dial and
+protection and the persistent Wintun session. Windows removes the cached
+adapter exemption during a guarded dial and
 revalidates/reapplies networking even when the new lease is unchanged. The
 selected transport is reported rather than simply displaying
 "automatic".
@@ -249,8 +237,9 @@ connection may be needed.
 
 Once active, the guard stays across process crashes and terminal failures.
 With automatic networking, an explicit Disconnect, normal cancellation, or
-`--cleanup-network` restores connectivity. Manual Windows setup requires its
-matching down helper. Do not delete the journal to bypass failed cleanup.
+`--cleanup-network` restores connectivity. In manual mode, the operator owns
+all setup and restoration. Do not delete the automatic-networking journal to
+bypass failed cleanup.
 Linux guard persistence covers a process crash, not a reboot or external
 firewall removal.
 Payload tunneling remains IPv4-only; necessary endpoint/control exceptions do
@@ -271,14 +260,24 @@ fixed behavior; clients require no extra option.
 
 Client and server agree before the interface is configured. Linux applies the
 final lease MTU, Windows applies it to the Windows IP interface as well as
-Wintun, and Android passes it to `VpnService.Builder.setMtu`. Manual desktop
+Wintun, and Android passes it to `VpnService.Builder.setMtu`. Manual Windows
 setup must use the MTU printed by the connected CLI, not the server ceiling.
 No client-facing MTU toggle is necessary.
 
-The value stays fixed for the connection. Reconnects can choose another MTU;
-a change can recreate the desktop TUN and interrupt existing flows. A later
-QUIC size-limit reduction uses reliable capsules for affected packets rather
-than resizing the live interface. HTTP/2, the native multi-lane fallback, and
+The interface value stays fixed for the connection. A separate per-direction
+packet budget follows reductions in QUIC's live datagram capacity. Both native
+client and server fragment DF-clear IPv4 packets or return rate-limited
+fragmentation-needed feedback for DF-set packets; the client delivers feedback
+to its local IP stack through the existing TUN receive path. These changes do
+not rebuild Android's VPN interface or alter desktop routes mid-session.
+Non-adapting DF flows can use a bounded, reported reliable compatibility path,
+which can still incur head-of-line blocking and never exceeds the negotiated
+interface ceiling. Peers omitting the optional authenticated gateway metadata
+use a reported capsule exception for affected DF packets, without inventing
+an ICMP source address.
+
+Reconnects can choose another interface MTU; a change can recreate the desktop
+TUN and interrupt existing flows. HTTP/2, the native multi-lane fallback, and
 HTTP/3 without Datagrams retain the configured server MTU. This setting does
 not apply to the HTTPS forward proxy, which has no VPN TUN interface.
 
@@ -293,6 +292,9 @@ routing and firewall/kill-switch rules.
 
 Use `porta-android-arm64-v8a.apk` for most current physical devices,
 `armeabi-v7a` for older 32-bit ARM devices, or `x86_64` for an emulator.
+The interface and VPN notification support English and Simplified Chinese.
+Android 13 and newer expose Porta in the system per-app language settings;
+older releases follow the device language.
 
 QR onboarding has two steps:
 
@@ -385,11 +387,12 @@ an active or reconnecting profile before editing or deleting it. Deleting a
 local profile does not revoke its token or free its server-side device slot;
 an administrator must forget the enrollment separately when needed.
 
-The connection summary shows the effective tunnel MTU. **Log** updates while
+The connection summary shows the negotiated interface MTU. **Log** updates while
 open and includes connection setup details, MTU selection, assigned address,
 DNS, transport, and fallback/retry information. Automatic selection is
-distinguished from a server-configured MTU; the value stays fixed until the
-next connection. When an HTTP/2 fallback attempt ends, per-lane diagnostics
+distinguished from a server-configured MTU; the interface value stays fixed until
+the next connection. A lower live datagram packet budget is reported separately
+in transport diagnostics. When an HTTP/2 fallback attempt ends, per-lane diagnostics
 record drop totals, queue high-water marks, oldest queued-packet age, and
 reconnect counts. The log retains the latest 200 events, includes millisecond
 timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but

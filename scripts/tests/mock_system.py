@@ -130,16 +130,17 @@ elif name == "systemctl":
         raise RuntimeError(f"unexpected systemctl call: {args}")
 elif name == "sysctl":
     values = state.setdefault("sysctl", {})
-    if args[0] == "-n":
-        print(values[args[1]])
-    elif args[0] == "-w":
-        key, value = args[1].split("=", 1)
-        values[key] = value
-    elif args[0] == "-p":
-        for line in safe(args[1]).read_text().splitlines():
+    operation = [arg for arg in args if arg != "-q"]
+    if operation[0] == "-n":
+        print(values[operation[1].replace("/", ".")])
+    elif operation[0] == "-w":
+        key, value = operation[1].split("=", 1)
+        values[key.replace("/", ".")] = value
+    elif operation[0] == "-p":
+        for line in safe(operation[1]).read_text().splitlines():
             if line and not line.startswith("#"):
                 key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
+                values[key.strip().replace("/", ".")] = value.strip()
 elif name == "ip":
     if "show" in args and state.get("fail_ip_list"):
         code = 2
@@ -225,6 +226,12 @@ elif name == "openssl":
         print("a" * 64)
     elif "-checkhost" in args:
         pass
+    elif args and args[0] == "x509" and "-fingerprint" in args:
+        print("sha256 Fingerprint=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8")
+    elif args and args[0] == "x509" and "-pubkey" in args and "-inform" in args:
+        print("mock release public key")
+    elif args and args[0] == "dgst":
+        code = 1 if state.get("fail_release_signature") else 0
     else:
         path = safe(args[args.index("-in") + 1])
         if state.get("slow_openssl"):
@@ -297,17 +304,27 @@ elif name == "git":
     if args[0] == "rev-parse":
         if state.get("missing_revision"):
             code = 128
+        elif args[-1] == "HEAD":
+            print(state.get("head_commit", "b" * 40))
+        elif args[-1].startswith("refs/tags/"):
+            tag = args[-1].removeprefix("refs/tags/").removesuffix("^{commit}")
+            print(state.get("tag_commits", {}).get(tag, "c" * 40))
         else:
             print("a" * 40)
     elif args[0] == "cat-file":
         code = 1 if state.get("missing_previous_file") else 0
     elif args[0] == "show":
         print(state.get("previous_version", "0.1.3"))
+    elif args[:2] == ["tag", "--list"]:
+        print("\n".join(state.get("release_tags", [])))
+    elif args[:2] == ["show-ref", "--verify"]:
+        code = 0 if state.get("release_tag_exists") else 1
+    elif args[0] == "tag":
+        state["release_tag_exists"] = True
+    elif args[0] == "push":
+        pass
     else:
         raise RuntimeError(f"unexpected git invocation: {args}")
-elif name == "gomobile":
-    output = safe(args[args.index("-o") + 1])
-    output.write_text("aar")
 elif name == "adb":
     if args == ["shell", "dumpsys", "connectivity"]:
         print("TRANSPORT_VPN")

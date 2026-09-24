@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
+  <meta name="theme-color" content="#f8f8f5">
+  <link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml">
+  <title>Porta · Less, but better</title>
+  <style>
+    @font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-style:normal;font-weight:200 900;font-display:swap}
+    :root{color-scheme:light;font-family:"Mona Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--ink:#121212;--muted:#71716c;--lime:#c9ee48;--line:#d8d8d2;font-feature-settings:"cv11","ss01","ss03";font-synthesis:none}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;color:var(--ink);background:#f8f8f5}
+    .page{width:min(1160px,calc(100% - 48px));min-height:100vh;margin:auto;display:grid;grid-template-rows:auto 1fr auto}
+    header{height:74px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:11px;font-size:15px;font-weight:820}.brand img{width:31px}.number{font:800 10px/1 "Mona Sans",sans-serif;letter-spacing:.16em}
+    main{position:relative;display:flex;align-items:center;padding:50px 0;overflow:hidden}.copy{position:relative;z-index:2;max-width:800px}.eyebrow{font-size:10px;font-weight:820;letter-spacing:.18em;text-transform:uppercase}
+    h1{margin:20px 0 22px;font-size:clamp(62px,9vw,116px);font-weight:590;line-height:.82;letter-spacing:-.078em}.accent{display:inline-block;padding:0 .08em;background:var(--lime);transform:rotate(-1deg)}
+    .lead{max-width:530px;margin:0;color:var(--muted);font-size:clamp(15px,1.45vw,18px);line-height:1.65}.access-link{display:inline-flex;align-items:center;gap:28px;margin-top:32px;border-bottom:1px solid var(--ink);color:var(--ink);padding:0 0 7px;text-decoration:none;font-size:12px;font-weight:820}.access-link:after{content:"→";font-size:16px}
+    .orbit{position:absolute;width:min(44vw,500px);height:min(44vw,500px);right:-3%;top:50%;translate:0 -50%;border:1px solid #bdbdb7;border-radius:50%}.orbit:before,.orbit:after{content:"";position:absolute;border-radius:50%}.orbit:before{width:52%;height:52%;left:24%;top:24%;border:1px solid #bdbdb7}.orbit:after{width:22px;height:22px;left:8%;top:26%;background:var(--lime);box-shadow:0 0 0 10px #f8f8f5}
+    footer{min-height:58px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);color:#777772;font-size:10px}
+    @media(max-width:760px){.page{width:min(100% - 28px,1160px)}main{align-items:flex-start;padding:52px 0 330px}.orbit{width:310px;height:310px;right:-80px;top:auto;bottom:16px;translate:0}h1{font-size:clamp(58px,17vw,84px)}}
+    @media(max-width:430px){header{height:62px}.number{display:none}main{padding-top:40px;padding-bottom:285px}.orbit{width:265px;height:265px}footer{align-items:flex-start;flex-direction:column;justify-content:center;gap:3px}}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><span class="number">06 / 06</span></header>
+    <main><section class="copy"><div class="eyebrow">Purposefully simple</div><h1>Less noise.<br><span class="accent">More direction.</span></h1><p class="lead">Porta keeps the next step close for approved users, with a clear beginning and nothing unnecessary.</p><a class="access-link" href="/access">Get access</a></section><div class="orbit" aria-hidden="true"></div></main>
+    <footer><span>Porta</span><span>Useful by design</span></footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
+  <meta name="theme-color" content="#f7d7cb">
+  <link rel="icon" href="/assets/porta-mark.svg" type="image/svg+xml">
+  <title>Porta · Work in view</title>
+  <style>
+    @font-face{font-family:"Mona Sans";src:url("/assets/mona-sans.woff2") format("woff2-variations");font-style:normal;font-weight:200 900;font-display:swap}
+    :root{color-scheme:light;font-family:"Mona Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--ink:#2a1718;--muted:#765f60;--coral:#ef745f;--cream:#fff8ef;--line:rgba(42,23,24,.13);font-feature-settings:"cv11","ss01","ss03";font-synthesis:none}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;color:var(--ink);background:#f7d7cb}
+    .page{width:min(1140px,calc(100% - 42px));min-height:100vh;margin:auto;display:grid;grid-template-rows:auto 1fr auto}
+    header{height:70px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:11px;font-size:15px;font-weight:820}.brand img{width:31px}.place{font-size:10px;font-weight:760;letter-spacing:.12em;text-transform:uppercase}
+    main{display:grid;grid-template-columns:minmax(330px,.78fr) minmax(0,1.22fr);gap:clamp(30px,6vw,80px);align-items:center;padding:40px 0}
+    .art{position:relative;min-height:520px;border-radius:180px 180px 24px 24px;background:var(--cream);overflow:hidden;box-shadow:0 30px 70px rgba(82,40,38,.13)}.sun{position:absolute;width:210px;height:210px;left:50%;top:34%;translate:-50% -50%;border-radius:50%;background:var(--coral);box-shadow:0 0 0 42px rgba(239,116,95,.14),0 0 0 84px rgba(239,116,95,.07)}.line{position:absolute;left:14%;right:14%;bottom:25%;height:1px;background:var(--ink)}.caption{position:absolute;left:28px;right:28px;bottom:25px;display:flex;justify-content:space-between;font-size:9px;font-weight:780;letter-spacing:.12em;text-transform:uppercase}
+    .eyebrow{color:#a24237;font-size:10px;font-weight:800;letter-spacing:.17em;text-transform:uppercase}h1{margin:18px 0 20px;font-size:clamp(54px,7vw,88px);font-weight:640;line-height:.9;letter-spacing:-.068em}
+    .lead{max-width:510px;margin:0;color:var(--muted);font-size:clamp(15px,1.5vw,18px);line-height:1.65}.access-link{display:inline-flex;align-items:center;justify-content:space-between;min-width:150px;margin-top:30px;border:1px solid var(--ink);border-radius:0;color:var(--ink);padding:12px 14px;text-decoration:none;font-size:11px;font-weight:800}.access-link:after{content:"→";font-size:15px}
+    footer{min-height:58px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);color:#866f70;font-size:10px}
+    @media(max-width:780px){.page{width:min(100% - 26px,1140px)}main{grid-template-columns:1fr;gap:34px;padding:32px 0}.copy{order:-1}.art{min-height:340px;border-radius:120px 120px 20px 20px}.sun{width:150px;height:150px}h1{font-size:clamp(52px,15vw,76px)}}
+    @media(max-width:430px){header{height:62px}.place{display:none}.art{min-height:290px}.caption{left:20px;right:20px}footer{align-items:flex-start;flex-direction:column;justify-content:center;gap:3px}}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header><div class="brand"><img src="/assets/porta-mark.svg" alt="">Porta</div><span class="place">Collection 05</span></header>
+    <main>
+      <section class="art" aria-label="Abstract sunrise artwork"><div class="sun"></div><div class="line"></div><div class="caption"><span>Porta</span><span>05 / 06</span></div></section>
+      <section class="copy"><div class="eyebrow">Everything in its place</div><h1>Work,<br>gathered.</h1><p class="lead">One calm place for approved Porta users to continue with the people and resources that matter.</p><a class="access-link" href="/access">Get access</a></section>
+    </main>
+    <footer><span>Porta</span><span>A considered place to begin</span></footer>
+  </div>
+</body>
+</html>

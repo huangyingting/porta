@@ -22,13 +22,24 @@ Do not copy `deploy.sh` by itself. It also requires the helper scripts in
 
 **Release bundle:**
 
-```sh
+```bash
+set -o pipefail
 gh release download --repo huangyingting/porta \
-  --pattern porta-deploy.tar.gz --pattern SHA256SUMS
-grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c -
-tar -xzf porta-deploy.tar.gz
-cd porta
-export GH_TOKEN=$(gh auth token)
+  --pattern porta-deploy.tar.gz --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sig --pattern release-signing-cert.der &&
+expected=763e9e1dd32d2f6538149d7b86809af698d1f96c9e29b4e30ec35fc1a8969bd8 &&
+actual=$(openssl x509 -inform DER -in release-signing-cert.der \
+  -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2 | tr '[:upper:]' '[:lower:]') &&
+test "$actual" = "$expected" &&
+openssl x509 -inform DER -in release-signing-cert.der -pubkey -noout \
+  > release-public-key.pem &&
+openssl dgst -sha256 -verify release-public-key.pem \
+  -signature SHA256SUMS.sig SHA256SUMS &&
+grep ' porta-deploy.tar.gz$' SHA256SUMS | sha256sum -c - &&
+tar -xzf porta-deploy.tar.gz &&
+cd porta &&
+GH_TOKEN=$(gh auth token) &&
+export GH_TOKEN
 ```
 
 The repository is private, so `gh` must be authenticated with read access.
@@ -69,6 +80,8 @@ synchronization, client downloads, and the loopback operations listener.
 
 The HTTPS forward proxy is enabled by default. Add
 `--disable-forward-proxy` only for a VPN-only deployment.
+Forward-proxy CONNECT uses HTTP/1.1 or HTTP/2; HTTP/3 is reserved for the
+native MASQUE CONNECT-IP tunnel.
 
 ## Use
 
@@ -90,10 +103,13 @@ sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
 
 ### Linux client
 
-```sh
+```bash
 chmod +x porta-client-linux-amd64
-sudo PORTA_TOKEN="CLIENT_TOKEN" ./porta-client-linux-amd64 \
+read -rsp "Client token: " PORTA_TOKEN && echo
+export PORTA_TOKEN
+sudo --preserve-env=PORTA_TOKEN ./porta-client-linux-amd64 \
   --server https://vpn.example.com:8443
+unset PORTA_TOKEN
 ```
 
 Linux configures routes, DNS, and an owned fail-closed firewall automatically;
@@ -156,7 +172,9 @@ Re-run `scripts/deploy.sh` to upgrade while preserving credentials, client
 records, usage, and leases.
 
 Automatic HTTP/3 tunnel MTU selection is enabled by default, with a 1400
-ceiling and a conservative 1100 baseline. Clients require no extra setting.
+ceiling and a conservative 1100 baseline. Datagram packet budgets also adapt
+downward when QUIC's capacity shrinks, without resizing the live VPN interface.
+Clients require no extra setting.
 Use `--auto-mtu=false --mtu 1100` for a fixed MTU. See
 [MTU selection](docs/architecture.md#stable-per-connection-mtu-selection)
 for fallback, IPv4 handling, and nested-VPN limits.

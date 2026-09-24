@@ -1,5 +1,11 @@
 /bin/
 /dist/
+/.server-benchmark/
+/.server-interop/
+/rust/target/
+/rust/*/target/
+/rust/porta-windows/gen/
+__pycache__/
 /*.pem
 /*.key
 /*.crt

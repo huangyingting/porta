@@ -101,31 +101,4 @@ class ConnectionDiagnosticsTest {
         assertEquals("dial [redacted URL]", message)
     }
 
-    @Test
-    fun laneDiagnosticsExposeOnlyQueueAndRecoveryCounters() {
-        val message = formatHttp2LaneDiagnostic(
-            lane = 2,
-            queue = PacketQueueSnapshot(
-                packets = 3,
-                bytes = 1200,
-                highWaterPackets = 8,
-                highWaterBytes = 8192,
-                oldestAgeMillis = 17,
-                enqueued = 20,
-                dequeued = 12,
-                expiredDrops = 1,
-                overflowDrops = 2,
-                tailDrops = 3,
-                oldestDrops = 4,
-                recoveryDrops = 5,
-                droppedByClass = emptyMap(),
-            ),
-            reconnects = 6,
-        )
-
-        assertEquals(
-            "HTTP/2 lane 2: drops 15; high-water 8192B/8p; oldest 17ms; reconnects 6",
-            message,
-        )
-    }
 }

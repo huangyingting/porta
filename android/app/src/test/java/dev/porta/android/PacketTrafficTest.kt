@@ -1,26 +1,23 @@
 package dev.porta.android
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PacketTrafficTest {
     @Test
-    fun reservesLaneZeroForDnsIcmpAckOnlyAndSmallUdp() {
+    fun classifiesDnsIcmpAckOnlyAndSmallUdpAsControl() {
         val dns = udpPacket(sourcePort = 40_000, destinationPort = 53, payloadBytes = 300)
         val icmp = ipv4Packet(protocol = 1, transportBytes = 8)
         val ack = tcpPacket(sourcePort = 443, destinationPort = 40_000, flags = 0x10)
         val smallUdp = udpPacket(sourcePort = 123, destinationPort = 40_000, payloadBytes = 32)
 
         for (packet in listOf(dns, icmp, ack, smallUdp)) {
-            assertEquals(PacketClass.CONTROL, classifyIPv4Packet(packet).packetClass)
-            assertEquals(0, http2PacketLane(packet, 4))
+            assertEquals(PacketClass.CONTROL, classifyIPv4Packet(packet))
         }
     }
 
     @Test
-    fun tcpAckWithPayloadOrLifecycleFlagsUsesDataLane() {
+    fun classifiesTcpAckWithPayloadOrLifecycleFlagsAsTcp() {
         val ackWithPayload = tcpPacket(
             sourcePort = 443,
             destinationPort = 40_000,
@@ -34,13 +31,12 @@ class PacketTrafficTest {
         )
 
         for (packet in listOf(ackWithPayload, synAck)) {
-            assertEquals(PacketClass.TCP, classifyIPv4Packet(packet).packetClass)
-            assertTrue(http2PacketLane(packet, 4) in 1..3)
+            assertEquals(PacketClass.TCP, classifyIPv4Packet(packet))
         }
     }
 
     @Test
-    fun fragmentsAreNeverClassifiedAsSmallUdpControlAndStayTogether() {
+    fun fragmentsAreNeverClassifiedAsSmallUdpControl() {
         val first = udpPacket(
             sourcePort = 40_000,
             destinationPort = 53,
@@ -54,39 +50,8 @@ class PacketTrafficTest {
             repeat(8) { index -> it[20 + index] = (index * 13).toByte() }
         }
 
-        assertEquals(PacketClass.DATAGRAM, classifyIPv4Packet(first).packetClass)
-        assertEquals(PacketClass.DATAGRAM, classifyIPv4Packet(continuation).packetClass)
-        assertEquals(http2PacketLane(first, 4), http2PacketLane(continuation, 4))
-
-        val otherDatagram = continuation.copyOf().also {
-            it[4] = 0x56
-            it[5] = 0x78
-        }
-        assertNotEquals(
-            classifyIPv4Packet(first).flow,
-            classifyIPv4Packet(otherDatagram).flow,
-        )
-    }
-
-    @Test
-    fun ordinaryFlowRoutingIgnoresPacketIdsChecksumsAndPayload() {
-        val packet = tcpPacket(
-            sourcePort = 40_000,
-            destinationPort = 443,
-            flags = 0x18,
-            payloadBytes = 64,
-        )
-        val lane = http2PacketLane(packet, 4)
-
-        repeat(32) { value ->
-            val changed = packet.copyOf()
-            changed[4] = value.toByte()
-            changed[5] = (255 - value).toByte()
-            changed[10] = (value * 3).toByte()
-            changed[11] = (value * 7).toByte()
-            changed[changed.lastIndex] = value.toByte()
-            assertEquals(lane, http2PacketLane(changed, 4))
-        }
+        assertEquals(PacketClass.DATAGRAM, classifyIPv4Packet(first))
+        assertEquals(PacketClass.DATAGRAM, classifyIPv4Packet(continuation))
     }
 }
 

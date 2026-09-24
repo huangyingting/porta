@@ -4,9 +4,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 module.exports = async function testOnboarding(directory) {
-  const script = (file, name) => fs.readFileSync(path.join(directory, file), 'utf8')
-    .match(new RegExp('const ' + name + ' = `([\\s\\S]*?)`'))[1];
-  const joinScript = script('portal_join_page.go', 'portalJoinScript');
+  const script = file => fs.readFileSync(path.join(directory, file), 'utf8');
+  const joinScript = script('portal-join.js');
   function join(hash, state = 'auto', historyFailure = false) {
     const events = {}, order = [], forms = [];
     const location = {hash, search: '?untrusted=query', reload() { order.push('reload'); }};
@@ -96,7 +95,7 @@ module.exports = async function testOnboarding(directory) {
   node('setup-uri').value = 'porta://profile?v=1&server=https%3A%2F%2Fvpn.example.test&token=private-token';
   node('setup-uri').type = 'hidden';
   node('setup-qr').src = 'data:image/png;base64,aW1hZ2U=';
-  vm.runInContext(script('client_setup_page.go', 'portalClientScript'), context);
+  vm.runInContext(script('portal-client.js'), context);
   node('setup-reveal-token').listeners.click();
   assert.equal(node('setup-token').type, 'text');
   assert.equal(node('setup-reveal-token')['aria-pressed'], 'true');
@@ -138,6 +137,6 @@ module.exports = async function testOnboarding(directory) {
 };
 
 if (require.main === module) {
-  module.exports(process.argv[2] || path.resolve(__dirname, '../../cmd/porta-server'))
+  module.exports(process.argv[2] || path.resolve(__dirname, '../../rust/porta-server/assets'))
     .catch(error => { console.error(error); process.exitCode = 1; });
 }

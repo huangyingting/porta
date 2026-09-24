@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 import uuid
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,7 +50,7 @@ class AutomationTests(unittest.TestCase):
         )
         for command in (
             "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "openssl",
-            "curl", "ss", "make", "mv", "git", "gomobile", "adb", "sleep", "gh", "uname",
+            "curl", "ss", "make", "mv", "git", "adb", "sleep", "gh", "uname",
             "sudo", "unshare",
         ):
             (self.bin / command).symlink_to(MOCK)
@@ -72,7 +73,7 @@ class AutomationTests(unittest.TestCase):
     def run_script(self, name, *args, success=True, cwd=None):
         result = subprocess.run(
             ["bash" if name.endswith(("deploy.sh", "server-up.sh", "server-down.sh",
-                                      "check-version.sh", "build-android-aar.sh",
+                                      "check-version.sh", "build-android-rust.sh",
                                       "test-server-firewall.sh")) else "sh",
              str(ROOT / "scripts" / name), *map(str, args)],
             cwd=cwd or self.root, env=self.env, text=True, capture_output=True,
@@ -239,7 +240,7 @@ class AutomationTests(unittest.TestCase):
                 )
         self.assertFalse((self.root / "commands.jsonl").exists())
 
-    def test_automatic_mtu_scopes_icmp_acceptance_to_owned_tun(self):
+    def test_mtu_feedback_scopes_icmp_acceptance_to_owned_tun(self):
         self.run_script("server-up.sh", "porta.0", "10.66.0.1/24",
                         "10.66.0.0/24", "eth0", "8443")
         calls = self.commands()
@@ -250,11 +251,10 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(ipv4_changes), 2)
         self.assertTrue(all("/porta.0/" in value for value in ipv4_changes))
 
-    def test_fixed_mtu_does_not_change_source_validation(self):
+    def test_network_setup_rejects_obsolete_mtu_mode_argument(self):
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
-                        "eth0", "8443", "--auto-mtu=false")
-        self.assertFalse(any("accept_local" in " ".join(call) or "rp_filter" in " ".join(call)
-                             for call in self.commands()))
+                        "eth0", "8443", "--auto-mtu=false", success=False)
+        self.assertFalse((self.root / "commands.jsonl").exists())
 
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
@@ -425,12 +425,108 @@ class AutomationTests(unittest.TestCase):
         self.update_state(missing_previous_file=True)
         self.run_script("check-version.sh", "base")
 
-    def test_android_relative_output_uses_callers_directory(self):
+    def test_rust_package_versions_match_application_version(self):
+        version = (ROOT / "internal/buildinfo/VERSION").read_text().strip()
+        for manifest in (ROOT / "rust").glob("*/Cargo.toml"):
+            package = manifest.read_text().split("[package]", 1)
+            if len(package) != 2:
+                continue
+            match = re.search(r'(?m)^version = "([^"]+)"$', package[1])
+            self.assertIsNotNone(match, manifest)
+            self.assertEqual(match.group(1), version, manifest)
+
+    def test_version_advances_above_global_tags_and_allows_release_reruns(self):
+        self.update_state(previous_version="0.1.29",
+                          release_tags=["v0.1.27", "v0.1.38", "v0.1.099"])
+        self.version_file("0.1.30")
+        self.run_script("check-version.sh", "base", success=False)
+        self.version_file("0.1.39")
+        self.run_script("check-version.sh", "base")
+        self.update_state(release_tags=["v0.1.38", "v0.1.39"])
+        self.run_script("check-version.sh", "base", success=False)
+        self.update_state(tag_commits={"v0.1.39": "b" * 40})
+        self.run_script("check-version.sh", "base")
+        self.version_file("0.1.40")
+        self.update_state(previous_version="0.1.39")
+        self.run_script("check-version.sh", "base")
+
+    def prepare_android_rust_build(self):
         ndk = self.root / "ndk"
-        ndk.mkdir()
-        self.env.update(ANDROID_NDK_HOME=str(ndk), GOMOBILE=str(self.bin / "gomobile"))
-        self.run_script("build-android-aar.sh", "nested/output.aar")
-        self.assertEqual((self.root / "nested/output.aar").read_text(), "aar")
+        tools = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+        tools.mkdir(parents=True)
+        for name in (
+            "aarch64-linux-android26-clang",
+            "armv7a-linux-androideabi26-clang",
+            "x86_64-linux-android26-clang",
+        ):
+            (tools / name).write_text("#!/bin/sh\n")
+            (tools / name).chmod(0o755)
+        readelf = tools / "llvm-readelf"
+        readelf.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x4000'\n"
+        )
+        readelf.chmod(0o755)
+
+        rustup = self.root / "rustup"
+        rustup.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' aarch64-linux-android armv7-linux-androideabi "
+            "x86_64-linux-android\n"
+        )
+        rustup.chmod(0o755)
+        cargo = self.root / "cargo"
+        cargo.write_text(
+            "#!/bin/sh\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$1\" = --target ]; then target=$2; shift 2; else shift; fi\n"
+            "done\n"
+            "mkdir -p \"$CARGO_TARGET_DIR/$target/release\"\n"
+            "printf '%s' \"$target\" > "
+            "\"$CARGO_TARGET_DIR/$target/release/libporta_android.so\"\n"
+        )
+        cargo.chmod(0o755)
+        target_dir = self.root / "target"
+        self.env.update(
+            ANDROID_NDK_ROOT=str(ndk),
+            ANDROID_NDK_HOME=str(ndk),
+            CARGO=str(cargo),
+            RUSTUP=str(rustup),
+            CARGO_TARGET_DIR=str(target_dir),
+        )
+        return readelf
+
+    def test_android_rust_libraries_use_requested_output_directory(self):
+        self.prepare_android_rust_build()
+        self.run_script("build-android-rust.sh", "nested/jni")
+        expected = {
+            "arm64-v8a": "aarch64-linux-android",
+            "armeabi-v7a": "armv7-linux-androideabi",
+            "x86_64": "x86_64-linux-android",
+        }
+        for abi, target in expected.items():
+            self.assertEqual((self.root / f"nested/jni/{abi}/libporta_android.so").read_text(),
+                             target)
+
+    def test_android_rust_build_rejects_failed_or_invalid_elf_inspection(self):
+        readelf = self.prepare_android_rust_build()
+        cases = {
+            "inspection-failed": (
+                "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x4000'\nexit 1\n"
+            ),
+            "empty": "exit 0\n",
+            "no-load-headers": "printf '%s\\n' 'Program Headers:'\n",
+            "malformed": "printf '%s\\n' 'LOAD 0 0 0 0 0 R E invalid'\n",
+            "misaligned": "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x1000'\n",
+            "mixed-alignment": (
+                "printf '%s\\n' 'LOAD 0 0 0 0 0 R E 0x4000' "
+                "'LOAD 0 0 0 0 0 R E 0x1000'\n"
+            ),
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                readelf.write_text("#!/bin/sh\n" + body)
+                self.run_script("build-android-rust.sh", f"jni-{name}", success=False)
 
     def test_android_soak_restores_wifi_after_failure(self):
         self.update_state(fail_sleep=True)
@@ -601,7 +697,7 @@ class AutomationTests(unittest.TestCase):
             (self.root / "system/etc/porta/landing/custom.html").read_text(),
             "<h1>custom landing</h1>",
         )
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443;", unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE", unit)
         self.assertEqual(self.state()["stopped_helpers"][0], "old down")
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
@@ -612,16 +708,16 @@ class AutomationTests(unittest.TestCase):
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1280", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=true", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
-    def test_deploy_fixed_mtu_disables_discovery_and_helper_settings(self):
+    def test_deploy_fixed_mtu_disables_discovery_but_preserves_feedback_setup(self):
         deploy = self.prepare_deploy(timer=False)
         self.run_deploy(deploy, "--build-local", "--auto-mtu=false", "--mtu", "1100")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertIn("--auto-mtu=false", unit)
         self.assertNotIn("--auto-mtu=true", unit)
         self.assertIn("--mtu 1100", unit)
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --auto-mtu=false", unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
     def test_bundled_service_uses_automatic_mtu_defaults(self):
         unit = (ROOT / "deploy/porta.service").read_text()
@@ -630,8 +726,8 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--auto-mtu=true", start)
         self.assertIn("--mtu 1400", unit)
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
-        self.assertIn("--auto-mtu=true", setup)
-        self.assertIn("eth0 8443 --auto-mtu=true", setup)
+        self.assertNotIn("--auto-mtu", setup)
+        self.assertIn("eth0 8443;", setup)
         self.assertIn("RuntimeDirectoryPreserve=yes", unit)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
@@ -771,7 +867,9 @@ class AutomationTests(unittest.TestCase):
             (release / name).write_bytes(data)
             checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
         (release / "SHA256SUMS").write_text("".join(checksums))
-        assets.append("SHA256SUMS")
+        (release / "SHA256SUMS.sig").write_bytes(b"signed manifest")
+        (release / "release-signing-cert.der").write_bytes(b"release certificate")
+        assets.extend(["SHA256SUMS", "SHA256SUMS.sig", "release-signing-cert.der"])
         (release / "release.json").write_text(json.dumps({
             "tag_name": "v0.1.4",
             "assets": [{"name": name, "url": f"https://api.github.com/mock-assets/{name}"}
@@ -785,6 +883,8 @@ class AutomationTests(unittest.TestCase):
         downloads = self.root / "system/var/lib/porta/downloads"
         self.assertEqual((downloads / "CLIENT_VERSION").read_text(), "v0.1.4\n")
         self.assertTrue((downloads / "porta-client-windows-amd64.zip").is_file())
+        self.assertTrue((downloads / "SHA256SUMS.sig").is_file())
+        self.assertTrue((downloads / "release-signing-cert.der").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
@@ -823,6 +923,16 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("stopped_helpers", self.state())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
+    def test_release_signature_failure_leaves_installation_untouched(self):
+        deploy = self.prepare_deploy()
+        before = self.snapshot()
+        self.release_assets()
+        self.update_state(fail_release_signature=True)
+        self.run_deploy(deploy, success=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("stopped_helpers", self.state())
+        self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
     def test_failed_release_upgrade_restores_previous_downloads(self):
         deploy = self.prepare_deploy()
         before = self.snapshot()
@@ -834,13 +944,146 @@ class AutomationTests(unittest.TestCase):
         self.assertFalse(list((self.root / "system/var/lib/porta").glob("downloads.new.*")))
 
     def release_script(self, name):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        return self.workflow_script("release.yml", name)
+
+    def workflow_script(self, filename, name):
+        workflow = (ROOT / ".github/workflows" / filename).read_text()
         step = workflow.split(f"      - name: {name}\n", 1)[1]
         step = step.split("\n      - ", 1)[0]
         script = step.split("        run: ", 1)[1]
         if script.startswith("|\n"):
             return "\n".join(line[10:] for line in script[2:].splitlines())
         return script.strip()
+
+    def test_main_requires_rust_promotion_and_all_platform_results(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn('  push:\n    branches:\n      - "**"', triggers)
+        self.assertIn("  pull_request:\n    branches:\n      - main", triggers)
+        self.assertNotIn("tags:", triggers)
+        self.assertNotIn("schedule:", triggers)
+        self.assertNotIn("secrets.", workflow)
+        self.assertIn("name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}\n"
+                      "    if: ${{ always() }}", workflow)
+        self.assertIn("needs: [rust, windows, android]", workflow)
+        script = self.workflow_script("ci.yml", "Require Rust promotion and every build")
+        good = {
+            "EVENT_NAME": "pull_request", "HEAD_BRANCH": "rust",
+            "HEAD_REPOSITORY": "huangyingting/porta", "REPOSITORY": "huangyingting/porta",
+            "RUST_RESULT": "success", "WINDOWS_RESULT": "success", "ANDROID_RESULT": "success",
+        }
+        cases = [(good, True), (good | {"EVENT_NAME": "push", "HEAD_BRANCH": ""}, True)]
+        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT"):
+            for outcome in ("failure", "cancelled", "skipped"):
+                cases.append((good | {job: outcome}, False))
+        cases.extend([
+            (good | {"HEAD_BRANCH": "golang"}, False),
+            (good | {"HEAD_BRANCH": "feature"}, False),
+            (good | {"HEAD_REPOSITORY": "other/porta"}, False),
+        ])
+        for values, accepted in cases:
+            with self.subTest(values=values):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script],
+                    cwd=self.root, env=self.env | values,
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, accepted,
+                                 result.stdout + result.stderr)
+
+    def test_release_only_builds_the_successful_trusted_main_push(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        for value in ("workflow_run:", "workflows: [CI]", "types: [completed]", "branches: [main]"):
+            self.assertIn(value, triggers)
+        self.assertNotIn("push:", triggers)
+        self.assertNotIn("workflow_dispatch:", triggers)
+        for guard in (
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.event == 'push'",
+            "github.event.workflow_run.head_branch == 'main'",
+            "github.event.workflow_run.head_repository.full_name == github.repository",
+        ):
+            self.assertEqual(workflow.count(guard), 2)
+        self.assertEqual(workflow.count("ref: ${{ github.event.workflow_run.head_sha }}"), 2)
+        self.assertIn("group: release-main\n  cancel-in-progress: false", workflow)
+        self.assertLess(workflow.index("- name: Verify release version"),
+                        workflow.index("- name: Prepare persistent Android signing key"))
+
+    def test_release_version_checks_real_commit_ancestry_and_tag_identity(self):
+        repository = self.root / "repository"
+        git = shutil.which("git")
+        environment = self.env | {"PATH": os.environ["PATH"],
+                                  "GITHUB_ENV": str(self.root / "github.env")}
+
+        def run_git(*args):
+            result = subprocess.run([git, "-C", str(repository), *args],
+                                    env=environment, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+
+        repository.mkdir()
+        run_git("init", "--quiet", "--initial-branch=main")
+        run_git("config", "user.name", "Workflow Test")
+        run_git("config", "user.email", "workflow-test@example.invalid")
+        run_git("commit", "--quiet", "--allow-empty", "-m", "base")
+        base = run_git("rev-parse", "HEAD")
+        run_git("commit", "--quiet", "--allow-empty", "-m", "tested main")
+        head = run_git("rev-parse", "HEAD")
+        run_git("update-ref", "refs/remotes/origin/main", head)
+        (repository / "scripts").mkdir()
+        shutil.copy(ROOT / "scripts/check-version.sh", repository / "scripts/check-version.sh")
+        version = repository / "internal/buildinfo/VERSION"
+        version.parent.mkdir(parents=True)
+        version.write_text("0.1.39\n")
+
+        def verify(sha, accepted):
+            output = self.root / "github.env"
+            output.unlink(missing_ok=True)
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", self.release_script("Verify release version")],
+                cwd=repository, env=environment | {"PORTA_RELEASE_SHA": sha},
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode == 0, accepted,
+                             result.stdout + result.stderr)
+            if accepted:
+                self.assertIn("PORTA_RELEASE_TAG=v0.1.39\n", output.read_text())
+                self.assertIn("PORTA_ANDROID_VERSION_CODE=1039\n", output.read_text())
+            else:
+                self.assertFalse(output.exists())
+
+        verify(head, True)
+        verify(base, False)
+        run_git("update-ref", "refs/remotes/origin/main", base)
+        verify(head, False)
+        run_git("update-ref", "refs/remotes/origin/main", head)
+        run_git("tag", "-a", "v0.1.39", "-m", "matching release", head)
+        verify(head, True)
+        run_git("tag", "-d", "v0.1.39")
+        run_git("tag", "v0.1.39", base)
+        verify(head, False)
+
+    def deployment_bundle_script(self, path):
+        blocks = re.findall(
+            r"```(?:bash|sh)\n(.*?)\n```",
+            (ROOT / path).read_text(),
+            flags=re.DOTALL,
+        )
+        matches = [
+            block for block in blocks
+            if "porta-deploy.tar.gz" in block
+            and "release-signing-cert.der" in block
+            and "tar -xzf" in block
+        ]
+        self.assertEqual(len(matches), 1, path)
+        return matches[0]
+
+    def write_mock_command(self, name, script):
+        command = self.bin / name
+        command.unlink(missing_ok=True)
+        command.write_text("#!/bin/sh\nset -eu\n" + script)
+        command.chmod(0o755)
 
     def test_workflows_pin_actions_and_gradle_distribution(self):
         action_reference = re.compile(r"^[^@\s]+@[0-9a-f]{40}(?:\s+#\s+v\S+)?$")
@@ -852,6 +1095,466 @@ class AutomationTests(unittest.TestCase):
                 self.assertRegex(reference, action_reference, f"mutable action in {workflow}")
         wrapper = (ROOT / "android/gradle/wrapper/gradle-wrapper.properties").read_text()
         self.assertRegex(wrapper, r"(?m)^distributionSha256Sum=[0-9a-f]{64}$")
+
+    def test_client_builds_use_rust_without_go_tooling(self):
+        build_sources = "\n".join(
+            (ROOT / path).read_text()
+            for path in ("Makefile", ".github/workflows/ci.yml",
+                         ".github/workflows/release.yml", ".github/workflows/live.yml")
+        )
+        for obsolete in ("setup-go", "gomobile", "gobind"):
+            self.assertNotIn(obsolete, build_sources)
+        self.assertIsNone(re.search(r"(?<![A-Za-z])go (?:build|test|run)\b", build_sources))
+        go_sources = sorted(
+            path.relative_to(ROOT)
+            for directory in ("cmd", "internal", "mobile", "scripts", "experiments")
+            for path in (ROOT / directory).rglob("*.go")
+        )
+        self.assertEqual(go_sources, [])
+        for obsolete in (
+            "go.mod",
+            "go.sum",
+            "scripts/build-android-aar.sh",
+            "scripts/windows-up.ps1",
+            "scripts/windows-down.ps1",
+        ):
+            self.assertFalse((ROOT / obsolete).exists(), obsolete)
+
+    def test_android_workflows_do_not_request_removed_sdk_tools(self):
+        for filename in ("ci.yml", "release.yml", "live.yml"):
+            workflow = (ROOT / ".github/workflows" / filename).read_text()
+            self.assertRegex(
+                workflow,
+                r"uses: android-actions/setup-android@[0-9a-f]{40}[^\n]*\n"
+                r"        with:\n          packages: platform-tools\n",
+                filename,
+            )
+
+    def test_android_rust_build_tracks_patched_transport_sources(self):
+        gradle = (ROOT / "android/app/build.gradle.kts").read_text()
+        for path in (
+            "rust/porta-server/vendor/h3/Cargo.toml",
+            "rust/porta-server/vendor/h3/src",
+            "rust/porta-server/vendor/hyper/Cargo.toml",
+            "rust/porta-server/vendor/hyper/src",
+            "rust/porta-server/vendor/quinn-proto/Cargo.toml",
+            "rust/porta-server/vendor/quinn-proto/src",
+        ):
+            self.assertIn(path, gradle)
+        build = (ROOT / "scripts/build-android-rust.sh").read_text()
+        self.assertIn("max-page-size=16384", build)
+        self.assertIn("common-page-size=16384", build)
+        self.assertIn("llvm-readelf", build)
+        self.assertNotRegex(build, r"\bmapfile\b")
+
+        manifest = (ROOT / "android/app/src/main/AndroidManifest.xml").read_text()
+        self.assertIn("android.net.VpnService.SUPPORTS_ALWAYS_ON", manifest)
+        self.assertRegex(
+            manifest,
+            r'android:name="android\.net\.VpnService\.SUPPORTS_ALWAYS_ON"\s+'
+            r'android:value="false"',
+        )
+
+    def test_android_jni_entrypoints_are_not_obfuscated(self):
+        rules = (ROOT / "android/app/proguard-rules.pro").read_text()
+        for symbol in ("portamobile.Portamobile", "portamobile.ProofProvider",
+                       "portamobile.Protector", "native <methods>"):
+            self.assertIn(symbol, rules)
+
+    def test_android_certificate_fetch_policy_is_scoped(self):
+        namespace = "{http://schemas.android.com/apk/res/android}"
+        manifest = ET.parse(ROOT / "android/app/src/main/AndroidManifest.xml").getroot()
+        application = manifest.find("application")
+        self.assertEqual(application.get(namespace + "usesCleartextTraffic"), "false")
+        self.assertEqual(
+            application.get(namespace + "networkSecurityConfig"),
+            "@xml/network_security_config",
+        )
+        configuration = ET.parse(
+            ROOT / "android/app/src/main/res/xml/network_security_config.xml"
+        ).getroot()
+        base = configuration.find("base-config")
+        self.assertEqual(base.get("cleartextTrafficPermitted"), "false")
+        self.assertEqual(
+            [certificate.get("src") for certificate in base.findall("trust-anchors/certificates")],
+            ["system"],
+        )
+        domains = configuration.findall("domain-config")
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0].get("cleartextTrafficPermitted"), "true")
+        self.assertEqual(
+            [(domain.text, domain.get("includeSubdomains")) for domain in domains[0].findall("domain")],
+            [("c.lencr.org", "true")],
+        )
+        self.assertEqual(
+            [certificate.get("src") for certificate in configuration.findall(
+                "debug-overrides/trust-anchors/certificates"
+            )],
+            ["user"],
+        )
+        for manifest_path in (ROOT / "android/app/src/debug").rglob("AndroidManifest.xml"):
+            self.assertNotIn("networkSecurityConfig", manifest_path.read_text())
+
+        service = (ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt").read_text()
+        self.assertLess(
+            service.index("builder.addDisallowedApplication(packageName)"),
+            service.index("builder.establish()"),
+        )
+
+    def test_live_client_ci_is_credential_free_and_non_enrolling(self):
+        workflow = (ROOT / ".github/workflows/live.yml").read_text()
+        live = workflow[workflow.index("  live-windows:"):]
+        self.assertNotIn("secrets.", live)
+        self.assertIn("PORTA_TLS_TEST_URL: https://porta-dev.i-csu.org:8443", live)
+        self.assertIn("--test platform_tls", live)
+        self.assertIn("connectedDebugAndroidTest", live)
+        self.assertIn("disk-size: 2048M", live)
+        self.assertIn("/usr/share/dotnet", live)
+        self.assertIn("/usr/local/share/boost", live)
+        self.assertIn(
+            "android.testInstrumentationRunnerArguments.portaTlsOrigin="
+            "https://porta-dev.i-csu.org:8443",
+            live,
+        )
+        probe = (ROOT / "rust/porta-client/tests/platform_tls.rs").read_text()
+        self.assertIn("ci-live-probe-invalid-account", probe)
+        self.assertIn("HTTP 401", probe)
+        self.assertNotIn("NetworkManager", probe)
+        self.assertNotIn("Tun::open", probe)
+        self.assertEqual(workflow.count("github.ref == 'refs/heads/main'"), 3)
+
+    def test_full_vpn_ci_is_protected_isolated_and_credentialed(self):
+        workflow = (ROOT / ".github/workflows/live.yml").read_text()
+        workflow_settings = workflow[:workflow.index("jobs:")]
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name != 'schedule' && !inputs.vpn_e2e }}",
+            workflow_settings,
+        )
+        vpn = workflow[
+            workflow.index("  vpn-e2e-linux:"):workflow.index("  live-windows:")
+        ]
+        self.assertIn("environment: development", vpn)
+        self.assertIn("permissions:\n      contents: read", vpn)
+        self.assertIn("group: porta-development-vpn-e2e", vpn)
+        self.assertIn("cancel-in-progress: false", vpn)
+        self.assertIn("secrets.PORTA_E2E_TOKEN", vpn)
+        self.assertIn("secrets.PORTA_E2E_LINUX_IDENTITY_BASE64", vpn)
+        self.assertIn("./scripts/test-live-vpn.sh", vpn)
+        self.assertIn(
+            "PORTA_E2E_ARTIFACT_DIR: ${{ runner.temp }}/porta-vpn-e2e",
+            vpn[vpn.index("- name: Exercise the real VPN data path"):],
+        )
+        self.assertNotIn("pull_request", vpn)
+        before_exercise = vpn[:vpn.index("- name: Exercise the real VPN data path")]
+        self.assertNotIn("secrets.PORTA_E2E_", before_exercise)
+        harness = (ROOT / "scripts/test-live-vpn.sh").read_text()
+        for fragment in [
+            "ip netns add",
+            "type veth",
+            "masquerade",
+            "ip daddr \"$gateway\" drop",
+            "iptables -w -I FORWARD 1 -i \"$host_interface\" -j ACCEPT",
+            "--ctstate ESTABLISHED,RELATED -j ACCEPT",
+            "iptables -w -D FORWARD",
+            "--transport \"$transport\"",
+            "--identity \"$identity_path\"",
+            "connected address=.* transport=$transport",
+            "ip -4 route show proto 186",
+            "ip -4 route get \"$gateway\"",
+            "ping -n -c 3",
+            "interface_mtu=$(<\"/sys/class/net/$interface/mtu\")",
+            "df_payload=$((interface_mtu - 28))",
+            "ping -n -c 1 -W 5 -M do -s \"$df_payload\"",
+            "Porta-owned routes remain",
+            "Porta leak-protection table remains",
+            "private Porta gateway remains reachable",
+            "sudo -n test -d \"$work/artifacts\"",
+            "PORTA_E2E_ARTIFACT_DIR must not already exist",
+        ]:
+            self.assertIn(fragment, harness)
+        self.assertNotIn("--token", harness)
+        self.assertIn('install -o "$(id -u)" -g "$(id -g)" -m 0600', harness)
+        self.assertNotIn(
+            'chown -R "$(id -u):$(id -g)" "$artifact_directory"',
+            harness,
+        )
+
+    def test_windows_release_uses_native_msvc_package(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertRegex(workflow, r"(?ms)^  windows:\n.*?runs-on: windows-latest")
+        self.assertIn("--target x86_64-pc-windows-msvc", workflow)
+        self.assertIn("name: porta-windows-release", workflow)
+        self.assertIn("path: porta-client-windows-amd64.zip", workflow)
+        self.assertIn("actions/download-artifact@", workflow)
+        self.assertNotIn("WebView2Loader.dll", workflow)
+        package = (ROOT / "rust/porta-windows-package/src/lib.rs").read_text()
+        for name in ("porta.exe", "porta-cli.exe", "wintun.dll"):
+            self.assertIn(f'"{name}"', package)
+
+    def test_windows_ci_proves_native_wfp_acceptance_ran(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        network = (ROOT / "rust/porta-client/src/windows/network.rs").read_text()
+        self.assertIn('PORTA_WFP_NATIVE_TEST: "1"', workflow)
+        self.assertIn("PORTA_WFP_NATIVE_TEST_MARKER", workflow)
+        self.assertIn("native WFP rollback acceptance did not run", workflow)
+        self.assertIn('std::env::var("PORTA_WFP_NATIVE_TEST")', network)
+        self.assertIn('std::env::var_os("PORTA_WFP_NATIVE_TEST_MARKER")', network)
+        self.assertIn("native_wfp_transaction_rollback_accepts_generated_policy", network)
+        self.assertIn("FwpmTransactionAbort0", network)
+
+    def test_native_client_security_failures_remain_fail_closed(self):
+        windows_network = (
+            ROOT / "rust/porta-client/src/windows/network.rs"
+        ).read_text()
+        helper = windows_network.split("let mut command = Command::new(powershell);", 1)[1]
+        self.assertLess(helper.index(".env_clear()"), helper.index('.env("SystemRoot"'))
+
+        android_service = (
+            ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt"
+        ).read_text()
+        permanent_failure = android_service.split(
+            "} catch (error: PermanentTunnelException) {", 1
+        )[1].split("} catch (error: Exception) {", 1)[0]
+        self.assertIn("retainVpn = descriptor.get() != null", permanent_failure)
+        self.assertIn(
+            "if (!retainVpn || !holdVpnAfterTerminalFailure(runGeneration, finalStatus))",
+            android_service,
+        )
+        blocked = android_service.split(
+            "private fun holdVpnAfterTerminalFailure", 1
+        )[1].split("private fun finishTunnel", 1)[0]
+        self.assertIn("failClosed.set(true)", blocked)
+        self.assertIn("outboundPackets.clear()", blocked)
+
+        android_ui = (
+            ROOT / "android/app/src/main/java/dev/porta/android/MainActivity.kt"
+        ).read_text()
+        self.assertIn(
+            'value.startsWith("Waiting") || value.startsWith("Connection blocked")',
+            android_ui,
+        )
+        client_docs = "\n".join(
+            (ROOT / path).read_text() for path in ("README.md", "docs/clients.md")
+        )
+        self.assertNotRegex(client_docs, r"sudo\s+PORTA_TOKEN=")
+        self.assertIn("--preserve-env=PORTA_TOKEN", client_docs)
+
+    def test_native_client_ui_is_bilingual_and_traffic_updates_are_incremental(self):
+        frontend = ROOT / "rust/porta-windows/frontend"
+        html = (frontend / "index.html").read_text()
+        javascript = (frontend / "app.js").read_text()
+        css = (frontend / "app.css").read_text()
+        desktop = (ROOT / "rust/porta-windows/src/desktop.rs").read_text()
+        tauri = json.loads((ROOT / "rust/porta-windows/tauri.conf.json").read_text())
+
+        self.assertIn('id="language-action"', html)
+        self.assertIn('data-i18n="connectionLog"', html)
+        self.assertNotIn('id="primary-connect"', html)
+        self.assertNotIn('id="profile-transport"', html)
+        self.assertNotIn("OpenLogFolder", javascript)
+        self.assertIn('"zh-CN": {', javascript)
+        self.assertIn('listen("porta:traffic"', javascript)
+        self.assertIn("function profileSignature()", javascript)
+        self.assertIn("if (canvas.width !== pixelWidth || canvas.height !== pixelHeight)", javascript)
+        self.assertNotIn("open_log_folder", desktop)
+        traffic_handler = javascript.split("function applyTraffic", 1)[1].split(
+            "function renderTraffic", 1
+        )[0]
+        self.assertNotIn("renderProfiles", traffic_handler)
+        self.assertIn("contain: content", css)
+
+        progress = desktop.split("Event::Progress {", 1)[1].split(
+            "Event::Reconnecting", 1
+        )[0]
+        self.assertIn("traffic = Some(traffic_from(&state))", progress)
+        lightweight_publish = desktop.split("if let Some(traffic) = traffic", 1)[1].split(
+            "if let Some(line) = activity", 1
+        )[0]
+        self.assertIn('app.emit("porta:traffic", traffic)', lightweight_publish)
+        self.assertIn("return;", lightweight_publish)
+
+        window = tauri["app"]["windows"][0]
+        self.assertTrue(window["resizable"])
+        self.assertGreaterEqual(window["width"], 480)
+        self.assertGreaterEqual(window["height"], 680)
+
+        def dictionary_keys(block):
+            matches = re.findall(
+                r'^\s+(?:"([^"]+)"|([A-Za-z][A-Za-z0-9]*)):',
+                block,
+                flags=re.MULTILINE,
+            )
+            return {quoted or bare for quoted, bare in matches}
+
+        english_dictionary = javascript.split("en: {", 1)[1].split(
+            '\n  },\n  "zh-CN"',
+            1,
+        )[0]
+        chinese_dictionary = javascript.split('"zh-CN": {', 1)[1].split(
+            "\n  },\n};",
+            1,
+        )[0]
+        english_keys = dictionary_keys(english_dictionary)
+        chinese_keys = dictionary_keys(chinese_dictionary)
+        self.assertSetEqual(english_keys, chinese_keys)
+        static_keys = set(re.findall(
+            r'data-i18n(?:-placeholder|-aria-label|-title)?="([^"]+)"',
+            html,
+        ))
+        self.assertTrue(static_keys <= english_keys)
+
+        english = ET.parse(
+            ROOT / "android/app/src/main/res/values/strings.xml"
+        ).getroot()
+        chinese = ET.parse(
+            ROOT / "android/app/src/main/res/values-zh-rCN/strings.xml"
+        ).getroot()
+        english_names = {element.attrib["name"] for element in english.findall("string")}
+        chinese_names = {element.attrib["name"] for element in chinese.findall("string")}
+        self.assertSetEqual(english_names, chinese_names)
+
+        manifest = ET.parse(ROOT / "android/app/src/main/AndroidManifest.xml").getroot()
+        android_namespace = "{http://schemas.android.com/apk/res/android}"
+        application = manifest.find("application")
+        self.assertEqual(
+            application.attrib[android_namespace + "localeConfig"],
+            "@xml/locales_config",
+        )
+        android_service = (
+            ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt"
+        ).read_text()
+        self.assertIn(".setContentText(localizedNotificationText(text))", android_service)
+        self.assertIn("R.string.notification_disconnect", android_service)
+        android_activity = (
+            ROOT / "android/app/src/main/java/dev/porta/android/MainActivity.kt"
+        ).read_text()
+        self.assertIn("R.string.reconnecting_secure_tunnel", android_activity)
+
+    def test_benchmark_defaults_to_allowed_cpu_affinity(self):
+        benchmark = (ROOT / "experiments/server-benchmark/run.sh").read_text()
+        self.assertIn('Cpus_allowed_list:', benchmark)
+        self.assertNotIn('PORTA_SERVER_BENCH_SERVER_CPUS:-"0,1"', benchmark)
+        self.assertNotIn('PORTA_SERVER_BENCH_CLIENT_CPUS:-"2,3"', benchmark)
+
+    def test_wintun_checksum_is_consistent(self):
+        expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+        makefile = (ROOT / "Makefile").read_text().lower()
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text().lower()
+        self.assertIn(f"wintun_sha256 := {expected}", makefile)
+        self.assertIn(expected, workflow)
+        dll_expected = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+        tunnel = (ROOT / "rust/porta-client/src/windows/tun.rs").read_text().lower()
+        self.assertIn(dll_expected, tunnel)
+
+    def test_release_manifest_uses_pinned_signing_certificate(self):
+        expected = (ROOT / "android/signing-certificate.sha256").read_text().strip()
+        deploy = (ROOT / "scripts/deploy.sh").read_text().lower()
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn(f"release_signing_fingerprint={expected}", deploy)
+        self.assertIn("SignReleaseManifest.java", workflow)
+        self.assertIn("SHA256SUMS.sig", workflow)
+
+    def test_documented_release_verification_blocks_extraction_on_failure(self):
+        self.write_mock_command(
+            "gh",
+            """
+if [ "${1:-} ${2:-}" = "release download" ]; then
+    : > porta-deploy.tar.gz
+    : > SHA256SUMS.sig
+    : > release-signing-cert.der
+    printf 'fixture  porta-deploy.tar.gz\\n' > SHA256SUMS
+elif [ "${1:-} ${2:-}" = "auth token" ]; then
+    printf 'test-token\\n'
+else
+    exit 1
+fi
+""",
+        )
+        self.write_mock_command(
+            "openssl",
+            """
+case "$*" in
+    *" -fingerprint "*)
+        if [ "${FAIL_STAGE:-}" = certificate ]; then
+            printf 'sha256 Fingerprint=%s\\n' \
+                0000000000000000000000000000000000000000000000000000000000000000
+        else
+            printf 'sha256 Fingerprint=%s\\n' "$EXPECTED_FINGERPRINT"
+        fi
+        ;;
+    *" -pubkey "*)
+        printf '%s\\n' test-public-key
+        ;;
+    "dgst "*)
+        [ "${FAIL_STAGE:-}" != signature ]
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+""",
+        )
+        self.write_mock_command(
+            "sha256sum",
+            """
+cat >/dev/null
+[ "${FAIL_STAGE:-}" != checksum ]
+""",
+        )
+        self.write_mock_command(
+            "tar",
+            """
+: > "$EXTRACTED_MARKER"
+mkdir porta
+""",
+        )
+
+        for path in ("README.md", "docs/deployment.md"):
+            script = self.deployment_bundle_script(path)
+            expected = re.search(r"expected=([0-9a-f]{64})", script)
+            self.assertIsNotNone(expected, path)
+            for failure in ("certificate", "signature", "checksum", ""):
+                with self.subTest(path=path, failure=failure or "none"):
+                    directory = self.root / f"{Path(path).stem}-{failure or 'ok'}"
+                    directory.mkdir()
+                    marker = directory / "extracted"
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=directory,
+                        env=self.env | {
+                            "EXPECTED_FINGERPRINT": expected.group(1),
+                            "EXTRACTED_MARKER": str(marker),
+                            "FAIL_STAGE": failure,
+                        },
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if failure:
+                        self.assertNotEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+                        self.assertFalse(marker.exists())
+                    else:
+                        self.assertEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+                        self.assertTrue(marker.is_file())
+
+    def test_rust_release_uses_compatible_glibc_baseline_and_guard(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("runs-on: ubuntu-22.04", workflow)
+        guard = re.search(r"grep -Eq '([^']*GLIBC[^']*)'", workflow)
+        self.assertIsNotNone(guard)
+        pattern = guard.group(1)
+        for version, accepted in (("2.35", True), ("2.36", False), ("2.40", False)):
+            result = subprocess.run(
+                ["grep", "-Eq", pattern],
+                input=f"GLIBC_{version}\n",
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode == 1, accepted, version)
 
     def signing_environment(self):
         return self.env | {
@@ -936,7 +1639,8 @@ class AutomationTests(unittest.TestCase):
         result = subprocess.run(
             ["bash", "-euo", "pipefail", "-c", self.release_script("Publish GitHub release")],
             cwd=self.root,
-            env=self.env | {"GITHUB_REF_NAME": "v0.1.4"},
+            env=self.env | {"GITHUB_REF_NAME": "main", "PORTA_RELEASE_TAG": "v0.1.4",
+                            "PORTA_RELEASE_SHA": "a" * 40},
             text=True, capture_output=True, timeout=10,
         )
         if success:
@@ -954,6 +1658,8 @@ class AutomationTests(unittest.TestCase):
         self.publish_release()
         self.assertFalse(self.state()["release_draft"])
         self.assertTrue(self.state()["assets_uploaded"])
+        self.assertIn(["git", "tag", "v0.1.4", "a" * 40], self.commands())
+        self.assertIn(["git", "push", "origin", "refs/tags/v0.1.4"], self.commands())
 
     def test_published_release_is_not_overwritten_on_rerun(self):
         self.update_state(release_draft=False)

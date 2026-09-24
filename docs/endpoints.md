@@ -25,9 +25,10 @@
   native clients. A group declares two through four lanes.
   Every lane carries an independent signed native-device proof; requests
   without valid lane metadata or a supported protocol version are rejected.
-- Standard HTTP `CONNECT` requests form the authenticated HTTPS forward proxy.
-  The Basic-auth username is ignored and the password is a client token. All
-  forward-proxy requests for an account use the logical device ID
+- Standard HTTP `CONNECT` requests over HTTP/1.1 or HTTP/2 form the
+  authenticated HTTPS forward proxy. HTTP/3 is reserved for native MASQUE
+  CONNECT-IP. The Basic-auth username is ignored and the password is a client
+  token. All forward-proxy requests for an account use the logical device ID
   `forward-proxy`.
 
 A token identifies a client account. Native requests additionally send:
@@ -49,14 +50,18 @@ nonce. The nonce cache is intentionally in-memory; a restart forgets it, so TLS
 and the short timestamp window remain part of replay protection. Forward-proxy
 requests do not use this protocol.
 
-Porta sends optional `X-Porta-DNS` and `X-Porta-MTU` response extensions because
-RFC 9484 does not define DNS or link-MTU configuration.
+Porta sends optional `X-Porta-Gateway`, `X-Porta-DNS` and `X-Porta-MTU` response
+extensions because RFC 9484 does not define that interface configuration. The
+authenticated gateway address also identifies the source of client-local ICMP
+MTU feedback; it is not inferred from an unrelated public endpoint address.
 
 HTTP/3 clients additionally request the optional
 `X-Porta-MTU-Discovery: 1` capability. Server-side `--auto-mtu` is enabled by
 default. When both peers support Datagrams, a nonce in the response header enables
 bounded datagram-only probes and reliable MTU selection before address
-assignment. No offer means the ordinary fixed MTU. See the
+assignment. The agreed value is the interface ceiling; live HTTP/3 datagram
+packet budgets can decrease without changing this agreement or wire version.
+No offer means a fixed interface MTU, not a fixed QUIC payload capacity. See the
 [MTU extension](architecture.md#stable-per-connection-mtu-selection) for
 message formats, bounds, and transport exclusions.
 
