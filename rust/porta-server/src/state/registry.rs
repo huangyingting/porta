@@ -973,6 +973,12 @@ impl ClientRegistry {
         Ok(summary)
     }
 
+    /// DNS names of every device relative to the resolver zone,
+    /// `device.account`, by account and device ID.
+    pub fn dns_names(&self) -> HashMap<(String, String), String> {
+        dns_labels(&self.inner.state.lock().clients)
+    }
+
     /// Every subnet routed to a device, with its owner.
     pub fn routed_subnets(&self) -> Vec<RoutedSubnet> {
         let state = self.inner.state.lock();
@@ -2110,6 +2116,70 @@ fn summarize_client(
 /// full-size packet per second in each direction.
 pub const MIN_RATE_LIMIT_KBPS: u32 = 64;
 
+/// A DNS label for a display name: lower-case letters, digits and single
+/// hyphens.
+fn dns_label(name: &str, fallback: &str) -> String {
+    let mut label = String::new();
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            label.push(character.to_ascii_lowercase());
+        } else if !label.is_empty() && !label.ends_with('-') {
+            label.push('-');
+        }
+        if label.len() >= 40 {
+            break;
+        }
+    }
+    let label = label.trim_end_matches('-');
+    if label.is_empty() {
+        fallback.to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+/// Unique `device.account` names. Duplicate labels get a short suffix
+/// derived from the immutable ID, older accounts keeping the plain label.
+fn dns_labels(clients: &[ClientRecord]) -> HashMap<(String, String), String> {
+    let mut ordered = clients.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| (left.created_at, &left.id).cmp(&(right.created_at, &right.id)));
+    let mut used = HashSet::new();
+    let mut names = HashMap::new();
+    for client in ordered {
+        let mut account = dns_label(&client.name, "client");
+        if !used.insert(account.clone()) {
+            account = format!("{account}-{}", &client.id[..4.min(client.id.len())]);
+            used.insert(account.clone());
+        }
+        let devices = client
+            .devices
+            .iter()
+            .filter(|device| device.id != FORWARD_PROXY_DEVICE_ID)
+            .collect::<Vec<_>>();
+        for device in &devices {
+            let base = dns_label(&device.name, "device");
+            let duplicate = devices
+                .iter()
+                .filter(|other| dns_label(&other.name, "device") == base)
+                .count()
+                > 1;
+            let label = if duplicate {
+                format!(
+                    "{base}-{}",
+                    &hex::encode(Sha256::digest(device.id.as_bytes()))[..4]
+                )
+            } else {
+                base
+            };
+            names.insert(
+                (client.id.clone(), device.id.clone()),
+                format!("{label}.{account}"),
+            );
+        }
+    }
+    names
+}
+
 fn prefixes_overlap(left: &Ipv4Net, right: &Ipv4Net) -> bool {
     left.contains(&right.network()) || right.contains(&left.network())
 }
@@ -2858,6 +2928,55 @@ mod tests {
                 "/v1/tunnel",
             )
             .await
+    }
+
+    #[test]
+    fn dns_labels_are_sanitized_and_unique() {
+        assert_eq!(
+            dns_label("Alice's MacBook Pro", "device"),
+            "alice-s-macbook-pro"
+        );
+        assert_eq!(dns_label("  ***  ", "device"), "device");
+        let at = OffsetDateTime::now_utc();
+        let client = |id: &str, name: &str, created_at, devices: Vec<DeviceRecord>| ClientRecord {
+            id: id.into(),
+            name: name.into(),
+            token_hash: String::new(),
+            max_devices: 5,
+            enabled: true,
+            created_at,
+            devices,
+            limits: AccountLimits::default(),
+            usage_period: None,
+            enrollment: EnrollmentPolicy::Open,
+            enrollment_open_until: None,
+            access: AccessPolicy::default(),
+        };
+        let mut phone = test_device("Phone", at);
+        phone.id = "d-phone".into();
+        let mut second_phone = test_device("phone", at);
+        second_phone.id = "d-other-phone".into();
+        let clients = vec![
+            client(
+                "bbbb000000000000",
+                "Team",
+                at + Duration::from_secs(60),
+                vec![test_device("Laptop", at)],
+            ),
+            client("aaaa000000000000", "Team", at, vec![phone, second_phone]),
+        ];
+        let names = dns_labels(&clients);
+        let name =
+            |account: &str, device: &str| names[&(account.to_owned(), device.to_owned())].clone();
+        // The older account keeps the plain label; duplicate devices get suffixes.
+        assert!(name("bbbb000000000000", &clients[0].devices[0].id).ends_with(".team-bbbb"));
+        let first = name("aaaa000000000000", "d-phone");
+        let second = name("aaaa000000000000", "d-other-phone");
+        assert!(
+            first.starts_with("phone-") && first.ends_with(".team"),
+            "{first}"
+        );
+        assert_ne!(first, second);
     }
 
     #[tokio::test]

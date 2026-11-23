@@ -305,6 +305,35 @@ limit on the next hop's account, or an unreachable next hop. Monitor
 Avoid loops: a chain that eventually points back to an earlier hop forwards
 packets until their TTL expires.
 
+## Built-in DNS resolver
+
+`--dns-resolver` (`deploy.sh --dns-resolver`) serves DNS on the gateway's
+tunnel address, `10.66.0.1` by default, and advertises it to clients instead
+of `--dns`:
+
+- Every connected device gets a name, `device.account.porta.internal`, built
+  from its device and account names (duplicates get a short suffix). The
+  admin page shows each device's name. A client resolves only the devices it
+  may reach (same account, shared access group, or `--client-to-client`, and
+  both access policies); other names do not exist for it. Reverse lookups of
+  client addresses return these names.
+- Other names are forwarded to `--dns-upstream` resolvers
+  (`deploy.sh --dns-upstreams 9.9.9.9,149.112.112.112`), by default the
+  host's `/etc/resolv.conf` servers. `--dns-forward corp.example=10.20.0.53`
+  sends a domain and its subdomains to another resolver, for example an
+  internal zone reached through a subnet router.
+- `--dns-blocklist FILE` refuses listed domains and their subdomains with
+  NXDOMAIN. The file holds one domain per line or uses hosts-file format, and
+  is reloaded within a minute of changing. `deploy.sh` installs it as
+  `/etc/porta/dns-blocklist.txt`, which you can then edit in place.
+
+Split tunnels add `porta.internal` to their DNS domains automatically. The
+resolver answers only live clients and the gateway host: `server-up.sh` drops
+traffic to the gateway's tunnel address from any other interface. On a
+cascade relay, forwarded queries leave from the relay itself, not through the
+exit; point `--dns-upstream` at a resolver you trust there. The daemon needs
+`CAP_NET_BIND_SERVICE` for port 53, which `deploy.sh` grants.
+
 ## Exit selection
 
 A gateway can offer several exits and let each account choose one in its

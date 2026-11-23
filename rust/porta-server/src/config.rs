@@ -58,6 +58,24 @@ pub struct Config {
     /// (repeatable). Other names keep using the device's resolver.
     #[arg(long = "dns-domain", value_name = "DOMAIN")]
     pub dns_domains: Vec<String>,
+    /// Serve DNS on the gateway's tunnel address and advertise it instead of
+    /// --dns: device names under porta.internal, optional blocklists, and
+    /// forwarding to --dns-upstream.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    pub dns_resolver: bool,
+    /// Resolver the built-in resolver forwards to, as IP or IP:PORT
+    /// (repeatable). Defaults to the host's /etc/resolv.conf servers.
+    #[arg(long = "dns-upstream", value_name = "ADDRESS")]
+    pub dns_upstreams: Vec<String>,
+    /// Sends queries for DOMAIN and its subdomains to another resolver, as
+    /// DOMAIN=IP or DOMAIN=IP:PORT (repeatable), for example an internal
+    /// zone behind the gateway.
+    #[arg(long = "dns-forward", value_name = "DOMAIN=ADDRESS")]
+    pub dns_forwards: Vec<String>,
+    /// File of domains the built-in resolver refuses (NXDOMAIN), one per line
+    /// or in hosts-file format; subdomains are refused too.
+    #[arg(long, value_parser = parse_path)]
+    pub dns_blocklist: Option<PathBuf>,
     /// Let every client reach every other client's devices and subnets.
     /// Without it, only devices of one account or of accounts that share an
     /// access group reach each other.
@@ -323,6 +341,7 @@ impl Config {
         if self.readiness_timeout.is_zero() {
             bail!("--readiness-timeout must be positive");
         }
+        self.validate_resolver()?;
         if !self.dns.is_empty() {
             let dns = self.dns.parse::<Ipv4Addr>().context(
                 "advertised DNS must be a unicast IPv4 address, not loopback or link-local",
@@ -385,6 +404,99 @@ impl Config {
         }
         self.validate_upstream()?;
         self.validate_routing()?;
+        Ok(())
+    }
+
+    /// The gateway's address on the client pool.
+    pub fn gateway_address(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.pool.network()) + 1)
+    }
+
+    /// Upstream resolvers of the built-in resolver.
+    pub fn resolver_upstreams(&self) -> Result<Vec<SocketAddr>> {
+        let mut upstreams = Vec::new();
+        for value in &self.dns_upstreams {
+            let address = value
+                .parse::<SocketAddr>()
+                .or_else(|_| value.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+                .with_context(|| {
+                    format!("--dns-upstream {value:?} must be an IP address or IP:PORT")
+                })?;
+            upstreams.push(address);
+        }
+        if upstreams.is_empty() {
+            upstreams = std::fs::read_to_string("/etc/resolv.conf")
+                .map(|text| system_nameservers(&text))
+                .unwrap_or_default();
+        }
+        let gateway = IpAddr::V4(self.gateway_address());
+        upstreams.retain(|address| address.ip() != gateway);
+        if upstreams.is_empty() {
+            upstreams.push(SocketAddr::from(([1, 1, 1, 1], 53)));
+        }
+        Ok(upstreams)
+    }
+
+    /// Conditional forwarding of the built-in resolver, by domain.
+    pub fn resolver_forwards(&self) -> Result<Vec<(String, SocketAddr)>> {
+        self.dns_forwards
+            .iter()
+            .map(|spec| {
+                let (domain, address) = spec
+                    .split_once('=')
+                    .context("--dns-forward must be DOMAIN=ADDRESS")?;
+                let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+                let valid = !domain.is_empty()
+                    && domain.len() <= 253
+                    && domain.split('.').all(|label| {
+                        !label.is_empty()
+                            && label.len() <= 63
+                            && label.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                            })
+                    });
+                if !valid {
+                    bail!("--dns-forward domain {domain:?} is invalid");
+                }
+                let address = address
+                    .parse::<SocketAddr>()
+                    .or_else(|_| address.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+                    .with_context(|| {
+                        format!("--dns-forward {spec:?} needs an IP address or IP:PORT")
+                    })?;
+                Ok((domain, address))
+            })
+            .collect()
+    }
+
+    fn validate_resolver(&mut self) -> Result<()> {
+        if !self.dns_resolver {
+            if !self.dns_upstreams.is_empty()
+                || self.dns_blocklist.is_some()
+                || !self.dns_forwards.is_empty()
+            {
+                bail!("--dns-upstream, --dns-forward and --dns-blocklist require --dns-resolver");
+            }
+            return Ok(());
+        }
+        self.resolver_upstreams()?;
+        self.resolver_forwards()?;
+        if let Some(path) = &self.dns_blocklist {
+            if !path.is_absolute() {
+                bail!("--dns-blocklist must be an absolute path");
+            }
+        }
+        // Clients use the built-in resolver; split tunnels resolve device
+        // names through it too.
+        self.dns = self.gateway_address().to_string();
+        if !self.routes.is_empty()
+            && !self
+                .dns_domains
+                .iter()
+                .any(|domain| domain == crate::dns::ZONE)
+        {
+            self.dns_domains.push(crate::dns::ZONE.to_owned());
+        }
         Ok(())
     }
 
@@ -656,6 +768,15 @@ fn normalize_domain(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// IPv4 and IPv6 `nameserver` entries of a resolv.conf.
+fn system_nameservers(text: &str) -> Vec<SocketAddr> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .filter_map(|value| value.trim().split('%').next()?.parse::<IpAddr>().ok())
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect()
+}
+
 fn normalize_https_origin(value: &str) -> Result<String> {
     let uri = value.trim().parse::<http::Uri>()?;
     let authority = uri
@@ -903,6 +1024,51 @@ mod tests {
         assert_eq!(
             config.upstream_identity,
             Some(PathBuf::from("/var/lib/porta/upstream-identity.json"))
+        );
+    }
+
+    #[test]
+    fn the_resolver_replaces_the_advertised_dns_and_joins_split_domains() {
+        let config = relay_config(
+            &[
+                "--dns-resolver",
+                "--dns-upstream",
+                "9.9.9.9",
+                "--dns-forward",
+                "Corp.Example.=10.20.0.53:5353",
+                "--route",
+                "10.20.0.0/16",
+            ],
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.dns, "10.66.0.1");
+        assert_eq!(config.dns_domains, vec!["porta.internal"]);
+        assert_eq!(
+            config.resolver_upstreams().unwrap(),
+            vec!["9.9.9.9:53".parse().unwrap()]
+        );
+        assert_eq!(
+            config.resolver_forwards().unwrap(),
+            vec![(
+                "corp.example".to_owned(),
+                "10.20.0.53:5353".parse().unwrap()
+            )]
+        );
+        for arguments in [
+            vec!["--dns-upstream", "9.9.9.9"],
+            vec!["--dns-resolver", "--dns-upstream", "resolver"],
+            vec!["--dns-resolver", "--dns-forward", "corp.example"],
+            vec!["--dns-resolver", "--dns-blocklist", "relative.txt"],
+        ] {
+            assert!(relay_config(&arguments, "").is_err(), "{arguments:?}");
+        }
+        assert_eq!(
+            system_nameservers("nameserver 127.0.0.53\n# x\nnameserver fe80::1%eth0\n"),
+            vec![
+                "127.0.0.53:53".parse::<SocketAddr>().unwrap(),
+                "[fe80::1]:53".parse().unwrap()
+            ]
         );
     }
 

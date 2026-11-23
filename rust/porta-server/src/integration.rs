@@ -210,6 +210,18 @@ pub fn network_policy(
     }
 }
 
+/// Current device names for the resolver.
+pub trait NameSource: Send + Sync {
+    /// Names relative to the resolver zone, by account and device ID.
+    fn names(&self) -> HashMap<(String, String), String>;
+}
+
+impl NameSource for StateRegistry {
+    fn names(&self) -> HashMap<(String, String), String> {
+        self.dns_names()
+    }
+}
+
 struct RegistrySessionCleanup {
     guard: Mutex<Option<SessionGuard>>,
 }
@@ -392,11 +404,12 @@ impl WebRegistryAdapter {
 
     fn summary(&self, id: &str) -> Result<WebClientSummary, WebRegistryError> {
         let snapshot = self.usage.snapshot();
+        let names = self.registry.dns_names();
         self.registry
             .list_with_usage(&snapshot)
             .into_iter()
             .find(|client| client.id == id)
-            .map(web_client_summary)
+            .map(|summary| web_client_summary(summary, &names))
             .ok_or(WebRegistryError::NotFound)
     }
 }
@@ -511,11 +524,12 @@ pub fn usage_month(now: time::OffsetDateTime) -> String {
 impl WebRegistry for WebRegistryAdapter {
     fn list_clients(&self) -> Result<Vec<WebClientSummary>, WebRegistryError> {
         let snapshot = self.usage.snapshot();
+        let names = self.registry.dns_names();
         Ok(self
             .registry
             .list_with_usage(&snapshot)
             .into_iter()
-            .map(web_client_summary)
+            .map(|summary| web_client_summary(summary, &names))
             .collect())
     }
 
@@ -528,10 +542,10 @@ impl WebRegistry for WebRegistryAdapter {
         let name = name.to_owned();
         Box::pin(async move {
             join_web_mutation(tokio::spawn(async move {
-                registry
-                    .create(name, max_devices)
-                    .await
-                    .map(|(summary, token)| (web_client_summary(summary), token))
+                let created = registry.create(name, max_devices).await;
+                let names = registry.dns_names();
+                created
+                    .map(|(summary, token)| (web_client_summary(summary, &names), token))
                     .map_err(web_registry_error)
             }))
             .await
@@ -550,10 +564,10 @@ impl WebRegistry for WebRegistryAdapter {
         let name = name.to_owned();
         Box::pin(async move {
             join_web_mutation(tokio::spawn(async move {
-                registry
-                    .update(&id, name, max_devices, enabled)
-                    .await
-                    .map(web_client_summary)
+                let updated = registry.update(&id, name, max_devices, enabled).await;
+                let names = registry.dns_names();
+                updated
+                    .map(|summary| web_client_summary(summary, &names))
                     .map_err(web_registry_error)
             }))
             .await
@@ -878,7 +892,11 @@ fn parse_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, WebRegistryE
         .collect()
 }
 
-fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClientSummary {
+fn web_client_summary(
+    summary: crate::state::registry::ClientSummary,
+    names: &HashMap<(String, String), String>,
+) -> WebClientSummary {
+    let account_id = summary.id.clone();
     WebClientSummary {
         id: summary.id,
         name: summary.name,
@@ -922,6 +940,10 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
             .devices
             .into_iter()
             .map(|device| WebDeviceSummary {
+                dns_name: names
+                    .get(&(account_id.clone(), device.id.clone()))
+                    .map(|name| format!("{name}.{}", crate::dns::ZONE))
+                    .unwrap_or_default(),
                 id: device.id,
                 name: device.name,
                 first_seen: format_time(device.first_seen),
@@ -1068,10 +1090,19 @@ pub struct SwitchConfig {
     pub always_reachable: Vec<Ipv4Addr>,
     /// Policy routing for accounts that select an exit.
     pub exits: Option<Arc<ExitRules>>,
+    /// Device names for the built-in resolver.
+    pub names: Option<Arc<dyn NameSource>>,
+}
+
+impl std::fmt::Debug for dyn NameSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NameSource")
+    }
 }
 
 struct RouteContext {
     account_id: String,
+    device_id: String,
     network: NetworkPolicy,
 }
 
@@ -1115,6 +1146,26 @@ impl RouterAdapter {
         })
     }
 
+    /// Whether two sessions' devices may exchange traffic.
+    fn peers(&self, sender: &RouteContext, receiver: &RouteContext) -> bool {
+        self.switching.client_to_client
+            || sender.account_id == receiver.account_id
+            || (sender.network.group.is_some() && sender.network.group == receiver.network.group)
+    }
+
+    /// Whether `querier` may learn about the device at `address`.
+    fn visible(
+        &self,
+        querier: Ipv4Addr,
+        asker: &RouteContext,
+        address: Ipv4Addr,
+        target: &RouteContext,
+    ) -> bool {
+        self.peers(asker, target)
+            && asker.network.permits(address)
+            && target.network.permits(querier)
+    }
+
     /// Applies source validation, access policy and client-to-client rules
     /// to a packet from the session at `lease`.
     fn classify(&self, lease: Ipv4Addr, packet: &[u8]) -> Result<Verdict, RouterError> {
@@ -1137,11 +1188,7 @@ impl RouterAdapter {
             let receiver = contexts.get(&target);
             let peers = self.switching.client_to_client
                 || match (sender, receiver) {
-                    (Some(sender), Some(receiver)) => {
-                        sender.account_id == receiver.account_id
-                            || (sender.network.group.is_some()
-                                && sender.network.group == receiver.network.group)
-                    }
+                    (Some(sender), Some(receiver)) => self.peers(sender, receiver),
                     _ => false,
                 };
             let permitted = sender.is_none_or(|sender| sender.network.permits(destination))
@@ -1320,6 +1367,7 @@ impl PacketRouter for RouterAdapter {
             uplink.write().insert(address, limiter.clone());
             let context = Arc::new(RouteContext {
                 account_id: request.account_id,
+                device_id: request.device_id,
                 network: request.network,
             });
             contexts.write().insert(address, context.clone());
@@ -1390,6 +1438,40 @@ impl PacketRouter for RouterAdapter {
                 .await
                 .map_err(map_route_error)
         })
+    }
+}
+
+impl crate::dns::Directory for RouterAdapter {
+    fn is_client(&self, address: Ipv4Addr) -> bool {
+        self.contexts.read().contains_key(&address)
+    }
+
+    fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<Ipv4Addr> {
+        let names = self.switching.names.as_ref()?.names();
+        let contexts = self.contexts.read();
+        let asker = contexts.get(&querier)?;
+        contexts
+            .iter()
+            .filter(|(_, target)| {
+                names
+                    .get(&(target.account_id.clone(), target.device_id.clone()))
+                    .is_some_and(|candidate| candidate == name)
+            })
+            .find(|(address, target)| self.visible(querier, asker, **address, target))
+            .map(|(address, _)| *address)
+    }
+
+    fn reverse(&self, querier: Ipv4Addr, address: Ipv4Addr) -> Option<String> {
+        let names = self.switching.names.as_ref()?.names();
+        let contexts = self.contexts.read();
+        let asker = contexts.get(&querier)?;
+        let target = contexts.get(&address)?;
+        if !self.visible(querier, asker, address, target) {
+            return None;
+        }
+        names
+            .get(&(target.account_id.clone(), target.device_id.clone()))
+            .cloned()
     }
 }
 
@@ -1617,6 +1699,7 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                device_id: "device".into(),
                 network: Default::default(),
             })
             .await;
@@ -1628,6 +1711,7 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                device_id: "device".into(),
                 network: Default::default(),
             })
             .await
@@ -1658,6 +1742,7 @@ mod tests {
     fn context(account_id: &str, network: NetworkPolicy) -> Arc<RouteContext> {
         Arc::new(RouteContext {
             account_id: account_id.into(),
+            device_id: format!("{account_id}-device"),
             network,
         })
     }
@@ -1682,6 +1767,7 @@ mod tests {
                     client_to_client,
                     always_reachable: vec![gateway],
                     exits: None,
+                    names: None,
                 },
             );
             (router, adapter)
@@ -1828,6 +1914,7 @@ mod tests {
                         kind: RouteKind::ConnectIp,
                         parent: CancellationToken::new(),
                         account_id: "account".into(),
+                        device_id: "device".into(),
                         network: NetworkPolicy::default(),
                     })
                     .await
@@ -2092,6 +2179,7 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                device_id: "device".into(),
                 network: Default::default(),
             })
             .await

@@ -230,6 +230,12 @@ EOF
     type filter hook forward priority -10; policy accept;
     iifname "$tun_interface" ip daddr { 169.254.0.0/16, 100.100.100.200 } drop
   }
+  # Services on the gateway's tunnel address, such as the built-in DNS
+  # resolver, serve clients only, never other networks.
+  chain gateway_guard {
+    type filter hook input priority -5; policy accept;
+    iifname != { "lo", "$tun_interface" } ip daddr ${gateway_cidr%/*} drop
+  }
 EOF
   if ! $client_host_access; then
     # Clients may ping the gateway and use a resolver on it; other host

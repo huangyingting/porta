@@ -25,6 +25,7 @@ make test-cascade
 make test-split-tunnel
 make test-subnet-router
 make test-exit-selection
+make test-dns-resolver
 make test-service-user
 make vet
 make build
@@ -58,6 +59,12 @@ another account and checks access groups, allow and deny lists, and the
 router's forwarding restore. The second relays one account through a default
 upstream, a named exit, and the local exit, and checks that a selected exit
 that is down fails closed.
+
+`make test-dns-resolver` runs `scripts/test-dns-resolver.sh`: three clients
+of two accounts use the gateway's built-in resolver, which must resolve and
+reverse-resolve peer device names only, forward over UDP and TCP to a fake
+upstream, refuse a blocklisted domain, and stay unreachable from outside the
+tunnel.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

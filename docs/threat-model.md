@@ -155,6 +155,9 @@ not conceal transport fingerprints from network inspection.
   every client of a gateway, across all accounts, a peer. Leave it off unless
   all clients are mutually trusted; client hosts must protect their own
   services from their peers.
+- The built-in resolver reveals device names and addresses only to a
+  device's peers, but every name a client looks up is visible to the gateway
+  and to the resolvers it forwards to.
 - A subnet router exposes its LAN to its peers. Its LAN hosts can initiate
   connections to peers, as with WireGuard `AllowedIPs`; restrict them with
   deny lists or host firewalls. Source validation is relaxed only for the

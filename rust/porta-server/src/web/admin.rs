@@ -36,6 +36,9 @@ pub struct DeviceSummary {
     /// Networks behind the device that the gateway routes to it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subnets: Vec<String>,
+    /// Name clients resolve through the built-in resolver.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dns_name: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -270,6 +273,8 @@ pub struct GatewayStatus {
     pub dns_domains: Vec<String>,
     /// Every client reaches every other client (`--client-to-client`).
     pub client_to_client: bool,
+    /// The built-in resolver serves device names (`--dns-resolver`).
+    pub dns_resolver: bool,
     /// Exit names an account's access policy may select.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exits: Vec<String>,

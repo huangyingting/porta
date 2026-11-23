@@ -370,6 +370,7 @@ class AutomationTests(unittest.TestCase):
         self.assertIn('iifname "porta0" ct state established,related accept', guard)
         self.assertIn("th dport 53 accept", guard)
         self.assertTrue(guard.rstrip().endswith('iifname "porta0" drop'))
+        self.assertIn('iifname != { "lo", "porta0" } ip daddr 10.66.0.1 drop', transaction)
 
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
                         "--client-host-access")
@@ -908,6 +909,36 @@ class AutomationTests(unittest.TestCase):
                         ("--exits", "local=https://us.example"),
                         ("--exits", "us=http://us.example"),
                         ("--no-upstream", "--local-exit")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_deploy_dns_resolver_installs_blocklist_and_binds_port_53(self):
+        deploy = self.prepare_deploy(timer=False)
+        cert, key = self.certificate_pair("source", "new")
+        blocklist = self.root / "blocklist.txt"
+        blocklist.write_text("ads.example\n")
+        result = self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key,
+                                 "--port", "8443", "--dns-resolver",
+                                 "--dns-upstreams", "9.9.9.9,149.112.112.112:53",
+                                 "--dns-forwards", "corp.example=10.20.0.53",
+                                 "--dns-blocklist", blocklist)
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        installed = self.root / "system/etc/porta/dns-blocklist.txt"
+        self.assertIn("--dns-resolver --dns-upstream 9.9.9.9 --dns-upstream 149.112.112.112:53 "
+                      f"--dns-forward corp.example=10.20.0.53 --dns-blocklist {installed}", start)
+        # Port 53 needs the bind capability even with a high public port.
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n", unit)
+        self.assertEqual(installed.read_text(), "ads.example\n")
+        self.assertIn("built-in resolver on 10.66.0.1", result.stdout)
+
+        self.run_deploy(deploy, "--build-local", "--dns-resolver=false", "--dns-upstreams=",
+                        "--dns-forwards=", "--dns-blocklist=")
+        self.assertFalse(installed.exists())
+        self.assertNotIn("--dns-resolver",
+                         (self.root / "system/etc/systemd/system/porta.service").read_text())
+        for options in (("--dns-upstreams", "9.9.9.9"), ("--dns-resolver", "--dns-upstreams", "bad"),
+                        ("--dns-resolver", "--dns-blocklist", "/missing")):
             with self.subTest(options=options):
                 self.run_deploy(deploy, "--build-local", *options, success=False)
 

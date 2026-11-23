@@ -302,6 +302,7 @@ pub struct RouteRequest {
     pub parent: CancellationToken,
     /// Account whose throughput limit applies to the route.
     pub account_id: String,
+    pub device_id: String,
     pub network: NetworkPolicy,
 }
 
@@ -630,6 +631,7 @@ impl Services {
                 kind: request.route,
                 parent: authenticated.cancellation.token(),
                 account_id: authenticated.identity.account_id.clone(),
+                device_id: proof.device_id.clone(),
                 network: authenticated.network.clone(),
             })
             .await

@@ -66,6 +66,8 @@ jobs:
         run: make test-subnet-router
       - name: Test per-account exit selection end to end
         run: make test-exit-selection
+      - name: Test the built-in DNS resolver end to end
+        run: make test-dns-resolver
       - name: Test the unprivileged systemd service end to end
         run: make test-service-user
       - run: make build

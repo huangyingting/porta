@@ -197,6 +197,10 @@ also be single addresses. Group names have at most 32 letters, digits, `-`
 or `_`, and are stored in lower case. The change reconnects the account's
 devices. Client summaries include the policy as `access`.
 
+Device summaries include `dns_name`, the device's name under
+`porta.internal`, and `GET /api/gateway` reports `dns_resolver` when the
+built-in resolver serves those names.
+
 `PUT /api/clients/{clientID}/devices/{deviceID}/subnets` with
 `{"subnets": ["10.30.0.0/24"]}` routes networks to a device, and an empty list
 stops routing them; the device reconnects. Device summaries include

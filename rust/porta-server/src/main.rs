@@ -4,6 +4,7 @@ use porta_server_rust::config::{version_requested, Config};
 use porta_server_rust::data::ratelimit::RateLimiters;
 use porta_server_rust::data::router::Router;
 use porta_server_rust::data::tun::NativeTun;
+use porta_server_rust::dns::{Resolver, ResolverConfig};
 use porta_server_rust::http_handler::{AdminHttpHandler, PublicHttpHandler};
 use porta_server_rust::integration::{
     AbuseLimiter, AccountPolicyEnforcer, GatewayNetwork, NativeAuthenticator, PoolAdapter,
@@ -101,11 +102,13 @@ async fn run() -> Result<()> {
             .collect::<Vec<_>>();
         let dns_domains = config.dns_domains.clone();
         let client_to_client = config.client_to_client;
+        let dns_resolver = config.dns_resolver;
         let exits = config.exit_names();
         let provider: GatewayStatusProvider = Arc::new(move || GatewayStatus {
             routes: routes.clone(),
             dns_domains: dns_domains.clone(),
             client_to_client,
+            dns_resolver,
             exits: exits.clone(),
             ..base()
         });
@@ -120,6 +123,33 @@ async fn run() -> Result<()> {
     let abuse = Arc::new(AbuseGuard::default_with_metrics(metrics.clone()));
     let leases = PoolAdapter::new(pool.clone());
     let rate_limits = RateLimiters::with_metrics(metrics.clone());
+    let packet_router = RouterAdapter::with_switching(
+        router.clone(),
+        leases.clone(),
+        rate_limits.clone(),
+        SwitchConfig {
+            client_to_client: config.client_to_client,
+            always_reachable: [Some(pool.gateway()), config.dns_address()?]
+                .into_iter()
+                .flatten()
+                .collect(),
+            exits: exit_rules.clone(),
+            names: Some(registry.clone()),
+        },
+    );
+    let resolver = if config.dns_resolver {
+        Some(Resolver::new(
+            ResolverConfig {
+                listen: pool.gateway(),
+                upstreams: config.resolver_upstreams()?,
+                forwards: config.resolver_forwards()?,
+                blocklist: config.dns_blocklist.clone(),
+            },
+            packet_router.clone(),
+        )?)
+    } else {
+        None
+    };
     let services = Arc::new(Services {
         authenticator: NativeAuthenticator::with_usage(
             registry.clone(),
@@ -127,19 +157,7 @@ async fn run() -> Result<()> {
             usage.clone(),
         ),
         leases: leases.clone(),
-        router: RouterAdapter::with_switching(
-            router.clone(),
-            leases,
-            rate_limits.clone(),
-            SwitchConfig {
-                client_to_client: config.client_to_client,
-                always_reachable: [Some(pool.gateway()), config.dns_address()?]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-                exits: exit_rules.clone(),
-            },
-        ),
+        router: packet_router,
         usage: UsageAdapter::new(usage.clone()),
         metrics: metrics.clone(),
         routing: TunnelRouting {
@@ -322,6 +340,16 @@ async fn run() -> Result<()> {
     });
     let exit_shutdown = tokio_util::sync::CancellationToken::new();
     let exit_task = exit_rules.map(|rules| tokio::spawn(rules.run(exit_shutdown.clone())));
+    let resolver_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut resolver_task = match resolver {
+        Some(resolver) => {
+            let listeners = resolver.bind()?;
+            Some(tokio::spawn(
+                resolver.run(listeners, resolver_shutdown.clone()),
+            ))
+        }
+        None => None,
+    };
     let admission = Arc::new(ConnectionAdmission::new(metrics.clone()));
     let retry = Arc::new(RetryController::new(admission.as_ref(), metrics));
     let mut acme_manager = None;
@@ -503,6 +531,13 @@ async fn run() -> Result<()> {
     if let Err(error) = policy_task.await {
         if run_error.is_none() {
             run_error = Some(error.into());
+        }
+    }
+    resolver_shutdown.cancel();
+    if let Some(task) = resolver_task.take() {
+        let error = task_error(task.await);
+        if run_error.is_none() {
+            run_error = error;
         }
     }
     exit_shutdown.cancel();

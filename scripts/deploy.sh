@@ -24,6 +24,14 @@ Options:
   --pool CIDR               Client pool (default: 10.66.0.0/24)
   --gateway-cidr CIDR       Gateway address and prefix (default: 10.66.0.1/24)
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
+  --dns-resolver[=BOOL]     Serve DNS on the gateway address instead, with
+                            device names under porta.internal
+  --dns-upstreams IP[,IP]   Resolvers the built-in resolver forwards to
+                            (default: the host's resolvers)
+  --dns-forwards D=IP[,...] Send a domain's queries to another resolver, such
+                            as an internal zone (DOMAIN=IP or DOMAIN=IP:PORT)
+  --dns-blocklist FILE      Domains the built-in resolver refuses; installed as
+                            /etc/porta/dns-blocklist.txt. --dns-blocklist= removes it
   --mtu MTU                 Tunnel MTU ceiling (default: 1400)
   --auto-mtu[=BOOL]         Automatic HTTP/3 MTU selection (default: true)
   --trust-proxy-headers[=BOOL]
@@ -112,6 +120,10 @@ routes=
 dns_domains=
 exits=
 local_exit=false
+dns_resolver=false
+dns_upstreams=
+dns_forwards=
+dns_blocklist=
 
 # Options persisted across upgrades. Values are parsed, never sourced, and
 # validated below exactly like command-line input.
@@ -120,7 +132,7 @@ saved_option_names=(
   domain certificate private_key acme_email port admin_port external_interface
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client client_host_access routes
-  dns_domains exits local_exit
+  dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist
 )
 declare -A saved_options=()
 if [[ -e $deploy_config || -L $deploy_config ]]; then
@@ -179,6 +191,14 @@ while [[ $# -gt 0 ]]; do
     --client-to-client=*) client_to_client=$(parse_bool --client-to-client "${1#*=}"); shift ;;
     --client-host-access) client_host_access=true; shift ;;
     --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
+    --dns-resolver) dns_resolver=true; shift ;;
+    --dns-resolver=*) dns_resolver=$(parse_bool --dns-resolver "${1#*=}"); shift ;;
+    --dns-upstreams) require_value "$@"; dns_upstreams=$2; shift 2 ;;
+    --dns-upstreams=*) dns_upstreams=${1#*=}; shift ;;
+    --dns-forwards) require_value "$@"; dns_forwards=$2; shift 2 ;;
+    --dns-forwards=*) dns_forwards=${1#*=}; shift ;;
+    --dns-blocklist) require_value "$@"; dns_blocklist=$2; shift 2 ;;
+    --dns-blocklist=*) dns_blocklist=${1#*=}; shift ;;
     --exits) require_value "$@"; exits=$2; shift 2 ;;
     --exits=*) exits=${1#*=}; shift ;;
     --local-exit) local_exit=true; shift ;;
@@ -195,7 +215,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
-for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access local_exit; do
+for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access local_exit dns_resolver; do
   [[ ${!option} == true || ${!option} == false ]] || die "invalid saved value for $option"
 done
 [[ -n $domain ]] || die "--domain is required on the first deployment"
@@ -252,6 +272,34 @@ if [[ -n $dns_domains ]]; then
 fi
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
+resolver_arguments=
+if $dns_resolver; then
+  resolver_arguments=" --dns-resolver"
+  if [[ -n $dns_upstreams ]]; then
+    IFS=, read -ra upstream_resolvers <<<"$dns_upstreams"
+    for upstream_resolver in "${upstream_resolvers[@]}"; do
+      [[ $upstream_resolver =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{1,5})?$ ]] ||
+        die "invalid --dns-upstreams entry: $upstream_resolver"
+      resolver_arguments+=" --dns-upstream $upstream_resolver"
+    done
+  fi
+  if [[ -n $dns_forwards ]]; then
+    IFS=, read -ra forward_specs <<<"$dns_forwards"
+    for forward_spec in "${forward_specs[@]}"; do
+      [[ $forward_spec =~ ^[A-Za-z0-9_.-]+=[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{1,5})?$ ]] ||
+        die "invalid --dns-forwards entry: $forward_spec"
+      resolver_arguments+=" --dns-forward $forward_spec"
+    done
+  fi
+  if [[ -n $dns_blocklist ]]; then
+    [[ $dns_blocklist == /* && -f $dns_blocklist && $dns_blocklist =~ ^/[A-Za-z0-9_./:@+-]+$ ]] ||
+      die "--dns-blocklist must name an existing absolute path"
+    resolver_arguments+=" --dns-blocklist /etc/porta/dns-blocklist.txt"
+  fi
+else
+  [[ -z $dns_upstreams && -z $dns_forwards && -z $dns_blocklist ]] ||
+    die "--dns-upstreams, --dns-forwards and --dns-blocklist require --dns-resolver"
+fi
 exit_names=()
 exit_urls=()
 if [[ -n $exits ]]; then
@@ -742,6 +790,9 @@ effective_options[external_interface]=$configured_external_interface
 if [[ -n $upstream_ca ]]; then
   effective_options[upstream_ca]=/etc/porta/upstream-ca.pem
 fi
+if [[ -n $dns_blocklist ]]; then
+  effective_options[dns_blocklist]=/etc/porta/dns-blocklist.txt
+fi
 if [[ ${#saved_options[@]} -gt 0 ]]; then
   for name in "${saved_option_names[@]}"; do
     previous=${saved_options[$name]-}
@@ -845,6 +896,13 @@ if [[ -n $upstream || ${#exit_names[@]} -gt 0 ]]; then
     rm -f /etc/porta/upstream-ca.pem
   fi
 fi
+if [[ -n $dns_blocklist ]]; then
+  if [[ $(realpath "$dns_blocklist") != "$(realpath -m /etc/porta/dns-blocklist.txt)" ]]; then
+    install -m 0644 "$dns_blocklist" /etc/porta/dns-blocklist.txt
+  fi
+else
+  rm -f /etc/porta/dns-blocklist.txt
+fi
 chmod 0600 "$environment_file"
 {
   echo "# Written by deploy.sh; later runs reuse these options. Edit with care."
@@ -886,7 +944,7 @@ else
   tls_preflight=
   capabilities="CAP_NET_ADMIN CAP_NET_BIND_SERVICE"
 fi
-if (( port < 1024 || admin_port < 1024 )) && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
+if { (( port < 1024 || admin_port < 1024 )) || $dns_resolver; } && [[ $capabilities != *CAP_NET_BIND_SERVICE* ]]; then
   capabilities+=" CAP_NET_BIND_SERVICE"
 fi
 forward_proxy_argument=
@@ -943,7 +1001,7 @@ User=$service_user
 Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$client_to_client_argument --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -1081,6 +1139,7 @@ Exit traffic:    $([[ -n $upstream ]] && echo "relayed through $upstream via $up
 Selectable exits: ${selectable_exits:-none}
 Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
+Client DNS:      $([[ $dns_resolver == true ]] && echo "built-in resolver on ${gateway_cidr%/*} with names under porta.internal" || echo "$dns")
 Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_domains:+ (DNS for ${dns_domains//,/, })}" || echo "full tunnel")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Browser portal:  https://$domain:$port
