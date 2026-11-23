@@ -215,12 +215,18 @@ EOF
   cat <<EOF
 }
 table inet porta_guard {
+  # Per-source rate tracking uses explicit dynamic sets, the form current
+  # nftables lists for the deprecated meter syntax as well.
+  set tcp4 { type ipv4_addr; size 65535; flags dynamic,timeout; }
+  set tcp6 { type ipv6_addr; size 65535; flags dynamic,timeout; }
+  set udp4 { type ipv4_addr; size 65535; flags dynamic,timeout; }
+  set udp6 { type ipv6_addr; size 65535; flags dynamic,timeout; }
   chain input {
     type filter hook input priority -10; policy accept;
-    iifname "$external_interface" meta nfproto ipv4 tcp dport $public_port ct state new tcp flags & (fin | syn | rst | ack) == syn meter tcp4 size 65535 { ip saddr timeout 10s limit rate over 200/second burst 400 packets } counter drop
-    iifname "$external_interface" meta nfproto ipv6 tcp dport $public_port ct state new tcp flags & (fin | syn | rst | ack) == syn meter tcp6 size 65535 { ip6 saddr timeout 10s limit rate over 200/second burst 400 packets } counter drop
-    iifname "$external_interface" meta nfproto ipv4 udp dport $public_port ct state new meter udp4 size 65535 { ip saddr timeout 10s limit rate over 500/second burst 1000 packets } counter drop
-    iifname "$external_interface" meta nfproto ipv6 udp dport $public_port ct state new meter udp6 size 65535 { ip6 saddr timeout 10s limit rate over 500/second burst 1000 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv4 tcp dport $public_port ct state new tcp flags & (fin | syn | rst | ack) == syn update @tcp4 { ip saddr timeout 10s limit rate over 200/second burst 400 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv6 tcp dport $public_port ct state new tcp flags & (fin | syn | rst | ack) == syn update @tcp6 { ip6 saddr timeout 10s limit rate over 200/second burst 400 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv4 udp dport $public_port ct state new update @udp4 { ip saddr timeout 10s limit rate over 500/second burst 1000 packets } counter drop
+    iifname "$external_interface" meta nfproto ipv6 udp dport $public_port ct state new update @udp6 { ip6 saddr timeout 10s limit rate over 500/second burst 1000 packets } counter drop
   }
 }
 EOF

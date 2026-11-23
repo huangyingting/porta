@@ -486,7 +486,7 @@ meters drop only excessive new traffic:
 - TCP initial SYNs: 200 per second with a 400-packet burst;
 - UDP new-flow packets: 500 per second with a 1000-packet burst.
 
-Each dynamic meter is capped at 65,535 source entries with a ten-second source
+Each per-source tracking set is capped at 65,535 source entries with a ten-second source
 timeout. Established traffic, unrelated ports, and ICMP/ICMPv6 PMTU feedback
 do not match these drop rules. Forwarding/NAT and input-guard tables are
 replaced in one nftables transaction and removed together when the service

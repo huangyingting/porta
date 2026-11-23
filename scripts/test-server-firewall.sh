@@ -43,9 +43,10 @@ trap '"'"'echo "firewall check failed: $BASH_COMMAND" >&2; printf "%s\n" "$forwa
 grep -Fq "iifname \"porta0\" oifname \"eth0\" accept" <<<"$forward_rules"
 grep -Fq "ip saddr 10.66.0.0/24 masquerade" <<<"$forward_rules"
 grep -Fq "tcp dport 8443" <<<"$guard_rules"
-grep -Fq "meter tcp4 size 65535" <<<"$guard_rules"
+grep -Eq "set tcp4 \{|meter tcp4 size 65535" <<<"$guard_rules"
+grep -Fq "size 65535" <<<"$guard_rules"
 grep -Fq "limit rate over 200/second burst 400 packets" <<<"$guard_rules"
-grep -Fq "meter udp6 size 65535" <<<"$guard_rules"
+grep -Eq "update @udp6 \{|meter udp6 size 65535" <<<"$guard_rules"
 grep -Fq "limit rate over 500/second burst 1000 packets" <<<"$guard_rules"
 [[ $(sysctl -n net.ipv4.conf.porta0.accept_local) == 1 ]]
 [[ $(sysctl -n net.ipv4.conf.porta0.rp_filter) == 2 ]]

@@ -732,6 +732,19 @@ struct NftEntry {
     chain: Option<NftChain>,
     #[serde(default)]
     rule: Option<NftRule>,
+    #[serde(default)]
+    set: Option<NftSet>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NftSet {
+    name: String,
+    #[serde(default, rename = "type")]
+    kind: Value,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    flags: Vec<String>,
 }
 
 async fn check_porta_rules(
@@ -800,7 +813,11 @@ async fn check_porta_input_guard(
     let table: NftDocument = serde_json::from_slice(&data).context("decode Porta input guard")?;
     let mut found_chain = false;
     let mut rules = Vec::new();
+    let mut sets = Vec::new();
     for entry in table.nftables {
+        if let Some(set) = entry.set {
+            sets.push(set);
+        }
         if let Some(chain) = entry.chain {
             if chain.name == "input" {
                 found_chain = chain.kind == "filter"
@@ -832,7 +849,9 @@ async fn check_porta_input_guard(
         );
     }
     for (index, (rule, expected)) in rules.iter().zip(expected.iter()).enumerate() {
-        if !matches_input_guard_rule(rule, &egress, config.public_port, expected) {
+        if !matches_input_guard_rule(rule, &egress, config.public_port, expected)
+            || (uses_named_set(rule) && !valid_guard_set(&sets, expected))
+        {
             bail!(
                 "Porta input guard rule {} is missing or malformed",
                 index + 1
@@ -1012,17 +1031,66 @@ fn matches_initial_syn(expression: &Map<String, Value>) -> bool {
         })
 }
 
+/// Whether a guard rule tracks sources in a named set (`update @tcp4 {...}`)
+/// rather than an inline meter. nftables may list a meter in either form.
+fn uses_named_set(rule: &NftRule) -> bool {
+    rule.expr
+        .iter()
+        .any(|expression| expression.contains_key("set"))
+}
+
+fn valid_guard_set(sets: &[NftSet], expected: &InputGuardRule) -> bool {
+    let address_type = if expected.address_protocol == "ip" {
+        "ipv4_addr"
+    } else {
+        "ipv6_addr"
+    };
+    sets.iter().any(|set| {
+        set.name == expected.meter
+            && set.kind.as_str() == Some(address_type)
+            && set.size == 65535
+            && set.flags.iter().any(|flag| flag == "dynamic")
+            && set.flags.iter().any(|flag| flag == "timeout")
+    })
+}
+
 fn matches_input_meter(expression: &Map<String, Value>, expected: &InputGuardRule) -> bool {
-    let Some(meter) = expression.get("meter").and_then(Value::as_object) else {
+    // Inline form: {"meter": {"name", "size", "key": {"elem"}, "stmt": {"limit"}}}.
+    // Named-set form: {"set": {"op": "update", "set": "@name", "elem": {"elem"},
+    // "stmt": [{"limit"}]}}, whose set size is validated separately.
+    let (element, limit) = if let Some(meter) = expression.get("meter").and_then(Value::as_object) {
+        if meter.get("name").and_then(Value::as_str) != Some(expected.meter)
+            || meter.get("size").and_then(Value::as_u64) != Some(65535)
+        {
+            return false;
+        }
+        (
+            meter.get("key"),
+            meter
+                .get("stmt")
+                .and_then(Value::as_object)
+                .and_then(|statement| statement.get("limit")),
+        )
+    } else if let Some(update) = expression.get("set").and_then(Value::as_object) {
+        let statements = update.get("stmt").and_then(Value::as_array);
+        if update.get("op").and_then(Value::as_str) != Some("update")
+            || update.get("set").and_then(Value::as_str)
+                != Some(format!("@{}", expected.meter).as_str())
+            || statements.is_none_or(|statements| statements.len() != 1)
+        {
+            return false;
+        }
+        (
+            update.get("elem"),
+            statements
+                .and_then(|statements| statements.first())
+                .and_then(Value::as_object)
+                .and_then(|statement| statement.get("limit")),
+        )
+    } else {
         return false;
     };
-    if meter.get("name").and_then(Value::as_str) != Some(expected.meter)
-        || meter.get("size").and_then(Value::as_u64) != Some(65535)
-    {
-        return false;
-    }
-    let Some(element) = meter
-        .get("key")
+    let Some(element) = element
         .and_then(Value::as_object)
         .and_then(|key| key.get("elem"))
         .and_then(Value::as_object)
@@ -1046,12 +1114,7 @@ fn matches_input_meter(expression: &Map<String, Value>, expected: &InputGuardRul
     {
         return false;
     }
-    let Some(limit) = meter
-        .get("stmt")
-        .and_then(Value::as_object)
-        .and_then(|statement| statement.get("limit"))
-        .and_then(Value::as_object)
-    else {
+    let Some(limit) = limit.and_then(Value::as_object) else {
         return false;
     };
     !limit.contains_key("rate_unit")
@@ -1352,6 +1415,61 @@ mod tests {
         byte_rate[4]["meter"]["stmt"]["limit"]["rate_unit"] = json!("mbytes");
         assert!(!matches_input_guard_rule(
             &rule(Value::Array(byte_rate)),
+            "eth0",
+            8443,
+            &expected
+        ));
+    }
+
+    #[test]
+    fn input_guard_accepts_the_named_set_form_with_a_valid_set() {
+        // As listed by `nft -j` for `update @tcp4 { ip saddr timeout 10s limit ... }`.
+        let expected = InputGuardRule::new("tcp", "ip", "tcp4", 200, 400, true);
+        let expressions = json!([
+            {"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},
+            {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8443}},
+            {"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"new"}},
+            {"match":{"op":"==","left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},
+                ["fin","syn","rst","ack"]]},"right":"syn"}},
+            {"set":{"op":"update","elem":{"elem":{"val":{"payload":{"protocol":"ip",
+                "field":"saddr"}},"timeout":10}},"set":"@tcp4",
+                "stmt":[{"limit":{"rate":200,"burst":400,"per":"second","inv":true}}]}},
+            {"counter":{"packets":0,"bytes":0}},
+            {"drop":null}
+        ]);
+        let valid = rule(expressions.clone());
+        assert!(uses_named_set(&valid));
+        assert!(matches_input_guard_rule(&valid, "eth0", 8443, &expected));
+
+        let set = |size, flags: &[&str]| NftSet {
+            name: "tcp4".into(),
+            kind: json!("ipv4_addr"),
+            size,
+            flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
+        };
+        assert!(valid_guard_set(
+            &[set(65535, &["timeout", "dynamic"])],
+            &expected
+        ));
+        assert!(!valid_guard_set(
+            &[set(1024, &["timeout", "dynamic"])],
+            &expected
+        ));
+        assert!(!valid_guard_set(&[set(65535, &["dynamic"])], &expected));
+        assert!(!valid_guard_set(&[], &expected));
+
+        let mut other_set = expressions.as_array().unwrap().clone();
+        other_set[4]["set"]["set"] = json!("@udp4");
+        assert!(!matches_input_guard_rule(
+            &rule(Value::Array(other_set)),
+            "eth0",
+            8443,
+            &expected
+        ));
+        let mut additive = expressions.as_array().unwrap().clone();
+        additive[4]["set"]["op"] = json!("add");
+        assert!(!matches_input_guard_rule(
+            &rule(Value::Array(additive)),
             "eth0",
             8443,
             &expected

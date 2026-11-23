@@ -162,8 +162,9 @@ class AutomationTests(unittest.TestCase):
         self.assertIn('iifname "porta0" drop', transaction)
         self.assertIn("ip saddr 10.66.0.0/24 masquerade", transaction)
         self.assertIn('iifname "eth0" meta nfproto ipv4 tcp dport 8443', transaction)
-        self.assertIn('meter tcp4 size 65535', transaction)
-        self.assertIn('meter udp6 size 65535', transaction)
+        self.assertIn('set tcp4 { type ipv4_addr; size 65535; flags dynamic,timeout; }', transaction)
+        self.assertIn('update @tcp4 { ip saddr timeout 10s limit rate over 200/second', transaction)
+        self.assertIn('update @udp6 { ip6 saddr timeout 10s limit rate over 500/second', transaction)
         mutations = [call for call in self.commands() if call[:2] == ["nft", "-f"]]
         self.assertEqual(len(mutations), 1)
         self.assertEqual(len(self.state()["iptables_rules"]), 2)
