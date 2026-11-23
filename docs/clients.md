@@ -91,6 +91,19 @@ line to the connection details. See
 [Split tunneling](deployment.md#split-tunneling) for per-platform DNS
 behavior.
 
+## Subnet routers
+
+The Linux CLI can publish the network behind its device. After an
+administrator assigns subnets to the device, run it with `--subnet-router`:
+
+```sh
+sudo ./porta-client-linux-amd64 --server https://vpn.example.com --subnet-router
+```
+
+The client enables IPv4 forwarding, masquerades tunnel traffic toward the
+assigned subnets, and restores forwarding when it disconnects. It logs the
+subnets on connection. See [Subnet routing](deployment.md#subnet-routing-site-to-site).
+
 ## Linux CLI
 
 Automatic Linux networking requires root, `iproute2`, `nftables`, and a running

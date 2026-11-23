@@ -319,14 +319,53 @@ listening on all addresses, are unreachable from the tunnel. Add
 `--client-host-access` to allow clients to reach every host service, for
 example to administer the gateway over the tunnel; metadata remains blocked.
 
-## Client-to-client traffic
+## Client-to-client traffic and access policy
 
-By default each client can reach only its exit; traffic between leases is
-dropped. Add `--client-to-client` to let all clients of the gateway reach each
-other's tunnel addresses, as in a hub-and-spoke WireGuard bounce server. This
-applies to every account on the gateway, so enable it only when all clients
-are trusted to see each other. It combines with `--upstream`: inter-client
-traffic stays on the hub while Internet traffic continues to the next hop.
+The gateway switches traffic between clients itself; the kernel never
+forwards it. Devices of one account always reach each other. Devices of
+different accounts reach each other only when both accounts share an access
+group, or when the daemon runs with `--client-to-client`
+(`deploy.sh --client-to-client`), which makes every client a peer, as in a
+hub-and-spoke WireGuard bounce server. Enable that only when all clients are
+trusted to see each other.
+
+Each account also has an access policy, set in the admin page's **Network
+access** section or with `PUT /api/clients/{id}/access`:
+
+- **Allowed destinations**: IPv4 prefixes the account may reach. Empty allows
+  everything.
+- **Blocked destinations**: prefixes the account may never reach; they win
+  over allowed ones and over a shared group.
+- **Group**: accounts with the same group name reach each other's devices and
+  subnets.
+
+The gateway address and its `--dns` server stay reachable whatever the lists
+say. Policies apply to traffic in both directions between clients, and to
+traffic toward the exit. Changing an account's policy reconnects its devices,
+which pick up the new rules automatically.
+
+## Subnet routing (site-to-site)
+
+A device can publish the network behind it, like a WireGuard peer with
+`AllowedIPs` or a Tailscale subnet router. In the admin page, open the
+account's devices and choose **Subnets** for the router device, or call
+`PUT /api/clients/{id}/devices/{device}/subnets` with
+`{"subnets": ["10.30.0.0/24"]}`. Subnets must be unicast prefixes of `/8` or
+longer, may not overlap the client pool or another device's subnets, and are
+limited to 16 per device.
+
+Run the Linux client on that device with `--subnet-router`. It enables IPv4
+forwarding (restoring the previous value when it disconnects) and
+masquerades tunnel traffic toward the subnets, so LAN hosts need no route back
+to the client pool. The gateway then accepts packets from that device whose
+source lies in its subnets, routes the subnets to it, and lets peers reach
+them under the same rules as client-to-client traffic: same account, shared
+group, or `--client-to-client`, and each side's access policy. Hosts behind a
+subnet router can only talk to clients, never to the exit. Split-tunnel
+clients also route every published subnet and the client pool through the
+tunnel. A host firewall that drops forwarded traffic on the router, such as
+Docker's `FORWARD` policy, must allow traffic from the tunnel interface to the
+LAN.
 
 ## Split tunneling
 

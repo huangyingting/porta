@@ -119,11 +119,19 @@ pub fn parse_account_status(headers: &http::HeaderMap) -> AccountStatus {
 pub struct Routing {
     pub routes: Vec<Ipv4Net>,
     pub dns_domains: Vec<String>,
+    /// Networks behind this device that the gateway routes to it, when the
+    /// device is a subnet router.
+    pub subnets: Vec<Ipv4Net>,
 }
 
 impl Routing {
     pub fn is_full_tunnel(&self) -> bool {
         self.routes.is_empty()
+    }
+
+    /// Whether `address` lies in a network this device routes for others.
+    pub fn serves(&self, address: Ipv4Addr) -> bool {
+        self.subnets.iter().any(|subnet| subnet.contains(&address))
     }
 
     /// Whether `address` is sent through the tunnel.
@@ -133,6 +141,8 @@ impl Routing {
 }
 
 pub const HEADER_ROUTES: &str = "x-porta-routes";
+pub const HEADER_SUBNETS: &str = "x-porta-subnets";
+const MAX_SUBNETS: usize = 16;
 pub const HEADER_DNS_DOMAINS: &str = "x-porta-dns-domains";
 const MAX_ROUTES: usize = 64;
 const MAX_DNS_DOMAINS: usize = 16;
@@ -151,22 +161,30 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
             })
             .transpose()
     };
-    let mut routes = Vec::new();
-    if let Some(value) = text(HEADER_ROUTES)? {
-        for item in value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-        {
-            let route = item
-                .parse::<Ipv4Net>()
-                .ok()
-                .filter(|route| route.prefix_len() > 0 && *route == route.trunc())
-                .ok_or_else(|| {
-                    ClientError::permanent(format!("gateway sent an invalid route {item:?}"))
-                })?;
-            routes.push(route);
+    let prefixes = |name: &str| -> Result<Vec<Ipv4Net>, ClientError> {
+        let mut prefixes = Vec::new();
+        if let Some(value) = text(name)? {
+            for item in value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
+                let prefix = item
+                    .parse::<Ipv4Net>()
+                    .ok()
+                    .filter(|prefix| prefix.prefix_len() > 0 && *prefix == prefix.trunc())
+                    .ok_or_else(|| {
+                        ClientError::permanent(format!("gateway sent an invalid route {item:?}"))
+                    })?;
+                prefixes.push(prefix);
+            }
         }
+        Ok(prefixes)
+    };
+    let routes = prefixes(HEADER_ROUTES)?;
+    let subnets = prefixes(HEADER_SUBNETS)?;
+    if subnets.len() > MAX_SUBNETS {
+        return Err(ClientError::permanent("gateway sent too many subnets"));
     }
     let mut dns_domains = Vec::new();
     if let Some(value) = text(HEADER_DNS_DOMAINS)? {
@@ -204,6 +222,7 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
     Ok(Routing {
         routes,
         dns_domains,
+        subnets,
     })
 }
 
@@ -352,7 +371,7 @@ impl Connection {
         }
         let info = porta_wire::ip::parse_ipv4(packet)
             .map_err(|error| ClientError::permanent(error.to_string()))?;
-        if info.source != self.lease.address.addr() {
+        if info.source != self.lease.address.addr() && !self.routing.serves(info.source) {
             return Err(ClientError::permanent(format!(
                 "packet source {} does not match lease {}",
                 info.source, self.lease.address
@@ -378,7 +397,9 @@ impl Connection {
                     let Ok(info) = porta_wire::ip::parse_ipv4(&packet) else {
                         continue;
                     };
-                    if info.destination == self.lease.address.addr() {
+                    if info.destination == self.lease.address.addr()
+                        || self.routing.serves(info.destination)
+                    {
                         return Ok(packet);
                     }
                 }
@@ -594,6 +615,15 @@ mod tests {
             assert!(parse_routing(&headers).is_err(), "{invalid}");
         }
         headers.remove(HEADER_ROUTES);
+        assert!(parse_routing(&headers).is_err());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(HEADER_SUBNETS, "10.30.0.0/24".parse().unwrap());
+        let router = parse_routing(&headers).unwrap();
+        assert!(router.is_full_tunnel());
+        assert!(router.serves(Ipv4Addr::new(10, 30, 0, 5)));
+        assert!(!router.serves(Ipv4Addr::new(10, 31, 0, 5)));
+        headers.insert(HEADER_SUBNETS, "10.30.0.1/24".parse().unwrap());
         assert!(parse_routing(&headers).is_err());
     }
 

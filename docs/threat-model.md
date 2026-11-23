@@ -150,9 +150,15 @@ not conceal transport fingerprints from network inspection.
   unless `--client-host-access` is set. Other private networks routed from the
   gateway, such as its cloud VPC, remain reachable by design for remote access;
   restrict them with additional operator firewall rules when not intended.
-- `--client-to-client` lets every client of a gateway, across all accounts,
-  reach every other client's tunnel address. Leave it off unless all clients
-  are mutually trusted; client hosts must then protect their own services.
+- Devices of one account reach each other, and accounts that share an access
+  group reach each other's devices and subnets. `--client-to-client` makes
+  every client of a gateway, across all accounts, a peer. Leave it off unless
+  all clients are mutually trusted; client hosts must protect their own
+  services from their peers.
+- A subnet router exposes its LAN to its peers. Its LAN hosts can initiate
+  connections to peers, as with WireGuard `AllowedIPs`; restrict them with
+  deny lists or host firewalls. Source validation is relaxed only for the
+  router's own assigned subnets.
 - Native clients mitigate fallback head-of-line blocking with independent
   HTTP/2 connections, a prioritized control lane, bounded queues, and
   flow-pinned data lanes. Loss can still stall every flow assigned to the

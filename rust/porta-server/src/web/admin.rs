@@ -33,6 +33,9 @@ pub struct DeviceSummary {
     pub status: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub target: String,
+    /// Networks behind the device that the gateway routes to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subnets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +76,34 @@ pub struct ClientSummary {
     pub enrollment_open_until: Option<String>,
     #[serde(default)]
     pub pending_devices: usize,
+    #[serde(default)]
+    pub access: ClientAccess,
+}
+
+/// Network access rules of an account, as returned in summaries and
+/// accepted by `PUT /api/clients/{id}/access`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAccess {
+    /// Destination prefixes the account may reach; empty allows all.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Destination prefixes the account may never reach.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Accounts in the same group reach each other's devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Named exit; unset uses the gateway default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
+}
+
+/// Body of `PUT /api/clients/{id}/devices/{device}/subnets`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSubnets {
+    pub subnets: Vec<String>,
 }
 
 /// Body of `PUT /api/clients/{id}/enrollment`.
@@ -178,6 +209,30 @@ pub trait ClientRegistry: Send + Sync {
             ))
         })
     }
+    fn set_client_access<'a>(
+        &'a self,
+        _id: &'a str,
+        _access: ClientAccess,
+    ) -> BoxFuture<'a, Result<ClientSummary, RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Invalid(
+                "access policies are unsupported".into(),
+            ))
+        })
+    }
+    /// Assigns the networks a device routes for other clients.
+    fn set_device_subnets<'a>(
+        &'a self,
+        _id: &'a str,
+        _device_id: &'a str,
+        _subnets: Vec<String>,
+    ) -> BoxFuture<'a, Result<ClientSummary, RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Invalid(
+                "subnet routing is unsupported".into(),
+            ))
+        })
+    }
     /// Starts a new quota period now, clearing the account's quota usage.
     fn reset_client_usage<'a>(
         &'a self,
@@ -210,6 +265,11 @@ pub struct GatewayStatus {
     pub routes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dns_domains: Vec<String>,
+    /// Every client reaches every other client (`--client-to-client`).
+    pub client_to_client: bool,
+    /// Exit names an account's access policy may select.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exits: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -376,6 +436,33 @@ impl AdminService {
                 match self
                     .registry
                     .set_client_enrollment(&client_id, enrollment)
+                    .await
+                {
+                    Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
+                    Err(error) => registry_error(error),
+                }
+            }
+            ("PUT", [_, "access"]) => {
+                let access: ClientAccess = match decode_json(request) {
+                    Ok(access) => access,
+                    Err(response) => return response,
+                };
+                match self.registry.set_client_access(&client_id, access).await {
+                    Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
+                    Err(error) => registry_error(error),
+                }
+            }
+            ("PUT", [_, "devices", device, "subnets"]) => {
+                let Some(device) = path_unescape(device) else {
+                    return Response::not_found();
+                };
+                let input: DeviceSubnets = match decode_json(request) {
+                    Ok(input) => input,
+                    Err(response) => return response,
+                };
+                match self
+                    .registry
+                    .set_device_subnets(&client_id, &device, input.subnets)
                     .await
                 {
                     Ok(client) => json_response(200, &serde_json::json!({ "client": client })),

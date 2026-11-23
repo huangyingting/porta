@@ -151,9 +151,8 @@ start_gateway() {
   )
   local upstream_token=
   local upstream_options=()
-  local network_options=()
   if ((gateway == 1)); then
-    network_options=(--client-to-client)
+    arguments+=(--client-to-client)
   fi
   if ((gateway < gateways)); then
     arguments+=(
@@ -176,7 +175,7 @@ start_gateway() {
   done
   in_ns "$gateway" env PORTA_RUNTIME_DIRECTORY="$directory/runtime" \
     "$repository_root/scripts/server-up.sh" porta0 10.66.0.1/24 10.66.0.0/24 east "$port" \
-    "${upstream_options[@]}" "${network_options[@]}" >>"$work/gateway-$gateway.log" 2>&1
+    "${upstream_options[@]}" >>"$work/gateway-$gateway.log" 2>&1
 }
 
 stop_gateway() {

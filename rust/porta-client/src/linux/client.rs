@@ -40,6 +40,9 @@ pub struct Config {
     pub reconnect_max_delay: Duration,
     pub manual_network: bool,
     pub network_state: PathBuf,
+    /// Forward and masquerade tunnel traffic to the subnets the gateway
+    /// routes to this device.
+    pub subnet_router: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,7 +351,9 @@ pub async fn run(
     let network = if config.manual_network {
         None
     } else {
-        Some(NetworkManager::open(config.network_state.clone())?)
+        let mut network = NetworkManager::open(config.network_state.clone())?;
+        network.set_subnet_router(config.subnet_router);
+        Some(network)
     };
     let mut runtime = Runtime::new(network, config.transport);
     let mut endpoints = if let Some(network) = runtime.network.as_ref() {
@@ -548,6 +553,25 @@ async fn run_loop(
                 split_tunnel_summary(&connection.routing),
             ));
         }
+        if !connection.routing.subnets.is_empty() {
+            let subnets = connection
+                .routing
+                .subnets
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            observer(runtime.event(
+                State::Configuring,
+                if config.subnet_router {
+                    format!("subnet router subnets={subnets}")
+                } else {
+                    format!(
+                        "the gateway routes {subnets} to this device; run with --subnet-router to forward them"
+                    )
+                },
+            ));
+        }
         if let Some(network) = runtime.network.as_mut() {
             observer(runtime.counters.event(
                 State::Configuring,
@@ -616,6 +640,7 @@ async fn run_connection(
     let outbound = runtime.outbound_rx.clone();
     let upload_counters = runtime.counters.clone();
     let leased_source = connection.lease.address.addr();
+    let routing = connection.routing.clone();
     let upload = tokio::spawn(async move {
         loop {
             let packet = tokio::select! {
@@ -628,7 +653,7 @@ async fn run_connection(
                     None => return,
                 }
             };
-            if !packet_has_source(&packet, leased_source) {
+            if !packet_has_source(&packet, leased_source, &routing) {
                 continue;
             }
             let result = tokio::select! {
@@ -731,6 +756,12 @@ fn validate_config(config: &Config) -> Result<(), RunError> {
             "TUN interface name is required".to_owned(),
         ));
     }
+    if config.subnet_router && config.manual_network {
+        return Err(RunError::Invalid(
+            "--subnet-router needs automatic networking; with --manual-network configure forwarding yourself"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -824,8 +855,11 @@ fn restored_endpoints(endpoint: &Url, saved: Vec<SocketAddr>) -> Result<Vec<Sock
     Ok(endpoints)
 }
 
-fn packet_has_source(packet: &[u8], source: Ipv4Addr) -> bool {
-    porta_wire::ip::parse_ipv4(packet).is_ok_and(|info| info.source == source)
+/// Whether the tunnel may carry `packet`: it comes from the lease or, on a
+/// subnet router, from a network behind this device.
+fn packet_has_source(packet: &[u8], source: Ipv4Addr, routing: &crate::tunnel::Routing) -> bool {
+    porta_wire::ip::parse_ipv4(packet)
+        .is_ok_and(|info| info.source == source || routing.serves(info.source))
 }
 
 fn normalize_ip(address: IpAddr) -> IpAddr {
@@ -891,11 +925,38 @@ mod tests {
         packet[12..16].copy_from_slice(&[10, 66, 0, 2]);
         packet[16..20].copy_from_slice(&[198, 51, 100, 1]);
 
-        assert!(packet_has_source(&packet, Ipv4Addr::new(10, 66, 0, 2)));
-        assert!(!packet_has_source(&packet, Ipv4Addr::new(192, 0, 2, 10)));
+        let full = crate::tunnel::Routing::default();
+        assert!(packet_has_source(
+            &packet,
+            Ipv4Addr::new(10, 66, 0, 2),
+            &full
+        ));
+        assert!(!packet_has_source(
+            &packet,
+            Ipv4Addr::new(192, 0, 2, 10),
+            &full
+        ));
         assert!(!packet_has_source(
             &packet[..10],
-            Ipv4Addr::new(10, 66, 0, 2)
+            Ipv4Addr::new(10, 66, 0, 2),
+            &full
+        ));
+
+        // A subnet router also carries packets from the networks behind it.
+        packet[12..16].copy_from_slice(&[10, 30, 0, 5]);
+        let router = crate::tunnel::Routing {
+            subnets: vec!["10.30.0.0/24".parse().unwrap()],
+            ..crate::tunnel::Routing::default()
+        };
+        assert!(!packet_has_source(
+            &packet,
+            Ipv4Addr::new(10, 66, 0, 2),
+            &full
+        ));
+        assert!(packet_has_source(
+            &packet,
+            Ipv4Addr::new(10, 66, 0, 2),
+            &router
         ));
     }
 

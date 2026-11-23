@@ -211,6 +211,8 @@ route_device() { in_ns client ip -o route get "$1" | sed -n 's/.* dev \([^ ]*\).
 [[ $(route_device 10.20.0.10) == porta-ci0 ]] || { echo "corp traffic is not routed into the tunnel" >&2; exit 1; }
 [[ $(route_device 172.31.9.2) == pub ]] || { echo "public traffic is routed into the tunnel" >&2; exit 1; }
 [[ $(route_device 192.0.2.1) == pub ]] || { echo "default traffic is routed into the tunnel" >&2; exit 1; }
+# Peers and their subnets stay reachable: the client pool is routed too.
+[[ $(route_device 10.66.0.1) == porta-ci0 ]] || { echo "the client pool is not routed into the tunnel" >&2; exit 1; }
 expect_seen 10.20.0.10 10.20.0.1 "corp request through the tunnel"
 expect_seen 172.31.9.2 172.31.9.1 "public request outside the tunnel"
 echo "only the advertised prefix uses the tunnel; other traffic goes direct"

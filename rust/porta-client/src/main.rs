@@ -95,6 +95,12 @@ mod linux {
         #[arg(
             long,
             action = ArgAction::SetTrue,
+            help = "Route the subnets the gateway assigns to this device: forward and masquerade tunnel traffic to them"
+        )]
+        subnet_router: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
         cleanup_network: bool,
@@ -144,6 +150,7 @@ mod linux {
                     reconnect_max_delay: arguments.reconnect_max_delay,
                     manual_network: arguments.manual_network,
                     network_state: arguments.network_state,
+                    subnet_router: arguments.subnet_router,
                 },
                 &cancellation,
                 print_event,

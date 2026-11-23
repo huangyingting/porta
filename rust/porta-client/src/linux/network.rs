@@ -92,6 +92,9 @@ struct Action {
     mtu: u16,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     was_up: bool,
+    /// A sysctl value to restore, for `forwarding`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    previous_value: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -110,6 +113,10 @@ struct NetworkState {
     /// means a full tunnel, which guards all traffic.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     split_prefixes: Vec<String>,
+    /// Subnet router: networks behind this device that tunnel traffic is
+    /// forwarded and masqueraded to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subnet_routes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -168,6 +175,7 @@ pub struct NetworkManager {
     _lock: File,
     state: NetworkState,
     commands: Arc<dyn CommandRunner>,
+    subnet_router: bool,
 }
 
 impl NetworkManager {
@@ -195,6 +203,7 @@ impl NetworkManager {
             None => NetworkState::default(),
         };
         Ok(Self {
+            subnet_router: false,
             state_path,
             _lock: lock,
             state,
@@ -230,6 +239,12 @@ impl NetworkManager {
         }
         self.protect().await?;
         self.ensure_escape(&endpoint).await
+    }
+
+    /// Forwards and masquerades tunnel traffic to the subnets the gateway
+    /// routes to this device.
+    pub fn set_subnet_router(&mut self, enabled: bool) {
+        self.subnet_router = enabled;
     }
 
     pub async fn up(
@@ -286,6 +301,7 @@ impl NetworkManager {
                 .await?;
             self.state.interface.clear();
             self.state.index = 0;
+            self.state.subnet_routes.clear();
             self.persist()?;
             link = self
                 .link(interface)
@@ -404,13 +420,27 @@ impl NetworkManager {
         {
             split_prefixes.push(dns.clone());
         }
+        let subnet_routes = if self.subnet_router {
+            routing.subnets.iter().map(ToString::to_string).collect()
+        } else {
+            Vec::new()
+        };
+        if !subnet_routes.is_empty() {
+            self.ensure_forwarding(&link, &alias).await?;
+        }
         let previous_split = std::mem::replace(&mut self.state.split_prefixes, split_prefixes);
+        let previous_subnets = std::mem::replace(&mut self.state.subnet_routes, subnet_routes);
         if let Err(error) = self.persist() {
             self.state.endpoints = previous;
             self.state.split_prefixes = previous_split;
+            self.state.subnet_routes = previous_subnets;
             return Err(error);
         }
         self.protect().await?;
+        if self.state.subnet_routes.is_empty() {
+            self.cleanup_matching(|action| action.kind == "forwarding")
+                .await?;
+        }
         let address_copy = address.clone();
         let dns_copy = dns_destination.unwrap_or_default();
         let endpoint_prefix = endpoint.prefix()?;
@@ -421,6 +451,35 @@ impl NetworkManager {
                 || (action.kind == "escape" && action.destination != endpoint_prefix)
         })
         .await
+    }
+
+    /// Enables IPv4 forwarding for a subnet router, journaling the value it
+    /// replaces. Forwarding that was already on is left to its owner.
+    async fn ensure_forwarding(
+        &mut self,
+        link: &LinkInfo,
+        alias: &str,
+    ) -> Result<(), NetworkError> {
+        if self
+            .state
+            .undo
+            .iter()
+            .any(|action| action.kind == "forwarding")
+        {
+            return Ok(());
+        }
+        let current = self
+            .invoke("sysctl", &["-n", "net.ipv4.ip_forward"], "")
+            .await?;
+        if current.trim() == "1" {
+            return Ok(());
+        }
+        let mut action = link_action("forwarding", link, alias);
+        action.previous_value = current.trim().to_owned();
+        self.record(action).await?;
+        self.invoke("sysctl", &["-w", "net.ipv4.ip_forward=1"], "")
+            .await?;
+        Ok(())
     }
 
     /// Points systemd-resolved at the tunnel DNS server: for every name in a
@@ -555,6 +614,21 @@ impl NetworkManager {
                 if split { "accept" } else { "drop" }
             ));
         }
+        if !self.state.subnet_routes.is_empty() {
+            script.push_str(&format!(
+                "add chain inet {table} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n\
+                 flush chain inet {table} postrouting\n\
+                 add rule inet {table} postrouting iifname \"{interface}\" ip daddr {{ {subnets} }} masquerade\n",
+                table = self.state.table,
+                interface = self.state.interface,
+                subnets = self.state.subnet_routes.join(", "),
+            ));
+        } else if exists && self.chain_exists("postrouting").await? {
+            script.push_str(&format!(
+                "delete chain inet {} postrouting\n",
+                self.state.table
+            ));
+        }
         let mut add = |rule: &str| {
             script.push_str(&format!(
                 "add rule inet {} output {rule}\n",
@@ -612,6 +686,24 @@ impl NetworkManager {
         }
         self.invoke("nft", &["-f", "-"], &script).await?;
         Ok(())
+    }
+
+    async fn chain_exists(&self, chain: &str) -> Result<bool, NetworkError> {
+        let output = self
+            .invoke("nft", &["-j", "list", "chains", "inet"], "")
+            .await?;
+        let listing: Value = serde_json::from_str(&output)?;
+        Ok(listing
+            .get("nftables")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("chain").is_some_and(|value| {
+                        value.get("table").and_then(Value::as_str) == Some(&self.state.table)
+                            && value.get("name").and_then(Value::as_str) == Some(chain)
+                    })
+                })
+            }))
     }
 
     async fn table_exists(&self) -> Result<bool, NetworkError> {
@@ -864,6 +956,25 @@ impl NetworkManager {
     }
 
     async fn undo(&self, action: &Action) -> Result<(), NetworkError> {
+        if action.kind == "forwarding" {
+            // Restore even when the TUN is already gone; leave a value that
+            // something else changed since.
+            let current = self
+                .invoke("sysctl", &["-n", "net.ipv4.ip_forward"], "")
+                .await?;
+            if current.trim() == "1" {
+                self.invoke(
+                    "sysctl",
+                    &[
+                        "-w",
+                        &format!("net.ipv4.ip_forward={}", action.previous_value),
+                    ],
+                    "",
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         let mut link = self.action_link(action).await?;
         if link.is_none() && action.kind == "escape" && !stable_link_identity(action) {
             let named = self.link(&action.interface).await?;
@@ -1432,6 +1543,18 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
             "invalid network journal split route".to_owned(),
         ));
     }
+    if state.subnet_routes.len() > 16
+        || state.subnet_routes.iter().any(|prefix| {
+            prefix.parse::<ipnet::Ipv4Net>().map_or(true, |parsed| {
+                parsed.prefix_len() == 0 || parsed != parsed.trunc()
+            })
+        })
+        || (!state.subnet_routes.is_empty() && !valid_interface(&state.interface))
+    {
+        return Err(NetworkError::Invalid(
+            "invalid network journal subnet route".to_owned(),
+        ));
+    }
     for endpoint in &state.endpoints {
         let parsed = parse_endpoint(SocketAddr::new(endpoint.address()?, endpoint.port))?;
         if parsed != *endpoint {
@@ -1510,6 +1633,7 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
             Ok(())
         }
         "dns" => Ok(()),
+        "forwarding" if action.previous_value == "0" => Ok(()),
         _ => Err(NetworkError::Invalid(
             "invalid network journal action".to_owned(),
         )),

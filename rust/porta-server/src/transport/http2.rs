@@ -688,7 +688,7 @@ async fn consume_uploads(input: &mut BytesMut, session: &Session, mtu: u16) -> R
             session.services().metrics.dropped_from_client();
             continue;
         };
-        if info.source != session.lease.address {
+        if !session.may_send_from(info.source) {
             session.services().metrics.dropped_from_client();
             continue;
         }
@@ -819,6 +819,7 @@ mod tests {
                     },
                     cancellation: Arc::new(TokenCancellation::new(token)),
                     cleanup: Arc::new(NoopCleanup),
+                    network: Default::default(),
                 })
             })
         }
@@ -843,6 +844,7 @@ mod tests {
                     },
                     cancellation: Arc::new(TokenCancellation::new(cancellation)),
                     cleanup: Arc::new(NoopCleanup),
+                    network: Default::default(),
                 })
             })
         }

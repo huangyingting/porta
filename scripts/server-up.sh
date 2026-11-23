@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--client-to-client] [--client-host-access]" >&2
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--client-host-access]" >&2
   echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443" >&2
   echo "cascade relay: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --upstream-interface porta-up0" >&2
   exit 2
@@ -16,7 +16,6 @@ external_interface=$4
 public_port=$5
 shift 5
 upstream_interface=
-client_to_client=false
 client_host_access=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,7 +24,6 @@ while [[ $# -gt 0 ]]; do
       upstream_interface=$2
       shift 2
       ;;
-    --client-to-client) client_to_client=true; shift ;;
     --client-host-access) client_host_access=true; shift ;;
     *) usage ;;
   esac
@@ -153,13 +151,8 @@ table ip porta {
     type filter hook forward priority filter; policy accept;
     iifname "$tun_interface" oifname "$forward_interface" accept
     iifname "$forward_interface" oifname "$tun_interface" ct state established,related accept
-EOF
-  if $client_to_client; then
-    # Hub-and-spoke: connected clients may reach each other's leases.
-    printf '    iifname "%s" oifname "%s" ip saddr %s ip daddr %s accept\n' \
-      "$tun_interface" "$tun_interface" "$pool_cidr" "$pool_cidr"
-  fi
-  cat <<EOF
+    # Traffic between clients never reaches the kernel: the daemon switches
+    # it between sessions under each account's access policy.
     iifname "$tun_interface" drop
     oifname "$tun_interface" drop
   }
@@ -201,14 +194,6 @@ EOF
     iifname "$tun_interface" icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept
     iifname "$tun_interface" meta l4proto { tcp, udp } th dport 53 accept
     iifname "$tun_interface" drop
-  }
-EOF
-  fi
-  if $client_to_client; then
-    cat <<EOF
-  chain client_redirects {
-    type filter hook output priority filter; policy accept;
-    oifname "$tun_interface" icmp type redirect drop
   }
 EOF
   fi

@@ -1,3 +1,4 @@
+use crate::data::queue::DropReason;
 use crate::data::ratelimit::{AccountRateLimiter, Direction as RateDirection, RateLimiters};
 use crate::data::router::{Router, RouterError, Session as RouterSession};
 use crate::ops::abuse::{AbuseGuard, Surface};
@@ -9,7 +10,7 @@ use crate::proxy::service::{
 };
 use crate::state::pool::{Lease as PoolLease, Pool, PoolError};
 use crate::state::registry::{
-    AccountLimits, ClientRegistry as StateRegistry, EnrollmentPolicy,
+    AccessPolicy, AccountLimits, ClientRegistry as StateRegistry, EnrollmentPolicy,
     RegistryError as StateRegistryError, UsagePeriod,
 };
 use crate::state::sessions::SessionGuard;
@@ -17,12 +18,13 @@ use crate::state::usage;
 use crate::transport::session::{
     AccountStatus, Authenticated, AuthenticationError, AuthenticationRequest, Authenticator,
     Cleanup, ClientIdentity as TransportIdentity, DenialReason, Lease, LeaseAllocator, LeaseError,
-    LeaseMode, LeaseRequest, Metrics, PacketRouter, PacketSource, QueueDrop, RouteError, RouteKind,
-    RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata, UsageSession,
+    LeaseMode, LeaseRequest, Metrics, NetworkPolicy, PacketRouter, PacketSource, QueueDrop,
+    RouteError, RouteKind, RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata,
+    UsageSession,
 };
 use crate::web::admin::{
-    ClientEnrollment as WebClientEnrollment, ClientIdentity as WebIdentity,
-    ClientLimits as WebClientLimits, ClientRegistry as WebRegistry,
+    ClientAccess as WebClientAccess, ClientEnrollment as WebClientEnrollment,
+    ClientIdentity as WebIdentity, ClientLimits as WebClientLimits, ClientRegistry as WebRegistry,
     ClientSummary as WebClientSummary, DeviceSummary as WebDeviceSummary,
     RegistryError as WebRegistryError,
 };
@@ -166,8 +168,14 @@ impl Authenticator for NativeAuthenticator {
                 usage.as_deref(),
                 &session.identity.account_id,
             );
+            let network = network_policy(
+                &status_registry,
+                &session.identity.account_id,
+                &session.device_id,
+            );
             Ok(Authenticated {
                 account,
+                network,
                 identity: TransportIdentity {
                     account_id: session.identity.account_id,
                     lease_id: session.identity.lease_id,
@@ -176,6 +184,28 @@ impl Authenticator for NativeAuthenticator {
                 cleanup: Arc::new(RegistrySessionCleanup::new(session.guard)),
             })
         })
+    }
+}
+
+/// The network rules of one device's tunnel.
+pub fn network_policy(
+    registry: &StateRegistry,
+    account_id: &str,
+    device_id: &str,
+) -> NetworkPolicy {
+    let device = registry.device_network(account_id, device_id);
+    NetworkPolicy {
+        allow: device.access.allow,
+        deny: device.access.deny,
+        group: device.access.group,
+        exit: device.access.exit,
+        subnets: device.subnets,
+        published: registry
+            .routed_subnets()
+            .into_iter()
+            .filter(|routed| routed.account_id != account_id || routed.device_id != device_id)
+            .map(|routed| routed.subnet)
+            .collect(),
     }
 }
 
@@ -330,11 +360,33 @@ impl ProxyUsage for ProxyUsageAdapter {
 pub struct WebRegistryAdapter {
     registry: Arc<StateRegistry>,
     usage: Arc<usage::Store>,
+    network: GatewayNetwork,
+}
+
+/// Gateway facts that access policies and subnet routes are checked against.
+#[derive(Clone, Debug, Default)]
+pub struct GatewayNetwork {
+    /// Exit names an account may select.
+    pub exits: Vec<String>,
+    /// Networks no device may route, such as the client pool.
+    pub reserved: Vec<ipnet::Ipv4Net>,
 }
 
 impl WebRegistryAdapter {
     pub fn new(registry: Arc<StateRegistry>, usage: Arc<usage::Store>) -> Arc<Self> {
-        Arc::new(Self { registry, usage })
+        Self::with_network(registry, usage, GatewayNetwork::default())
+    }
+
+    pub fn with_network(
+        registry: Arc<StateRegistry>,
+        usage: Arc<usage::Store>,
+        network: GatewayNetwork,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            usage,
+            network,
+        })
     }
 
     fn summary(&self, id: &str) -> Result<WebClientSummary, WebRegistryError> {
@@ -684,6 +736,57 @@ impl WebRegistry for WebRegistryAdapter {
         })
     }
 
+    fn set_client_access<'a>(
+        &'a self,
+        id: &'a str,
+        access: WebClientAccess,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        let exits = self.network.exits.clone();
+        Box::pin(async move {
+            let access = AccessPolicy {
+                allow: parse_prefixes(&access.allow)?,
+                deny: parse_prefixes(&access.deny)?,
+                group: access.group,
+                exit: access.exit,
+            };
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_access(&owned_id, access, &exits)
+                    .await
+                    .map(|_| ())
+                    .map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
+    fn set_device_subnets<'a>(
+        &'a self,
+        id: &'a str,
+        device_id: &'a str,
+        subnets: Vec<String>,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        let owned_device = device_id.to_owned();
+        let reserved = self.network.reserved.clone();
+        Box::pin(async move {
+            let subnets = parse_prefixes(&subnets)?;
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_device_subnets(&owned_id, &owned_device, subnets, &reserved)
+                    .await
+                    .map(|_| ())
+                    .map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
     fn review_device<'a>(
         &'a self,
         id: &'a str,
@@ -760,6 +863,20 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
     }
 }
 
+fn parse_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, WebRegistryError> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<ipnet::Ipv4Net>()
+                .or_else(|_| value.parse::<Ipv4Addr>().map(ipnet::Ipv4Net::from))
+                .map_err(|_| WebRegistryError::Invalid(format!("{value:?} is not an IPv4 prefix")))
+        })
+        .collect()
+}
+
 fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClientSummary {
     WebClientSummary {
         id: summary.id,
@@ -784,6 +901,22 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
         enrollment: summary.enrollment.to_owned(),
         enrollment_open_until: summary.enrollment_open_until.map(format_time),
         pending_devices: summary.pending_devices,
+        access: WebClientAccess {
+            allow: summary
+                .access
+                .allow
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            deny: summary
+                .access
+                .deny
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            group: summary.access.group,
+            exit: summary.access.exit,
+        },
         devices: summary
             .devices
             .into_iter()
@@ -804,6 +937,7 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
                 transport: device.transport,
                 assigned_address: device.assigned_address,
                 target: device.target,
+                subnets: device.subnets.iter().map(ToString::to_string).collect(),
             })
             .collect(),
     }
@@ -918,6 +1052,35 @@ pub struct RouterAdapter {
     limiters: Arc<RateLimiters>,
     /// Uplink limiter by lease; leases are unique per live device session.
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
+    /// Account and network policy of each live session, by lease.
+    contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
+    switching: SwitchConfig,
+}
+
+/// Gateway-wide rules for traffic between clients.
+#[derive(Clone, Debug, Default)]
+pub struct SwitchConfig {
+    /// Every client may reach every other client, as if in one group.
+    pub client_to_client: bool,
+    /// Destinations that access policies never block, such as the gateway
+    /// address and its DNS server.
+    pub always_reachable: Vec<Ipv4Addr>,
+}
+
+struct RouteContext {
+    account_id: String,
+    network: NetworkPolicy,
+}
+
+/// What happens to a packet a client sent.
+#[derive(Debug, Eq, PartialEq)]
+enum Verdict {
+    /// Continue through the TUN device to the kernel: the exit or the
+    /// gateway host.
+    Kernel,
+    /// Switch directly to the live session at this lease address.
+    Deliver(Ipv4Addr),
+    Drop(DropReason),
 }
 
 impl RouterAdapter {
@@ -930,12 +1093,73 @@ impl RouterAdapter {
         leases: Arc<PoolAdapter>,
         limiters: Arc<RateLimiters>,
     ) -> Arc<Self> {
+        Self::with_switching(router, leases, limiters, SwitchConfig::default())
+    }
+
+    pub fn with_switching(
+        router: Arc<Router>,
+        leases: Arc<PoolAdapter>,
+        limiters: Arc<RateLimiters>,
+        switching: SwitchConfig,
+    ) -> Arc<Self> {
         Arc::new(Self {
             router,
             leases,
             limiters,
             uplink: Arc::default(),
+            contexts: Arc::default(),
+            switching,
         })
+    }
+
+    /// Applies source validation, access policy and client-to-client rules
+    /// to a packet from the session at `lease`.
+    fn classify(&self, lease: Ipv4Addr, packet: &[u8]) -> Result<Verdict, RouterError> {
+        let info = porta_wire::ip::parse_ipv4(packet)
+            .map_err(|_| RouterError::InvalidPacket("client packet"))?;
+        let (source, destination) = (info.source, info.destination);
+        let contexts = self.contexts.read();
+        let sender = contexts.get(&lease);
+        let from_subnet = source != lease;
+        if from_subnet && !sender.is_some_and(|sender| sender.network.routes_subnet(source)) {
+            return Err(RouterError::SourceSpoofed {
+                got: source,
+                expected: lease,
+            });
+        }
+        if let Some(target) = self.router.owner(destination) {
+            if target == lease {
+                return Ok(Verdict::Drop(DropReason::PolicyDenied));
+            }
+            let receiver = contexts.get(&target);
+            let peers = self.switching.client_to_client
+                || match (sender, receiver) {
+                    (Some(sender), Some(receiver)) => {
+                        sender.account_id == receiver.account_id
+                            || (sender.network.group.is_some()
+                                && sender.network.group == receiver.network.group)
+                    }
+                    _ => false,
+                };
+            let permitted = sender.is_none_or(|sender| sender.network.permits(destination))
+                && receiver.is_none_or(|receiver| receiver.network.permits(source));
+            return Ok(if peers && permitted {
+                Verdict::Deliver(target)
+            } else {
+                Verdict::Drop(DropReason::PolicyDenied)
+            });
+        }
+        // Hosts behind a subnet router only exchange traffic with clients.
+        if from_subnet {
+            return Ok(Verdict::Drop(DropReason::PolicyDenied));
+        }
+        if self.switching.always_reachable.contains(&destination)
+            || sender.is_none_or(|sender| sender.network.permits(destination))
+        {
+            Ok(Verdict::Kernel)
+        } else {
+            Ok(Verdict::Drop(DropReason::PolicyDenied))
+        }
     }
 
     fn uplink_allowed(&self, lease: Ipv4Addr, bytes: usize) -> bool {
@@ -960,6 +1184,8 @@ struct RouteHandle {
     limiter: Arc<AccountRateLimiter>,
     limiters: Arc<RateLimiters>,
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
+    context: Arc<RouteContext>,
+    contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
 }
 
 impl RouteHandle {
@@ -1008,6 +1234,13 @@ impl Cleanup for RouteHandle {
         {
             uplink.remove(&self.address);
         }
+        let mut contexts = self.contexts.write();
+        if contexts
+            .get(&self.address)
+            .is_some_and(|context| Arc::ptr_eq(context, &self.context))
+        {
+            contexts.remove(&self.address);
+        }
     }
 }
 
@@ -1022,6 +1255,7 @@ impl PacketRouter for RouterAdapter {
         let limiter = self.limiters.limiter(&request.account_id);
         let limiters = self.limiters.clone();
         let uplink = self.uplink.clone();
+        let contexts = self.contexts.clone();
         Box::pin(async move {
             let lease = lease.ok_or(RouteError::Conflict)?;
             let mut registered = None;
@@ -1057,12 +1291,20 @@ impl PacketRouter for RouterAdapter {
             let cancellation = session.cancellation();
             let address = request.lease.address;
             uplink.write().insert(address, limiter.clone());
+            let context = Arc::new(RouteContext {
+                account_id: request.account_id,
+                network: request.network,
+            });
+            contexts.write().insert(address, context.clone());
+            router.set_subnets(address, &context.network.subnets);
             let handle = Arc::new(RouteHandle {
                 session,
                 address,
                 limiter,
                 limiters,
                 uplink,
+                context,
+                contexts,
             });
             Ok(RouteSession {
                 downlink: handle.clone(),
@@ -1081,14 +1323,30 @@ impl PacketRouter for RouterAdapter {
     ) -> BoxFuture<'static, Result<(), RouteError>> {
         let router = self.router.clone();
         let allowed = self.uplink_allowed(lease, packet.len());
+        let verdict = self.classify(lease, &packet);
         Box::pin(async move {
             if !allowed {
                 return Ok(());
             }
-            router
-                .inject(&cancellation, lease, &packet)
-                .await
-                .map_err(map_route_error)
+            match verdict.map_err(map_route_error)? {
+                Verdict::Kernel => router
+                    .inject_validated(&cancellation, &packet)
+                    .await
+                    .map_err(map_route_error),
+                Verdict::Deliver(target) => {
+                    match forwarded(&packet) {
+                        Some(packet) => {
+                            router.deliver(target, packet);
+                        }
+                        None => router.record_policy_drop(DropReason::TtlExpired),
+                    }
+                    Ok(())
+                }
+                Verdict::Drop(reason) => {
+                    router.record_policy_drop(reason);
+                    Ok(())
+                }
+            }
         })
     }
 
@@ -1105,6 +1363,19 @@ impl PacketRouter for RouterAdapter {
                 .map_err(map_route_error)
         })
     }
+}
+
+/// A copy of `packet` with its TTL decremented, as a router forwards it, or
+/// `None` once the TTL is exhausted.
+fn forwarded(packet: &[u8]) -> Option<Bytes> {
+    let ttl = *packet.get(8)?;
+    if ttl <= 1 {
+        return None;
+    }
+    let mut packet = packet.to_vec();
+    packet[8] = ttl - 1;
+    porta_wire::ip::set_ipv4_header_checksum(&mut packet).ok()?;
+    Some(Bytes::from(packet))
 }
 
 fn map_route_error(error: RouterError) -> RouteError {
@@ -1318,6 +1589,7 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                network: Default::default(),
             })
             .await;
         assert!(matches!(stale, Err(RouteError::Conflict)));
@@ -1328,6 +1600,7 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                network: Default::default(),
             })
             .await
             .unwrap();
@@ -1345,6 +1618,214 @@ mod tests {
         route.cleanup.close();
         leases.release(&first);
         leases.release(&current);
+    }
+
+    fn addressed_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Bytes {
+        let mut packet = ipv4_packet(source).to_vec();
+        packet[16..20].copy_from_slice(&destination.octets());
+        porta_wire::ip::set_ipv4_header_checksum(&mut packet).unwrap();
+        Bytes::from(packet)
+    }
+
+    fn context(account_id: &str, network: NetworkPolicy) -> Arc<RouteContext> {
+        Arc::new(RouteContext {
+            account_id: account_id.into(),
+            network,
+        })
+    }
+
+    #[tokio::test]
+    async fn switching_enforces_sources_peers_and_access_policy() {
+        let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
+        let c: Ipv4Addr = "10.66.0.4".parse().unwrap();
+        let lan: Ipv4Addr = "10.30.0.5".parse().unwrap();
+        let internet: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let gateway: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let subnet: ipnet::Ipv4Net = "10.30.0.0/24".parse().unwrap();
+        let build = |client_to_client| {
+            let router = Arc::new(Router::new(Arc::new(MemoryDevice::default()), None));
+            let pool = Arc::new(Pool::new("10.66.0.0/24").unwrap());
+            let adapter = RouterAdapter::with_switching(
+                router.clone(),
+                PoolAdapter::new(pool),
+                RateLimiters::new(),
+                SwitchConfig {
+                    client_to_client,
+                    always_reachable: vec![gateway],
+                },
+            );
+            (router, adapter)
+        };
+        let parent = CancellationToken::new();
+        let (router, adapter) = build(false);
+        let _sessions = [a, b, c].map(|address| router.register(&parent, address));
+        router.set_subnets(b, &[subnet]);
+        let set = |address, account, network| {
+            adapter
+                .contexts
+                .write()
+                .insert(address, context(account, network));
+        };
+        let router_b = NetworkPolicy {
+            subnets: vec![subnet],
+            ..NetworkPolicy::default()
+        };
+        set(a, "alpha", NetworkPolicy::default());
+        set(b, "beta", router_b.clone());
+        set(c, "alpha", NetworkPolicy::default());
+        let verdict = |from, source, destination| {
+            adapter.classify(from, &addressed_packet(source, destination))
+        };
+
+        assert_eq!(verdict(a, a, internet).unwrap(), Verdict::Kernel);
+        // Devices of one account reach each other; other accounts do not.
+        assert_eq!(verdict(a, a, c).unwrap(), Verdict::Deliver(c));
+        assert_eq!(
+            verdict(a, a, b).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(
+            verdict(a, a, lan).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        // Only the subnet router may send from its subnet, and only to clients.
+        assert!(matches!(
+            verdict(a, lan, internet),
+            Err(RouterError::SourceSpoofed { .. })
+        ));
+        assert_eq!(
+            verdict(b, lan, internet).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+
+        // A shared group makes the accounts peers, including the subnet.
+        let team = Some("team".to_owned());
+        set(
+            a,
+            "alpha",
+            NetworkPolicy {
+                group: team.clone(),
+                ..NetworkPolicy::default()
+            },
+        );
+        set(
+            b,
+            "beta",
+            NetworkPolicy {
+                group: team.clone(),
+                ..router_b.clone()
+            },
+        );
+        assert_eq!(verdict(a, a, b).unwrap(), Verdict::Deliver(b));
+        assert_eq!(verdict(a, a, lan).unwrap(), Verdict::Deliver(b));
+        assert_eq!(verdict(b, lan, a).unwrap(), Verdict::Deliver(a));
+
+        // Deny lists win over peering, in both directions.
+        set(
+            a,
+            "alpha",
+            NetworkPolicy {
+                group: team.clone(),
+                deny: vec![subnet],
+                ..NetworkPolicy::default()
+            },
+        );
+        assert_eq!(
+            verdict(a, a, lan).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(
+            verdict(b, lan, a).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+
+        // An allow list confines the exit but keeps the gateway reachable.
+        set(
+            a,
+            "alpha",
+            NetworkPolicy {
+                allow: vec![subnet],
+                ..NetworkPolicy::default()
+            },
+        );
+        assert_eq!(
+            verdict(a, a, internet).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(verdict(a, a, gateway).unwrap(), Verdict::Kernel);
+
+        // --client-to-client makes every client a peer.
+        let (router, adapter) = build(true);
+        let _sessions = [a, b].map(|address| router.register(&parent, address));
+        adapter
+            .contexts
+            .write()
+            .insert(a, context("alpha", NetworkPolicy::default()));
+        adapter
+            .contexts
+            .write()
+            .insert(b, context("beta", NetworkPolicy::default()));
+        assert_eq!(
+            adapter.classify(a, &addressed_packet(a, b)).unwrap(),
+            Verdict::Deliver(b)
+        );
+    }
+
+    #[tokio::test]
+    async fn switched_packets_reach_the_peer_with_a_decremented_ttl() {
+        let pool = Arc::new(Pool::new("10.66.0.0/24").unwrap());
+        let leases = PoolAdapter::new(pool);
+        let mut routes = Vec::new();
+        for name in ["first", "second"] {
+            let lease = leases
+                .acquire(LeaseRequest {
+                    lease_id: name.into(),
+                    group_id: None,
+                    mode: LeaseMode::Exclusive,
+                })
+                .await
+                .unwrap();
+            routes.push(lease);
+        }
+        let device = Arc::new(MemoryDevice::default());
+        let adapter = RouterAdapter::new(Arc::new(Router::new(device.clone(), None)), leases);
+        let mut sessions = Vec::new();
+        for lease in &routes {
+            sessions.push(
+                adapter
+                    .register(RouteRequest {
+                        lease: lease.clone(),
+                        kind: RouteKind::ConnectIp,
+                        parent: CancellationToken::new(),
+                        account_id: "account".into(),
+                        network: NetworkPolicy::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (first, second) = (routes[0].address, routes[1].address);
+        adapter
+            .inject_from_client(
+                sessions[0].cancellation.clone(),
+                first,
+                addressed_packet(first, second),
+            )
+            .await
+            .unwrap();
+        let switched = sessions[1].downlink.try_packet().unwrap();
+        assert_eq!(switched[8], 63);
+        assert!(porta_wire::ip::parse_ipv4(&switched).is_ok());
+        assert!(device.writes.lock().is_empty());
+        assert!(forwarded(&addressed_packet(first, second)[..]).is_some());
+        let mut expiring = addressed_packet(first, second).to_vec();
+        expiring[8] = 1;
+        assert!(forwarded(&expiring).is_none());
+
+        // A closed session's context and subnets disappear with it.
+        sessions[1].cleanup.close();
+        assert!(!adapter.contexts.read().contains_key(&second));
     }
 
     const TOKEN: &str = "bootstrap-token-0123456789";
@@ -1582,6 +2063,7 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                network: Default::default(),
             })
             .await
             .unwrap();

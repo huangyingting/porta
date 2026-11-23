@@ -24,6 +24,10 @@ pub enum DropReason {
     SessionClosed,
     InvalidTunPacket,
     NoSession,
+    /// An account's access policy refused the packet.
+    PolicyDenied,
+    /// A packet switched between clients ran out of hops.
+    TtlExpired,
 }
 
 pub trait DataMetrics: Send + Sync + 'static {

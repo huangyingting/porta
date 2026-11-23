@@ -1645,7 +1645,7 @@ pub(crate) async fn inject_packet(session: &Session, packet: Bytes, mtu: u16) ->
         session.services().metrics.dropped_from_client();
         return Ok(());
     };
-    if info.source != session.lease.address {
+    if !session.may_send_from(info.source) {
         session.services().metrics.dropped_from_client();
         return Ok(());
     }
@@ -3331,6 +3331,7 @@ mod tests {
                     },
                     cancellation: Arc::new(TokenCancellation::new(token)),
                     cleanup: Arc::new(NoopCleanup),
+                    network: Default::default(),
                 })
             })
         }

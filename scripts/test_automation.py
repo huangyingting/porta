@@ -337,21 +337,23 @@ class AutomationTests(unittest.TestCase):
         # Instance metadata stays blocked even when host access is allowed.
         self.assertIn("169.254.0.0/16", transaction)
 
-    def test_client_to_client_forwarding_is_opt_in(self):
+    def test_kernel_never_forwards_between_clients(self):
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
-        self.assertNotIn('oifname "porta0" ip saddr', self.state()["nft_transaction"])
-        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
-                        "--client-to-client")
         transaction = self.state()["nft_transaction"]
         forward = transaction.split("chain forward {", 1)[1].split("}", 1)[0].splitlines()
-        rules = [line.strip() for line in forward if line.strip() and "type filter" not in line]
-        # Readiness requires the egress and return rules to stay first.
-        self.assertEqual(rules[:3], [
+        rules = [line.strip() for line in forward
+                 if line.strip() and "type filter" not in line and not line.strip().startswith("#")]
+        # Readiness requires the egress and return rules to stay first; the
+        # daemon switches client-to-client traffic itself.
+        self.assertEqual(rules, [
             'iifname "porta0" oifname "eth0" accept',
             'iifname "eth0" oifname "porta0" ct state established,related accept',
-            'iifname "porta0" oifname "porta0" ip saddr 10.66.0.0/24 ip daddr 10.66.0.0/24 accept',
+            'iifname "porta0" drop',
+            'oifname "porta0" drop',
         ])
-        self.assertIn('oifname "porta0" icmp type redirect drop', transaction)
+        # The option moved to the daemon.
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                        "--client-to-client", success=False)
 
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
@@ -834,12 +836,13 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(environment.read_text().count("PORTA_UPSTREAM_TOKEN="), 1)
         self.assertIn(f"PORTA_UPSTREAM_TOKEN={token}\n", environment.read_text())
 
-    def test_deploy_client_to_client_is_passed_to_network_setup(self):
+    def test_deploy_client_to_client_is_passed_to_the_daemon(self):
         deploy = self.prepare_deploy(timer=False)
         result = self.run_deploy(deploy, "--build-local", "--client-to-client")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --client-to-client;",
-                      unit)
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn("--dns 1.1.1.1 --client-to-client --mtu", start)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
         self.assertIn("allowed within 10.66.0.0/24", result.stdout)
 
     def test_deploy_runs_the_daemon_as_an_unprivileged_user(self):

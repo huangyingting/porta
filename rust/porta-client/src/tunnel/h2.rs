@@ -386,11 +386,17 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         };
         let lease = connection.lease;
         *group.account.lock().expect("HTTP/2 account lock poisoned") = connection.account;
-        group
-            .routing
-            .lock()
-            .expect("HTTP/2 routing lock poisoned")
-            .get_or_insert_with(|| connection.routing.clone());
+        let routing_changed = {
+            let mut routing = group.routing.lock().expect("HTTP/2 routing lock poisoned");
+            routing.get_or_insert_with(|| connection.routing.clone()) != &connection.routing
+        };
+        if routing_changed {
+            // The gateway changed this device's routes or subnets, as after an
+            // administrator update; reconnecting reconfigures the network.
+            close_lane(connection).await;
+            group.fail(ClientError::retryable("gateway routing changed"));
+            return;
+        }
         if let Err(error) = group.accept_lease(lease) {
             close_lane(connection).await;
             group.fail(error);
@@ -819,6 +825,12 @@ async fn download_lane(
         .lock()
         .expect("HTTP/2 lease lock poisoned")
         .expect("active HTTP/2 lane has a lease");
+    let routing = group
+        .routing
+        .lock()
+        .expect("HTTP/2 routing lock poisoned")
+        .clone()
+        .unwrap_or_default();
     let mut framed = BytesMut::new();
     loop {
         let data = tokio::select! {
@@ -852,7 +864,7 @@ async fn download_lane(
             let Ok(info) = porta_wire::ip::parse_ipv4(&packet) else {
                 continue;
             };
-            if info.destination != lease.address.addr() {
+            if info.destination != lease.address.addr() && !routing.serves(info.destination) {
                 continue;
             }
             tokio::select! {

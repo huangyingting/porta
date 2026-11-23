@@ -6,8 +6,9 @@ use porta_server_rust::data::router::Router;
 use porta_server_rust::data::tun::NativeTun;
 use porta_server_rust::http_handler::{AdminHttpHandler, PublicHttpHandler};
 use porta_server_rust::integration::{
-    AbuseLimiter, AccountPolicyEnforcer, NativeAuthenticator, PoolAdapter, ProxyUsageAdapter,
-    RegistryProxyAuthorizer, RouterAdapter, UsageAdapter, WebRegistryAdapter,
+    AbuseLimiter, AccountPolicyEnforcer, GatewayNetwork, NativeAuthenticator, PoolAdapter,
+    ProxyUsageAdapter, RegistryProxyAuthorizer, RouterAdapter, SwitchConfig, UsageAdapter,
+    WebRegistryAdapter,
 };
 use porta_server_rust::ops::abuse::AbuseGuard;
 use porta_server_rust::ops::acme::{AutomaticCertificateConfig, AutomaticCertificateManager};
@@ -94,9 +95,11 @@ async fn run() -> Result<()> {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         let dns_domains = config.dns_domains.clone();
+        let client_to_client = config.client_to_client;
         let provider: GatewayStatusProvider = Arc::new(move || GatewayStatus {
             routes: routes.clone(),
             dns_domains: dns_domains.clone(),
+            client_to_client,
             ..base()
         });
         provider
@@ -117,12 +120,34 @@ async fn run() -> Result<()> {
             usage.clone(),
         ),
         leases: leases.clone(),
-        router: RouterAdapter::with_rate_limits(router.clone(), leases, rate_limits.clone()),
+        router: RouterAdapter::with_switching(
+            router.clone(),
+            leases,
+            rate_limits.clone(),
+            SwitchConfig {
+                client_to_client: config.client_to_client,
+                always_reachable: [Some(pool.gateway()), config.dns_address()?]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            },
+        ),
         usage: UsageAdapter::new(usage.clone()),
         metrics: metrics.clone(),
         routing: TunnelRouting {
-            routes: config.routes.clone(),
+            // Split tunnels also route the client pool so that peers and
+            // their subnets stay reachable.
+            routes: if config.routes.is_empty() {
+                Vec::new()
+            } else {
+                let mut routes = config.routes.clone();
+                if !routes.contains(&config.pool.trunc()) {
+                    routes.push(config.pool.trunc());
+                }
+                routes
+            },
             dns_domains: config.dns_domains.clone(),
+            subnets: Vec::new(),
         },
     });
     let dns = config.dns_address()?;
@@ -165,8 +190,14 @@ async fn run() -> Result<()> {
         None,
     ));
     drop(metrics_token);
-    let web_registry: Arc<dyn WebClientRegistry> =
-        WebRegistryAdapter::new(registry.clone(), usage.clone());
+    let web_registry: Arc<dyn WebClientRegistry> = WebRegistryAdapter::with_network(
+        registry.clone(),
+        usage.clone(),
+        GatewayNetwork {
+            exits: Vec::new(),
+            reserved: vec![config.pool.trunc()],
+        },
+    );
     let downloads = config
         .client_downloads
         .as_ref()
@@ -553,6 +584,8 @@ mod upstream {
             version: porta_server_rust::VERSION.trim().to_owned(),
             routes: Vec::new(),
             dns_domains: Vec::new(),
+            client_to_client: false,
+            exits: Vec::new(),
             upstream: upstream.as_ref().map(|(status, url, interface)| {
                 let snapshot = status.snapshot();
                 UpstreamStatus {

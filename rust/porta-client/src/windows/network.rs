@@ -3087,6 +3087,7 @@ mod tests {
         let mut routing = Routing {
             routes: vec!["10.20.0.0/16".parse().unwrap()],
             dns_domains: Vec::new(),
+            ..Routing::default()
         };
         validate_lease("Porta", &endpoint, lease, &routing).unwrap();
         assert!(validate_lease("Porta", &endpoint, lease, &Routing::default()).is_err());

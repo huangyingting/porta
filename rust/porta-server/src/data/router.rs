@@ -3,6 +3,7 @@ use super::queue::{
     QueueConfig,
 };
 use bytes::Bytes;
+use ipnet::Ipv4Net;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -250,6 +251,9 @@ impl FlowTable {
 struct RouterInner {
     device: Arc<dyn PacketDevice>,
     sessions: RwLock<HashMap<Ipv4Addr, SessionGroup>>,
+    /// Networks behind subnet-router sessions, most specific first, with
+    /// the lease address of the session that routes each.
+    subnets: RwLock<Vec<(Ipv4Net, Ipv4Addr)>>,
     metrics: Option<Arc<dyn DataMetrics>>,
 }
 
@@ -284,6 +288,7 @@ impl Router {
             inner: Arc::new(RouterInner {
                 device,
                 sessions: RwLock::new(HashMap::new()),
+                subnets: RwLock::new(Vec::new()),
                 metrics,
             }),
         }
@@ -374,6 +379,51 @@ impl Router {
         Ok(GroupRegistration { session, collapsed })
     }
 
+    /// Routes `subnets` to the session at `lease` until that session ends.
+    pub fn set_subnets(&self, lease: Ipv4Addr, subnets: &[Ipv4Net]) {
+        let mut routes = self.inner.subnets.write();
+        routes.retain(|(_, owner)| *owner != lease);
+        routes.extend(subnets.iter().map(|subnet| (subnet.trunc(), lease)));
+        routes.sort_by_key(|(subnet, _)| std::cmp::Reverse(subnet.prefix_len()));
+    }
+
+    /// The lease address of the live session that receives packets for
+    /// `destination`: its own lease or a subnet it routes.
+    pub fn owner(&self, destination: Ipv4Addr) -> Option<Ipv4Addr> {
+        let sessions = self.inner.sessions.read();
+        if sessions.contains_key(&destination) {
+            return Some(destination);
+        }
+        self.inner
+            .subnets
+            .read()
+            .iter()
+            .find(|(subnet, _)| subnet.contains(&destination))
+            .map(|(_, owner)| *owner)
+            .filter(|owner| sessions.contains_key(owner))
+    }
+
+    /// Queues a packet for the session at `lease`, as if it had arrived
+    /// from the TUN device.
+    pub fn deliver(&self, lease: Ipv4Addr, packet: Bytes) -> bool {
+        let session = {
+            let sessions = self.inner.sessions.read();
+            sessions
+                .get(&lease)
+                .and_then(|group| select_lane(group, &packet))
+        };
+        let Some(session) = session else {
+            self.record_drop(DropReason::NoSession);
+            return false;
+        };
+        session.enqueue(packet);
+        true
+    }
+
+    pub fn record_policy_drop(&self, reason: DropReason) {
+        self.record_drop(reason);
+    }
+
     pub async fn inject(
         &self,
         cancellation: &CancellationToken,
@@ -430,6 +480,13 @@ impl Router {
                     .get(&destination)
                     .and_then(|group| select_lane(group, &packet))
             };
+            let session = session.or_else(|| {
+                let owner = self.owner(destination)?;
+                let sessions = self.inner.sessions.read();
+                sessions
+                    .get(&owner)
+                    .and_then(|group| select_lane(group, &packet))
+            });
             let Some(session) = session else {
                 self.record_drop(DropReason::NoSession);
                 continue;
@@ -516,6 +573,10 @@ fn remove_session(
     };
     if remove_group {
         sessions.remove(&address);
+        router
+            .subnets
+            .write()
+            .retain(|(_, owner)| *owner != address);
     }
 }
 

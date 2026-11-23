@@ -58,6 +58,11 @@ pub struct Config {
     /// (repeatable). Other names keep using the device's resolver.
     #[arg(long = "dns-domain", value_name = "DOMAIN")]
     pub dns_domains: Vec<String>,
+    /// Let every client reach every other client's devices and subnets.
+    /// Without it, only devices of one account or of accounts that share an
+    /// access group reach each other.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    pub client_to_client: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub auto_mtu: bool,
     #[arg(long, default_value = "")]

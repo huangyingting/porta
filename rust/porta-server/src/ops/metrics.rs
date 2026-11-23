@@ -32,6 +32,8 @@ pub struct Metrics {
     invalid_tun_drops: AtomicU64,
     no_session_drops: AtomicU64,
     rate_limited_drops: AtomicU64,
+    policy_denied_drops: AtomicU64,
+    ttl_expired_drops: AtomicU64,
     mtu_fragmented: AtomicU64,
     mtu_icmp_sent: AtomicU64,
     mtu_icmp_suppressed: AtomicU64,
@@ -150,6 +152,8 @@ impl Metrics {
             "invalid_tun_packet" => &self.invalid_tun_drops,
             "no_session" => &self.no_session_drops,
             "rate_limited" => &self.rate_limited_drops,
+            "policy_denied" => &self.policy_denied_drops,
+            "ttl_expired" => &self.ttl_expired_drops,
             _ => return,
         };
         target.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +345,8 @@ impl Metrics {
                 ("invalid_tun_packet", &self.invalid_tun_drops),
                 ("no_session", &self.no_session_drops),
                 ("rate_limited", &self.rate_limited_drops),
+                ("policy_denied", &self.policy_denied_drops),
+                ("ttl_expired", &self.ttl_expired_drops),
             ]
             .into_iter()
             .map(|(reason, value)| (format!("reason={reason:?}"), value.load(Ordering::Relaxed))),

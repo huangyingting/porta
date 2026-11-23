@@ -187,10 +187,15 @@ successful retry rather than making its address available to another identity.
 Linux forwarding and NAT are deliberately outside the daemon. The supplied
 setup script makes these changes explicit and reversible. The daemon itself can
 run with only access to `/dev/net/tun` plus the configured TCP/UDP port.
-Client-to-client forwarding between leases is dropped unless the setup script
-runs with `--client-to-client`, which accepts `porta0`-to-`porta0` traffic
-within the pool and suppresses the ICMP redirects Linux would otherwise send
-for it.
+Traffic between clients never reaches the kernel: the router delivers a
+packet whose destination is another live lease, or a subnet routed to another
+device, directly to that session's queue, decrementing its TTL. Before that,
+it checks the source (the sender's lease or one of its subnets), whether the
+two devices are peers (same account, shared access group, or
+`--client-to-client`), and both accounts' allow and deny lists. Packets toward
+the exit are checked against the sender's lists; packets sourced from a
+subnet may only reach other clients. The kernel forward chain therefore drops
+all `porta0`-to-`porta0` traffic.
 
 Packet-device reads transfer ownership of their buffers to the caller. The
 router and client receive queues pass those buffers onward without another

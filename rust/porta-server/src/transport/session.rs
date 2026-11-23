@@ -116,6 +116,38 @@ pub struct Authenticated {
     pub cancellation: Arc<dyn Cancellation>,
     pub cleanup: Arc<dyn Cleanup>,
     pub account: AccountStatus,
+    pub network: NetworkPolicy,
+}
+
+/// Network rules for one device's tunnel, enforced by the packet router.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NetworkPolicy {
+    /// Destinations the device may reach; empty allows every destination.
+    pub allow: Vec<ipnet::Ipv4Net>,
+    /// Destinations the device may never reach; takes precedence over `allow`.
+    pub deny: Vec<ipnet::Ipv4Net>,
+    /// Devices of accounts in the same group reach each other.
+    pub group: Option<String>,
+    /// Named exit for the device's traffic; unset uses the gateway default.
+    pub exit: Option<String>,
+    /// Networks behind this device that it routes for other clients.
+    pub subnets: Vec<ipnet::Ipv4Net>,
+    /// Subnets behind other devices, added to split-tunnel routes.
+    pub published: Vec<ipnet::Ipv4Net>,
+}
+
+impl NetworkPolicy {
+    /// Whether the allow and deny lists let the device exchange packets
+    /// with `address`.
+    pub fn permits(&self, address: std::net::Ipv4Addr) -> bool {
+        !self.deny.iter().any(|prefix| prefix.contains(&address))
+            && (self.allow.is_empty() || self.allow.iter().any(|prefix| prefix.contains(&address)))
+    }
+
+    /// Whether `address` lies in a network behind this device.
+    pub fn routes_subnet(&self, address: std::net::Ipv4Addr) -> bool {
+        self.subnets.iter().any(|subnet| subnet.contains(&address))
+    }
 }
 
 /// Account limits reported to the client when a tunnel is established.
@@ -270,6 +302,7 @@ pub struct RouteRequest {
     pub parent: CancellationToken,
     /// Account whose throughput limit applies to the route.
     pub account_id: String,
+    pub network: NetworkPolicy,
 }
 
 pub trait PacketSource: Send + Sync {
@@ -440,10 +473,13 @@ pub struct TunnelRouting {
     pub routes: Vec<ipnet::Ipv4Net>,
     /// With split routes: domains resolved by the tunnel DNS server.
     pub dns_domains: Vec<String>,
+    /// Networks behind this client that the gateway routes to it.
+    pub subnets: Vec<ipnet::Ipv4Net>,
 }
 
 pub const HEADER_ROUTES: &str = "x-porta-routes";
 pub const HEADER_DNS_DOMAINS: &str = "x-porta-dns-domains";
+pub const HEADER_SUBNETS: &str = "x-porta-subnets";
 
 impl TunnelRouting {
     pub fn is_full_tunnel(&self) -> bool {
@@ -490,6 +526,32 @@ impl TunnelRouting {
                 headers.insert(HEADER_DNS_DOMAINS, value);
             }
         }
+        if !self.subnets.is_empty() {
+            let subnets = self
+                .subnets
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Ok(value) = http::HeaderValue::from_str(&subnets) {
+                headers.insert(HEADER_SUBNETS, value);
+            }
+        }
+    }
+
+    /// The routing one device receives: its own subnets, and in a split
+    /// tunnel also the subnets other devices publish.
+    pub fn for_device(&self, network: &NetworkPolicy) -> Self {
+        let mut routing = self.clone();
+        routing.subnets.clone_from(&network.subnets);
+        if !routing.is_full_tunnel() {
+            for subnet in &network.published {
+                if !routing.routes.contains(subnet) {
+                    routing.routes.push(*subnet);
+                }
+            }
+        }
+        routing
     }
 }
 
@@ -568,6 +630,7 @@ impl Services {
                 kind: request.route,
                 parent: authenticated.cancellation.token(),
                 account_id: authenticated.identity.account_id.clone(),
+                network: authenticated.network.clone(),
             })
             .await
         {
@@ -618,7 +681,7 @@ impl Services {
             usage: usage.clone(),
             counted_usage: usage,
             account: authenticated.account,
-            routing: self.routing.clone(),
+            routing: self.routing.for_device(&authenticated.network),
             closed: AtomicBool::new(false),
         })
     }
@@ -648,6 +711,17 @@ pub struct Session {
 }
 
 impl Session {
+    /// Whether the client may send packets from `source`: its lease or, on a
+    /// subnet router, a network behind it.
+    pub fn may_send_from(&self, source: Ipv4Addr) -> bool {
+        source == self.lease.address
+            || self
+                .routing
+                .subnets
+                .iter()
+                .any(|subnet| subnet.contains(&source))
+    }
+
     pub fn close(&self) {
         self.close_with_reason(if self.cancellation.is_cancelled() {
             "cancelled"

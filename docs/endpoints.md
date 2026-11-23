@@ -188,13 +188,31 @@ and `.../deny` review a device. Client summaries include `enrollment`,
 devices. Refused native tunnels receive HTTP 403 with `X-Porta-Reason`
 `device-pending`, `enrollment-closed`, or `device-denied`.
 
+## Access policy and subnet routes
+
+`PUT /api/clients/{clientID}/access` replaces an account's access policy:
+`{"allow": ["10.20.0.0/16"], "deny": ["10.20.9.0/24"], "group": "team", "exit": null}`.
+Every field is optional; empty lists and `null` remove a rule. Prefixes may
+also be single addresses. Group names have at most 32 letters, digits, `-`
+or `_`, and are stored in lower case. The change reconnects the account's
+devices. Client summaries include the policy as `access`.
+
+`PUT /api/clients/{clientID}/devices/{deviceID}/subnets` with
+`{"subnets": ["10.30.0.0/24"]}` routes networks to a device, and an empty list
+stops routing them; the device reconnects. Device summaries include
+`subnets`. The gateway tells the device its subnets with the
+`X-Porta-Subnets` response header, and adds other devices' subnets and the
+client pool to split-tunnel `X-Porta-Routes`.
+
 ## Gateway status
 
 `GET /api/gateway` returns the server version and, on a cascade relay, the
 next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","interface":"porta-up0","connected":true,"address":"10.66.0.2","transport":"h3"}}`.
 While disconnected, `connected` is `false` and `error` holds the last failure.
-A split-tunnel gateway adds `routes` and `dns_domains`. The admin page shows
-both as banners.
+A split-tunnel gateway adds `routes` and `dns_domains`, `client_to_client`
+reports `--client-to-client`, and `exits` lists the exit names access
+policies may select. The admin page shows the routing and next hop as
+banners.
 
 ## Session administration
 

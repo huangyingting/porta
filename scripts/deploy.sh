@@ -851,8 +851,9 @@ if [[ -n $upstream ]]; then
   fi
   network_up_options=" --upstream-interface $upstream_interface"
 fi
+client_to_client_argument=
 if $client_to_client; then
-  network_up_options+=" --client-to-client"
+  client_to_client_argument=" --client-to-client"
 fi
 if $client_host_access; then
   network_up_options+=" --client-host-access"
@@ -874,7 +875,7 @@ User=$service_user
 Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$client_to_client_argument --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure

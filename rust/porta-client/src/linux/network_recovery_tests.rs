@@ -15,6 +15,8 @@ struct FakeState {
     addresses: HashMap<String, Vec<String>>,
     routes: HashMap<String, Vec<RouteInfo>>,
     tables: HashMap<String, String>,
+    chains: Vec<(String, String)>,
+    sysctl: HashMap<String, String>,
     dns: HashMap<String, String>,
     domains: HashMap<String, String>,
     commands: Vec<String>,
@@ -99,6 +101,16 @@ impl FakeCommands {
                         let fields = line.split_whitespace().collect::<Vec<_>>();
                         if line.starts_with("delete table ") {
                             state.tables.remove(fields[3]);
+                            state.chains.retain(|(table, _)| table != fields[3]);
+                        } else if line.starts_with("add chain ") {
+                            let chain = (fields[3].to_owned(), fields[4].to_owned());
+                            if !state.chains.contains(&chain) {
+                                state.chains.push(chain);
+                            }
+                        } else if line.starts_with("delete chain ") {
+                            state.chains.retain(|(table, chain)| {
+                                !(table == fields[3] && chain == fields[4])
+                            });
                         } else if line.starts_with("add table ") {
                             state.tables.insert(
                                 fields[3].to_owned(),
@@ -107,6 +119,16 @@ impl FakeCommands {
                         }
                     }
                     return Ok(String::new());
+                }
+                if arguments.get(2).is_some_and(|value| value == "chains") {
+                    let chains = state
+                        .chains
+                        .iter()
+                        .map(|(table, chain)| {
+                            json!({"chain": {"family": "inet", "table": table, "name": chain}})
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(json!({"nftables": chains}).to_string());
                 }
                 let tables = state
                     .tables
@@ -121,6 +143,17 @@ impl FakeCommands {
                     })
                     .collect::<Vec<_>>();
                 Ok(json!({"nftables": tables}).to_string())
+            }
+            "sysctl" => {
+                if arguments[0] == "-n" {
+                    return Ok(format!(
+                        "{}\n",
+                        state.sysctl.get(&arguments[1]).map_or("0", String::as_str)
+                    ));
+                }
+                let (key, value) = arguments[1].split_once('=').unwrap();
+                state.sysctl.insert(key.to_owned(), value.to_owned());
+                Ok(String::new())
             }
             "resolvectl" => {
                 match arguments.first().map(String::as_str) {
@@ -448,6 +481,7 @@ async fn split_tunnel_routes_only_advertised_prefixes_and_scopes_dns_and_guard()
             "192.168.5.0/24".parse().unwrap(),
         ],
         dns_domains: vec!["corp.example".to_owned()],
+        ..crate::tunnel::Routing::default()
     };
     manager.prepare(endpoint).await.unwrap();
     manager
@@ -504,12 +538,85 @@ async fn split_tunnel_routes_only_advertised_prefixes_and_scopes_dns_and_guard()
 }
 
 #[tokio::test]
+async fn subnet_router_forwards_and_masquerades_its_subnets_and_restores_forwarding() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    manager.set_subnet_router(true);
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        subnets: vec!["10.30.0.0/24".parse().unwrap()],
+        ..crate::tunnel::Routing::default()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.sysctl["net.ipv4.ip_forward"], "1");
+        let rules = state.scripts.last().unwrap();
+        assert!(
+            rules.contains("iifname \"porta0\" ip daddr { 10.30.0.0/24 } masquerade"),
+            "{rules}"
+        );
+        // The full-tunnel output guard still applies to the host itself.
+        assert!(rules.contains("policy drop"), "{rules}");
+    }
+
+    // Without assigned subnets the NAT chain and forwarding are removed.
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.sysctl["net.ipv4.ip_forward"], "0");
+        assert!(state.scripts.last().unwrap().contains("delete chain"));
+    }
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    manager.down().await.unwrap();
+    let state = snapshot(&commands);
+    assert_eq!(state.sysctl["net.ipv4.ip_forward"], "0");
+    assert!(state.tables.is_empty());
+}
+
+#[tokio::test]
+async fn subnet_router_leaves_forwarding_it_did_not_enable() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    manager.set_subnet_router(true);
+    snapshot(&commands)
+        .sysctl
+        .insert("net.ipv4.ip_forward".to_owned(), "1".to_owned());
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        subnets: vec!["10.30.0.0/24".parse().unwrap()],
+        ..crate::tunnel::Routing::default()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    manager.down().await.unwrap();
+    assert_eq!(snapshot(&commands).sysctl["net.ipv4.ip_forward"], "1");
+}
+
+#[tokio::test]
 async fn split_tunnel_without_dns_domains_leaves_dns_alone() {
     let (_directory, _path, commands, mut manager) = new_fake();
     let endpoint = "198.51.100.10:443".parse().unwrap();
     let routing = crate::tunnel::Routing {
         routes: vec!["10.20.0.0/16".parse().unwrap()],
         dns_domains: Vec::new(),
+        ..crate::tunnel::Routing::default()
     };
     manager.prepare(endpoint).await.unwrap();
     manager

@@ -3,6 +3,7 @@ use crate::state::usage;
 use crate::wire::device_auth;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use ipnet::Ipv4Net;
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -91,7 +92,38 @@ pub struct ClientRecord {
         with = "optional_rfc3339"
     )]
     pub enrollment_open_until: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "AccessPolicy::is_default")]
+    pub access: AccessPolicy,
 }
+
+/// Network access rules for an account's tunnels. The default reaches every
+/// destination and belongs to no client-to-client group.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AccessPolicy {
+    /// Destinations the account may reach; empty allows every destination.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<Ipv4Net>,
+    /// Destinations the account may never reach; takes precedence over `allow`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<Ipv4Net>,
+    /// Accounts in the same group reach each other's devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Named exit for the account's traffic; unset uses the gateway default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
+}
+
+impl AccessPolicy {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Prefixes per allow or deny list.
+pub const MAX_ACCESS_PREFIXES: usize = 64;
+/// Subnets one device may route for other clients.
+pub const MAX_DEVICE_SUBNETS: usize = 16;
 
 /// How an account accepts device keys it has not seen before.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -242,6 +274,23 @@ pub struct DeviceRecord {
     pub last_seen: OffsetDateTime,
     #[serde(default, skip_serializing_if = "DeviceStatus::is_approved")]
     pub status: DeviceStatus,
+    /// Networks behind this device that the gateway routes to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subnets: Vec<Ipv4Net>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedSubnet {
+    pub account_id: String,
+    pub device_id: String,
+    pub subnet: Ipv4Net,
+}
+
+/// The network rules that apply to one device's tunnel.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeviceNetwork {
+    pub access: AccessPolicy,
+    pub subnets: Vec<Ipv4Net>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -282,6 +331,7 @@ pub struct ClientSummary {
     pub quota_used_bytes: Option<u64>,
     /// `active`, `disabled`, `expired`, or `quota_exceeded`.
     pub status: &'static str,
+    pub access: AccessPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -310,6 +360,8 @@ pub struct DeviceSummary {
     pub assigned_address: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub target: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subnets: Vec<Ipv4Net>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -480,6 +532,7 @@ impl ClientRegistry {
                     usage_period: None,
                     enrollment: EnrollmentPolicy::Open,
                     enrollment_open_until: None,
+                    access: AccessPolicy::default(),
                 }]
             }
             Err(error) => return Err(error.into()),
@@ -591,6 +644,7 @@ impl ClientRegistry {
             usage_period: None,
             enrollment: EnrollmentPolicy::Open,
             enrollment_open_until: None,
+            access: AccessPolicy::default(),
         };
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -810,32 +864,148 @@ impl ClientRegistry {
         id: &str,
         change: impl Fn(&mut ClientRecord) -> Result<(), RegistryError>,
     ) -> Result<ClientSummary, RegistryError> {
+        self.mutate_clients(id, |clients| {
+            let client = clients
+                .iter_mut()
+                .find(|client| client.id == id)
+                .ok_or(RegistryError::NotFound)?;
+            change(client)
+        })
+        .await
+    }
+
+    /// Like `mutate_client`, for changes to `id` that are validated against
+    /// every client record.
+    async fn mutate_clients(
+        &self,
+        id: &str,
+        change: impl Fn(&mut [ClientRecord]) -> Result<(), RegistryError>,
+    ) -> Result<ClientSummary, RegistryError> {
         self.ensure_open()?;
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
         let candidate = {
             let state = self.inner.state.lock();
             let mut clients = state.clients.clone();
-            let client = clients
-                .iter_mut()
-                .find(|client| client.id == id)
-                .ok_or(RegistryError::NotFound)?;
-            change(client)?;
+            change(&mut clients)?;
             clients
         };
         self.persist_clients(&candidate).await?;
         let mut state = self.inner.state.lock();
         let blocked = state.quota_blocked.contains(id);
-        let client = find_client_mut(&mut state, id)?;
-        if change(client).is_err() {
+        if change(&mut state.clients).is_err() {
             // Memory changed since the snapshot; keep it consistent with disk.
             if let Some(persisted) = candidate.into_iter().find(|client| client.id == id) {
-                *client = persisted;
+                *find_client_mut(&mut state, id)? = persisted;
             }
         }
+        let client = find_client_mut(&mut state, id)?;
         let summary = summarize_client(client, &self.inner.sessions, None, blocked);
         drop(state);
         Ok(summary)
+    }
+
+    /// Replaces an account's network access policy and reconnects its
+    /// sessions so that the new rules apply. `exits` lists the exit names the
+    /// gateway offers.
+    pub async fn set_access(
+        &self,
+        id: &str,
+        access: AccessPolicy,
+        exits: &[String],
+    ) -> Result<ClientSummary, RegistryError> {
+        let access = validate_access(access, exits)?;
+        let summary = self
+            .mutate_client(id, |client| {
+                client.access = access.clone();
+                Ok(())
+            })
+            .await?;
+        self.end_sessions(id).await;
+        Ok(summary)
+    }
+
+    /// Assigns the networks behind a device ("subnet router") and reconnects
+    /// it. Subnets may not overlap another device's subnets or `reserved`,
+    /// such as the client pool.
+    pub async fn set_device_subnets(
+        &self,
+        id: &str,
+        device_id: &str,
+        subnets: Vec<Ipv4Net>,
+        reserved: &[Ipv4Net],
+    ) -> Result<ClientSummary, RegistryError> {
+        let subnets = validate_subnets(subnets, reserved)?;
+        let summary = self
+            .mutate_clients(id, |clients| {
+                for client in clients.iter() {
+                    for device in &client.devices {
+                        if client.id == id && device.id == device_id {
+                            continue;
+                        }
+                        if let Some(conflict) = device.subnets.iter().find(|existing| {
+                            subnets
+                                .iter()
+                                .any(|subnet| prefixes_overlap(subnet, existing))
+                        }) {
+                            return Err(RegistryError::InvalidInput(format!(
+                                "{conflict} is already routed to device {} of {}",
+                                device.name, client.name
+                            )));
+                        }
+                    }
+                }
+                let device = clients
+                    .iter_mut()
+                    .find(|client| client.id == id)
+                    .ok_or(RegistryError::NotFound)?
+                    .devices
+                    .iter_mut()
+                    .find(|device| device.id == device_id && device.id != FORWARD_PROXY_DEVICE_ID)
+                    .ok_or(RegistryError::NotFound)?;
+                device.subnets.clone_from(&subnets);
+                Ok(())
+            })
+            .await?;
+        let key = DeviceKey::new(id, device_id);
+        let _drain = self.begin_device_drain(&key);
+        self.inner.sessions.cancel_device(id, device_id).await;
+        Ok(summary)
+    }
+
+    /// Every subnet routed to a device, with its owner.
+    pub fn routed_subnets(&self) -> Vec<RoutedSubnet> {
+        let state = self.inner.state.lock();
+        state
+            .clients
+            .iter()
+            .flat_map(|client| {
+                client.devices.iter().flat_map(move |device| {
+                    device.subnets.iter().map(move |subnet| RoutedSubnet {
+                        account_id: client.id.clone(),
+                        device_id: device.id.clone(),
+                        subnet: *subnet,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// The access policy and routed subnets of one device's tunnel.
+    pub fn device_network(&self, id: &str, device_id: &str) -> DeviceNetwork {
+        let state = self.inner.state.lock();
+        let Some(client) = state.clients.iter().find(|client| client.id == id) else {
+            return DeviceNetwork::default();
+        };
+        DeviceNetwork {
+            access: client.access.clone(),
+            subnets: client
+                .devices
+                .iter()
+                .find(|device| device.id == device_id)
+                .map(|device| device.subnets.clone())
+                .unwrap_or_default(),
+        }
     }
 
     /// Starts a new quota period whose usage is measured from `baseline_bytes`.
@@ -1211,6 +1381,7 @@ impl ClientRegistry {
                     first_seen: now,
                     last_seen: now,
                     status,
+                    subnets: Vec::new(),
                 });
                 (account_id, clients, None, true)
             }
@@ -1362,6 +1533,7 @@ impl ClientRegistry {
                 first_seen: now,
                 last_seen: now,
                 status: DeviceStatus::Approved,
+                subnets: Vec::new(),
             });
             (account_id, clients)
         };
@@ -1895,6 +2067,7 @@ fn summarize_client(
                         |_| device_usage.active_sessions,
                     ),
                     status: device.status.as_str(),
+                    subnets: device.subnets,
                     id: device.id,
                     name: device.name,
                     first_seen: device.first_seen,
@@ -1929,12 +2102,108 @@ fn summarize_client(
             "active"
         },
         limits: client.limits.clone(),
+        access: client.access.clone(),
     }
 }
 
 /// Smallest accepted throughput limit; lower values cannot carry one
 /// full-size packet per second in each direction.
 pub const MIN_RATE_LIMIT_KBPS: u32 = 64;
+
+fn prefixes_overlap(left: &Ipv4Net, right: &Ipv4Net) -> bool {
+    left.contains(&right.network()) || right.contains(&left.network())
+}
+
+fn normalize_prefixes(prefixes: Vec<Ipv4Net>) -> Vec<Ipv4Net> {
+    let mut prefixes = prefixes
+        .into_iter()
+        .map(|prefix| prefix.trunc())
+        .collect::<Vec<_>>();
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
+fn validate_access(access: AccessPolicy, exits: &[String]) -> Result<AccessPolicy, RegistryError> {
+    if access.allow.len() > MAX_ACCESS_PREFIXES || access.deny.len() > MAX_ACCESS_PREFIXES {
+        return Err(RegistryError::InvalidInput(format!(
+            "allow and deny lists hold at most {MAX_ACCESS_PREFIXES} prefixes each"
+        )));
+    }
+    let group = access
+        .group
+        .map(|group| group.trim().to_ascii_lowercase())
+        .filter(|group| !group.is_empty());
+    if let Some(group) = &group {
+        if group.len() > 32
+            || !group
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(RegistryError::InvalidInput(
+                "group names use at most 32 letters, digits, '-' or '_'".into(),
+            ));
+        }
+    }
+    let exit = access.exit.filter(|exit| !exit.is_empty());
+    if let Some(exit) = &exit {
+        if !exits.iter().any(|known| known == exit) {
+            return Err(RegistryError::InvalidInput(format!(
+                "unknown exit {exit:?}; this gateway offers: {}",
+                exits.join(", ")
+            )));
+        }
+    }
+    Ok(AccessPolicy {
+        allow: normalize_prefixes(access.allow),
+        deny: normalize_prefixes(access.deny),
+        group,
+        exit,
+    })
+}
+
+fn validate_subnets(
+    subnets: Vec<Ipv4Net>,
+    reserved: &[Ipv4Net],
+) -> Result<Vec<Ipv4Net>, RegistryError> {
+    let subnets = normalize_prefixes(subnets);
+    if subnets.len() > MAX_DEVICE_SUBNETS {
+        return Err(RegistryError::InvalidInput(format!(
+            "a device routes at most {MAX_DEVICE_SUBNETS} subnets"
+        )));
+    }
+    for subnet in &subnets {
+        let address = subnet.network();
+        if subnet.prefix_len() < 8
+            || address.is_loopback()
+            || address.is_link_local()
+            || address.is_multicast()
+            || address.is_broadcast()
+            || address.is_unspecified()
+        {
+            return Err(RegistryError::InvalidInput(format!(
+                "{subnet} cannot be routed to a device; use a unicast prefix of /8 or longer"
+            )));
+        }
+        if let Some(conflict) = reserved
+            .iter()
+            .find(|reserved| prefixes_overlap(subnet, reserved))
+        {
+            return Err(RegistryError::InvalidInput(format!(
+                "{subnet} overlaps the gateway network {conflict}"
+            )));
+        }
+    }
+    if subnets
+        .windows(2)
+        .any(|pair| prefixes_overlap(&pair[0], &pair[1]))
+    {
+        return Err(RegistryError::InvalidInput(
+            "a device's subnets may not overlap each other".into(),
+        ));
+    }
+    Ok(subnets)
+}
 
 fn validate_limits(limits: &AccountLimits) -> Result<(), RegistryError> {
     if limits.monthly_quota_bytes == Some(0) {
@@ -2085,6 +2354,7 @@ mod tests {
             first_seen: at,
             last_seen: at,
             status: DeviceStatus::Approved,
+            subnets: Vec::new(),
         }
     }
 
@@ -2294,6 +2564,7 @@ mod tests {
                     usage_period: None,
                     enrollment: EnrollmentPolicy::Open,
                     enrollment_open_until: None,
+                    access: AccessPolicy::default(),
                 })
                 .collect(),
             ..RegistryState::default()
@@ -2318,6 +2589,7 @@ mod tests {
                 usage_period: None,
                 enrollment: EnrollmentPolicy::Open,
                 enrollment_open_until: None,
+                access: AccessPolicy::default(),
             },
             ClientRecord {
                 id: "8899aabbccddeeff".into(),
@@ -2331,6 +2603,7 @@ mod tests {
                 usage_period: None,
                 enrollment: EnrollmentPolicy::Open,
                 enrollment_open_until: None,
+                access: AccessPolicy::default(),
             },
         ];
         rebuild_token_index(&mut state);
@@ -2359,6 +2632,7 @@ mod tests {
                 usage_period: None,
                 enrollment: EnrollmentPolicy::Open,
                 enrollment_open_until: None,
+                access: AccessPolicy::default(),
             }],
         };
         tokio::fs::write(&path, serde_json::to_vec(&file).unwrap())
@@ -2584,6 +2858,104 @@ mod tests {
                 "/v1/tunnel",
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn access_policies_and_device_subnets_are_validated_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let id = registry.list()[0].id.clone();
+        let mut devices = Vec::new();
+        for nonce in [1, 2] {
+            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            devices.push(enroll(&registry, &key, nonce).await.unwrap().device_id);
+        }
+        let pool: Ipv4Net = "10.66.0.0/24".parse().unwrap();
+        let exits = vec!["local".to_owned()];
+        let net = |value: &str| -> Ipv4Net { value.parse().unwrap() };
+
+        let summary = registry
+            .set_access(
+                &id,
+                AccessPolicy {
+                    allow: vec![net("10.30.0.9/24"), net("10.30.0.0/24")],
+                    deny: Vec::new(),
+                    group: Some(" Team ".into()),
+                    exit: Some("local".into()),
+                },
+                &exits,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.access.allow, vec![net("10.30.0.0/24")]);
+        assert_eq!(summary.access.group.as_deref(), Some("team"));
+        for invalid in [
+            AccessPolicy {
+                group: Some("bad group".into()),
+                ..AccessPolicy::default()
+            },
+            AccessPolicy {
+                exit: Some("elsewhere".into()),
+                ..AccessPolicy::default()
+            },
+            AccessPolicy {
+                deny: vec![net("10.0.0.0/8"); MAX_ACCESS_PREFIXES + 1],
+                ..AccessPolicy::default()
+            },
+        ] {
+            assert!(matches!(
+                registry.set_access(&id, invalid, &exits).await,
+                Err(RegistryError::InvalidInput(_))
+            ));
+        }
+
+        registry
+            .set_device_subnets(&id, &devices[0], vec![net("10.30.0.0/24")], &[pool])
+            .await
+            .unwrap();
+        for (subnets, reason) in [
+            (vec![net("10.30.0.128/25")], "already routed"),
+            (vec![net("10.66.0.0/16")], "gateway network"),
+            (vec![net("127.0.0.0/8")], "unicast"),
+            (vec![net("10.0.0.0/4")], "unicast"),
+        ] {
+            match registry
+                .set_device_subnets(&id, &devices[1], subnets, &[pool])
+                .await
+            {
+                Err(RegistryError::InvalidInput(message)) => {
+                    assert!(message.contains(reason), "{message}")
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        registry
+            .set_device_subnets(&id, &devices[1], vec![net("10.31.0.0/24")], &[pool])
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.device_network(&id, &devices[0]).subnets,
+            vec![net("10.30.0.0/24")]
+        );
+        assert_eq!(registry.routed_subnets().len(), 2);
+
+        // Both survive a restart, and replacing a device's own subnets works.
+        registry.close().await.unwrap();
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let network = registry.device_network(&id, &devices[0]);
+        assert_eq!(network.access.group.as_deref(), Some("team"));
+        assert_eq!(network.subnets, vec![net("10.30.0.0/24")]);
+        registry
+            .set_device_subnets(&id, &devices[0], vec![net("10.30.0.0/23")], &[pool])
+            .await
+            .unwrap();
+        registry
+            .set_device_subnets(&id, &devices[0], Vec::new(), &[pool])
+            .await
+            .unwrap();
+        assert_eq!(registry.routed_subnets().len(), 1);
+        registry.close().await.unwrap();
     }
 
     #[tokio::test]
