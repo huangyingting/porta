@@ -219,6 +219,31 @@ may select, and `upstreams` lists every next hop, with `name` set for named
 exits. The admin page shows the routing and next hop as
 banners.
 
+## Administrators and audit
+
+Admin API requests run as the signed-in administrator, or as an owner with the
+break-glass `Authorization: Bearer PORTA_ADMIN_TOKEN`. Viewers may only read;
+operators may change clients; owners may also manage administrators. A
+request the role does not allow returns HTTP 403.
+
+- `GET /api/me` returns the caller's `kind` (`token`, `admin` or `sso`),
+  `name`, `role` and whether `totp` is on. `POST /api/me/totp` starts TOTP
+  enrollment and returns `secret`, `uri` and a `qr_code` data URI;
+  `PUT /api/me/totp` with `{"code": "123456"}` turns it on.
+  `PUT /api/me/password` takes `{"current": ..., "password": ...}`.
+- `GET /api/admins` lists administrators; `POST /api/admins` creates one from
+  `{"username", "role", "password", "sso_email", "disabled"}`;
+  `PUT /api/admins/{id}` changes any of those except the username;
+  `DELETE /api/admins/{id}` removes one, and `DELETE /api/admins/{id}/totp`
+  turns off its two-factor authentication.
+- `GET /api/audit?limit=200` returns up to 1000 recent `events`, newest
+  first; `GET /api/audit/export` downloads every retained event as JSON
+  lines.
+
+Browser sign-in uses `POST /admin/sign-in` (form fields `username`,
+`password`, `code`), and single sign-on `GET /auth/oidc/start` and
+`GET /auth/oidc/callback`.
+
 ## Session administration
 
 Authorized administrators can end current sessions without changing tokens:

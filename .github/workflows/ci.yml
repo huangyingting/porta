@@ -68,6 +68,8 @@ jobs:
         run: make test-exit-selection
       - name: Test the built-in DNS resolver end to end
         run: make test-dns-resolver
+      - name: Test administrator identities, SSO and the audit log end to end
+        run: make test-admin-identity
       - name: Test the unprivileged systemd service end to end
         run: make test-service-user
       - run: make build

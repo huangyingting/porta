@@ -3490,6 +3490,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "arc-swap",
+ "aws-lc-rs",
  "base64 0.22.1",
  "bytes",
  "clap",

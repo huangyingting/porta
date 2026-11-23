@@ -942,6 +942,28 @@ class AutomationTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.run_deploy(deploy, "--build-local", *options, success=False)
 
+    def test_deploy_oidc_derives_the_redirect_and_keeps_the_secret_private(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.env["PORTA_OIDC_CLIENT_SECRET"] = "oidc-client-secret-0123456789"
+        result = self.run_deploy(deploy, "--build-local", "--port", "8443",
+                                 "--oidc-issuer", "https://login.example.com/tenant/v2.0",
+                                 "--oidc-client-id", "porta-admin")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--oidc-issuer https://login.example.com/tenant/v2.0 --oidc-client-id porta-admin "
+                      "--oidc-redirect-url https://vpn.example:8443/auth/oidc/callback", unit)
+        environment = self.root / "system/etc/porta/porta.env"
+        self.assertIn("PORTA_OIDC_CLIENT_SECRET=oidc-client-secret-0123456789\n", environment.read_text())
+        self.assertNotIn("oidc-client-secret", unit + result.stdout + result.stderr)
+        del self.env["PORTA_OIDC_CLIENT_SECRET"]
+        self.run_deploy(deploy, "--build-local")
+        self.assertIn("PORTA_OIDC_CLIENT_SECRET=", environment.read_text())
+        self.run_deploy(deploy, "--build-local", "--oidc-issuer=", "--oidc-client-id=")
+        self.assertNotIn("PORTA_OIDC_CLIENT_SECRET", environment.read_text())
+        self.assertNotIn("--oidc", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        for options in (("--oidc-issuer", "http://login.example.com"), ("--oidc-issuer", "https://login.example.com")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
     def test_deploy_client_to_client_is_passed_to_the_daemon(self):
         deploy = self.prepare_deploy(timer=False)
         result = self.run_deploy(deploy, "--build-local", "--client-to-client")

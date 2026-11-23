@@ -60,7 +60,12 @@
 ## Operator responsibilities
 
 - Keep the admin listener bound to loopback and access it through an SSH tunnel.
-  Use independent random admin and client tokens. The server can obtain its
+  Use independent random admin and client tokens. Keep `PORTA_ADMIN_TOKEN` as
+  a break-glass credential and give each administrator a named account with
+  the least role they need, two-factor authentication or single sign-on.
+- Protect `/var/lib/porta/admins.json` (password hashes and TOTP secrets) and
+  `/var/lib/porta/audit.log`; both are written `0600` for the service user.
+  Ship the audit log off the host if it must survive a host compromise. The server can obtain its
   certificate from Let's Encrypt or load an externally managed certificate;
   clients validate either through their system trust store.
 - When using automatic Let's Encrypt certificates, protect and persist the ACME

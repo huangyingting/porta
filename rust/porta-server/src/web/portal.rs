@@ -1,12 +1,15 @@
-use super::admin::{json_response, AdminService, ClientRegistry, RegistryError};
+use super::admin::{json_response, AdminActor, AdminService, ClientRegistry, RegistryError};
 use super::downloads::{open_download_file, DownloadService, CLIENT_DOWNLOAD_PREFIX};
 use super::landing::set_crawler_policy;
+use super::oidc::OidcClient;
 use super::session::{
     constant_time_eq, expired_session_cookie, form_urlencode, hash_token, html_escape, parse_form,
     unix_time_now, CredentialCipher, PortalRole, PortalSession, RequestContext, Response,
     SessionStore, PORTAL_COOKIE_NAME, PORTAL_SESSION_TTL_SECS,
 };
 use crate::ops::abuse::{AbuseGuard, Surface};
+use crate::ops::audit::{Actor, AuditEvent, AuditLog};
+use crate::state::admins::{AdminError, AdminStore};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -25,6 +28,7 @@ pub const PORTAL_JOIN_SCRIPT_PATH: &str = "/assets/portal-join.js";
 pub const PORTAL_CLIENT_SCRIPT_PATH: &str = "/assets/portal-client.js";
 
 const PORTAL_ACCESS_HTML: &str = include_str!("../../assets/portal-access.html");
+const ADMIN_SIGN_IN_HTML: &str = include_str!("../../assets/admin-sign-in.html");
 const PORTAL_DOWNLOADS_HTML: &str = include_str!("../../assets/portal-downloads.html");
 const PORTAL_JOIN_HTML: &str = include_str!("../../assets/portal-join.html");
 const PORTAL_JOIN_SCRIPT: &str = include_str!("../../assets/portal-join.js");
@@ -74,6 +78,9 @@ pub struct Portal {
     token_cipher: CredentialCipher,
     sessions: SessionStore,
     abuse: Option<Arc<AbuseGuard>>,
+    admins: Option<Arc<AdminStore>>,
+    audit: Option<Arc<AuditLog>>,
+    oidc: Option<Arc<OidcClient>>,
 }
 
 impl Portal {
@@ -101,6 +108,54 @@ impl Portal {
             token_cipher,
             sessions: SessionStore::default(),
             abuse: None,
+            admins: None,
+            audit: None,
+            oidc: None,
+        })
+    }
+
+    /// Named administrators, the audit log, and single sign-on.
+    pub fn set_identity(
+        &mut self,
+        admins: Option<Arc<AdminStore>>,
+        audit: Option<Arc<AuditLog>>,
+        oidc: Option<Arc<OidcClient>>,
+    ) {
+        let admin = std::mem::replace(
+            &mut self.admin,
+            AdminService::new(Arc::clone(&self.registry), Vec::new()),
+        );
+        self.admin = admin.with_identity(admins.clone(), audit.clone());
+        self.admins = admins;
+        self.audit = audit;
+        self.oidc = oidc;
+    }
+
+    fn record(&self, event: AuditEvent) {
+        if let Some(audit) = &self.audit {
+            audit.record(event);
+        }
+    }
+
+    /// The administrator behind a portal session. Sessions of deleted or
+    /// disabled administrators no longer authorize anything.
+    fn admin_actor(&self, session: &PortalSession) -> Option<AdminActor> {
+        if session.role != PortalRole::Admin {
+            return None;
+        }
+        if session.client_id.is_empty() {
+            return Some(AdminActor::break_glass());
+        }
+        let identity = self.admins.as_ref()?.get(&session.client_id)?;
+        Some(AdminActor {
+            kind: if session.admin_kind.is_empty() {
+                "admin"
+            } else {
+                session.admin_kind
+            },
+            id: identity.id,
+            name: identity.username,
+            role: identity.role,
         })
     }
 
@@ -140,6 +195,18 @@ impl Portal {
                 Some(access_page_response(request, false, 200))
             }
             "/access" if request.method == "POST" => Some(self.sign_in(request, now)),
+            "/admin/sign-in" if request.is_get_or_head() => Some(admin_sign_in_page(
+                request,
+                self.oidc.is_some(),
+                "",
+                "",
+                200,
+            )),
+            "/admin/sign-in" if request.method == "POST" => Some(self.admin_sign_in(request, now)),
+            "/auth/oidc/start" if request.method == "GET" => Some(self.oidc_start(request).await),
+            "/auth/oidc/callback" if request.method == "GET" => {
+                Some(self.oidc_callback(request, now).await)
+            }
             "/portal/logout" if request.method == "POST" => Some(self.sign_out(request)),
             "/portal/admin" => Some(self.serve_admin_page(request, now).await),
             "/portal/downloads" => Some(self.serve_downloads_page(request, now)),
@@ -180,6 +247,10 @@ impl Portal {
             if let Some(reservation) = reservation {
                 reservation.refund();
             }
+            self.record(
+                AuditEvent::new(AdminActor::break_glass().audit_actor(), "admin.sign_in", "")
+                    .address(request.client_ip.or(request.peer_ip)),
+            );
             return self.start_session(PortalSession::admin(now), "/portal/admin", now);
         }
         let session = match self.client_session(token, now) {
@@ -199,6 +270,216 @@ impl Portal {
             reservation.refund();
         }
         self.start_session(session, "/portal/downloads", now)
+    }
+
+    fn admin_sign_in(&self, request: &RequestContext, now: u64) -> Response {
+        let sso = self.oidc.is_some();
+        if !same_origin_portal_request(request, self.trust_proxy_headers) {
+            return admin_sign_in_page(request, sso, "", "Access could not be verified.", 403);
+        }
+        let Some(store) = &self.admins else {
+            return admin_sign_in_page(
+                request,
+                sso,
+                "",
+                "Named administrators are not enabled.",
+                404,
+            );
+        };
+        let Some(form) = parse_form(&request.body, 4 << 10) else {
+            return admin_sign_in_page(request, sso, "", "Access could not be verified.", 400);
+        };
+        let field = |name: &str| {
+            form.iter()
+                .find_map(|(key, value)| (key == name).then(|| value.trim().to_owned()))
+                .unwrap_or_default()
+        };
+        let (username, password, code) = (field("username"), field("password"), field("code"));
+        let reservation = match self.reserve_authentication(request, Surface::Portal) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                let mut response = admin_sign_in_page(
+                    request,
+                    sso,
+                    &username,
+                    "Too many attempts. Wait a moment and try again.",
+                    429,
+                );
+                response.set_header("Retry-After", "5");
+                return response;
+            }
+        };
+        let attempted = Actor {
+            kind: "admin",
+            id: String::new(),
+            name: username.to_ascii_lowercase(),
+        };
+        let address = request.client_ip.or(request.peer_ip);
+        match store.authenticate(&username, &password, &code, time::OffsetDateTime::now_utc()) {
+            Ok(identity) => {
+                if let Some(reservation) = reservation {
+                    reservation.refund();
+                }
+                self.record(
+                    AuditEvent::new(
+                        Actor {
+                            kind: "admin",
+                            id: identity.id.clone(),
+                            name: identity.username.clone(),
+                        },
+                        "admin.sign_in",
+                        "",
+                    )
+                    .address(address),
+                );
+                self.start_session(
+                    PortalSession::named_admin(&identity.id, &identity.username, "admin", now),
+                    "/portal/admin",
+                    now,
+                )
+            }
+            Err(AdminError::CodeRequired) => {
+                // The password was right; ask for the second factor.
+                if let Some(reservation) = reservation {
+                    reservation.refund();
+                }
+                admin_sign_in_page(
+                    request,
+                    sso,
+                    &username,
+                    "Enter the code from your authenticator app.",
+                    401,
+                )
+            }
+            Err(_) => {
+                self.record(
+                    AuditEvent::new(attempted, "admin.sign_in", "")
+                        .outcome("denied")
+                        .address(address),
+                );
+                admin_sign_in_page(
+                    request,
+                    sso,
+                    &username,
+                    "Access could not be verified.",
+                    401,
+                )
+            }
+        }
+    }
+
+    async fn oidc_start(&self, request: &RequestContext) -> Response {
+        let Some(oidc) = &self.oidc else {
+            return Response::not_found();
+        };
+        match oidc.start().await {
+            Ok(location) => {
+                let mut response = Response::redirect(&location);
+                response.set_header("Cache-Control", "no-store");
+                response
+            }
+            Err(error) => {
+                tracing::warn!(%error, "single sign-on could not start");
+                admin_sign_in_page(
+                    request,
+                    true,
+                    "",
+                    "Single sign-on is unavailable right now.",
+                    503,
+                )
+            }
+        }
+    }
+
+    async fn oidc_callback(&self, request: &RequestContext, now: u64) -> Response {
+        let (Some(oidc), Some(store)) = (&self.oidc, &self.admins) else {
+            return Response::not_found();
+        };
+        let parameter = |name: &str| {
+            request
+                .query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                .and_then(form_value)
+                .unwrap_or_default()
+        };
+        let (code, state) = (parameter("code"), parameter("state"));
+        let address = request.client_ip.or(request.peer_ip);
+        if code.is_empty() || state.is_empty() {
+            return admin_sign_in_page(request, true, "", "Single sign-on was cancelled.", 400);
+        }
+        let identity = match oidc.finish(&code, &state).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(%error, "single sign-on failed");
+                self.record(
+                    AuditEvent::new(
+                        Actor {
+                            kind: "sso",
+                            id: String::new(),
+                            name: String::new(),
+                        },
+                        "admin.sign_in",
+                        "",
+                    )
+                    .outcome("denied")
+                    .address(address)
+                    .detail(serde_json::json!({ "error": error.to_string() })),
+                );
+                return admin_sign_in_page(
+                    request,
+                    true,
+                    "",
+                    "Single sign-on could not be verified.",
+                    401,
+                );
+            }
+        };
+        let admin = identity
+            .email_verified
+            .then(|| store.sso_admin(&identity.email))
+            .flatten();
+        let Some(admin) = admin else {
+            self.record(
+                AuditEvent::new(
+                    Actor {
+                        kind: "sso",
+                        id: identity.subject.clone(),
+                        name: identity.email.clone(),
+                    },
+                    "admin.sign_in",
+                    "",
+                )
+                .outcome("denied")
+                .address(address)
+                .detail(serde_json::json!({ "error": "no administrator for this verified email" })),
+            );
+            return admin_sign_in_page(
+                request,
+                true,
+                "",
+                "This account is not an administrator of this gateway.",
+                403,
+            );
+        };
+        self.record(
+            AuditEvent::new(
+                Actor {
+                    kind: "sso",
+                    id: admin.id.clone(),
+                    name: admin.username.clone(),
+                },
+                "admin.sign_in",
+                "",
+            )
+            .address(address)
+            .detail(serde_json::json!({ "email": identity.email })),
+        );
+        self.start_session(
+            PortalSession::named_admin(&admin.id, &admin.username, "sso", now),
+            "/portal/admin",
+            now,
+        )
     }
 
     fn reserve_authentication(
@@ -237,6 +518,7 @@ impl Portal {
             token_hash,
             encrypted_token,
             expires_at: now.saturating_add(PORTAL_SESSION_TTL_SECS),
+            admin_kind: "",
         })
     }
 
@@ -275,31 +557,31 @@ impl Portal {
         if !request.is_get_or_head() {
             return Response::not_found();
         }
-        if self
+        let Some(actor) = self
             .session(request, now)
-            .is_none_or(|session| session.role != PortalRole::Admin)
-        {
+            .and_then(|session| self.admin_actor(&session))
+        else {
             return Response::redirect("/");
-        }
+        };
         let mut admin_request = request.clone();
         admin_request.path = "/".into();
         self.admin
-            .handle(&admin_request, true)
+            .handle(&admin_request, Some(actor))
             .await
             .unwrap_or_else(Response::not_found)
     }
 
     async fn serve_admin_api(&self, request: &RequestContext, now: u64) -> Option<Response> {
-        if self
+        let Some(actor) = self
             .session(request, now)
-            .is_none_or(|session| session.role != PortalRole::Admin)
-        {
+            .and_then(|session| self.admin_actor(&session))
+        else {
             return if request.is_get_or_head() {
                 None
             } else {
                 Some(Response::not_found())
             };
-        }
+        };
         if !request.is_get_or_head()
             && !same_origin_portal_request(request, self.trust_proxy_headers)
         {
@@ -309,7 +591,7 @@ impl Portal {
                 b"invalid request origin\n".to_vec(),
             ));
         }
-        self.admin.handle(request, true).await
+        self.admin.handle(request, Some(actor)).await
     }
 
     fn serve_downloads_page(&self, request: &RequestContext, now: u64) -> Response {
@@ -767,9 +1049,19 @@ pub fn profile_qr_code(input: &ProfileQrInput) -> Result<String, &'static str> {
 }
 
 pub fn same_origin_portal_request(request: &RequestContext, trust_proxy_headers: bool) -> bool {
+    // Browsers mark where a request comes from; pages cannot forge this.
+    let fetch_site = request.header("sec-fetch-site");
+    if fetch_site.is_some_and(|site| !matches!(site, "same-origin" | "none")) {
+        return false;
+    }
     let Some(origin) = request.header("origin") else {
         return true;
     };
+    // Portal pages send no referrer, so browsers report a same-origin form
+    // post's origin as "null".
+    if origin == "null" {
+        return fetch_site == Some("same-origin");
+    }
     let Some(parsed) = parse_https_origin(origin) else {
         return false;
     };
@@ -915,6 +1207,48 @@ fn format_quota_size(size: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Decodes one `application/x-www-form-urlencoded` value.
+fn form_value(value: &str) -> Option<String> {
+    parse_form(format!("v={value}").as_bytes(), 8 << 10)?
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+}
+
+fn admin_sign_in_page(
+    request: &RequestContext,
+    sso: bool,
+    username: &str,
+    message: &str,
+    status: u16,
+) -> Response {
+    let message = if message.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"error\" role=\"alert\">{}</p>",
+            html_escape(message)
+        )
+    };
+    let sso = if sso {
+        "<a class=\"sso\" href=\"/auth/oidc/start\">Sign in with single sign-on</a>"
+    } else {
+        ""
+    };
+    let body = render_asset_template(
+        ADMIN_SIGN_IN_HTML,
+        &[
+            ("%%PORTA_ADMIN_MESSAGE%%", message.as_str()),
+            ("%%PORTA_ADMIN_USERNAME%%", html_escape(username).as_str()),
+            ("%%PORTA_ADMIN_SSO%%", sso),
+        ],
+    );
+    let mut response = Response::html(status, body.into_bytes());
+    response.set_header("Cache-Control", "no-store");
+    set_portal_security_headers(&mut response);
+    response.without_body_for_head(request)
 }
 
 fn access_page_response(request: &RequestContext, invalid: bool, status: u16) -> Response {
@@ -1143,7 +1477,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn qr_code_data_uri(payload: &str) -> Result<String, ()> {
+pub(crate) fn qr_code_data_uri(payload: &str) -> Result<String, ()> {
     let qr = QrCode::encode(payload.as_bytes())?;
     Ok(format!(
         "data:image/png;base64,{}",
@@ -1797,6 +2131,32 @@ mod tests {
         request.peer_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!same_origin_portal_request(&request, false));
         assert!(same_origin_portal_request(&request, true));
+
+        // Browsers send "Origin: null" for same-origin form posts from pages
+        // without a referrer; Sec-Fetch-Site tells them apart.
+        let form = |site: Option<&str>| {
+            let request = RequestContext::new("POST", "/access")
+                .with_host("vpn.example.com")
+                .with_header("Origin", "null");
+            match site {
+                Some(site) => request.with_header("Sec-Fetch-Site", site),
+                None => request,
+            }
+        };
+        assert!(same_origin_portal_request(
+            &form(Some("same-origin")),
+            false
+        ));
+        assert!(!same_origin_portal_request(
+            &form(Some("cross-site")),
+            false
+        ));
+        assert!(!same_origin_portal_request(&form(None), false));
+        let forged = RequestContext::new("POST", "/access")
+            .with_host("vpn.example.com")
+            .with_header("Origin", "https://vpn.example.com")
+            .with_header("Sec-Fetch-Site", "cross-site");
+        assert!(!same_origin_portal_request(&forged, false));
     }
 
     #[test]
@@ -1860,7 +2220,8 @@ mod tests {
                 "<form method=\"post\" action=\"/access\">",
                 "<div class=\"field\">",
                 "<input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"current-password\" autofocus required>",
-                "<p class=\"note\">Credentials are exchanged for a secure, temporary browser session.</p>",
+                "<p class=\"note\">Credentials are exchanged for a secure, temporary browser session.",
+                "<a href=\"/admin/sign-in\">sign in with an account</a>",
             ] {
                 assert!(page.contains(fragment), "missing access design: {fragment}");
             }

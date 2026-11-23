@@ -14,6 +14,7 @@ use porta_server_rust::integration::{
 use porta_server_rust::ops::abuse::AbuseGuard;
 use porta_server_rust::ops::acme::{AutomaticCertificateConfig, AutomaticCertificateManager};
 use porta_server_rust::ops::admission::{ConnectionAdmission, RetryController};
+use porta_server_rust::ops::audit::AuditLog;
 use porta_server_rust::ops::exits::ExitRules;
 use porta_server_rust::ops::metrics::Metrics;
 use porta_server_rust::ops::shutdown::Drain;
@@ -26,6 +27,7 @@ use porta_server_rust::proxy::service::{ForwardProxy, DEFAULT_MAX_CONNECTIONS};
 use porta_server_rust::server::{
     bind_tcp_listener, bind_udp_socket, serve_tcp, Handler, ServeOptions,
 };
+use porta_server_rust::state::admins::AdminStore;
 use porta_server_rust::state::pool::Pool;
 use porta_server_rust::state::registry::ClientRegistry;
 use porta_server_rust::state::usage::Store as UsageStore;
@@ -37,6 +39,7 @@ use porta_server_rust::web::admin::{
     UpstreamStatus,
 };
 use porta_server_rust::web::landing::{load_landing_template_set, LandingSite};
+use porta_server_rust::web::oidc::{OidcClient, OidcConfig};
 use porta_server_rust::web::portal::Portal;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -121,6 +124,40 @@ async fn run() -> Result<()> {
         Arc::new(ClientRegistry::open(&config.client_registry, bootstrap_token.as_str()).await?);
     drop(bootstrap_token);
     let abuse = Arc::new(AbuseGuard::default_with_metrics(metrics.clone()));
+    let admins = Arc::new(
+        AdminStore::open(
+            config
+                .admin_store
+                .clone()
+                .expect("validated configuration has an admin store"),
+            "Porta",
+        )
+        .context("open the administrator store")?,
+    );
+    let audit = Arc::new(
+        AuditLog::open(
+            config
+                .audit_log
+                .clone()
+                .expect("validated configuration has an audit log"),
+        )
+        .context("open the audit log")?,
+    );
+    let oidc = if config.oidc_issuer.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
+            OidcClient::new(OidcConfig {
+                issuer: config.oidc_issuer.clone(),
+                client_id: config.oidc_client_id.clone(),
+                client_secret: (!config.oidc_client_secret.is_empty())
+                    .then(|| Zeroizing::new(std::mem::take(&mut config.oidc_client_secret))),
+                redirect_url: config.oidc_redirect_url.clone(),
+                ca: config.oidc_ca.clone(),
+            })
+            .map_err(anyhow::Error::msg)?,
+        ))
+    };
     let leases = PoolAdapter::new(pool.clone());
     let rate_limits = RateLimiters::with_metrics(metrics.clone());
     let packet_router = RouterAdapter::with_switching(
@@ -158,7 +195,7 @@ async fn run() -> Result<()> {
         ),
         leases: leases.clone(),
         router: packet_router,
-        usage: UsageAdapter::new(usage.clone()),
+        usage: UsageAdapter::with_audit(usage.clone(), Some(audit.clone())),
         metrics: metrics.clone(),
         routing: TunnelRouting {
             // Split tunnels also route the client pool so that peers and
@@ -247,6 +284,7 @@ async fn run() -> Result<()> {
     .map_err(anyhow::Error::msg)?;
     portal.set_abuse_guard(Some(abuse.clone()));
     portal.set_gateway_status(gateway_status.clone());
+    portal.set_identity(Some(admins.clone()), Some(audit.clone()), oidc);
     let portal = Arc::new(portal);
     let landing = Arc::new(match &config.landing_template_dir {
         Some(directory) => LandingSite::with_templates(
@@ -291,7 +329,8 @@ async fn run() -> Result<()> {
     let admin_handler: Arc<dyn Handler> = Arc::new(AdminHttpHandler::new(
         Arc::new(
             AdminService::new(web_registry, admin_token.as_bytes().to_vec())
-                .with_gateway_status(gateway_status),
+                .with_gateway_status(gateway_status)
+                .with_identity(Some(admins), Some(audit)),
         ),
         operations,
     ));

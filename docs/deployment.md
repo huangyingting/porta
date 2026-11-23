@@ -683,6 +683,41 @@ disconnects it, but a device with a still-valid shared token can enroll again.
 Use **Disconnect now** to end current sessions without changing credentials;
 clients with automatic reconnect enabled may reconnect immediately.
 
+### Administrators, single sign-on and the audit log
+
+`PORTA_ADMIN_TOKEN` is a break-glass owner credential. For day-to-day use,
+sign in with it once, open **Administrators**, and create an account for each
+person:
+
+- **Owner** manages administrators and everything else.
+- **Operator** manages clients, devices, limits and access policies.
+- **Viewer** can only look.
+
+Administrators sign in at `/admin/sign-in` with a password of at least 12
+characters (stored as PBKDF2-SHA256) and can turn on two-factor
+authentication with any TOTP authenticator app from the page header. Codes
+are accepted once, with 30 seconds of clock drift either way. Disabling or
+deleting an administrator ends what their sessions can do immediately.
+
+For single sign-on, register Porta with your OpenID Connect provider using the
+redirect URL `https://DOMAIN[:PORT]/auth/oidc/callback`, then deploy with
+`--oidc-issuer URL --oidc-client-id ID` and the client secret, if any, in
+`PORTA_OIDC_CLIENT_SECRET` (daemon options: `--oidc-issuer`,
+`--oidc-client-id`, `--oidc-redirect-url`, `--oidc-ca` for a private issuer).
+Give an administrator a **Single sign-on email**; a user whose verified email
+matches signs in with **Sign in with single sign-on**. Porta uses the
+authorization code flow with PKCE and a nonce, and checks the ID token's
+RS256 or ES256 signature against the issuer's keys, its issuer, audience and
+expiry. Users without a matching administrator are refused.
+
+Every admin API change, denied request, administrator sign-in (successful or
+not) and tunnel connection is appended to `/var/lib/porta/audit.log` as JSON
+lines with the actor, action, target, outcome, address and time. Request
+bodies, such as passwords, are never recorded. The file rotates at 10 MiB,
+keeping five older files. Owners and operators see recent events under
+**Audit log** and can export them all. The daemon options `--admin-store` and
+`--audit-log` move the administrator store and the log.
+
 ### Device enrollment
 
 A client token can enroll devices, so a leaked token could otherwise add

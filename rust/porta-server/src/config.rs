@@ -40,6 +40,27 @@ pub struct Config {
     pub client_registry: PathBuf,
     #[arg(long, num_args = 0..=1, default_missing_value = "", value_parser = parse_path)]
     pub usage_state: Option<PathBuf>,
+    /// Named administrators. Defaults to admins.json beside the client registry.
+    #[arg(long, value_parser = parse_path)]
+    pub admin_store: Option<PathBuf>,
+    /// Audit log of administrative changes, sign-ins and tunnel connections.
+    /// Defaults to audit.log beside the client registry.
+    #[arg(long, value_parser = parse_path)]
+    pub audit_log: Option<PathBuf>,
+    /// OpenID Connect issuer for administrator single sign-on.
+    #[arg(long, default_value = "")]
+    pub oidc_issuer: String,
+    #[arg(long, default_value = "")]
+    pub oidc_client_id: String,
+    /// Redirect URL registered with the issuer, such as
+    /// https://vpn.example.com/auth/oidc/callback.
+    #[arg(long, default_value = "")]
+    pub oidc_redirect_url: String,
+    /// Extra CA certificate for a privately signed issuer.
+    #[arg(long, value_parser = parse_path)]
+    pub oidc_ca: Option<PathBuf>,
+    #[arg(skip)]
+    pub oidc_client_secret: String,
     #[arg(long, default_value = "porta0")]
     pub interface: String,
     #[arg(long, default_value = "10.66.0.0/24")]
@@ -228,6 +249,13 @@ impl fmt::Debug for Config {
             .field("exits", &self.exits)
             .field("exit_tokens", &self.exit_tokens.keys().collect::<Vec<_>>())
             .field("local_exit", &self.local_exit)
+            .field("admin_store", &self.admin_store)
+            .field("audit_log", &self.audit_log)
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field("oidc_redirect_url", &self.oidc_redirect_url)
+            .field("oidc_ca", &self.oidc_ca)
+            .field("oidc_client_secret", &redacted(&self.oidc_client_secret))
             .field("admin_token", &redacted(&self.admin_token))
             .field("upstream_token", &redacted(&self.upstream_token))
             .finish()
@@ -276,6 +304,7 @@ impl Config {
         }
         self.admin_token = std::env::var("PORTA_ADMIN_TOKEN").unwrap_or_default();
         self.upstream_token = std::env::var("PORTA_UPSTREAM_TOKEN").unwrap_or_default();
+        self.oidc_client_secret = std::env::var("PORTA_OIDC_CLIENT_SECRET").unwrap_or_default();
         self.exit_tokens = std::env::vars()
             .filter_map(|(name, value)| {
                 name.strip_prefix("PORTA_EXIT_TOKEN_")
@@ -342,6 +371,7 @@ impl Config {
             bail!("--readiness-timeout must be positive");
         }
         self.validate_resolver()?;
+        self.validate_identity()?;
         if !self.dns.is_empty() {
             let dns = self.dns.parse::<Ipv4Addr>().context(
                 "advertised DNS must be a unicast IPv4 address, not loopback or link-local",
@@ -404,6 +434,56 @@ impl Config {
         }
         self.validate_upstream()?;
         self.validate_routing()?;
+        Ok(())
+    }
+
+    /// Path beside the client registry.
+    fn beside_registry(&self, name: &str) -> PathBuf {
+        self.client_registry
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join(name)
+    }
+
+    fn validate_identity(&mut self) -> Result<()> {
+        if self.admin_store.is_none() {
+            self.admin_store = Some(self.beside_registry("admins.json"));
+        }
+        if self.audit_log.is_none() {
+            self.audit_log = Some(self.beside_registry("audit.log"));
+        }
+        let configured = [
+            &self.oidc_issuer,
+            &self.oidc_client_id,
+            &self.oidc_redirect_url,
+        ]
+        .iter()
+        .filter(|value| !value.is_empty())
+        .count();
+        if configured == 0 {
+            if self.oidc_ca.is_some() || !self.oidc_client_secret.is_empty() {
+                bail!("--oidc-ca and PORTA_OIDC_CLIENT_SECRET require --oidc-issuer");
+            }
+            return Ok(());
+        }
+        if configured != 3 {
+            bail!("--oidc-issuer, --oidc-client-id and --oidc-redirect-url are required together");
+        }
+        let issuer = normalize_https_origin(&self.oidc_issuer)
+            .or_else(|_| {
+                reqwest::Url::parse(&self.oidc_issuer)
+                    .ok()
+                    .filter(|url| url.scheme() == "https" && url.host_str().is_some())
+                    .map(|url| url.as_str().trim_end_matches('/').to_owned())
+                    .context("invalid issuer")
+            })
+            .context("--oidc-issuer must be an HTTPS URL")?;
+        self.oidc_issuer = issuer;
+        let redirect = reqwest::Url::parse(&self.oidc_redirect_url)
+            .ok()
+            .filter(|url| url.scheme() == "https" && url.path() == "/auth/oidc/callback")
+            .context("--oidc-redirect-url must be https://<this gateway>/auth/oidc/callback")?;
+        self.oidc_redirect_url = redirect.into();
         Ok(())
     }
 

@@ -163,7 +163,7 @@ impl AdminHttpHandler {
         };
         web_response(
             self.admin
-                .handle(&context, false)
+                .handle(&context, None)
                 .await
                 .unwrap_or_else(WebResponse::not_found),
         )

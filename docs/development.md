@@ -26,6 +26,7 @@ make test-split-tunnel
 make test-subnet-router
 make test-exit-selection
 make test-dns-resolver
+make test-admin-identity
 make test-service-user
 make vet
 make build
@@ -65,6 +66,12 @@ of two accounts use the gateway's built-in resolver, which must resolve and
 reverse-resolve peer device names only, forward over UDP and TCP to a fake
 upstream, refuse a blocklisted domain, and stay unreachable from outside the
 tunnel.
+
+`make test-admin-identity` runs `scripts/test-admin-identity.sh` against a
+fake OpenID provider that enforces PKCE and signs RS256 ID tokens. It checks
+local sign-in, TOTP enrollment and replay protection, role limits, single
+sign-on for a mapped and an unknown email, that disabling an administrator
+ends their session's rights, and the audit log's contents and permissions.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

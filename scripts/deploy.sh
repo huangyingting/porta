@@ -61,6 +61,11 @@ Options:
                             tunnel
   --dns-domains D[,D...]    Split DNS: clients resolve only these domains with
                             --dns; requires --routes
+  --oidc-issuer URL         OpenID Connect issuer for administrator single
+                            sign-on; --oidc-issuer= turns it off
+  --oidc-client-id ID       Client ID registered with the issuer; the secret, if
+                            any, comes from $PORTA_OIDC_CLIENT_SECRET or the
+                            saved one. Register https://DOMAIN[:PORT]/auth/oidc/callback
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
   --help                    Show this help
@@ -121,6 +126,8 @@ dns_domains=
 exits=
 local_exit=false
 dns_resolver=false
+oidc_issuer=
+oidc_client_id=
 dns_upstreams=
 dns_forwards=
 dns_blocklist=
@@ -132,7 +139,8 @@ saved_option_names=(
   domain certificate private_key acme_email port admin_port external_interface
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client client_host_access routes
-  dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist
+  dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist oidc_issuer
+  oidc_client_id
 )
 declare -A saved_options=()
 if [[ -e $deploy_config || -L $deploy_config ]]; then
@@ -191,6 +199,10 @@ while [[ $# -gt 0 ]]; do
     --client-to-client=*) client_to_client=$(parse_bool --client-to-client "${1#*=}"); shift ;;
     --client-host-access) client_host_access=true; shift ;;
     --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
+    --oidc-issuer) require_value "$@"; oidc_issuer=$2; shift 2 ;;
+    --oidc-issuer=*) oidc_issuer=${1#*=}; shift ;;
+    --oidc-client-id) require_value "$@"; oidc_client_id=$2; shift 2 ;;
+    --oidc-client-id=*) oidc_client_id=${1#*=}; shift ;;
     --dns-resolver) dns_resolver=true; shift ;;
     --dns-resolver=*) dns_resolver=$(parse_bool --dns-resolver "${1#*=}"); shift ;;
     --dns-upstreams) require_value "$@"; dns_upstreams=$2; shift 2 ;;
@@ -272,6 +284,14 @@ if [[ -n $dns_domains ]]; then
 fi
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
+oidc_arguments=
+if [[ -n $oidc_issuer || -n $oidc_client_id ]]; then
+  [[ $oidc_issuer =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] ||
+    die "--oidc-issuer must be an HTTPS URL"
+  [[ $oidc_client_id =~ ^[A-Za-z0-9._:@-]{1,200}$ ]] || die "--oidc-client-id is required with --oidc-issuer"
+  oidc_redirect="https://$domain$([[ $port == 443 ]] || printf ':%s' "$port")/auth/oidc/callback"
+  oidc_arguments=" --oidc-issuer ${oidc_issuer%/} --oidc-client-id $oidc_client_id --oidc-redirect-url $oidc_redirect"
+fi
 resolver_arguments=
 if $dns_resolver; then
   resolver_arguments=" --dns-resolver"
@@ -879,7 +899,15 @@ if [[ -n $upstream ]]; then
   mv "$environment_file.new" "$environment_file"
   unset upstream_token
 fi
-grep -v '^PORTA_EXIT_TOKEN_' "$environment_file" >"$environment_file.new" || true
+oidc_client_secret=${PORTA_OIDC_CLIENT_SECRET:-}
+if [[ -z $oidc_client_secret && -n $oidc_arguments ]]; then
+  oidc_client_secret=$(sed -n 's/^PORTA_OIDC_CLIENT_SECRET=//p' "$environment_file" | tail -n 1)
+fi
+grep -v '^PORTA_EXIT_TOKEN_\|^PORTA_OIDC_CLIENT_SECRET=' "$environment_file" >"$environment_file.new" || true
+if [[ -n $oidc_arguments && -n $oidc_client_secret ]]; then
+  printf 'PORTA_OIDC_CLIENT_SECRET=%s\n' "$oidc_client_secret" >>"$environment_file.new"
+fi
+unset oidc_client_secret
 for exit_token in "${exit_tokens[@]}"; do
   printf '%s\n' "$exit_token" >>"$environment_file.new"
 done
@@ -1001,7 +1029,7 @@ User=$service_user
 Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -1142,6 +1170,7 @@ Host services:   $([[ $client_host_access == true ]] && echo "reachable from cli
 Client DNS:      $([[ $dns_resolver == true ]] && echo "built-in resolver on ${gateway_cidr%/*} with names under porta.internal" || echo "$dns")
 Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_domains:+ (DNS for ${dns_domains//,/, })}" || echo "full tunnel")
 Admin endpoint:  http://127.0.0.1:$admin_port
+Admin sign-in:   https://$domain$([[ $port == 443 ]] || printf ':%s' "$port")/admin/sign-in$([[ -n $oidc_arguments ]] && echo " (single sign-on through $oidc_issuer)")
 Browser portal:  https://$domain:$port
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 Initial client:  sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env

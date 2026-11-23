@@ -1500,35 +1500,81 @@ fn map_route_error(error: RouterError) -> RouteError {
 
 pub struct UsageAdapter {
     store: Arc<usage::Store>,
+    audit: Option<Arc<crate::ops::audit::AuditLog>>,
 }
 
 impl UsageAdapter {
     pub fn new(store: Arc<usage::Store>) -> Arc<Self> {
-        Arc::new(Self { store })
+        Self::with_audit(store, None)
+    }
+
+    /// Also records tunnel connections and disconnections in `audit`.
+    pub fn with_audit(
+        store: Arc<usage::Store>,
+        audit: Option<Arc<crate::ops::audit::AuditLog>>,
+    ) -> Arc<Self> {
+        Arc::new(Self { store, audit })
     }
 }
 
 struct UsageHandle {
     session: usage::Session,
+    audit: Option<(Arc<crate::ops::audit::AuditLog>, UsageMetadata)>,
+    uploaded: AtomicU64,
+    downloaded: AtomicU64,
+}
+
+fn tunnel_event(metadata: &UsageMetadata, action: &str) -> crate::ops::audit::AuditEvent {
+    crate::ops::audit::AuditEvent::new(
+        crate::ops::audit::Actor {
+            kind: "client",
+            id: metadata.account_id.clone(),
+            name: String::new(),
+        },
+        action,
+        metadata.device_id.clone(),
+    )
+    .address(Some(metadata.address))
 }
 
 impl UsageSession for UsageHandle {
     fn uploaded(&self, bytes: u64, packets: u64) {
+        self.uploaded.fetch_add(bytes, Ordering::Relaxed);
         self.session.add_uploaded(bytes, packets);
     }
 
     fn downloaded(&self, bytes: u64, packets: u64) {
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
         self.session.add_downloaded(bytes, packets);
     }
 
     fn close(&self) {
         self.session.close();
+        if let Some((audit, metadata)) = &self.audit {
+            audit.record(
+                tunnel_event(metadata, "tunnel.disconnect").detail(serde_json::json!({
+                    "transport": metadata.transport,
+                    "uploaded_bytes": self.uploaded.load(Ordering::Relaxed),
+                    "downloaded_bytes": self.downloaded.load(Ordering::Relaxed),
+                })),
+            );
+        }
     }
 }
 
 impl Usage for UsageAdapter {
     fn begin(&self, metadata: UsageMetadata) -> Arc<dyn UsageSession> {
+        let audit = self.audit.clone().map(|audit| {
+            audit.record(
+                tunnel_event(&metadata, "tunnel.connect")
+                    .detail(serde_json::json!({ "transport": metadata.transport })),
+            );
+            (audit, metadata.clone())
+        });
         Arc::new(UsageHandle {
+            audit,
+            uploaded: AtomicU64::new(0),
+            downloaded: AtomicU64::new(0),
             session: self.store.begin(
                 if metadata.session_id.is_empty() {
                     String::new()
@@ -2105,7 +2151,7 @@ mod tests {
         let response = admin
             .handle(
                 &put(r#"{"expires_at":"2030-01-01T00:00:00Z","monthly_quota_bytes":5000000000,"rate_limit_kbps":10000}"#),
-                false,
+                None,
             )
             .await
             .unwrap();
@@ -2126,7 +2172,7 @@ mod tests {
             r#"{"expires_at":"tomorrow","monthly_quota_bytes":null,"rate_limit_kbps":null}"#,
             r#"{"expires_at":null,"monthly_quota_bytes":null,"rate_limit_kbps":8}"#,
         ] {
-            let response = admin.handle(&put(invalid), false).await.unwrap();
+            let response = admin.handle(&put(invalid), None).await.unwrap();
             assert_eq!(response.status, 400, "{invalid}");
         }
 
@@ -2145,7 +2191,7 @@ mod tests {
         registry.set_quota_blocked(&id, true).await;
         let reset = RequestContext::new("POST", format!("/api/clients/{id}/usage/reset"))
             .with_header("Authorization", "Bearer admin-token-0123456789abcdef");
-        let response = admin.handle(&reset, false).await.unwrap();
+        let response = admin.handle(&reset, None).await.unwrap();
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["client"]["quota_used_bytes"], 0);

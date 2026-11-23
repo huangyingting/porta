@@ -1,6 +1,7 @@
 pub mod abuse;
 pub mod acme;
 pub mod admission;
+pub mod audit;
 pub mod exits;
 pub mod metrics;
 pub mod readiness;
