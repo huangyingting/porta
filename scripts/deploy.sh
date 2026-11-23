@@ -636,6 +636,7 @@ rollback() {
       rollback_run restore_file server-down.sh /usr/local/libexec/porta/server-down.sh
       rollback_run restore_file sync-cert.sh /usr/local/libexec/porta/sync-cert.sh
       rollback_run restore_file 99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
+      rollback_run restore_file porta-tmpfiles.conf /etc/tmpfiles.d/porta.conf
       rollback_run restore_directory configuration /etc/porta
       rollback_run restore_directory downloads /var/lib/porta/downloads
       for state in leases clients usage; do
@@ -719,6 +720,7 @@ backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
 backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
 backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
 backup_file /etc/sysctl.d/99-porta-quic.conf 99-porta-quic.conf
+backup_file /etc/tmpfiles.d/porta.conf porta-tmpfiles.conf
 backup_directory /etc/porta configuration
 backup_directory /var/lib/porta/downloads downloads
 for state in leases clients usage; do
@@ -729,10 +731,20 @@ for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
 done
 deployment_started=true
 install -d -m 0755 /usr/local/libexec/porta /etc/porta /etc/porta/landing /var/lib/porta/downloads
+# The daemon runs as this unprivileged user with only its ambient network
+# capabilities. The "!"-prefixed network helpers run as root within the same
+# sandbox and keep their state in the root-only /run/porta.
+service_user=porta
+if ! getent passwd "$service_user" >/dev/null; then
+  useradd --system --user-group --home-dir /var/lib/porta --no-create-home \
+    --shell /usr/sbin/nologin "$service_user"
+fi
 install -m 0755 "$server_binary" /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
   /usr/local/libexec/porta/
 install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
+install -m 0644 deploy/porta-tmpfiles.conf /etc/tmpfiles.d/porta.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/porta.conf
 if ! $build_local; then
   downloads_stage=$(mktemp -d /var/lib/porta/downloads.new.XXXXXX)
   chmod 0755 "$downloads_stage"
@@ -796,12 +808,17 @@ if $reset_leases && [[ -s $lease_state ]]; then
   leases_archive=$(mktemp "$lease_state.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX.bak")
   mv "$lease_state" "$leases_archive"
 fi
+# State written by earlier root-run releases or restored by this script must
+# stay writable by the service user; landing templates must stay readable.
+chown -R "$service_user:$service_user" /var/lib/porta
+chgrp -R "$service_user" /etc/porta/landing
+chmod -R g+rX /etc/porta/landing
 
 if [[ $tls_mode == static ]]; then
   unit_after="After=network-online.target porta-cert-sync.service docker.service"
   unit_wants="Wants=network-online.target porta-cert-sync.service"
   tls_arguments="--tls-cert /etc/porta/tls/server.crt --tls-key /etc/porta/tls/server.key"
-  tls_preflight="ExecStartPre=/bin/sh -c 'test -s /etc/porta/tls/server.crt && test -s /etc/porta/tls/server.key'"
+  tls_preflight="ExecStartPre=/bin/sh -c 'test -s /etc/porta/tls/server.crt && test -r /etc/porta/tls/server.key'"
   capabilities=CAP_NET_ADMIN
 else
   unit_after="After=network-online.target docker.service"
@@ -853,20 +870,20 @@ $unit_wants
 
 [Service]
 Type=simple
+User=$service_user
+Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
 ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments --mtu $mtu --json-logs
-ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
-ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
+ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
+ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15
 LimitNOFILE=65536
 UMask=0077
 StateDirectory=porta
-RuntimeDirectory=porta
-RuntimeDirectoryMode=0700
-RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/porta
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -897,7 +914,7 @@ Description=Synchronize the Porta TLS certificate
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/porta/sync-cert.sh $certificate $private_key /etc/porta/tls
+ExecStart=/usr/local/libexec/porta/sync-cert.sh $certificate $private_key /etc/porta/tls $service_user
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

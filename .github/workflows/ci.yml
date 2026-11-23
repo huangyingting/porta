@@ -62,6 +62,8 @@ jobs:
         run: make test-cascade
       - name: Test split tunneling end to end
         run: make test-split-tunnel
+      - name: Test the unprivileged systemd service end to end
+        run: make test-service-user
       - run: make build
       - run: make test-rust-interop
 

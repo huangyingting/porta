@@ -65,6 +65,10 @@
   clients validate either through their system trust store.
 - When using automatic Let's Encrypt certificates, protect and persist the ACME
   cache directory and expose the challenge listener only as required.
+- Keep the daemon unprivileged. It runs as the `porta` user with only network
+  capabilities; a compromise can read the TLS key, tokens held in memory, and
+  `/var/lib/porta`, and can change network configuration, but cannot write
+  configuration, binaries, or the root-only network helper journals.
 - Restrict gateway egress, rate-limit the public endpoint, rotate credentials,
   and retain only privacy-appropriate operational logs.
 - Apply cloud-edge allow rules and managed DDoS protection where available.

@@ -51,7 +51,7 @@ class AutomationTests(unittest.TestCase):
         for command in (
             "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "openssl",
             "curl", "ss", "make", "mv", "git", "adb", "sleep", "gh", "uname",
-            "sudo", "unshare",
+            "sudo", "unshare", "getent", "useradd", "chown", "chgrp", "systemd-tmpfiles",
         ):
             (self.bin / command).symlink_to(MOCK)
 
@@ -104,6 +104,19 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(before, (destination / "server.crt").stat().st_mtime_ns)
         self.assertEqual((destination / "server.key").stat().st_mode & 0o777, 0o600)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        self.assert_no_stages(destination)
+
+    def test_certificate_group_grants_the_service_user_read_access(self):
+        cert, key = self.certificate_pair("source", "one")
+        destination = self.root / "tls"
+        self.run_script("sync-cert.sh", cert, key, destination)
+        # An unchanged pair still gains group access when a group is added.
+        self.run_script("sync-cert.sh", cert, key, destination, "porta")
+        self.assertEqual((destination / "server.key").stat().st_mode & 0o777, 0o640)
+        self.assertEqual((destination / "server.crt").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o750)
+        self.assertIn(["chgrp", "porta", str(destination / "server.key")],
+                      self.state()["ownership"])
         self.assert_no_stages(destination)
 
     def test_certificate_mismatch_and_copy_failure_preserve_old_pair(self):
@@ -634,7 +647,8 @@ class AutomationTests(unittest.TestCase):
         source = (checkout / "scripts/deploy.sh").read_text()
         for prefix in (
             "/usr/local/bin", "/usr/local/libexec/porta", "/etc/porta",
-            "/etc/sysctl.d", "/etc/systemd/system", "/var/lib/porta", "/run/lock",
+            "/etc/sysctl.d", "/etc/tmpfiles.d", "/etc/systemd/system", "/var/lib/porta",
+            "/run/lock",
         ):
             source = source.replace(prefix, str(self.root / "system" / prefix[1:]))
         source = source.replace("[[ $EUID -eq 0 ]]", "true")
@@ -642,7 +656,7 @@ class AutomationTests(unittest.TestCase):
         deploy.write_text(source)
         for directory in (
             "usr/local/bin", "usr/local/libexec/porta", "etc/porta/tls",
-            "etc/porta/landing", "etc/sysctl.d", "etc/systemd/system",
+            "etc/porta/landing", "etc/sysctl.d", "etc/tmpfiles.d", "etc/systemd/system",
             "var/lib/porta/downloads", "run/lock",
         ):
             (self.root / "system" / directory).mkdir(parents=True, exist_ok=True)
@@ -828,6 +842,58 @@ class AutomationTests(unittest.TestCase):
                       unit)
         self.assertIn("allowed within 10.66.0.0/24", result.stdout)
 
+    def test_deploy_runs_the_daemon_as_an_unprivileged_user(self):
+        deploy = self.prepare_deploy(timer=False)
+        cert, key = self.certificate_pair("source", "new")
+        self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key)
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("\nUser=porta\nGroup=porta\n", unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n", unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n", unit)
+        self.assertNotIn("RuntimeDirectory", unit)
+        self.assertIn("ReadWritePaths=/run/porta\n", unit)
+        tmpfiles = self.root / "system/etc/tmpfiles.d/porta.conf"
+        self.assertIn("d /run/porta 0700 root root -", tmpfiles.read_text())
+        self.assertIn(["systemd-tmpfiles", "--create", str(tmpfiles)], self.commands())
+        # Network helpers keep root but not the daemon's other privileges.
+        self.assertIn("ExecStartPost=!/bin/bash -c", unit)
+        self.assertIn("ExecStopPost=!", unit)
+        self.assertIn("test -r " + str(self.root / "system/etc/porta/tls/server.key"), unit)
+        sync = (self.root / "system/etc/systemd/system/porta-cert-sync.service").read_text()
+        self.assertIn(str(self.root / "system/etc/porta/tls") + " porta\n", sync)
+        self.assertEqual(self.state()["users"], ["porta"])
+        ownership = self.state()["ownership"]
+        self.assertIn(["chown", "porta:porta", str(self.root / "system/var/lib/porta")], ownership)
+        self.assertTrue(any(call[:2] == ["chgrp", "porta"] and call[2].endswith("/server.key")
+                            for call in ownership), ownership)
+        tls = self.root / "system/etc/porta/tls"
+        self.assertEqual((tls / "server.key").stat().st_mode & 0o777, 0o640)
+        self.assertEqual(tls.stat().st_mode & 0o777, 0o750)
+
+        # Redeploying keeps the existing user.
+        self.run_deploy(deploy, "--build-local")
+        self.assertEqual(self.state()["users"], ["porta"])
+
+    def test_release_bundle_contains_every_deploy_file_the_script_installs(self):
+        import re
+        used = set(re.findall(r"\bdeploy/[A-Za-z0-9_.-]+", (ROOT / "scripts/deploy.sh").read_text()))
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        package = workflow.split("name: Package deployment tools", 1)[1].split("- name:", 1)[0]
+        self.assertTrue(used)
+        for path in used:
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).is_file())
+                self.assertIn(path, package)
+
+    def test_bundled_units_run_the_daemon_unprivileged(self):
+        unit = (ROOT / "deploy/porta.service").read_text()
+        self.assertIn("\nUser=porta\nGroup=porta\n", unit)
+        self.assertIn("ExecStartPost=!/bin/bash", unit)
+        self.assertIn("ExecStopPost=!/usr/local/libexec/porta/server-down.sh", unit)
+        sync = (ROOT / "deploy/porta-cert-sync.service").read_text()
+        self.assertIn("/etc/porta/tls porta\n", sync)
+        self.assertIn("CAP_CHOWN", sync)
+
     def test_deploy_split_tunnel_routes_are_passed_saved_and_cleared(self):
         deploy = self.prepare_deploy(timer=False)
         result = self.run_deploy(deploy, "--build-local", "--routes", "10.20.0.0/16,192.168.5.0/24",
@@ -929,7 +995,11 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
         self.assertNotIn("--auto-mtu", setup)
         self.assertIn("eth0 8443;", setup)
-        self.assertIn("RuntimeDirectoryPreserve=yes", unit)
+        # Helper journals live in a root-only directory that outlives restarts.
+        self.assertIn("ReadWritePaths=/run/porta\n", unit)
+        self.assertNotIn("RuntimeDirectory", unit)
+        tmpfiles = (ROOT / "deploy/porta-tmpfiles.conf").read_text()
+        self.assertIn("d /run/porta 0700 root root -", tmpfiles)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
         deploy = self.prepare_deploy()

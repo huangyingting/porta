@@ -23,6 +23,7 @@ make test-windows-cross
 make test-native-firewall
 make test-cascade
 make test-split-tunnel
+make test-service-user
 make vet
 make build
 make build-windows
@@ -40,6 +41,13 @@ gateways in network namespaces form a client -> relay -> relay -> exit chain
 with identical pools. It checks the exit address seen by a web server, a
 full-size DF ping, a bulk transfer, client-to-client reachability, fail-closed
 behavior while the exit is down, and automatic recovery after it returns.
+
+`make test-service-user` runs `scripts/test-service-user.sh`, which needs
+systemd. It starts a relay and an exit gateway with every sandbox setting of
+`deploy/porta.service` through `systemd-run`, each in a network namespace and
+as an unprivileged user. It checks that the daemons hold only
+`CAP_NET_ADMIN`, own their state, relay a client's traffic, and that the root
+network helpers configure and remove the firewall.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

@@ -354,6 +354,26 @@ elif name == "adb":
                   "dev.porta.android/.TunnelService"]:
         if state.get("porta_service", True):
             print("ServiceRecord{porta dev.porta.android/.TunnelService}")
+elif name == "getent":
+    if args[0] != "passwd":
+        raise RuntimeError(f"unexpected getent invocation: {args}")
+    if args[1] == "porta":
+        code = 0 if args[1] in state.get("users", []) else 2
+    else:
+        code = subprocess.run(["/usr/bin/getent", *args], check=False).returncode
+elif name == "useradd":
+    if "--system" not in args or args[-1] in state.get("users", []):
+        raise RuntimeError(f"unexpected useradd invocation: {args}")
+    state.setdefault("users", []).append(args[-1])
+elif name == "systemd-tmpfiles":
+    if args[0] != "--create":
+        raise RuntimeError(f"unexpected systemd-tmpfiles invocation: {args}")
+    safe(args[1])
+elif name in ("chown", "chgrp"):
+    owner, *paths = [arg for arg in args if not arg.startswith("-")]
+    for path in paths:
+        safe(path)
+    state.setdefault("ownership", []).append([name, owner, *map(str, paths)])
 elif name == "sleep":
     code = 1 if state.get("fail_sleep") else 0
 elif name == "uname":

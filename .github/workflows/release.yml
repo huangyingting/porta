@@ -171,7 +171,8 @@ jobs:
         run: |
           mkdir -p dist/deploy-bundle/porta/scripts dist/deploy-bundle/porta/deploy
           cp scripts/deploy.sh scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh dist/deploy-bundle/porta/scripts/
-          cp deploy/99-porta-quic.conf deploy/porta-cert-sync.timer dist/deploy-bundle/porta/deploy/
+          cp deploy/99-porta-quic.conf deploy/porta-cert-sync.timer deploy/porta-tmpfiles.conf \
+            dist/deploy-bundle/porta/deploy/
           tar -C dist/deploy-bundle -czf dist/porta-deploy.tar.gz porta
       - name: Build Android release
         working-directory: android

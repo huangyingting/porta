@@ -120,7 +120,8 @@ The default deployment:
   numeric unicast IPv4 address, not loopback or link-local;
 - installs narrowly scoped nftables NAT, forwarding, and public-input guard
   rules;
-- installs hardened systemd services;
+- installs hardened systemd services and runs the daemon as the unprivileged
+  `porta` system user (see [Service user](#service-user));
 - either renews its own Let's Encrypt certificate or synchronizes externally
   managed certificate files every six hours;
 - tunes Linux UDP buffers for QUIC;
@@ -140,6 +141,28 @@ sudo ./scripts/deploy.sh \
   --pool 10.77.0.0/24 \
   --gateway-cidr 10.77.0.1/24
 ```
+
+### Service user
+
+`porta-server` runs as the `porta` system user, which deployment creates on
+first installation. It holds only the ambient `CAP_NET_ADMIN` capability, plus
+`CAP_NET_BIND_SERVICE` for ports below 1024 such as 443 and the ACME HTTP-01
+listener on 80. It owns `/var/lib/porta` (the client registry, leases, usage,
+ACME cache, and upstream identity) and can read but not change its
+configuration:
+
+- `/etc/porta/porta.env` is read by systemd as root and stays `0600`.
+- Static certificates are published to `/etc/porta/tls` as `root:porta`, with
+  the private key `0640`; `porta-cert-sync.service` keeps this on renewal.
+- Custom landing templates in `/etc/porta/landing` are made group-readable
+  by `porta` on every deployment.
+
+The `server-up.sh` and `server-down.sh` network helpers run as root through
+systemd's `!` prefix, inside the same sandbox and capability bounding set.
+They keep their recovery journals in `/run/porta`, which
+`/etc/tmpfiles.d/porta.conf` creates root-only, so the daemon cannot read or
+alter them. Upgrades from releases that ran the daemon as root hand existing
+state to `porta` automatically.
 
 ### Automatic tunnel MTU
 
