@@ -14,6 +14,9 @@ if [[ ${1:-} == --debug ]]; then
   profile=debug
   cargo_profile=()
 fi
+# The oldest systems PortaKit supports (apple/Package.swift); Rust and the
+# C code it links must agree on them.
+export MACOSX_DEPLOYMENT_TARGET=13.0 IPHONEOS_DEPLOYMENT_TARGET=16.0
 targets=(aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim)
 rustup target add "${targets[@]}" >/dev/null
 for target in "${targets[@]}"; do

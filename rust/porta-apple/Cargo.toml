@@ -5,10 +5,10 @@ edition = "2021"
 publish = false
 
 [lib]
-# libporta.a and libporta.dylib for the macOS and iOS apps' packet tunnel
-# extension; the C interface also builds and is tested on Linux.
+# libporta.a for the macOS and iOS apps' packet tunnel extension; the C
+# interface also builds and is tested on Linux.
 name = "porta"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 base64 = "0.22.1"
