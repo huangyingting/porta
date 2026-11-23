@@ -303,8 +303,10 @@ calls and retries after an earlier close future was cancelled.
 
 ## Platform clients
 
-- Linux configures the TUN, endpoint escape and full-tunnel routes, and
-  systemd-resolved per-link DNS through an exclusively locked recovery journal.
+- Linux configures the TUN, endpoint escape and full- or split-tunnel routes,
+  and systemd-resolved per-link DNS through an exclusively locked recovery
+  journal. A split tunnel's guard blocks only the advertised prefixes outside
+  the tunnel.
   An owned nftables OUTPUT guard remains installed during reconnect and cleanup
   removes it last. This covers host traffic, not containers or forwarded traffic.
 - Windows calls the official Wintun API through a pinned DLL whose SHA-256 is

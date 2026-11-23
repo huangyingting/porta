@@ -268,6 +268,7 @@ impl Http2Handler {
                 .boxed(),
         );
         set_account_headers(response.headers_mut(), &session.account);
+        session.routing.set_headers(response.headers_mut());
         let mtu = self.config.mtu;
         tokio::spawn(async move {
             let _lifetime = lifetime;
@@ -422,6 +423,7 @@ fn success_response(
     headers.insert(HEADER_LANE, lanes.index.to_string().parse().unwrap());
     headers.insert(HEADER_LANES, lanes.count.to_string().parse().unwrap());
     set_account_headers(headers, &session.account);
+    session.routing.set_headers(headers);
     if let Some(dns) = dns {
         headers.insert("X-Porta-DNS", dns.to_string().parse().unwrap());
     }
@@ -481,7 +483,7 @@ where
                     match capsule_type {
                         CAPSULE_ADDRESS_REQUEST => {
                             let (response, now_assigned) =
-                                address_response(&session.lease, assigned, &value)?;
+                                address_response(&session.lease, &session.routing, assigned, &value)?;
                             assigned = now_assigned;
                             downlink_ready = downlink_ready || now_assigned;
                             write_masque_output(&mut writer, &response, &session).await?;
@@ -925,6 +927,7 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -996,6 +999,7 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -1081,6 +1085,7 @@ mod tests {
             router: Arc::new(FakeRouter { uploads, downlink }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
         });
         let handler = Arc::new(
             Http2Handler::new(
@@ -1226,6 +1231,7 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
         });
         let handler = Arc::new(
             Http2Handler::new(

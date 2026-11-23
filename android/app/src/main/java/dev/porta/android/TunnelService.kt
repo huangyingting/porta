@@ -378,12 +378,15 @@ class TunnelService : VpnService() {
 
         try {
             val address = "${activeSession.address()}/${activeSession.prefixLength()}"
+            val routing = parseTunnelRouting(activeSession.routing())
+                ?: throw PermanentTunnelException("Gateway returned an invalid split-tunnel advertisement")
             val dns = activeSession.dns()
             val mtu = activeSession.mtu()
             configureVpn(
                 address,
                 dns,
                 mtu.toString(),
+                routing,
                 runGeneration,
             )
             val transport = when (val selected = activeSession.transport()) {
@@ -409,6 +412,7 @@ class TunnelService : VpnService() {
                 appVersion = Portamobile.version(),
                 protocolVersion = PacketFraming.VERSION,
                 account = parseAccountLimits(activeSession.accountStatus()),
+                routing = routing,
             )
             if (!publishConnectionDetails(attemptToken, details.toConnectionDetails())) {
                 throw InterruptedException("Native tunnel was replaced")
@@ -470,9 +474,10 @@ class TunnelService : VpnService() {
         addressHeader: String?,
         dnsHeader: String?,
         mtuHeader: String?,
+        routing: TunnelRouting,
         runGeneration: Long,
     ) = configureVpn(
-        parseVpnConfiguration(addressHeader, dnsHeader, mtuHeader),
+        parseVpnConfiguration(addressHeader, dnsHeader, mtuHeader, routing),
         runGeneration,
     )
 
@@ -480,6 +485,7 @@ class TunnelService : VpnService() {
         addressHeader: String?,
         dnsHeader: String?,
         mtuHeader: String?,
+        routing: TunnelRouting,
     ): VpnConfiguration {
         val addressParts = addressHeader?.split('/')
         if (addressParts?.size != 2) throw PermanentTunnelException("Gateway returned an invalid lease")
@@ -492,7 +498,11 @@ class TunnelService : VpnService() {
         if (parseIPv4Address(addressParts[0]) == null) {
             throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
         }
-        return VpnConfiguration(addressParts[0], prefix, dnsHeader.orEmpty(), mtu)
+        val dns = dnsHeader.orEmpty().takeIf { routing.usesTunnelDns }.orEmpty()
+        if (!routing.isFullTunnel && routing.dnsDomains.isNotEmpty() && parseIPv4Address(dns) == null) {
+            throw PermanentTunnelException("Gateway advertised split DNS without a resolver")
+        }
+        return VpnConfiguration(addressParts[0], prefix, dns, mtu, routing)
     }
 
     @Synchronized
@@ -506,8 +516,15 @@ class TunnelService : VpnService() {
             .setSession(currentProfileName ?: "Porta")
             .setMtu(configuration.mtu)
             .addAddress(configuration.address, configuration.prefix)
-            .addRoute("0.0.0.0", 0)
             .setBlocking(true)
+        if (configuration.routing.isFullTunnel) {
+            builder.addRoute("0.0.0.0", 0)
+        } else {
+            // A split tunnel only claims the advertised prefixes; other traffic
+            // keeps using the underlying network.
+            configuration.routing.routes.forEach { builder.addRoute(it.address, it.prefixLength) }
+            if (configuration.dns.isNotBlank()) builder.addRoute(configuration.dns, 32)
+        }
         // Platform certificate checks create Java sockets outside the native socket protector.
         builder.addDisallowedApplication(packageName)
         if (configuration.dns.isNotBlank()) builder.addDnsServer(configuration.dns)
@@ -1027,6 +1044,7 @@ class TunnelService : VpnService() {
         val prefix: Int,
         val dns: String,
         val mtu: Int,
+        val routing: TunnelRouting,
     )
 
     private data class SelectedNetworkCallbacks(

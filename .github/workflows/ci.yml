@@ -60,6 +60,8 @@ jobs:
         run: make test-native-firewall
       - name: Test cascade relay chain end to end
         run: make test-cascade
+      - name: Test split tunneling end to end
+        run: make test-split-tunnel
       - run: make build
       - run: make test-rust-interop
 
@@ -90,6 +92,13 @@ jobs:
           --package porta-windows
           --package porta-windows-package
           -- -D warnings
+      - name: Parse Windows network helper
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path rust/porta-client/src/windows/network.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; throw "network.ps1 has syntax errors" }
       - name: Test Windows clients and native WFP transactions
         env:
           PORTA_WFP_NATIVE_TEST: "1"

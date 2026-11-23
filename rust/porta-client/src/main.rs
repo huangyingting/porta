@@ -403,6 +403,23 @@ mod windows {
             .map_err(|error| client::RunError::Invalid(error.to_string()))
     }
 
+    fn split_summary(routing: &porta_client::tunnel::Routing) -> String {
+        if routing.is_full_tunnel() {
+            return String::new();
+        }
+        let routes = routing
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut summary = format!(" routes={}", routes.join(","));
+        if !routing.dns_domains.is_empty() {
+            summary.push_str(" dns_domains=");
+            summary.push_str(&routing.dns_domains.join(","));
+        }
+        summary
+    }
+
     fn print_event(event: Event) {
         match event {
             Event::RecoveringNetwork => {
@@ -414,14 +431,15 @@ mod windows {
             } => eprintln!("porta-client: connecting attempt={attempt} endpoint={remote_address}"),
             Event::ConfiguringNetwork => eprintln!("porta-client: configuring network"),
             Event::Connected(info) => eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={:?}{}",
+                "porta-client: connected address={} dns={} mtu={} transport={:?}{}{}",
                 info.lease.address,
                 info.lease
                     .dns
                     .map_or_else(|| "-".to_owned(), |address| address.to_string()),
                 info.lease.mtu,
                 info.transport,
-                super::account_summary(&info.account)
+                super::account_summary(&info.account),
+                split_summary(&info.routing)
             ),
             Event::Progress {
                 uploaded_bytes,

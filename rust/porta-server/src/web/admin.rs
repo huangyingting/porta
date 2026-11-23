@@ -205,6 +205,11 @@ pub struct GatewayStatus {
     pub version: String,
     /// Present when this gateway is a cascade relay.
     pub upstream: Option<UpstreamStatus>,
+    /// Split-tunnel prefixes advertised to clients; empty for a full tunnel.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -279,7 +284,7 @@ impl AdminService {
                 let status = self.gateway.as_ref().map_or_else(
                     || GatewayStatus {
                         version: crate::VERSION.trim().to_owned(),
-                        upstream: None,
+                        ..GatewayStatus::default()
                     },
                     |provider| provider(),
                 );

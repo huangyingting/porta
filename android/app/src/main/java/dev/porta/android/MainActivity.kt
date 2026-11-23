@@ -417,6 +417,7 @@ class MainActivity : Activity() {
                     ),
                 )
                 accountSummary(details.account)?.let { statusDetail.append("\n" + it) }
+                statusDetail.append("\n" + routingSummary(details.routing))
             }
         }
         statusDot.background = circle(
@@ -944,6 +945,22 @@ class MainActivity : Activity() {
         AccountDenial.ENROLLMENT_CLOSED -> getString(R.string.enrollment_closed_denied)
         AccountDenial.DEVICE_DENIED -> getString(R.string.device_denied_denied)
         null -> null
+    }
+
+    /** One line describing which destinations this connection tunnels. */
+    private fun routingSummary(routing: TunnelRouting): String = when {
+        routing.isFullTunnel -> getString(R.string.routing_full_tunnel)
+        routing.dnsDomains.isEmpty() -> resources.getQuantityString(
+            R.plurals.routing_split_tunnel,
+            routing.routes.size,
+            routing.routes.size,
+        )
+        else -> resources.getQuantityString(
+            R.plurals.routing_split_tunnel_dns,
+            routing.routes.size,
+            routing.routes.size,
+            routing.dnsDomains.joinToString(", "),
+        )
     }
 
     /** One line describing the account limits reported for this connection. */

@@ -28,7 +28,7 @@ use porta_server_rust::state::registry::ClientRegistry;
 use porta_server_rust::state::usage::Store as UsageStore;
 use porta_server_rust::transport::http2::{Http2Config, Http2Handler};
 use porta_server_rust::transport::http3::{serve_quinn, Http3Config, Http3Server};
-use porta_server_rust::transport::session::Services;
+use porta_server_rust::transport::session::{Services, TunnelRouting};
 use porta_server_rust::web::admin::{
     AdminService, ClientRegistry as WebClientRegistry, GatewayStatus, GatewayStatusProvider,
     UpstreamStatus,
@@ -86,7 +86,21 @@ async fn run() -> Result<()> {
     // The upstream TUN must exist before the client TUN appears: the network
     // helper starts once the client TUN exists and routes through both.
     let upstream = upstream::open(&mut config, &metrics)?;
-    let gateway_status = upstream::gateway_status(upstream.as_ref());
+    let gateway_status = {
+        let base = upstream::gateway_status(upstream.as_ref());
+        let routes = config
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let dns_domains = config.dns_domains.clone();
+        let provider: GatewayStatusProvider = Arc::new(move || GatewayStatus {
+            routes: routes.clone(),
+            dns_domains: dns_domains.clone(),
+            ..base()
+        });
+        provider
+    };
     let device = Arc::new(NativeTun::open(&config.interface, usize::from(config.mtu))?);
     let router = Arc::new(Router::new(device, Some(metrics.clone())));
     let bootstrap_token = Zeroizing::new(std::mem::take(&mut config.token));
@@ -106,6 +120,10 @@ async fn run() -> Result<()> {
         router: RouterAdapter::with_rate_limits(router.clone(), leases, rate_limits.clone()),
         usage: UsageAdapter::new(usage.clone()),
         metrics: metrics.clone(),
+        routing: TunnelRouting {
+            routes: config.routes.clone(),
+            dns_domains: config.dns_domains.clone(),
+        },
     });
     let dns = config.dns_address()?;
     let transport: Arc<dyn Handler> = Arc::new(Http2Handler::new(
@@ -533,6 +551,8 @@ mod upstream {
         });
         Arc::new(move || GatewayStatus {
             version: porta_server_rust::VERSION.trim().to_owned(),
+            routes: Vec::new(),
+            dns_domains: Vec::new(),
             upstream: upstream.as_ref().map(|(status, url, interface)| {
                 let snapshot = status.snapshot();
                 UpstreamStatus {
@@ -571,7 +591,7 @@ mod upstream {
     pub fn gateway_status(_relay: Option<&Relay>) -> GatewayStatusProvider {
         Arc::new(|| GatewayStatus {
             version: porta_server_rust::VERSION.trim().to_owned(),
-            upstream: None,
+            ..GatewayStatus::default()
         })
     }
 

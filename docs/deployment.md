@@ -199,7 +199,8 @@ overrides its saved value, is saved in turn, and is reported as
 `deploy: changing NAME: OLD -> NEW` before services are stopped. Use the
 explicit off-switches to remove saved behavior: `--no-upstream`, `--acme`
 (forget a saved certificate path), `--client-to-client=false`,
-`--client-host-access=false`, `--trust-proxy-headers=false`, and
+`--client-host-access=false`, `--routes=`, `--dns-domains=`,
+`--trust-proxy-headers=false`, and
 `--forward-proxy=true|false`. The external interface is saved only when given
 explicitly; otherwise it is detected on every run. An invalid or
 hand-edited file with unknown keys or unsafe characters is rejected before
@@ -303,6 +304,37 @@ other's tunnel addresses, as in a hub-and-spoke WireGuard bounce server. This
 applies to every account on the gateway, so enable it only when all clients
 are trusted to see each other. It combines with `--upstream`: inter-client
 traffic stays on the hub while Internet traffic continues to the next hop.
+
+## Split tunneling
+
+By default clients send all IPv4 traffic through the gateway (a full tunnel).
+To tunnel only private networks behind the gateway, advertise them with
+`--routes` and, optionally, the DNS domains the gateway's resolver should
+answer:
+
+```sh
+sudo ./scripts/deploy.sh --routes 10.20.0.0/16,192.168.5.0/24 \
+  --dns 10.20.0.53 --dns-domains corp.example
+```
+
+The daemon options are `--route CIDR` and `--dns-domain NAME`, repeated per
+entry (at most 64 routes and 16 domains). Routes cannot be `/0`, loopback, or
+multicast; DNS domains require routes. `--routes=` restores a full tunnel.
+
+Clients then route only those prefixes and the `--dns` resolver into the
+tunnel; all other traffic keeps the device's own network. Leak protection is
+scoped the same way: advertised prefixes are blocked outside the tunnel while
+it reconnects, and everything else is unaffected. DNS behaves per platform:
+
+- Linux scopes the tunnel resolver to the domains with a systemd-resolved
+  routing domain; without domains the host resolver is untouched.
+- Windows adds NRPT rules for the domains; without domains it sets no tunnel
+  DNS.
+- Android cannot scope DNS by domain for a VPN, so with domains it sends all
+  DNS to the tunnel resolver, and without domains it leaves DNS alone.
+
+The admin page shows a **Split tunnel** banner listing the advertised routes,
+and every client shows whether its connection is a full or split tunnel.
 
 ## Token portal and client downloads
 

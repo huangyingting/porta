@@ -43,6 +43,8 @@ pub struct ConnectionInfo {
     pub lease: Lease,
     /// Account limits the gateway reported when the tunnel was established.
     pub account: crate::tunnel::AccountStatus,
+    /// Destinations the gateway tunnels; empty routes mean a full tunnel.
+    pub routing: crate::tunnel::Routing,
     pub connected_at: Instant,
 }
 
@@ -299,7 +301,12 @@ pub async fn run(
         if let Some(manager) = network.as_mut() {
             observer.event(Event::ConfiguringNetwork);
             let result = manager
-                .up(device.name(), &connection.remote_address, connection.lease)
+                .up(
+                    device.name(),
+                    &connection.remote_address,
+                    connection.lease,
+                    &connection.routing,
+                )
                 .await;
             if let Err(source) = result {
                 connection.close().await;
@@ -321,6 +328,7 @@ pub async fn run(
             remote_address: connection.remote_address,
             lease: connection.lease,
             account: connection.account(),
+            routing: connection.routing.clone(),
             connected_at: Instant::now(),
         }));
 

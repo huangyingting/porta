@@ -22,7 +22,7 @@ use tokio::process::Command;
 #[cfg(windows)]
 use tokio::time::timeout;
 
-use crate::tunnel::Lease;
+use crate::tunnel::{Lease, Routing};
 
 #[cfg(windows)]
 use super::paths;
@@ -31,6 +31,8 @@ const EXACT_OWNERSHIP_STATE_VERSION: i32 = 2;
 const NATIVE_MTU_STATE_VERSION: i32 = 3;
 const MAX_STATE_SIZE: u64 = 1024 * 1024;
 const MAX_GUARD_FILTERS: usize = 128;
+const MAX_SPLIT_PREFIXES: usize = 65;
+const MAX_NRPT_DOMAINS: usize = 16;
 #[cfg(windows)]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
@@ -141,6 +143,12 @@ struct NetworkState {
     dns: Option<DnsState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mtu: Option<MtuState>,
+    /// Tunneled IPv4 prefixes of a split tunnel; empty for a full tunnel.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    split_prefixes: Vec<String>,
+    /// Domains whose NRPT rules send queries to the tunnel resolver.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    nrpt_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +157,8 @@ struct GuardSpec {
     interface_luid: u64,
     endpoint: EndpointState,
     application: String,
+    /// When non-empty only these prefixes are guarded (split tunnel).
+    split_prefixes: Vec<ipnet::Ipv4Net>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,7 +232,7 @@ impl NetworkManager {
         interface_name: &str,
         remote_address: &SocketAddr,
     ) -> Result<(), NetworkError> {
-        self.prepare_inner(interface_name, remote_address, false)
+        self.prepare_inner(interface_name, remote_address, false, None)
             .await
     }
 
@@ -231,19 +241,43 @@ impl NetworkManager {
         interface_name: &str,
         remote_address: &SocketAddr,
         lease: Lease,
+        routing: &Routing,
     ) -> Result<(), NetworkError> {
-        validate_lease(interface_name, remote_address, lease)?;
-        self.prepare_inner(interface_name, remote_address, true)
+        validate_lease(interface_name, remote_address, lease, routing)?;
+        let dns = lease
+            .dns
+            .filter(|_| routing.is_full_tunnel() || !routing.dns_domains.is_empty());
+        let mut split_prefixes = routing
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if let Some(dns) = dns.filter(|_| !routing.is_full_tunnel()) {
+            let dns = format!("{dns}/32");
+            if !split_prefixes.contains(&dns) {
+                split_prefixes.push(dns);
+            }
+        }
+        self.prepare_inner(interface_name, remote_address, true, Some(split_prefixes))
             .await?;
 
-        let dns = lease.dns.expect("validated DNS");
+        let dns = dns.map(|dns| dns.to_string()).unwrap_or_default();
+        let routes = routing
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let domains = routing.dns_domains.join(",");
         let configure = self
             .invoke([
                 OsString::from("configure-interface"),
                 self.state_path.as_os_str().to_owned(),
                 OsString::from(lease.address.to_string()),
-                OsString::from(dns.to_string()),
+                OsString::from(&dns),
                 OsString::from(lease.mtu.to_string()),
+                OsString::from(&routes),
+                OsString::from(&domains),
             ])
             .await;
         let reload = self.reload_required();
@@ -256,8 +290,10 @@ impl NetworkManager {
                 OsString::from("up"),
                 self.state_path.as_os_str().to_owned(),
                 OsString::from(lease.address.to_string()),
-                OsString::from(dns.to_string()),
+                OsString::from(dns),
                 OsString::from(lease.mtu.to_string()),
+                OsString::from(routes),
+                OsString::from(domains),
             ])
             .await;
         let reload = self.reload_required();
@@ -269,8 +305,10 @@ impl NetworkManager {
         interface_name: &str,
         remote_address: &SocketAddr,
         lease: Lease,
+        routing: &Routing,
     ) -> Result<(), NetworkError> {
-        self.up(interface_name, remote_address, lease).await
+        self.up(interface_name, remote_address, lease, routing)
+            .await
     }
 
     pub async fn down(&mut self) -> Result<(), NetworkError> {
@@ -311,6 +349,7 @@ impl NetworkManager {
         interface_name: &str,
         remote_address: &SocketAddr,
         require_interface: bool,
+        split_prefixes: Option<Vec<String>>,
     ) -> Result<(), NetworkError> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() || interface_name.contains('\0') {
@@ -381,6 +420,10 @@ impl NetworkManager {
             next.interface_luid = interface_luid;
             next.interface_guid = interface_guid;
         }
+        if let Some(split_prefixes) = split_prefixes {
+            next.split_prefixes = split_prefixes;
+        }
+        let guarded = parse_split_prefixes(&next.split_prefixes)?;
 
         let previous = std::mem::replace(&mut self.state, next);
         if let Err(error) = self.persist() {
@@ -392,6 +435,7 @@ impl NetworkManager {
             interface_luid,
             endpoint,
             application: self.state.application.clone(),
+            split_prefixes: guarded,
         };
         replace_guard(&spec).map_err(|error| {
             NetworkError::Combined(format!(
@@ -561,6 +605,7 @@ fn validate_lease(
     interface_name: &str,
     remote_address: &SocketAddr,
     lease: Lease,
+    routing: &Routing,
 ) -> Result<(), NetworkError> {
     if interface_name.trim().is_empty() {
         return Err(NetworkError::Invalid(
@@ -569,14 +614,33 @@ fn validate_lease(
     }
     if !valid_ipv4_unicast(lease.address.addr()) {
         return Err(NetworkError::Invalid(
-            "full tunnel requires a valid IPv4 lease".to_owned(),
+            "tunnel requires a valid IPv4 lease".to_owned(),
         ));
     }
-    let dns = lease.dns.filter(|address| valid_ipv4_unicast(*address));
-    let Some(dns) = dns else {
+    if routing.routes.len() >= MAX_SPLIT_PREFIXES || routing.dns_domains.len() > MAX_NRPT_DOMAINS {
         return Err(NetworkError::Invalid(
-            "full tunnel requires an IPv4 DNS resolver reachable through the tunnel".to_owned(),
+            "gateway advertised too many split-tunnel routes or DNS domains".to_owned(),
         ));
+    }
+    if routing
+        .dns_domains
+        .iter()
+        .any(|domain| !valid_dns_domain(domain))
+    {
+        return Err(NetworkError::Invalid(
+            "gateway advertised an invalid split-tunnel DNS domain".to_owned(),
+        ));
+    }
+    let needs_dns = routing.is_full_tunnel() || !routing.dns_domains.is_empty();
+    let dns = lease.dns.filter(|address| valid_ipv4_unicast(*address));
+    let dns = match dns {
+        Some(dns) => dns,
+        None if !needs_dns => Ipv4Addr::UNSPECIFIED,
+        None => {
+            return Err(NetworkError::Invalid(
+                "tunnel DNS requires an IPv4 resolver reachable through the tunnel".to_owned(),
+            ));
+        }
     };
     if !(576..=9000).contains(&lease.mtu) {
         return Err(NetworkError::Invalid(format!(
@@ -585,7 +649,7 @@ fn validate_lease(
         )));
     }
     let endpoint = parse_endpoint(remote_address)?;
-    if endpoint.ip == IpAddr::V4(dns) {
+    if needs_dns && endpoint.ip == IpAddr::V4(dns) {
         return Err(NetworkError::Invalid(
             "tunnel DNS cannot be the transport endpoint (its host route bypasses the tunnel)"
                 .to_owned(),
@@ -734,7 +798,7 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
         }
         match route.kind.as_str() {
             "tunnel" => {
-                if route.prefix != "0.0.0.0/1" && route.prefix != "128.0.0.0/1" {
+                if !prefix.addr().is_ipv4() || prefix.prefix_len() == 0 {
                     return Err(NetworkError::Invalid("invalid tunnel route".to_owned()));
                 }
             }
@@ -750,6 +814,17 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
                 return Err(NetworkError::Invalid("missing route kind".to_owned()));
             }
         }
+    }
+    parse_split_prefixes(&state.split_prefixes)?;
+    if state.nrpt_domains.len() > MAX_NRPT_DOMAINS
+        || state
+            .nrpt_domains
+            .iter()
+            .any(|domain| !valid_dns_domain(domain))
+    {
+        return Err(NetworkError::Invalid(
+            "invalid split DNS recovery state".to_owned(),
+        ));
     }
     for address in &state.addresses {
         let prefix: ipnet::Ipv4Net = address
@@ -802,6 +877,39 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
     Ok(())
 }
 
+fn parse_split_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, NetworkError> {
+    if values.len() > MAX_SPLIT_PREFIXES {
+        return Err(NetworkError::Invalid(
+            "too many split-tunnel prefixes".to_owned(),
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .parse::<ipnet::Ipv4Net>()
+                .ok()
+                .filter(|prefix| prefix.prefix_len() > 0 && prefix.trunc() == *prefix)
+                .ok_or_else(|| NetworkError::Invalid("invalid split-tunnel prefix".to_owned()))
+        })
+        .collect()
+}
+
+/// A DNS suffix safe to pass to the PowerShell helper and NRPT.
+fn valid_dns_domain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 fn optional_mtu(value: i32) -> bool {
     value == 0 || (576..=9000).contains(&value)
 }
@@ -825,6 +933,9 @@ fn object_key(owner: &str, index: i32) -> String {
 }
 
 fn guard_filters(spec: &GuardSpec) -> Vec<Filter> {
+    if !spec.split_prefixes.is_empty() {
+        return split_guard_filters(spec);
+    }
     let mut filters = Vec::new();
     for family in [4_u8, 6_u8] {
         for kind in ["packet", "transport", "connect", "accept"] {
@@ -907,6 +1018,66 @@ fn guard_filters(spec: &GuardSpec) -> Vec<Filter> {
             layer: if family == 4 { "forward4" } else { "forward6" },
             permit: false,
             conditions: Vec::new(),
+        });
+    }
+    filters
+}
+
+/// A split tunnel guards only the tunneled IPv4 prefixes: traffic to them may
+/// leave through loopback, the tunnel adapter, or the pinned transport, and
+/// is blocked everywhere else. All other destinations keep the host's normal
+/// routing, so no catch-all, IPv6, or forwarding blocks are installed. WFP
+/// ORs conditions on the same field, so one filter blocks every prefix.
+fn split_guard_filters(spec: &GuardSpec) -> Vec<Filter> {
+    let mut filters = Vec::new();
+    for kind in ["packet", "transport", "connect", "accept"] {
+        let layer = layer_name(kind, 4);
+        filters.push(Filter {
+            layer,
+            permit: true,
+            conditions: vec![Condition::Loopback],
+        });
+        if spec.interface_luid != 0 {
+            filters.push(Filter {
+                layer,
+                permit: true,
+                conditions: vec![Condition::Interface(spec.interface_luid)],
+            });
+        }
+        if let IpAddr::V4(endpoint) = spec.endpoint.ip {
+            let endpoint = IpNet::V4(ipnet::Ipv4Net::new(endpoint, 32).expect("host prefix"));
+            if kind == "packet" {
+                filters.push(Filter {
+                    layer,
+                    permit: true,
+                    conditions: vec![Condition::Address(endpoint)],
+                });
+            } else {
+                for protocol in [6_u8, 17_u8] {
+                    let mut conditions = vec![
+                        Condition::Address(endpoint),
+                        Condition::Protocol(protocol),
+                        Condition::RemotePort(spec.endpoint.port),
+                    ];
+                    if kind == "connect" || kind == "accept" {
+                        conditions.push(Condition::Application(spec.application.clone()));
+                    }
+                    filters.push(Filter {
+                        layer,
+                        permit: true,
+                        conditions,
+                    });
+                }
+            }
+        }
+        filters.push(Filter {
+            layer,
+            permit: false,
+            conditions: spec
+                .split_prefixes
+                .iter()
+                .map(|prefix| Condition::Address(IpNet::V4(*prefix)))
+                .collect(),
         });
     }
     filters
@@ -1126,7 +1297,7 @@ where
     let operation_text = operation.to_string_lossy();
     let expected = match operation_text.as_ref() {
         "prepare" | "down" | "retire-interface" => 2,
-        "configure-interface" | "up" => 5,
+        "configure-interface" | "up" => 7,
         _ => {
             return Err(NetworkError::Invalid(
                 "invalid network helper operation".to_owned(),
@@ -1192,6 +1363,14 @@ where
                 .get(4)
                 .cloned()
                 .unwrap_or_else(|| OsString::from("1100")),
+        )
+        .env(
+            "PORTA_NETWORK_ROUTES",
+            arguments.get(5).map_or_else(OsString::new, Clone::clone),
+        )
+        .env(
+            "PORTA_NETWORK_DNS_DOMAINS",
+            arguments.get(6).map_or_else(OsString::new, Clone::clone),
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2067,6 +2246,8 @@ mod tests {
                 applied: 1280,
                 pending: 0,
             }),
+            split_prefixes: Vec::new(),
+            nrpt_domains: Vec::new(),
         }
     }
 
@@ -2180,6 +2361,7 @@ mod tests {
                 port: 443,
             },
             application: r"C:\Porta\porta.exe".to_owned(),
+            split_prefixes: Vec::new(),
         }
     }
 
@@ -2820,6 +3002,103 @@ mod tests {
     }
 
     #[test]
+    fn split_policy_blocks_only_tunneled_prefixes_off_the_tunnel() {
+        let mut spec = test_spec("192.0.2.1");
+        spec.split_prefixes = vec![
+            "10.20.0.0/16".parse().unwrap(),
+            "1.1.1.1/32".parse().unwrap(),
+        ];
+        let filters = guard_filters(&spec);
+        assert!(filters.len() <= MAX_GUARD_FILTERS);
+        assert!(filters.iter().all(|filter| filter.layer.ends_with('4')));
+        assert!(!filters
+            .iter()
+            .any(|filter| filter.layer.starts_with("forward")));
+        for layer in ["packet4", "transport4", "connect4", "accept4"] {
+            let rules: Vec<_> = filters
+                .iter()
+                .filter(|filter| filter.layer == layer)
+                .collect();
+            let block = rules.last().unwrap();
+            assert!(!block.permit);
+            assert_eq!(
+                block.conditions,
+                vec![
+                    Condition::Address("10.20.0.0/16".parse().unwrap()),
+                    Condition::Address("1.1.1.1/32".parse().unwrap()),
+                ]
+            );
+            assert_eq!(rules.iter().filter(|filter| !filter.permit).count(), 1);
+            assert!(rules
+                .iter()
+                .any(|filter| filter.conditions == vec![Condition::Interface(77)]));
+        }
+
+        // The maximum advertised route set still fits one filter per layer.
+        spec.split_prefixes = (0..MAX_SPLIT_PREFIXES as u32)
+            .map(|index| {
+                ipnet::Ipv4Net::new(Ipv4Addr::from(0x0a00_0000 + (index << 8)), 24).unwrap()
+            })
+            .collect();
+        assert!(guard_filters(&spec).len() <= MAX_GUARD_FILTERS);
+    }
+
+    #[test]
+    fn split_journal_validates_prefixes_domains_and_tunnel_routes() {
+        let mut state = test_state();
+        state.split_prefixes = vec!["10.20.0.0/16".to_owned(), "1.1.1.1/32".to_owned()];
+        state.nrpt_domains = vec!["corp.example".to_owned()];
+        state.routes.push(RouteState {
+            kind: "tunnel".to_owned(),
+            prefix: "10.20.0.0/16".to_owned(),
+            interface_index: state.interface_index,
+            interface_guid: state.interface_guid.clone(),
+            next_hop: "0.0.0.0".to_owned(),
+            metric: 5,
+        });
+        let data = serde_json::to_vec(&state).unwrap();
+        validate_state(&serde_json::from_slice(&data).unwrap()).unwrap();
+
+        type StateDamage = Box<dyn Fn(&mut NetworkState)>;
+        let damages: Vec<StateDamage> = vec![
+            Box::new(|state| state.split_prefixes.push("0.0.0.0/0".to_owned())),
+            Box::new(|state| state.split_prefixes.push("10.20.0.1/16".to_owned())),
+            Box::new(|state| state.split_prefixes.push("2001:db8::/32".to_owned())),
+            Box::new(|state| state.nrpt_domains.push("bad domain;".to_owned())),
+            Box::new(|state| state.routes.last_mut().unwrap().prefix = "0.0.0.0/0".to_owned()),
+            Box::new(|state| state.routes.last_mut().unwrap().prefix = "2001:db8::/32".to_owned()),
+        ];
+        for damage in damages {
+            let mut damaged = state.clone();
+            damage(&mut damaged);
+            assert!(validate_state(&damaged).is_err());
+        }
+    }
+
+    #[test]
+    fn split_lease_needs_dns_only_for_dns_domains() {
+        let endpoint = "192.0.2.1:443".parse().unwrap();
+        let mut lease = crate::tunnel::Lease {
+            address: "10.0.0.2/24".parse().unwrap(),
+            gateway: None,
+            dns: None,
+            mtu: 1280,
+        };
+        let mut routing = Routing {
+            routes: vec!["10.20.0.0/16".parse().unwrap()],
+            dns_domains: Vec::new(),
+        };
+        validate_lease("Porta", &endpoint, lease, &routing).unwrap();
+        assert!(validate_lease("Porta", &endpoint, lease, &Routing::default()).is_err());
+        routing.dns_domains.push("corp.example".to_owned());
+        assert!(validate_lease("Porta", &endpoint, lease, &routing).is_err());
+        lease.dns = Some("1.1.1.1".parse().unwrap());
+        validate_lease("Porta", &endpoint, lease, &routing).unwrap();
+        routing.dns_domains = vec!["corp_example".to_owned()];
+        assert!(validate_lease("Porta", &endpoint, lease, &routing).is_err());
+    }
+
+    #[test]
     fn no_interface_policy_never_adds_interface_permits() {
         let mut spec = test_spec("192.0.2.1");
         spec.interface_luid = 0;
@@ -2916,6 +3195,12 @@ mod tests {
                 spec.key = format!("native-abort-{}-{case}-{variant}", std::process::id());
                 spec.application.clone_from(&application);
                 spec.interface_luid = interface_luid;
+                native_guard_rollback(spec.clone()).unwrap();
+                spec.key.push_str("-split");
+                spec.split_prefixes = vec![
+                    "10.20.0.0/16".parse().unwrap(),
+                    "1.1.1.1/32".parse().unwrap(),
+                ];
                 native_guard_rollback(spec).unwrap();
             }
         }

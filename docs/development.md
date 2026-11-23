@@ -22,6 +22,7 @@ make test-rust-interop
 make test-windows-cross
 make test-native-firewall
 make test-cascade
+make test-split-tunnel
 make vet
 make build
 make build-windows
@@ -39,6 +40,12 @@ gateways in network namespaces form a client -> relay -> relay -> exit chain
 with identical pools. It checks the exit address seen by a web server, a
 full-size DF ping, a bulk transfer, client-to-client reachability, fail-closed
 behavior while the exit is down, and automatic recovery after it returns.
+
+`make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
+gateway advertises one private prefix and a DNS domain; the test checks that
+only that prefix uses the tunnel, other traffic goes direct, DNS is scoped to
+the domain, the prefix fails closed rather than leaking while the gateway is
+down, and disconnecting restores the host's routing.
 
 `make test-automation` uses Python 3's standard library to exercise
 deployment, certificate sync, firewall cleanup and packaging with isolated

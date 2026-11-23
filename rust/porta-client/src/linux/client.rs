@@ -275,6 +275,21 @@ impl Runtime {
     }
 }
 
+fn split_tunnel_summary(routing: &crate::tunnel::Routing) -> String {
+    let routes = routing
+        .routes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut summary = format!("split tunnel routes={routes}");
+    if !routing.dns_domains.is_empty() {
+        summary.push_str(" dns_domains=");
+        summary.push_str(&routing.dns_domains.join(","));
+    }
+    summary
+}
+
 pub async fn cleanup_network(
     state_path: PathBuf,
     cancellation: &CancellationToken,
@@ -527,6 +542,12 @@ async fn run_loop(
         }
         runtime.transport = connection.transport;
         runtime.delivery_mode = connection.delivery_mode;
+        if !connection.routing.is_full_tunnel() {
+            observer(runtime.event(
+                State::Configuring,
+                split_tunnel_summary(&connection.routing),
+            ));
+        }
         if let Some(network) = runtime.network.as_mut() {
             observer(runtime.counters.event(
                 State::Configuring,
@@ -548,6 +569,7 @@ async fn run_loop(
                         .name(),
                     connection.remote_address,
                     connection.lease,
+                    &connection.routing,
                 )
                 .await
             {

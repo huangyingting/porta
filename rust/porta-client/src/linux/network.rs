@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::tunnel::Lease;
+use crate::tunnel::{Lease, Routing};
 
 const STATE_VERSION: u8 = 2;
 const ROUTE_PROTOCOL: u16 = 186;
@@ -106,6 +106,10 @@ struct NetworkState {
     index: u32,
     endpoints: Vec<EndpointState>,
     undo: Vec<Action>,
+    /// Split tunnel: prefixes that may only leave through the tunnel. Empty
+    /// means a full tunnel, which guards all traffic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    split_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -233,8 +237,12 @@ impl NetworkManager {
         interface: &str,
         endpoint: SocketAddr,
         lease: Lease,
+        routing: &Routing,
     ) -> Result<(), NetworkError> {
-        validate_lease(interface, lease)?;
+        // Full tunnels resolve every name through the tunnel; split tunnels
+        // only their DNS domains, and leave DNS alone without any.
+        let tunnel_dns = routing.is_full_tunnel() || !routing.dns_domains.is_empty();
+        validate_lease(interface, lease, tunnel_dns)?;
         self.prepare(endpoint).await?;
         if lease.dns
             == Some(match endpoint.ip() {
@@ -355,20 +363,76 @@ impl NetworkManager {
             )
             .await?;
         }
-        for destination in ["0.0.0.0/1", "128.0.0.0/1"] {
+        let destinations = if routing.is_full_tunnel() {
+            vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
+        } else {
+            routing.routes.iter().map(ToString::to_string).collect()
+        };
+        for destination in &destinations {
             let mut action = link_action("route", &link, &alias);
             action.family = 4;
-            action.destination = destination.to_owned();
+            action.destination = destination.clone();
             self.ensure_route(action).await?;
         }
-        let dns = lease
-            .dns
-            .expect("validated automatic Linux lease includes DNS");
-        let dns_destination = format!("{dns}/32");
-        let mut dns_route = link_action("dns-route", &link, &alias);
-        dns_route.family = 4;
-        dns_route.destination = dns_destination.clone();
-        self.ensure_route(dns_route).await?;
+        let dns_destination = if tunnel_dns {
+            let dns = lease
+                .dns
+                .expect("validated automatic Linux lease includes DNS");
+            let dns_destination = format!("{dns}/32");
+            let mut dns_route = link_action("dns-route", &link, &alias);
+            dns_route.family = 4;
+            dns_route.destination = dns_destination.clone();
+            self.ensure_route(dns_route).await?;
+            self.configure_dns(interface, &link, &alias, dns, routing)
+                .await?;
+            Some(dns_destination)
+        } else {
+            self.cleanup_matching(|action| matches!(action.kind.as_str(), "dns" | "dns-route"))
+                .await?;
+            None
+        };
+        let endpoint = parse_endpoint(endpoint)?;
+        let previous = std::mem::replace(&mut self.state.endpoints, vec![endpoint.clone()]);
+        let mut split_prefixes = if routing.is_full_tunnel() {
+            Vec::new()
+        } else {
+            destinations.clone()
+        };
+        if let Some(dns) = dns_destination
+            .as_ref()
+            .filter(|_| !routing.is_full_tunnel())
+        {
+            split_prefixes.push(dns.clone());
+        }
+        let previous_split = std::mem::replace(&mut self.state.split_prefixes, split_prefixes);
+        if let Err(error) = self.persist() {
+            self.state.endpoints = previous;
+            self.state.split_prefixes = previous_split;
+            return Err(error);
+        }
+        self.protect().await?;
+        let address_copy = address.clone();
+        let dns_copy = dns_destination.unwrap_or_default();
+        let endpoint_prefix = endpoint.prefix()?;
+        self.cleanup_matching(move |action| {
+            (action.kind == "address" && action.address != address_copy)
+                || (action.kind == "route" && !destinations.contains(&action.destination))
+                || (action.kind == "dns-route" && action.destination != dns_copy)
+                || (action.kind == "escape" && action.destination != endpoint_prefix)
+        })
+        .await
+    }
+
+    /// Points systemd-resolved at the tunnel DNS server: for every name in a
+    /// full tunnel, or only for the advertised domains in a split tunnel.
+    async fn configure_dns(
+        &mut self,
+        interface: &str,
+        link: &LinkInfo,
+        alias: &str,
+        dns: Ipv4Addr,
+        routing: &Routing,
+    ) -> Result<(), NetworkError> {
         if !self.has_action("dns", interface, "") {
             for property in ["dns", "domain"] {
                 let output = self
@@ -389,31 +453,35 @@ impl NetworkManager {
                     ));
                 }
             }
-            self.record(link_action("dns", &link, &alias)).await?;
+            self.record(link_action("dns", link, alias)).await?;
         }
-        for arguments in [
-            vec!["dns", interface, &dns.to_string()],
-            vec!["domain", interface, "~."],
-            vec!["default-route", interface, "yes"],
-        ] {
-            self.invoke("resolvectl", &arguments, "").await?;
+        let dns = dns.to_string();
+        let mut domains = vec!["domain".to_owned(), interface.to_owned()];
+        if routing.is_full_tunnel() {
+            domains.push("~.".to_owned());
+        } else {
+            domains.extend(
+                routing
+                    .dns_domains
+                    .iter()
+                    .map(|domain| format!("~{domain}")),
+            );
         }
-        let endpoint = parse_endpoint(endpoint)?;
-        let previous = std::mem::replace(&mut self.state.endpoints, vec![endpoint.clone()]);
-        if let Err(error) = self.persist() {
-            self.state.endpoints = previous;
-            return Err(error);
-        }
-        self.protect().await?;
-        let address_copy = address.clone();
-        let dns_copy = dns_destination.clone();
-        let endpoint_prefix = endpoint.prefix()?;
-        self.cleanup_matching(move |action| {
-            (action.kind == "address" && action.address != address_copy)
-                || (action.kind == "dns-route" && action.destination != dns_copy)
-                || (action.kind == "escape" && action.destination != endpoint_prefix)
-        })
-        .await
+        let default_route = if routing.is_full_tunnel() {
+            "yes"
+        } else {
+            "no"
+        };
+        self.invoke("resolvectl", &["dns", interface, &dns], "")
+            .await?;
+        self.invoke_owned("resolvectl", domains, "").await?;
+        self.invoke(
+            "resolvectl",
+            &["default-route", interface, default_route],
+            "",
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn down(&mut self) -> Result<(), NetworkError> {
@@ -466,16 +534,25 @@ impl NetworkManager {
     async fn protect(&self) -> Result<(), NetworkError> {
         let exists = self.table_exists().await?;
         let mut script = String::new();
+        let split = !self.state.split_prefixes.is_empty();
         if exists {
+            // Redeclaring the base chain updates its policy, which differs
+            // between full and split tunnels, in the same transaction.
             script.push_str(&format!("flush chain inet {} output\n", self.state.table));
+            script.push_str(&format!(
+                "add chain inet {} output {{ type filter hook output priority -150; policy {}; }}\n",
+                self.state.table,
+                if split { "accept" } else { "drop" }
+            ));
         } else {
             script.push_str(&format!(
                 "add table inet {} {{ comment \"Porta client {}\"; }}\n",
                 self.state.table, self.state.table
             ));
             script.push_str(&format!(
-                "add chain inet {} output {{ type filter hook output priority -150; policy drop; }}\n",
-                self.state.table
+                "add chain inet {} output {{ type filter hook output priority -150; policy {}; }}\n",
+                self.state.table,
+                if split { "accept" } else { "drop" }
             ));
         }
         let mut add = |rule: &str| {
@@ -501,6 +578,17 @@ impl NetworkManager {
                     link.name, link.index
                 ));
             }
+        }
+        if split {
+            // Only tunneled destinations are guarded: they may not leave
+            // through any other interface. Other traffic, including IPv6,
+            // uses the device's own network.
+            add(&format!(
+                "ip daddr {{ {} }} drop",
+                self.state.split_prefixes.join(", ")
+            ));
+            self.invoke("nft", &["-f", "-"], &script).await?;
+            return Ok(());
         }
         add("udp dport { 53, 853 } drop");
         add("tcp dport { 53, 853 } drop");
@@ -1333,6 +1421,17 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
             "invalid network journal header".to_owned(),
         ));
     }
+    if state.split_prefixes.len() > 128
+        || state.split_prefixes.iter().any(|prefix| {
+            prefix.parse::<ipnet::Ipv4Net>().map_or(true, |parsed| {
+                parsed.prefix_len() == 0 || parsed != parsed.trunc()
+            })
+        })
+    {
+        return Err(NetworkError::Invalid(
+            "invalid network journal split route".to_owned(),
+        ));
+    }
     for endpoint in &state.endpoints {
         let parsed = parse_endpoint(SocketAddr::new(endpoint.address()?, endpoint.port))?;
         if parsed != *endpoint {
@@ -1392,7 +1491,7 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
             if !matches!(action.family, 4 | 6)
                 || prefix.addr().is_ipv4() != (action.family == 4)
                 || (action.kind == "route"
-                    && !matches!(action.destination.as_str(), "0.0.0.0/1" | "128.0.0.0/1"))
+                    && (action.family != 4 || prefix.prefix_len() == 0 || prefix != prefix.trunc()))
                 || (action.kind == "escape"
                     && prefix.prefix_len() != if action.family == 4 { 32 } else { 128 })
                 || (action.kind == "dns-route"
@@ -1452,12 +1551,13 @@ fn valid_unicast(address: Ipv4Addr) -> bool {
         && address != Ipv4Addr::BROADCAST
 }
 
-fn validate_lease(interface: &str, lease: Lease) -> Result<(), NetworkError> {
+fn validate_lease(interface: &str, lease: Lease, tunnel_dns: bool) -> Result<(), NetworkError> {
     if !valid_interface(interface)
         || !valid_unicast(lease.address.addr())
-        || lease
-            .dns
-            .is_none_or(|dns| !valid_unicast(dns) || dns == lease.address.addr())
+        || (tunnel_dns
+            && lease
+                .dns
+                .is_none_or(|dns| !valid_unicast(dns) || dns == lease.address.addr()))
         || !(576..=9000).contains(&lease.mtu)
     {
         return Err(NetworkError::Invalid(

@@ -31,7 +31,7 @@ use crate::wire::ip::parse_ipv4;
 use crate::wire::masque::{
     decode_address_assign, decode_address_request, decode_mtu_probe, decode_mtu_selection,
     decode_route_advertisement, encode_address_assign, encode_mtu_selection,
-    encode_route_advertisement, parse_varint, Address, MasqueError, MtuProbe, MtuToken, Route,
+    encode_route_advertisement, parse_varint, Address, MasqueError, MtuProbe, MtuToken,
     CAPSULE_ADDRESS_ASSIGN, CAPSULE_ADDRESS_REQUEST, CAPSULE_DATAGRAM, CAPSULE_MTU_SELECT,
     CAPSULE_MTU_SELECTED, CAPSULE_ROUTE_ADVERTISEMENT, MAX_CAPSULE_SIZE, MAX_DISCOVERED_MTU,
     MTU_DISCOVERY_HEADER, SAFE_MTU,
@@ -602,6 +602,7 @@ where
 {
     let mut response = success_response(config, mtu.as_ref(), &session.lease);
     set_account_headers(response.headers_mut(), &session.account);
+    session.routing.set_headers(response.headers_mut());
     let response_sent = tokio::select! {
         biased;
         _ = session.cancellation.cancelled() => false,
@@ -709,7 +710,7 @@ where
                                 break 'tunnel Err(MasqueError::InvalidMtuMessage.into());
                             }
                             let (control, becomes_assigned) =
-                                address_response(&session.lease, assigned, &value)?;
+                                address_response(&session.lease, &session.routing, assigned, &value)?;
                             let ack = if becomes_assigned && !assigned {
                                 let (tx, rx) = oneshot::channel();
                                 assignment_ack = Some(rx);
@@ -1593,6 +1594,7 @@ fn set_version_headers(headers: &mut http::HeaderMap) {
 
 pub(crate) fn address_response(
     lease: &Lease,
+    routing: &crate::transport::session::TunnelRouting,
     assigned: bool,
     value: &[u8],
 ) -> Result<(Bytes, bool)> {
@@ -1628,11 +1630,7 @@ pub(crate) fn address_response(
     append_capsule(&mut control, CAPSULE_ADDRESS_ASSIGN, &assignment)?;
     let becomes_assigned = assigned || requested_ipv4;
     if becomes_assigned {
-        let routes = encode_route_advertisement(&[Route {
-            start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            end: IpAddr::V4(Ipv4Addr::BROADCAST),
-            protocol: 0,
-        }])?;
+        let routes = encode_route_advertisement(&routing.advertisement())?;
         append_capsule(&mut control, CAPSULE_ROUTE_ADVERTISEMENT, &routes)?;
     }
     Ok((control.freeze(), becomes_assigned))
@@ -2051,6 +2049,7 @@ mod tests {
             router: router.clone(),
             usage: Arc::new(NoopUsage),
             metrics: metrics.clone(),
+            routing: Default::default(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -3269,7 +3268,8 @@ mod tests {
             prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).unwrap()),
         }])
         .unwrap();
-        let (control, assigned) = address_response(&lease(), false, &request).unwrap();
+        let (control, assigned) =
+            address_response(&lease(), &Default::default(), false, &request).unwrap();
         assert!(assigned);
         let mut buffered = BytesMut::from(control.as_ref());
         let (first, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
@@ -3412,6 +3412,7 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
         });
         let session = services
             .open(OpenSessionRequest {

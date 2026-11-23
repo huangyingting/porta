@@ -113,8 +113,104 @@ pub fn parse_account_status(headers: &http::HeaderMap) -> AccountStatus {
     }
 }
 
+/// Destinations the gateway routes through the tunnel and the DNS domains it
+/// resolves. No routes means a full tunnel.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Routing {
+    pub routes: Vec<Ipv4Net>,
+    pub dns_domains: Vec<String>,
+}
+
+impl Routing {
+    pub fn is_full_tunnel(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Whether `address` is sent through the tunnel.
+    pub fn routes_address(&self, address: Ipv4Addr) -> bool {
+        self.is_full_tunnel() || self.routes.iter().any(|route| route.contains(&address))
+    }
+}
+
+pub const HEADER_ROUTES: &str = "x-porta-routes";
+pub const HEADER_DNS_DOMAINS: &str = "x-porta-dns-domains";
+const MAX_ROUTES: usize = 64;
+const MAX_DNS_DOMAINS: usize = 16;
+
+/// Reads split-tunnel routes. A malformed advertisement fails the tunnel
+/// rather than silently becoming a full tunnel or dropping routes.
+pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> {
+    let text = |name: &str| -> Result<Option<String>, ClientError> {
+        headers
+            .get(name)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| ClientError::permanent(format!("gateway sent an invalid {name}")))
+            })
+            .transpose()
+    };
+    let mut routes = Vec::new();
+    if let Some(value) = text(HEADER_ROUTES)? {
+        for item in value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            let route = item
+                .parse::<Ipv4Net>()
+                .ok()
+                .filter(|route| route.prefix_len() > 0 && *route == route.trunc())
+                .ok_or_else(|| {
+                    ClientError::permanent(format!("gateway sent an invalid route {item:?}"))
+                })?;
+            routes.push(route);
+        }
+    }
+    let mut dns_domains = Vec::new();
+    if let Some(value) = text(HEADER_DNS_DOMAINS)? {
+        for item in value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            let valid = item.len() <= 253
+                && item.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .bytes()
+                            .all(|value| value.is_ascii_alphanumeric() || value == b'-')
+                });
+            if !valid {
+                return Err(ClientError::permanent(format!(
+                    "gateway sent an invalid DNS domain {item:?}"
+                )));
+            }
+            dns_domains.push(item.to_ascii_lowercase());
+        }
+    }
+    if routes.len() > MAX_ROUTES || dns_domains.len() > MAX_DNS_DOMAINS {
+        return Err(ClientError::permanent(
+            "gateway sent too many routes or DNS domains",
+        ));
+    }
+    if routes.is_empty() && !dns_domains.is_empty() {
+        return Err(ClientError::permanent(
+            "gateway sent DNS domains without split routes",
+        ));
+    }
+    Ok(Routing {
+        routes,
+        dns_domains,
+    })
+}
+
 pub struct Connection {
     pub lease: Lease,
+    /// Routes and DNS domains advertised when the tunnel was established.
+    pub routing: Routing,
     /// Latest gateway-reported limits; HTTP/2 lanes that reconnect within a
     /// connection update it. Read with [`Connection::account`].
     account: Arc<StdMutex<AccountStatus>>,
@@ -388,6 +484,7 @@ mod tests {
             let (_, inbound) = mpsc::channel(1);
             let connection = Arc::new(Connection {
                 account: Default::default(),
+                routing: Routing::default(),
                 lease: Lease {
                     address: "10.66.0.2/32".parse().unwrap(),
                     gateway: None,
@@ -477,6 +574,27 @@ mod tests {
         }
         assert!(account_denial(forbidden, Some("<script>")).is_none());
         assert!(account_denial(http::StatusCode::UNAUTHORIZED, Some("account-expired")).is_none());
+    }
+
+    #[test]
+    fn split_routing_headers_are_strict() {
+        let mut headers = http::HeaderMap::new();
+        let full = parse_routing(&headers).unwrap();
+        assert!(full.is_full_tunnel());
+        assert!(full.routes_address(Ipv4Addr::new(8, 8, 8, 8)));
+        headers.insert(HEADER_ROUTES, "10.0.0.0/8, 192.168.5.0/24".parse().unwrap());
+        headers.insert(HEADER_DNS_DOMAINS, "Corp.Example,internal".parse().unwrap());
+        let split = parse_routing(&headers).unwrap();
+        assert_eq!(split.routes.len(), 2);
+        assert_eq!(split.dns_domains, vec!["corp.example", "internal"]);
+        assert!(split.routes_address(Ipv4Addr::new(10, 1, 2, 3)));
+        assert!(!split.routes_address(Ipv4Addr::new(8, 8, 8, 8)));
+        for invalid in ["10.0.0.1/8", "0.0.0.0/0", "not-a-route"] {
+            headers.insert(HEADER_ROUTES, invalid.parse().unwrap());
+            assert!(parse_routing(&headers).is_err(), "{invalid}");
+        }
+        headers.remove(HEADER_ROUTES);
+        assert!(parse_routing(&headers).is_err());
     }
 
     #[test]

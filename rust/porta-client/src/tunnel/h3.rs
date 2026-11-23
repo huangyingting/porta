@@ -263,6 +263,7 @@ async fn connect_address(
 
             let mut lease = response_lease(response.headers())?;
             let account = super::parse_account_status(response.headers());
+            let routing = super::parse_routing(response.headers())?;
             let (automatic, ceiling) = configure_mtu(
                 config,
                 response.headers(),
@@ -295,7 +296,7 @@ async fn connect_address(
             writer_lease_tx.send(lease).map_err(|_| {
                 failure.current().unwrap_or(ClientError::Closed)
             })?;
-            Ok((lease, account, automatic, ceiling, datagrams))
+            Ok((lease, account, routing, automatic, ceiling, datagrams))
         }) => {
             result.unwrap_or_else(|_| {
                 Err(if transport_ready {
@@ -306,7 +307,7 @@ async fn connect_address(
             })
         }
     };
-    let (lease, account, automatic, ceiling, datagrams) = match established {
+    let (lease, account, routing, automatic, ceiling, datagrams) = match established {
         Ok(established) => established,
         Err(error) => {
             cancellation.cancel();
@@ -330,6 +331,7 @@ async fn connect_address(
     Ok(Connection {
         lease,
         account: Arc::new(std::sync::Mutex::new(account)),
+        routing,
         remote_address,
         transport: Transport::Http3,
         delivery_mode: if datagrams {
@@ -1500,6 +1502,7 @@ mod tests {
         (
             Connection {
                 account: Default::default(),
+                routing: crate::tunnel::Routing::default(),
                 lease: Lease {
                     address: "10.66.0.2/32".parse().unwrap(),
                     gateway: gateway.then_some(Ipv4Addr::new(10, 66, 0, 1)),
@@ -2343,6 +2346,7 @@ mod tests {
         let (outbound, _requests) = mpsc::channel(1);
         let connection = Connection {
             account: Default::default(),
+            routing: crate::tunnel::Routing::default(),
             lease: Lease {
                 address: "10.0.0.2/32".parse().unwrap(),
                 gateway: None,

@@ -428,6 +428,69 @@ pub struct Services {
     pub router: Arc<dyn PacketRouter>,
     pub usage: Arc<dyn Usage>,
     pub metrics: Arc<dyn Metrics>,
+    /// Destinations clients route through the tunnel by default.
+    pub routing: TunnelRouting,
+}
+
+/// Which destinations a client sends through the tunnel, and which DNS
+/// names it resolves through the tunnel's DNS server.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TunnelRouting {
+    /// Empty means a full tunnel.
+    pub routes: Vec<ipnet::Ipv4Net>,
+    /// With split routes: domains resolved by the tunnel DNS server.
+    pub dns_domains: Vec<String>,
+}
+
+pub const HEADER_ROUTES: &str = "x-porta-routes";
+pub const HEADER_DNS_DOMAINS: &str = "x-porta-dns-domains";
+
+impl TunnelRouting {
+    pub fn is_full_tunnel(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Routes as RFC 9484 ROUTE_ADVERTISEMENT ranges.
+    pub fn advertisement(&self) -> Vec<crate::wire::masque::Route> {
+        use std::net::{IpAddr, Ipv4Addr};
+        if self.routes.is_empty() {
+            return vec![crate::wire::masque::Route {
+                start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                end: IpAddr::V4(Ipv4Addr::BROADCAST),
+                protocol: 0,
+            }];
+        }
+        let mut routes = self
+            .routes
+            .iter()
+            .map(|route| crate::wire::masque::Route {
+                start: IpAddr::V4(route.network()),
+                end: IpAddr::V4(route.broadcast()),
+                protocol: 0,
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by_key(|route| route.start);
+        routes
+    }
+
+    pub fn set_headers(&self, headers: &mut http::HeaderMap) {
+        if !self.routes.is_empty() {
+            let routes = self
+                .routes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Ok(value) = http::HeaderValue::from_str(&routes) {
+                headers.insert(HEADER_ROUTES, value);
+            }
+        }
+        if !self.dns_domains.is_empty() {
+            if let Ok(value) = http::HeaderValue::from_str(&self.dns_domains.join(",")) {
+                headers.insert(HEADER_DNS_DOMAINS, value);
+            }
+        }
+    }
 }
 
 pub struct OpenSessionRequest {
@@ -555,6 +618,7 @@ impl Services {
             usage: usage.clone(),
             counted_usage: usage,
             account: authenticated.account,
+            routing: self.routing.clone(),
             closed: AtomicBool::new(false),
         })
     }
@@ -579,6 +643,7 @@ pub struct Session {
     pub usage: Arc<dyn UsageSession>,
     counted_usage: Arc<CountedUsage>,
     pub account: AccountStatus,
+    pub routing: TunnelRouting,
     closed: AtomicBool,
 }
 

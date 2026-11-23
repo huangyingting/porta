@@ -80,6 +80,9 @@ struct DesktopSnapshot {
     /// `account-expired` or `quota-exceeded` when an account limit ended
     /// the last connection attempt.
     account_denial: String,
+    /// Tunneled prefixes of a split tunnel; empty while a full tunnel is up.
+    split_routes: Vec<String>,
+    split_dns_domains: Vec<String>,
     activity: Vec<String>,
 }
 
@@ -116,6 +119,7 @@ struct DesktopState {
     download_rate: u64,
     account: porta_client::tunnel::AccountStatus,
     account_denial: String,
+    routing: porta_client::tunnel::Routing,
     last_sample_at: Option<Instant>,
     last_uploaded: u64,
     last_downloaded: u64,
@@ -214,6 +218,7 @@ impl Controller {
                 download_rate: 0,
                 account: Default::default(),
                 account_denial: String::new(),
+                routing: Default::default(),
                 last_sample_at: None,
                 last_uploaded: 0,
                 last_downloaded: 0,
@@ -568,6 +573,7 @@ impl Controller {
                     state.mtu = info.lease.mtu;
                     state.account = info.account;
                     state.account_denial.clear();
+                    state.routing = info.routing;
                     state.connected_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
                     add_activity(
                         &mut state,
@@ -1159,6 +1165,13 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
         quota_used_bytes: state.account.quota_used_bytes,
         rate_limit_kbps: state.account.rate_limit_kbps.unwrap_or_default(),
         account_denial: state.account_denial.clone(),
+        split_routes: state
+            .routing
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        split_dns_domains: state.routing.dns_domains.clone(),
         activity: state.activity.clone(),
     }
 }
@@ -1277,6 +1290,7 @@ fn reset_connection(state: &mut DesktopState) {
     state.upload_rate = 0;
     state.download_rate = 0;
     state.account = Default::default();
+    state.routing = Default::default();
     state.last_sample_at = None;
     state.last_uploaded = 0;
     state.last_downloaded = 0;

@@ -79,6 +79,18 @@ same limits under **Your access**. Fail-closed protection behaves as for any
 other permanent rejection: disconnect, or run `--cleanup-network` on Linux, to
 use the network without the tunnel.
 
+## Split tunnels
+
+When the gateway advertises split-tunnel routes, clients route only those
+prefixes (and the tunnel resolver) through Porta and leave all other traffic
+on the local network. Leak protection covers only the advertised prefixes, so
+they fail closed while the tunnel reconnects. The Linux CLI logs
+`split tunnel routes=... dns_domains=...`, the Windows desktop shows a line
+such as *Split tunnel · 2 networks via the gateway*, and Android adds the same
+line to the connection details. See
+[Split tunneling](deployment.md#split-tunneling) for per-platform DNS
+behavior.
+
 ## Linux CLI
 
 Automatic Linux networking requires root, `iproute2`, `nftables`, and a running
@@ -136,6 +148,8 @@ The Windows CLI accepts the same `--token-file` option.
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
 full-tunnel routes, and per-link DNS automatically. Its owned nftables OUTPUT
 guard blocks physical IPv4, IPv6, and DNS bypass while connected or reconnecting.
+For a [split tunnel](#split-tunnels) it routes and guards only the advertised
+prefixes.
 Use `--manual-network` only when managing all routing, DNS, and protection
 yourself.
 

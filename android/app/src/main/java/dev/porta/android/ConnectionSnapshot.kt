@@ -15,6 +15,7 @@ internal data class ConnectionDetails(
     val appVersion: String = "",
     val protocolVersion: String = "",
     val account: AccountLimits = AccountLimits(),
+    val routing: TunnelRouting = TunnelRouting(),
 )
 
 internal data class ConnectionAttemptToken internal constructor(

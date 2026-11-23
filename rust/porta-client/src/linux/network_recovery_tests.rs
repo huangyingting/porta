@@ -429,12 +429,117 @@ fn snapshot(commands: &FakeCommands) -> std::sync::MutexGuard<'_, FakeState> {
     commands.state.lock().unwrap()
 }
 
+fn tunnel_destinations(state: &FakeState) -> Vec<String> {
+    state
+        .routes
+        .iter()
+        .filter(|(_, routes)| routes.iter().any(|route| route.device == "porta0"))
+        .map(|(key, _)| key.trim_start_matches("-4 ").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn split_tunnel_routes_only_advertised_prefixes_and_scopes_dns_and_guard() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        routes: vec![
+            "10.20.0.0/16".parse().unwrap(),
+            "192.168.5.0/24".parse().unwrap(),
+        ],
+        dns_domains: vec!["corp.example".to_owned()],
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        let tunnel_routes = tunnel_destinations(&state);
+        for expected in ["10.20.0.0/16", "192.168.5.0/24", "1.1.1.1/32"] {
+            assert!(
+                tunnel_routes.iter().any(|route| route == expected),
+                "{tunnel_routes:?}"
+            );
+        }
+        assert!(!tunnel_routes.iter().any(|route| route == "0.0.0.0/1"));
+        assert_eq!(
+            state.domains.get("porta0").map(String::as_str),
+            Some("~corp.example")
+        );
+        let rules = state.scripts.last().unwrap();
+        assert!(rules.contains("policy accept"), "{rules}");
+        assert!(
+            rules.contains("ip daddr { 10.20.0.0/16, 192.168.5.0/24, 1.1.1.1/32 } drop"),
+            "{rules}"
+        );
+        assert!(!rules.contains("udp dport { 53, 853 } drop"), "{rules}");
+    }
+
+    // A later full-tunnel lease replaces the split routes and guard.
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        let tunnel_routes = tunnel_destinations(&state);
+        assert!(
+            !tunnel_routes.iter().any(|route| route == "10.20.0.0/16"),
+            "{tunnel_routes:?}"
+        );
+        assert!(tunnel_routes.iter().any(|route| route == "0.0.0.0/1"));
+        assert_eq!(state.domains.get("porta0").map(String::as_str), Some("~."));
+        let rules = state.scripts.last().unwrap();
+        assert!(rules.contains("policy drop"), "{rules}");
+    }
+    manager.down().await.unwrap();
+    assert!(snapshot(&commands).tables.is_empty());
+}
+
+#[tokio::test]
+async fn split_tunnel_without_dns_domains_leaves_dns_alone() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        routes: vec!["10.20.0.0/16".parse().unwrap()],
+        dns_domains: Vec::new(),
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    let state = snapshot(&commands);
+    assert!(!state.dns.contains_key("porta0"));
+    assert!(!state.routes.contains_key("-4 1.1.1.1/32"));
+    assert!(state
+        .scripts
+        .last()
+        .unwrap()
+        .contains("ip daddr { 10.20.0.0/16 } drop"));
+}
+
 #[tokio::test]
 async fn automatic_full_tunnel_is_journaled_and_cleaned_in_order() {
     let (_directory, path, commands, mut manager) = new_fake();
     let endpoint = "198.51.100.10:443".parse().unwrap();
     manager.prepare(endpoint).await.unwrap();
-    manager.up("porta0", endpoint, test_lease()).await.unwrap();
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
     {
         let state = snapshot(&commands);
         assert_eq!(state.routes.len(), 4);
@@ -478,7 +583,12 @@ async fn automatic_full_tunnel_is_journaled_and_cleaned_in_order() {
 async fn interrupted_setup_resumes_without_removing_protection() {
     let (_baseline_directory, _path, baseline_commands, mut baseline) = new_fake();
     baseline
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     let mutation_count = baseline_commands.mutation_count();
@@ -489,7 +599,12 @@ async fn interrupted_setup_resumes_without_removing_protection() {
         commands.set_failure(failure, true);
         assert!(
             manager
-                .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+                .up(
+                    "porta0",
+                    "198.51.100.10:443".parse().unwrap(),
+                    test_lease(),
+                    &crate::tunnel::Routing::default()
+                )
                 .await
                 .is_err(),
             "mutation {failure} unexpectedly succeeded"
@@ -498,7 +613,12 @@ async fn interrupted_setup_resumes_without_removing_protection() {
         drop(manager);
         let mut recovered = NetworkManager::open_with_commands(path, commands.clone()).unwrap();
         recovered
-            .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+            .up(
+                "porta0",
+                "198.51.100.10:443".parse().unwrap(),
+                test_lease(),
+                &crate::tunnel::Routing::default(),
+            )
             .await
             .unwrap();
         let state = snapshot(&commands);
@@ -519,7 +639,12 @@ async fn interrupted_setup_resumes_without_removing_protection() {
 async fn every_interrupted_cleanup_is_retryable_after_restart() {
     let (_baseline_directory, _path, baseline_commands, mut baseline) = new_fake();
     baseline
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     baseline_commands.reset_mutations();
@@ -531,7 +656,12 @@ async fn every_interrupted_cleanup_is_retryable_after_restart() {
         for fail_after in [false, true] {
             let (_directory, path, commands, mut manager) = new_fake();
             manager
-                .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+                .up(
+                    "porta0",
+                    "198.51.100.10:443".parse().unwrap(),
+                    test_lease(),
+                    &crate::tunnel::Routing::default(),
+                )
                 .await
                 .unwrap();
             commands.reset_mutations();
@@ -596,7 +726,12 @@ fn existing_empty_or_unowned_journals_fail_closed() {
 async fn reused_physical_interface_index_does_not_receive_stale_cleanup() {
     let (_directory, _path, commands, mut manager) = new_fake();
     manager
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     {
@@ -626,7 +761,12 @@ async fn reused_physical_interface_index_does_not_receive_stale_cleanup() {
 async fn renamed_physical_interface_retains_escape_route_cleanup_ownership() {
     let (_directory, _path, commands, mut manager) = new_fake();
     manager
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     {

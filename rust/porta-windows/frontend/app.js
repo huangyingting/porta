@@ -78,6 +78,9 @@ const messages = {
     enrollmentClosedDenied: "This account accepts no new devices. Ask your administrator to allow enrollment.",
     deviceDeniedDenied: "Your administrator has not allowed this device to connect.",
     accountExpires: "Access until {date}",
+    fullTunnel: "All traffic goes through the gateway",
+    splitTunnel: "Split tunnel · {count} networks via the gateway",
+    splitTunnelDns: "Split tunnel · {count} networks via the gateway · DNS for {domains}",
     accountExpiresSoon: "Access ends {date}",
     quotaUsage: "{used} of {total} used this month",
     quotaAllowance: "{total} monthly allowance",
@@ -174,6 +177,9 @@ const messages = {
     enrollmentClosedDenied: "此账户不再接受新设备，请联系管理员开放注册。",
     deviceDeniedDenied: "管理员未允许此设备连接。",
     accountExpires: "可使用至 {date}",
+    fullTunnel: "所有流量均经由网关",
+    splitTunnel: "分流模式 · {count} 个网络经由网关",
+    splitTunnelDns: "分流模式 · {count} 个网络经由网关 · {domains} 使用隧道 DNS",
     accountExpiresSoon: "将于 {date} 到期",
     quotaUsage: "本月已用 {used} / {total}",
     quotaAllowance: "每月额度 {total}",
@@ -413,6 +419,7 @@ function applySnapshot(snapshot, recordTraffic) {
   setText("status-text", status);
   setText("status-detail", localizedDetail(snapshot));
   renderAccount(snapshot);
+  renderRouting(snapshot);
   const tone = snapshot.tone === "connected"
     ? "connected"
     : snapshot.tone === "warning"
@@ -475,6 +482,22 @@ function renderAccount(snapshot) {
   setText("account-detail", text);
   element.classList.toggle("hidden", !text);
   element.classList.toggle("warning", warning);
+}
+
+// Which destinations the gateway tunnels for the current connection.
+function renderRouting(snapshot) {
+  const element = $("routing-detail");
+  const routes = snapshot.splitRoutes || [];
+  const domains = snapshot.splitDnsDomains || [];
+  let text = "";
+  if (snapshot.connected) {
+    if (!routes.length) text = t("fullTunnel");
+    else if (domains.length) text = t("splitTunnelDns", { count: routes.length, domains: domains.join(", ") });
+    else text = t("splitTunnel", { count: routes.length });
+  }
+  setText("routing-detail", text);
+  element.title = routes.join("\n");
+  element.classList.toggle("hidden", !text);
 }
 
 function localizedDetail(snapshot) {

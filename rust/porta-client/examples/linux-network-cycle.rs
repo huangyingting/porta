@@ -41,7 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     require_success(Command::new("nft").args(["list", "table", "inet", table]))?;
 
     network
-        .up(device.name(), endpoint, lease)
+        .up(
+            device.name(),
+            endpoint,
+            lease,
+            &porta_client::tunnel::Routing::default(),
+        )
         .await
         .map_err(|error| format!("configure native network: {error}"))?;
     require_success(Command::new("ip").args(["route", "show", "0.0.0.0/1"]))?;

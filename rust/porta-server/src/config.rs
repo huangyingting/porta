@@ -50,6 +50,14 @@ pub struct Config {
     pub dns: String,
     #[arg(long, default_value_t = 1400)]
     pub mtu: u16,
+    /// IPv4 prefix routed through the tunnel (repeatable). Without any, clients
+    /// use a full tunnel.
+    #[arg(long = "route", value_name = "CIDR")]
+    pub routes: Vec<ipnet::Ipv4Net>,
+    /// With --route: DNS domain resolved through the tunnel's DNS server
+    /// (repeatable). Other names keep using the device's resolver.
+    #[arg(long = "dns-domain", value_name = "DOMAIN")]
+    pub dns_domains: Vec<String>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub auto_mtu: bool,
     #[arg(long, default_value = "")]
@@ -127,6 +135,8 @@ impl fmt::Debug for Config {
             .field("lease_state", &self.lease_state)
             .field("dns", &self.dns)
             .field("mtu", &self.mtu)
+            .field("routes", &self.routes)
+            .field("dns_domains", &self.dns_domains)
             .field("auto_mtu", &self.auto_mtu)
             .field("token", &redacted(&self.token))
             .field("metrics_token", &redacted(&self.metrics_token))
@@ -311,6 +321,51 @@ impl Config {
             bail!("--dns must be an IP address when --readiness-dns-name is configured");
         }
         self.validate_upstream()?;
+        self.validate_routing()?;
+        Ok(())
+    }
+
+    fn validate_routing(&mut self) -> Result<()> {
+        const MAX_ROUTES: usize = 64;
+        const MAX_DNS_DOMAINS: usize = 16;
+        if self.routes.len() > MAX_ROUTES {
+            bail!("at most {MAX_ROUTES} --route prefixes are supported");
+        }
+        for route in &mut self.routes {
+            *route = route.trunc();
+            if route.prefix_len() == 0 {
+                bail!("--route 0.0.0.0/0 is a full tunnel; omit --route instead");
+            }
+            if route.addr().is_loopback() || route.addr().is_multicast() {
+                bail!("--route {route} is not a routable unicast prefix");
+            }
+        }
+        self.routes.sort();
+        self.routes.dedup();
+        if self.dns_domains.len() > MAX_DNS_DOMAINS {
+            bail!("at most {MAX_DNS_DOMAINS} --dns-domain values are supported");
+        }
+        if !self.dns_domains.is_empty() {
+            if self.routes.is_empty() {
+                bail!("--dns-domain requires --route; a full tunnel resolves every name through the tunnel");
+            }
+            if self.dns.is_empty() {
+                bail!("--dns-domain requires --dns");
+            }
+        }
+        for domain in &mut self.dns_domains {
+            *domain = normalize_domain(domain);
+            let single_label = !domain.contains('.')
+                && !domain.is_empty()
+                && domain
+                    .bytes()
+                    .all(|value| value.is_ascii_alphanumeric() || value == b'-');
+            if !(valid_dns_name(domain) || single_label) {
+                bail!("--dns-domain {domain:?} is not a DNS name");
+            }
+        }
+        self.dns_domains.sort();
+        self.dns_domains.dedup();
         Ok(())
     }
 
@@ -624,6 +679,51 @@ mod tests {
         config.upstream_token = token.to_owned();
         config.validate()?;
         Ok(config)
+    }
+
+    #[test]
+    fn split_routes_and_dns_domains_are_validated_and_normalized() {
+        let config = relay_config(&[], "").unwrap();
+        assert!(config.routes.is_empty());
+        let config = relay_config(
+            &[
+                "--route",
+                "10.20.30.40/16",
+                "--route",
+                "10.20.0.0/16",
+                "--route",
+                "192.168.5.0/24",
+                "--dns-domain",
+                "Corp.Example.",
+                "--dns-domain",
+                "internal",
+            ],
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            config.routes,
+            vec![
+                "10.20.0.0/16".parse().unwrap(),
+                "192.168.5.0/24".parse().unwrap()
+            ]
+        );
+        assert_eq!(config.dns_domains, vec!["corp.example", "internal"]);
+        for (arguments, message) in [
+            (vec!["--route", "0.0.0.0/0"], "full tunnel"),
+            (vec!["--route", "127.0.0.0/8"], "routable"),
+            (vec!["--dns-domain", "corp.example"], "requires --route"),
+            (
+                vec!["--route", "10.0.0.0/8", "--dns-domain", "bad_domain"],
+                "not a DNS name",
+            ),
+        ] {
+            let error = relay_config(&arguments, "").unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{arguments:?}: {error:#}"
+            );
+        }
     }
 
     #[test]

@@ -172,6 +172,8 @@ struct Group {
     lease: Mutex<Option<Lease>>,
     /// Account status from the most recently established lane.
     account: Arc<Mutex<super::AccountStatus>>,
+    /// Routing from the first lane that established the group.
+    routing: Mutex<Option<super::Routing>>,
     flows: Mutex<FlowTable>,
     established: AtomicBool,
     failure: Arc<FailureSignal>,
@@ -188,6 +190,7 @@ struct LaneConnection {
     remote_address: SocketAddr,
     lease: Lease,
     account: super::AccountStatus,
+    routing: super::Routing,
 }
 
 pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
@@ -224,6 +227,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         lanes,
         lease: Mutex::new(None),
         account: Arc::default(),
+        routing: Mutex::new(None),
         flows: Mutex::new(FlowTable::default()),
         established: AtomicBool::new(false),
         failure: failure.clone(),
@@ -254,6 +258,12 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         .expect("control lane has a remote address");
 
     let account = group.account.clone();
+    let routing = group
+        .routing
+        .lock()
+        .expect("HTTP/2 routing lock poisoned")
+        .clone()
+        .unwrap_or_default();
     tasks.spawn(dispatch_outbound(group.clone(), outbound_rx));
     tasks.spawn(merge_downstream(group.clone(), receivers));
     tasks.spawn(monitor_capacity(group));
@@ -262,6 +272,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
     Ok(Connection {
         lease,
         account,
+        routing,
         remote_address,
         transport: Transport::Http2,
         delivery_mode: DeliveryMode::Framed,
@@ -375,6 +386,11 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         };
         let lease = connection.lease;
         *group.account.lock().expect("HTTP/2 account lock poisoned") = connection.account;
+        group
+            .routing
+            .lock()
+            .expect("HTTP/2 routing lock poisoned")
+            .get_or_insert_with(|| connection.routing.clone());
         if let Err(error) = group.accept_lease(lease) {
             close_lane(connection).await;
             group.fail(error);
@@ -451,10 +467,11 @@ async fn establish_lane(group: &Group, index: usize) -> Result<LaneConnection, C
         validate_response(&response, &group.session, index)?;
         let lease = lease_from_headers(response.headers())?;
         let account = super::parse_account_status(response.headers());
-        Ok((sender, response.into_body(), lease, account))
+        let routing = super::parse_routing(response.headers())?;
+        Ok((sender, response.into_body(), lease, account, routing))
     }
     .await;
-    let (sender, receiver, lease, account) = match established {
+    let (sender, receiver, lease, account, routing) = match established {
         Ok(established) => established,
         Err(error) => {
             driver.abort();
@@ -470,6 +487,7 @@ async fn establish_lane(group: &Group, index: usize) -> Result<LaneConnection, C
         remote_address,
         lease,
         account,
+        routing,
     })
 }
 
@@ -1194,6 +1212,7 @@ mod tests {
                 lanes,
                 lease: Mutex::new(None),
                 account: Arc::default(),
+                routing: Mutex::new(None),
                 flows: Mutex::new(FlowTable::default()),
                 established: AtomicBool::new(true),
                 failure: Arc::new(FailureSignal::default()),

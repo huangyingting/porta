@@ -594,6 +594,29 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAccount(
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
+/// Split-tunnel routing as `route,route|domain,domain`; no routes is a full tunnel.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeSessionRouting(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        let session = get_session(id)?;
+        Ok(JString::from_str(env, encode_routing(&session.connection.routing))?.into_raw())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+fn encode_routing(routing: &porta_client::tunnel::Routing) -> String {
+    let routes = routing
+        .routes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    format!("{}|{}", routes.join(","), routing.dns_domains.join(","))
+}
+
 fn encode_account(account: &porta_client::tunnel::AccountStatus) -> String {
     fn field(value: Option<impl ToString>) -> String {
         value.map(|value| value.to_string()).unwrap_or_default()

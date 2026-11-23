@@ -51,7 +51,11 @@ and the short timestamp window remain part of replay protection. Forward-proxy
 requests do not use this protocol.
 
 Porta sends optional `X-Porta-Gateway`, `X-Porta-DNS` and `X-Porta-MTU` response
-extensions because RFC 9484 does not define that interface configuration. The
+extensions because RFC 9484 does not define that interface configuration.
+A split-tunnel gateway also sends `X-Porta-Routes` (comma-separated IPv4
+prefixes, also advertised as a ROUTE_ADVERTISEMENT capsule on HTTP/3) and
+`X-Porta-DNS-Domains` (comma-separated names). Clients treat a malformed or
+oversized value as a permanent error rather than guessing a routing policy. The
 authenticated gateway address also identifies the source of client-local ICMP
 MTU feedback; it is not inferred from an unrelated public endpoint address.
 
@@ -189,7 +193,8 @@ devices. Refused native tunnels receive HTTP 403 with `X-Porta-Reason`
 `GET /api/gateway` returns the server version and, on a cascade relay, the
 next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","interface":"porta-up0","connected":true,"address":"10.66.0.2","transport":"h3"}}`.
 While disconnected, `connected` is `false` and `error` holds the last failure.
-The admin page shows this as a banner.
+A split-tunnel gateway adds `routes` and `dns_domains`. The admin page shows
+both as banners.
 
 ## Session administration
 

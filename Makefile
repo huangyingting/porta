@@ -11,7 +11,7 @@ WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef5
 
 .PHONY: all build build-rust-server build-rust-clients build-windows android android-debug \
 	check-version clean test test-automation test-rust test-rust-server test-rust-client \
-	test-rust-interop test-live-vpn test-cascade test-windows-cross test-native-firewall test-server-web \
+	test-rust-interop test-live-vpn test-cascade test-split-tunnel test-windows-cross test-native-firewall test-server-web \
 	verify-wintun vet
 
 all: build
@@ -71,6 +71,13 @@ test-cascade:
 		--package porta-server-rust --package porta-client-rust --locked
 	sudo -n ./scripts/test-cascade.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
 	sudo -n env PORTA_CASCADE_TRANSPORT=h2 ./scripts/test-cascade.sh \
+		$(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+
+test-split-tunnel:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-server-rust --package porta-client-rust --locked
+	sudo -n ./scripts/test-split-tunnel.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+	sudo -n env PORTA_SPLIT_TRANSPORT=h2 ./scripts/test-split-tunnel.sh \
 		$(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
 
 vet:

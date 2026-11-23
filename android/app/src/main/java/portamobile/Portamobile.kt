@@ -95,6 +95,10 @@ class Session internal constructor(handle: Long) : AutoCloseable {
     fun transport(): String =
         Portamobile.callNative { Portamobile.sessionTransport(requireHandle()) }
 
+    /** Split-tunnel routing encoded as `route,route|domain,domain`; empty routes mean a full tunnel. */
+    fun routing(): String =
+        Portamobile.callNative { Portamobile.sessionRouting(requireHandle()) }
+
     /** Account limits encoded as `expires|quota|used|rate`; empty fields are unset. */
     fun accountStatus(): String =
         Portamobile.callNative { Portamobile.sessionAccount(requireHandle()) }
@@ -181,6 +185,7 @@ object Portamobile {
     internal fun sessionMTU(handle: Long): Int = nativeSessionMTU(handle)
     internal fun sessionDNS(handle: Long): String = nativeSessionDNS(handle)
     internal fun sessionAccount(handle: Long): String = nativeSessionAccount(handle)
+    internal fun sessionRouting(handle: Long): String = nativeSessionRouting(handle)
     internal fun sessionAutomaticMTU(handle: Long): Boolean = nativeSessionAutomaticMTU(handle)
     internal fun sessionMaximumMTU(handle: Long): Int = nativeSessionMaximumMTU(handle)
     internal fun sessionPacketDeliveryMode(handle: Long): String =
@@ -220,6 +225,7 @@ object Portamobile {
     @JvmStatic private external fun nativeSessionMTU(handle: Long): Int
     @JvmStatic private external fun nativeSessionDNS(handle: Long): String
     @JvmStatic private external fun nativeSessionAccount(handle: Long): String
+    @JvmStatic private external fun nativeSessionRouting(handle: Long): String
     @JvmStatic private external fun nativeSessionAutomaticMTU(handle: Long): Boolean
     @JvmStatic private external fun nativeSessionMaximumMTU(handle: Long): Int
     @JvmStatic private external fun nativeSessionPacketDeliveryMode(handle: Long): String

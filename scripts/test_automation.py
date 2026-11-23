@@ -828,6 +828,28 @@ class AutomationTests(unittest.TestCase):
                       unit)
         self.assertIn("allowed within 10.66.0.0/24", result.stdout)
 
+    def test_deploy_split_tunnel_routes_are_passed_saved_and_cleared(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local", "--routes", "10.20.0.0/16,192.168.5.0/24",
+                                 "--dns-domains", "corp.example")
+        unit_path = self.root / "system/etc/systemd/system/porta.service"
+        unit = unit_path.read_text()
+        self.assertIn("--dns 1.1.1.1 --route 10.20.0.0/16 --route 192.168.5.0/24 "
+                      "--dns-domain corp.example --mtu", unit)
+        self.assertIn("split tunnel: 10.20.0.0/16, 192.168.5.0/24 (DNS for corp.example)",
+                      result.stdout)
+        config = (self.root / "system/etc/porta/deploy.conf").read_text()
+        self.assertIn("routes=10.20.0.0/16,192.168.5.0/24\n", config)
+
+        result = self.run_deploy(deploy, "--build-local", "--routes=", "--dns-domains=")
+        self.assertNotIn("--route", unit_path.read_text())
+        self.assertIn("Client routing:  full tunnel", result.stdout)
+        for options in (("--routes", "10.20.0.0/16;reboot"), ("--routes", "corp"),
+                        ("--dns-domains", "corp.example"),
+                        ("--routes", "10.20.0.0/16", "--dns-domains", "bad_domain")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
     def test_deploy_relay_without_token_fails_before_stopping_service(self):
         deploy = self.prepare_deploy(timer=False)
         before = self.snapshot()

@@ -42,6 +42,11 @@ Options:
   --client-host-access[=BOOL]
                             Let clients reach all services on this host; by
                             default they may only ping it and use DNS port 53
+  --routes CIDR[,CIDR...]   Split tunnel: clients route only these IPv4
+                            prefixes through Porta; --routes= restores a full
+                            tunnel
+  --dns-domains D[,D...]    Split DNS: clients resolve only these domains with
+                            --dns; requires --routes
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
   --help                    Show this help
@@ -97,6 +102,8 @@ upstream_ca=
 upstream_interface=porta-up0
 client_to_client=false
 client_host_access=false
+routes=
+dns_domains=
 
 # Options persisted across upgrades. Values are parsed, never sourced, and
 # validated below exactly like command-line input.
@@ -104,7 +111,8 @@ deploy_config=/etc/porta/deploy.conf
 saved_option_names=(
   domain certificate private_key acme_email port admin_port external_interface
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
-  upstream_ca upstream_interface client_to_client client_host_access
+  upstream_ca upstream_interface client_to_client client_host_access routes
+  dns_domains
 )
 declare -A saved_options=()
 if [[ -e $deploy_config || -L $deploy_config ]]; then
@@ -114,7 +122,7 @@ if [[ -e $deploy_config || -L $deploy_config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
     line_number=$((line_number + 1))
     [[ -z $line || $line == \#* ]] && continue
-    [[ $line =~ ^([a-z_]+)=([A-Za-z0-9_./:@+-]*)$ ]] ||
+    [[ $line =~ ^([a-z_]+)=([A-Za-z0-9_./:@+,-]*)$ ]] ||
       die "invalid line $line_number in $deploy_config"
     key=${BASH_REMATCH[1]}
     value=${BASH_REMATCH[2]}
@@ -163,6 +171,10 @@ while [[ $# -gt 0 ]]; do
     --client-to-client=*) client_to_client=$(parse_bool --client-to-client "${1#*=}"); shift ;;
     --client-host-access) client_host_access=true; shift ;;
     --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
+    --routes) require_value "$@"; routes=$2; shift 2 ;;
+    --routes=*) routes=${1#*=}; shift ;;
+    --dns-domains) require_value "$@"; dns_domains=$2; shift 2 ;;
+    --dns-domains=*) dns_domains=${1#*=}; shift ;;
     --release) require_value "$@"; release=$2; shift 2 ;;
     --build-local) build_local=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -208,6 +220,24 @@ mtu=$((10#$mtu))
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
+route_arguments=
+if [[ -n $routes ]]; then
+  IFS=, read -ra route_list <<<"$routes"
+  for route in "${route_list[@]}"; do
+    [[ $route =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "invalid --routes entry: $route"
+    route_arguments+=" --route $route"
+  done
+fi
+if [[ -n $dns_domains ]]; then
+  [[ -n $routes ]] || die "--dns-domains requires --routes"
+  IFS=, read -ra domain_list <<<"$dns_domains"
+  for split_domain in "${domain_list[@]}"; do
+    [[ ${#split_domain} -le 253 &&
+       $split_domain =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]] ||
+      die "invalid --dns-domains entry: $split_domain"
+    route_arguments+=" --dns-domain $split_domain"
+  done
+fi
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
 if [[ -z $upstream ]]; then
@@ -825,7 +855,7 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments --mtu $mtu --json-logs
 ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -956,6 +986,7 @@ Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "
 Exit traffic:    $([[ -n $upstream ]] && echo "relayed through $upstream via $upstream_interface" || echo "this host via $external_interface")
 Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
+Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_domains:+ (DNS for ${dns_domains//,/, })}" || echo "full tunnel")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Browser portal:  https://$domain:$port
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
