@@ -50,15 +50,28 @@ use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     if version_requested(std::env::args_os().skip(1)) {
         println!("{}", porta_server_rust::VERSION.trim());
         return;
     }
     #[cfg(unix)]
     let program = porta_server_rust::ops::handoff::Program::current();
-    match run().await {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("porta-server: start the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    let result = runtime.block_on(run());
+    // No other thread may run while an in-place restart rearranges
+    // descriptors: the runtime's own pipes are among them.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    match result {
         Ok(Stop::Exit) => {}
         #[cfg(unix)]
         Ok(Stop::Restart) => {
