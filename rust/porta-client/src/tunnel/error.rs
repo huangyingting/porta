@@ -5,6 +5,12 @@ use thiserror::Error;
 pub enum AccountDenial {
     Expired,
     QuotaExceeded,
+    /// The device is enrolled but waits for administrator approval.
+    DevicePending,
+    /// The account accepts no new devices.
+    EnrollmentClosed,
+    /// An administrator refused this device.
+    DeviceDenied,
 }
 
 impl AccountDenial {
@@ -13,6 +19,9 @@ impl AccountDenial {
         match reason {
             "account-expired" => Some(Self::Expired),
             "quota-exceeded" => Some(Self::QuotaExceeded),
+            "device-pending" => Some(Self::DevicePending),
+            "enrollment-closed" => Some(Self::EnrollmentClosed),
+            "device-denied" => Some(Self::DeviceDenied),
             _ => None,
         }
     }
@@ -22,6 +31,9 @@ impl AccountDenial {
         match self {
             Self::Expired => "account-expired",
             Self::QuotaExceeded => "quota-exceeded",
+            Self::DevicePending => "device-pending",
+            Self::EnrollmentClosed => "enrollment-closed",
+            Self::DeviceDenied => "device-denied",
         }
     }
 
@@ -31,6 +43,13 @@ impl AccountDenial {
             Self::QuotaExceeded => {
                 "the gateway account has used its monthly data quota; access resumes next month or when the administrator raises it"
             }
+            Self::DevicePending => {
+                "this device is waiting for administrator approval; connect again once it is approved"
+            }
+            Self::EnrollmentClosed => {
+                "this account accepts no new devices; ask the administrator to allow enrollment"
+            }
+            Self::DeviceDenied => "the administrator has not allowed this device to connect",
         }
     }
 }

@@ -172,6 +172,18 @@ that native clients display: `X-Porta-Account-Expires` (Unix seconds),
 `X-Porta-Quota-Bytes`, `X-Porta-Quota-Used-Bytes` (a snapshot at connection
 time) and `X-Porta-Rate-Limit-Kbps`. Enforcement never depends on them.
 
+## Device enrollment
+
+`PUT /api/clients/{clientID}/enrollment` sets the policy for unknown device
+keys: `{"policy": "open" | "approval" | "closed", "open_for_minutes": 15}`.
+`open_for_minutes` (1 to 10080) optionally lets new devices enroll directly
+until the window elapses. `POST /api/clients/{clientID}/devices/{deviceID}/approve`
+and `.../deny` review a device. Client summaries include `enrollment`,
+`enrollment_open_until`, and `pending_devices`, and each device has a
+`status` of `approved`, `pending`, or `denied`; `device_count` counts approved
+devices. Refused native tunnels receive HTTP 403 with `X-Porta-Reason`
+`device-pending`, `enrollment-closed`, or `device-denied`.
+
 ## Gateway status
 
 `GET /api/gateway` returns the server version and, on a cascade relay, the

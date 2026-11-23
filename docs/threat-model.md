@@ -106,6 +106,10 @@ not conceal transport fingerprints from network inspection.
   request proof could be replayed until its five-minute timestamp window
   expires. TLS normally prevents network capture; a reverse proxy terminating
   TLS can observe both the bearer token and proof and must be fully trusted.
+- With the default `open` enrollment policy, anyone holding an account token
+  can enroll new devices up to the device limit. The `approval` and `closed`
+  policies make enrollment an administrator decision; approval is keyed by the
+  device's public key, not by attested hardware.
 - Forward-proxy Basic usernames are ignored, so every proxy client using an
   account token shares one token-only `forward-proxy` enrollment and cannot be
   managed or attributed individually.

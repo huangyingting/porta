@@ -41,6 +41,9 @@ internal fun parseAccountLimits(value: String): AccountLimits {
 internal enum class AccountDenial(val code: String) {
     EXPIRED("account-expired"),
     QUOTA_EXCEEDED("quota-exceeded"),
+    DEVICE_PENDING("device-pending"),
+    ENROLLMENT_CLOSED("enrollment-closed"),
+    DEVICE_DENIED("device-denied"),
 }
 
 /** Finds the stable denial code the native bridge places in failure messages. */

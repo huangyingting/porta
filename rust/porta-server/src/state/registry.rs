@@ -59,6 +59,12 @@ pub enum RegistryError {
     Expired,
     #[error("client account has used its monthly data quota")]
     QuotaExceeded,
+    #[error("device is waiting for administrator approval")]
+    DevicePending,
+    #[error("device enrollment is closed for this account")]
+    EnrollmentClosed,
+    #[error("device enrollment was denied")]
+    DeviceDenied,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,6 +82,111 @@ pub struct ClientRecord {
     pub limits: AccountLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_period: Option<UsagePeriod>,
+    #[serde(default, skip_serializing_if = "EnrollmentPolicy::is_open")]
+    pub enrollment: EnrollmentPolicy,
+    /// New devices enroll directly until this instant, whatever the policy.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_rfc3339"
+    )]
+    pub enrollment_open_until: Option<OffsetDateTime>,
+}
+
+/// How an account accepts device keys it has not seen before.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentPolicy {
+    /// New devices enroll on first connection, up to the device limit.
+    #[default]
+    Open,
+    /// New devices wait for an administrator to approve them.
+    Approval,
+    /// New devices are refused.
+    Closed,
+}
+
+impl EnrollmentPolicy {
+    fn is_open(&self) -> bool {
+        *self == Self::Open
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Approval => "approval",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceStatus {
+    #[default]
+    Approved,
+    Pending,
+    Denied,
+}
+
+impl DeviceStatus {
+    fn is_approved(&self) -> bool {
+        *self == Self::Approved
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Pending => "pending",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+/// Pending and denied devices kept per account; further unknown devices are
+/// refused so that a leaked token cannot flood the registry.
+pub const MAX_UNAPPROVED_DEVICES: usize = 16;
+/// Longest temporary enrollment window an administrator can open.
+pub const MAX_ENROLLMENT_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn approved_devices(client: &ClientRecord) -> usize {
+    client
+        .devices
+        .iter()
+        .filter(|device| device.status.is_approved())
+        .count()
+}
+
+fn unapproved_devices(client: &ClientRecord) -> usize {
+    client.devices.len() - approved_devices(client)
+}
+
+/// Whether a new device enrolls directly, waits for approval, or is refused.
+fn enrollment_decision(
+    client: &ClientRecord,
+    now: OffsetDateTime,
+) -> Result<DeviceStatus, RegistryError> {
+    let window_open = client
+        .enrollment_open_until
+        .is_some_and(|until| until > now);
+    match client.enrollment {
+        _ if window_open => Ok(DeviceStatus::Approved),
+        EnrollmentPolicy::Open => Ok(DeviceStatus::Approved),
+        EnrollmentPolicy::Approval if unapproved_devices(client) < MAX_UNAPPROVED_DEVICES => {
+            Ok(DeviceStatus::Pending)
+        }
+        EnrollmentPolicy::Approval | EnrollmentPolicy::Closed => {
+            Err(RegistryError::EnrollmentClosed)
+        }
+    }
+}
+
+fn device_access(status: DeviceStatus) -> Result<(), RegistryError> {
+    match status {
+        DeviceStatus::Approved => Ok(()),
+        DeviceStatus::Pending => Err(RegistryError::DevicePending),
+        DeviceStatus::Denied => Err(RegistryError::DeviceDenied),
+    }
 }
 
 /// Optional account restrictions; absent values mean unrestricted.
@@ -129,6 +240,8 @@ pub struct DeviceRecord {
     pub first_seen: OffsetDateTime,
     #[serde(with = "rfc3339")]
     pub last_seen: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "DeviceStatus::is_approved")]
+    pub status: DeviceStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -159,6 +272,11 @@ pub struct ClientSummary {
     pub devices: Vec<DeviceSummary>,
     #[serde(flatten)]
     pub limits: AccountLimits,
+    pub enrollment: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none", with = "optional_rfc3339")]
+    pub enrollment_open_until: Option<OffsetDateTime>,
+    /// Devices waiting for approval.
+    pub pending_devices: usize,
     /// Traffic counted against the monthly quota in the current period.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_used_bytes: Option<u64>,
@@ -184,6 +302,8 @@ pub struct DeviceSummary {
     pub last_connected: Option<OffsetDateTime>,
     #[serde(skip_serializing_if = "Option::is_none", with = "optional_rfc3339")]
     pub last_disconnected: Option<OffsetDateTime>,
+    /// `approved`, `pending`, or `denied`.
+    pub status: &'static str,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub transport: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -358,6 +478,8 @@ impl ClientRegistry {
                     devices: Vec::new(),
                     limits: AccountLimits::default(),
                     usage_period: None,
+                    enrollment: EnrollmentPolicy::Open,
+                    enrollment_open_until: None,
                 }]
             }
             Err(error) => return Err(error.into()),
@@ -467,6 +589,8 @@ impl ClientRegistry {
             devices: Vec::new(),
             limits: AccountLimits::default(),
             usage_period: None,
+            enrollment: EnrollmentPolicy::Open,
+            enrollment_open_until: None,
         };
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -505,10 +629,10 @@ impl ClientRegistry {
                 .iter()
                 .find(|client| client.id == id)
                 .ok_or(RegistryError::NotFound)?;
-            if max_devices < client.devices.len() {
+            if max_devices < approved_devices(client) {
                 return Err(RegistryError::InvalidInput(format!(
                     "device limit cannot be below the {} enrolled devices",
-                    client.devices.len()
+                    approved_devices(client)
                 )));
             }
             let mut clients = state.clients.clone();
@@ -607,6 +731,111 @@ impl ClientRegistry {
             None,
             state.quota_blocked.contains(id),
         ))
+    }
+
+    /// Sets how the account accepts new devices. `window` additionally lets
+    /// new devices enroll directly until it elapses.
+    pub async fn set_enrollment(
+        &self,
+        id: &str,
+        policy: EnrollmentPolicy,
+        window: Option<Duration>,
+    ) -> Result<ClientSummary, RegistryError> {
+        if window.is_some_and(|window| window.is_zero() || window > MAX_ENROLLMENT_WINDOW) {
+            return Err(RegistryError::InvalidInput(
+                "enrollment window must be between one minute and seven days".into(),
+            ));
+        }
+        let until = window.map(|window| OffsetDateTime::now_utc() + window);
+        self.mutate_client(id, |client| {
+            client.enrollment = policy;
+            client.enrollment_open_until = until;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Lets a pending or denied device connect, within the device limit.
+    pub async fn approve_device(
+        &self,
+        id: &str,
+        device_id: &str,
+    ) -> Result<ClientSummary, RegistryError> {
+        self.mutate_client(id, |client| {
+            if approved_devices(client) >= client.max_devices {
+                return Err(RegistryError::InvalidInput(
+                    "the device limit is reached; raise it or forget a device first".into(),
+                ));
+            }
+            let device = client
+                .devices
+                .iter_mut()
+                .find(|device| device.id == device_id)
+                .ok_or(RegistryError::NotFound)?;
+            device.status = DeviceStatus::Approved;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Refuses a device until an administrator approves or forgets it, and
+    /// ends any of its sessions.
+    pub async fn deny_device(
+        &self,
+        id: &str,
+        device_id: &str,
+    ) -> Result<ClientSummary, RegistryError> {
+        let summary = self
+            .mutate_client(id, |client| {
+                let device = client
+                    .devices
+                    .iter_mut()
+                    .find(|device| device.id == device_id && device.id != FORWARD_PROXY_DEVICE_ID)
+                    .ok_or(RegistryError::NotFound)?;
+                device.status = DeviceStatus::Denied;
+                Ok(())
+            })
+            .await?;
+        let key = DeviceKey::new(id, device_id);
+        let _drain = self.begin_device_drain(&key);
+        self.inner.sessions.cancel_device(id, device_id).await;
+        Ok(summary)
+    }
+
+    /// Persists a change to one client record, then applies the same
+    /// idempotent change to the live record so that concurrent in-memory
+    /// metadata updates are kept.
+    async fn mutate_client(
+        &self,
+        id: &str,
+        change: impl Fn(&mut ClientRecord) -> Result<(), RegistryError>,
+    ) -> Result<ClientSummary, RegistryError> {
+        self.ensure_open()?;
+        let _mutation = self.inner.mutations.lock().await;
+        self.ensure_open()?;
+        let candidate = {
+            let state = self.inner.state.lock();
+            let mut clients = state.clients.clone();
+            let client = clients
+                .iter_mut()
+                .find(|client| client.id == id)
+                .ok_or(RegistryError::NotFound)?;
+            change(client)?;
+            clients
+        };
+        self.persist_clients(&candidate).await?;
+        let mut state = self.inner.state.lock();
+        let blocked = state.quota_blocked.contains(id);
+        let client = find_client_mut(&mut state, id)?;
+        if change(client).is_err() {
+            // Memory changed since the snapshot; keep it consistent with disk.
+            if let Some(persisted) = candidate.into_iter().find(|client| client.id == id) {
+                *client = persisted;
+            }
+        }
+        let summary = summarize_client(client, &self.inner.sessions, None, blocked);
+        drop(state);
+        Ok(summary)
     }
 
     /// Starts a new quota period whose usage is measured from `baseline_bytes`.
@@ -907,6 +1136,7 @@ impl ClientRegistry {
                 if device.public_key != canonical_key {
                     return Err(RegistryError::Unauthorized);
                 }
+                device_access(device.status)?;
                 if device.name == proof.name
                     && !elapsed_at_least(device.last_seen, now, LAST_SEEN_INTERVAL)
                 {
@@ -947,6 +1177,7 @@ impl ClientRegistry {
                 if device.public_key != canonical_key {
                     return Err(RegistryError::Unauthorized);
                 }
+                device_access(device.status)?;
                 let needs_persist = device.name != proof.name
                     || elapsed_at_least(device.last_seen, now, LAST_SEEN_INTERVAL);
                 if !needs_persist {
@@ -967,9 +1198,9 @@ impl ClientRegistry {
                 device.last_seen = now;
                 (account_id, clients, Some(device_index), false)
             } else {
-                if state.clients[client_index].devices.len()
-                    >= state.clients[client_index].max_devices
-                {
+                let client = &state.clients[client_index];
+                let status = enrollment_decision(client, now)?;
+                if status.is_approved() && approved_devices(client) >= client.max_devices {
                     return Err(RegistryError::DeviceLimit);
                 }
                 let mut clients = state.clients.clone();
@@ -979,6 +1210,7 @@ impl ClientRegistry {
                     public_key: canonical_key.clone(),
                     first_seen: now,
                     last_seen: now,
+                    status,
                 });
                 (account_id, clients, None, true)
             }
@@ -993,17 +1225,24 @@ impl ClientRegistry {
                 .find(|client| client.id == account_id)
                 .ok_or(RegistryError::Unauthorized)?;
             if is_new {
-                if client.devices.len() >= client.max_devices {
+                let enrolled = candidate
+                    .iter()
+                    .find(|client| client.id == account_id)
+                    .and_then(|client| client.devices.last())
+                    .cloned()
+                    .ok_or(RegistryError::InvalidDeviceProof)?;
+                if enrolled.status.is_approved() && approved_devices(client) >= client.max_devices {
                     return Err(RegistryError::DeviceLimit);
                 }
-                client.devices.push(
-                    candidate
-                        .iter()
-                        .find(|client| client.id == account_id)
-                        .and_then(|client| client.devices.last())
-                        .cloned()
-                        .ok_or(RegistryError::InvalidDeviceProof)?,
-                );
+                let status = enrolled.status;
+                client.devices.push(enrolled);
+                if !status.is_approved() {
+                    // The pending enrollment is recorded; the device can
+                    // connect once an administrator approves it.
+                    let key = DeviceKey::new(&account_id, &proof.device_id);
+                    remember_nonce(&mut state, key, proof.nonce.clone(), verified.signed_at);
+                    return Err(RegistryError::DevicePending);
+                }
             } else if let Some(device_index) = existing_index {
                 let persisted = candidate
                     .iter()
@@ -1110,7 +1349,8 @@ impl ClientRegistry {
                     guard,
                 });
             }
-            if state.clients[client_index].devices.len() >= state.clients[client_index].max_devices
+            if approved_devices(&state.clients[client_index])
+                >= state.clients[client_index].max_devices
             {
                 return Err(RegistryError::DeviceLimit);
             }
@@ -1121,6 +1361,7 @@ impl ClientRegistry {
                 public_key: String::new(),
                 first_seen: now,
                 last_seen: now,
+                status: DeviceStatus::Approved,
             });
             (account_id, clients)
         };
@@ -1578,7 +1819,9 @@ fn validate_stored_client(client: &ClientRecord) -> Result<(), RegistryError> {
             )));
         }
     }
-    if client.devices.len() > client.max_devices {
+    if approved_devices(client) > client.max_devices
+        || unapproved_devices(client) > MAX_UNAPPROVED_DEVICES
+    {
         return Err(RegistryError::InvalidInput(
             "enrolled devices exceed device limit".into(),
         ));
@@ -1619,7 +1862,16 @@ fn summarize_client(
         max_devices: client.max_devices,
         enabled: client.enabled,
         created_at: client.created_at,
-        device_count: devices.len(),
+        device_count: approved_devices(client),
+        enrollment: client.enrollment.as_str(),
+        enrollment_open_until: client
+            .enrollment_open_until
+            .filter(|until| *until > OffsetDateTime::now_utc()),
+        pending_devices: client
+            .devices
+            .iter()
+            .filter(|device| device.status == DeviceStatus::Pending)
+            .count(),
         active_sessions: snapshot.map_or_else(
             || sessions.active_count(&client.id, None),
             |_| client_usage.active_sessions,
@@ -1642,6 +1894,7 @@ fn summarize_client(
                         || sessions.active_count(&client.id, Some(&device.id)),
                         |_| device_usage.active_sessions,
                     ),
+                    status: device.status.as_str(),
                     id: device.id,
                     name: device.name,
                     first_seen: device.first_seen,
@@ -1831,6 +2084,7 @@ mod tests {
             public_key: URL_SAFE_NO_PAD.encode(encoded),
             first_seen: at,
             last_seen: at,
+            status: DeviceStatus::Approved,
         }
     }
 
@@ -2038,6 +2292,8 @@ mod tests {
                     devices: Vec::new(),
                     limits: AccountLimits::default(),
                     usage_period: None,
+                    enrollment: EnrollmentPolicy::Open,
+                    enrollment_open_until: None,
                 })
                 .collect(),
             ..RegistryState::default()
@@ -2060,6 +2316,8 @@ mod tests {
                 devices: Vec::new(),
                 limits: AccountLimits::default(),
                 usage_period: None,
+                enrollment: EnrollmentPolicy::Open,
+                enrollment_open_until: None,
             },
             ClientRecord {
                 id: "8899aabbccddeeff".into(),
@@ -2071,6 +2329,8 @@ mod tests {
                 devices: Vec::new(),
                 limits: AccountLimits::default(),
                 usage_period: None,
+                enrollment: EnrollmentPolicy::Open,
+                enrollment_open_until: None,
             },
         ];
         rebuild_token_index(&mut state);
@@ -2097,6 +2357,8 @@ mod tests {
                 devices: vec![test_device("phone", at), test_device("tablet", at)],
                 limits: AccountLimits::default(),
                 usage_period: None,
+                enrollment: EnrollmentPolicy::Open,
+                enrollment_open_until: None,
             }],
         };
         tokio::fs::write(&path, serde_json::to_vec(&file).unwrap())
@@ -2307,6 +2569,145 @@ mod tests {
         let encoded = serde_json::to_string(&client).unwrap();
         assert!(!encoded.contains("expires_at"));
         assert!(!encoded.contains("usage_period"));
+    }
+
+    async fn enroll(
+        registry: &ClientRegistry,
+        key: &SigningKey,
+        nonce: u8,
+    ) -> Result<AuthenticatedSession, RegistryError> {
+        registry
+            .authenticate_device_session(
+                BOOTSTRAP_TOKEN,
+                &signed_proof(key, "Phone", BOOTSTRAP_TOKEN, nonce),
+                "POST",
+                "/v1/tunnel",
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn approval_policy_holds_new_devices_until_reviewed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let id = registry.list()[0].id.clone();
+        let existing = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        drop(enroll(&registry, &existing, 1).await.unwrap());
+        registry
+            .set_enrollment(&id, EnrollmentPolicy::Approval, None)
+            .await
+            .unwrap();
+
+        // Enrolled devices keep working; a new one waits for approval.
+        drop(enroll(&registry, &existing, 2).await.unwrap());
+        let newcomer = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        assert!(matches!(
+            enroll(&registry, &newcomer, 3).await,
+            Err(RegistryError::DevicePending)
+        ));
+        assert!(matches!(
+            enroll(&registry, &newcomer, 4).await,
+            Err(RegistryError::DevicePending)
+        ));
+        let summary = &registry.list()[0];
+        assert_eq!(summary.enrollment, "approval");
+        assert_eq!(summary.pending_devices, 1);
+        assert_eq!(summary.device_count, 1);
+        let pending = summary
+            .devices
+            .iter()
+            .find(|device| device.status == "pending")
+            .unwrap()
+            .id
+            .clone();
+
+        // Pending state survives a restart.
+        registry.close().await.unwrap();
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        assert!(matches!(
+            enroll(&registry, &newcomer, 5).await,
+            Err(RegistryError::DevicePending)
+        ));
+        registry.approve_device(&id, &pending).await.unwrap();
+        drop(enroll(&registry, &newcomer, 6).await.unwrap());
+        assert_eq!(registry.list()[0].device_count, 2);
+
+        registry.deny_device(&id, &pending).await.unwrap();
+        assert!(matches!(
+            enroll(&registry, &newcomer, 7).await,
+            Err(RegistryError::DeviceDenied)
+        ));
+        assert_eq!(registry.list()[0].device_count, 1);
+        registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_enrollment_refuses_new_devices_outside_a_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let id = registry.list()[0].id.clone();
+        registry
+            .set_enrollment(&id, EnrollmentPolicy::Closed, None)
+            .await
+            .unwrap();
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        assert!(matches!(
+            enroll(&registry, &key, 1).await,
+            Err(RegistryError::EnrollmentClosed)
+        ));
+        assert_eq!(registry.list()[0].devices.len(), 0);
+        assert!(matches!(
+            registry
+                .set_enrollment(&id, EnrollmentPolicy::Closed, Some(Duration::ZERO))
+                .await,
+            Err(RegistryError::InvalidInput(_))
+        ));
+        let summary = registry
+            .set_enrollment(
+                &id,
+                EnrollmentPolicy::Closed,
+                Some(Duration::from_secs(900)),
+            )
+            .await
+            .unwrap();
+        assert!(summary.enrollment_open_until.is_some());
+        drop(enroll(&registry, &key, 2).await.unwrap());
+        assert_eq!(registry.list()[0].device_count, 1);
+        registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unapproved_devices_are_bounded_and_excluded_from_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let id = registry.list()[0].id.clone();
+        registry
+            .set_enrollment(&id, EnrollmentPolicy::Approval, None)
+            .await
+            .unwrap();
+        for nonce in 0..MAX_UNAPPROVED_DEVICES {
+            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            assert!(matches!(
+                enroll(&registry, &key, nonce as u8).await,
+                Err(RegistryError::DevicePending)
+            ));
+        }
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        assert!(matches!(
+            enroll(&registry, &key, 200).await,
+            Err(RegistryError::EnrollmentClosed)
+        ));
+        // Pending devices do not count toward the device limit.
+        registry
+            .update(&id, "Default client", 1, true)
+            .await
+            .unwrap();
+        registry.close().await.unwrap();
     }
 
     #[tokio::test]

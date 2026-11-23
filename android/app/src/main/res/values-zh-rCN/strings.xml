@@ -58,6 +58,9 @@
     <string name="connection_rejected">连接被拒绝</string>
     <string name="account_expired_denied">此账户已过期，请联系管理员续期。</string>
     <string name="quota_exceeded_denied">此账户已用完本月流量额度。下月恢复，或请管理员提高额度。</string>
+    <string name="device_pending_denied">此设备正在等待管理员批准。批准后请重新连接。</string>
+    <string name="enrollment_closed_denied">此账户不再接受新设备，请联系管理员开放注册。</string>
+    <string name="device_denied_denied">管理员未允许此设备连接。</string>
     <string name="account_expires">可使用至 %1$s</string>
     <string name="account_expires_soon">将于 %1$s 到期</string>
     <string name="quota_usage">本月已用 %1$s / %2$s</string>

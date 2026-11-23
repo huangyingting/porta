@@ -74,6 +74,9 @@ const messages = {
     profileReady: "{name} · {server}",
     accountExpiredDenied: "This account has expired. Ask your administrator to renew it.",
     quotaExceededDenied: "This account has used its monthly data allowance. Access resumes next month or when your administrator raises it.",
+    devicePendingDenied: "This device is waiting for administrator approval. Connect again once it is approved.",
+    enrollmentClosedDenied: "This account accepts no new devices. Ask your administrator to allow enrollment.",
+    deviceDeniedDenied: "Your administrator has not allowed this device to connect.",
     accountExpires: "Access until {date}",
     accountExpiresSoon: "Access ends {date}",
     quotaUsage: "{used} of {total} used this month",
@@ -167,6 +170,9 @@ const messages = {
     profileReady: "{name} · {server}",
     accountExpiredDenied: "此账户已过期，请联系管理员续期。",
     quotaExceededDenied: "此账户已用完本月流量额度。下月恢复，或请管理员提高额度。",
+    devicePendingDenied: "此设备正在等待管理员批准。批准后请重新连接。",
+    enrollmentClosedDenied: "此账户不再接受新设备，请联系管理员开放注册。",
+    deviceDeniedDenied: "管理员未允许此设备连接。",
     accountExpires: "可使用至 {date}",
     accountExpiresSoon: "将于 {date} 到期",
     quotaUsage: "本月已用 {used} / {total}",
@@ -501,6 +507,9 @@ function localizedDetail(snapshot) {
     default:
       if (snapshot.accountDenial === "account-expired") return t("accountExpiredDenied");
       if (snapshot.accountDenial === "quota-exceeded") return t("quotaExceededDenied");
+      if (snapshot.accountDenial === "device-pending") return t("devicePendingDenied");
+      if (snapshot.accountDenial === "enrollment-closed") return t("enrollmentClosedDenied");
+      if (snapshot.accountDenial === "device-denied") return t("deviceDeniedDenied");
       if (snapshot.detail === "Normal network access has been restored.") return t("networkRestored");
       if (snapshot.detail === "Network recovery remains pending.") return t("recoveryPending");
       return snapshot.detail;

@@ -43,6 +43,10 @@ class AccountStatusTest {
             AccountDenial.QUOTA_EXCEEDED,
             accountDenialIn("account-denied:quota-exceeded: monthly data quota"),
         )
+        assertEquals(
+            AccountDenial.DEVICE_PENDING,
+            accountDenialIn("Connection rejected: account-denied:device-pending: waiting for approval"),
+        )
         assertNull(accountDenialIn("gateway returned HTTP 401 Unauthorized"))
     }
 }

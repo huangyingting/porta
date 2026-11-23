@@ -179,6 +179,9 @@ pub enum AuthenticationError {
 pub enum DenialReason {
     AccountExpired,
     QuotaExceeded,
+    DevicePending,
+    EnrollmentClosed,
+    DeviceDenied,
 }
 
 impl DenialReason {
@@ -187,6 +190,9 @@ impl DenialReason {
         match self {
             Self::AccountExpired => "account-expired",
             Self::QuotaExceeded => "quota-exceeded",
+            Self::DevicePending => "device-pending",
+            Self::EnrollmentClosed => "enrollment-closed",
+            Self::DeviceDenied => "device-denied",
         }
     }
 }

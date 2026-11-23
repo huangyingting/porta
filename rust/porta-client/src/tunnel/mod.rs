@@ -465,6 +465,16 @@ mod tests {
                 .denial(),
             Some(AccountDenial::QuotaExceeded)
         );
+        for (code, denial) in [
+            ("device-pending", AccountDenial::DevicePending),
+            ("enrollment-closed", AccountDenial::EnrollmentClosed),
+            ("device-denied", AccountDenial::DeviceDenied),
+        ] {
+            let error = account_denial(forbidden, Some(code)).unwrap();
+            assert_eq!(error.denial(), Some(denial));
+            assert_eq!(denial.code(), code);
+            assert!(error.is_permanent());
+        }
         assert!(account_denial(forbidden, Some("<script>")).is_none());
         assert!(account_denial(http::StatusCode::UNAUTHORIZED, Some("account-expired")).is_none());
     }

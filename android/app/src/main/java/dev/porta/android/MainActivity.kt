@@ -940,6 +940,9 @@ class MainActivity : Activity() {
     private fun accountDenialText(value: String): String? = when (accountDenialIn(value)) {
         AccountDenial.EXPIRED -> getString(R.string.account_expired_denied)
         AccountDenial.QUOTA_EXCEEDED -> getString(R.string.quota_exceeded_denied)
+        AccountDenial.DEVICE_PENDING -> getString(R.string.device_pending_denied)
+        AccountDenial.ENROLLMENT_CLOSED -> getString(R.string.enrollment_closed_denied)
+        AccountDenial.DEVICE_DENIED -> getString(R.string.device_denied_denied)
         null -> null
     }
 

@@ -28,6 +28,9 @@ pub struct DeviceSummary {
     pub transport: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub assigned_address: String,
+    /// `approved`, `pending`, or `denied`.
+    #[serde(default)]
+    pub status: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub target: String,
 }
@@ -63,6 +66,24 @@ pub struct ClientSummary {
     /// `active`, `disabled`, `expired`, or `quota_exceeded`.
     #[serde(default)]
     pub status: String,
+    /// `open`, `approval`, or `closed`.
+    #[serde(default)]
+    pub enrollment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_open_until: Option<String>,
+    #[serde(default)]
+    pub pending_devices: usize,
+}
+
+/// Body of `PUT /api/clients/{id}/enrollment`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientEnrollment {
+    /// `open`, `approval`, or `closed`.
+    pub policy: String,
+    /// Lets new devices enroll directly for this many minutes.
+    #[serde(default)]
+    pub open_for_minutes: Option<u32>,
 }
 
 /// Account limits accepted by `PUT /api/clients/{id}/limits`. Every field
@@ -130,6 +151,30 @@ pub trait ClientRegistry: Send + Sync {
         Box::pin(async {
             Err(RegistryError::Invalid(
                 "account limits are unsupported".into(),
+            ))
+        })
+    }
+    fn set_client_enrollment<'a>(
+        &'a self,
+        _id: &'a str,
+        _enrollment: ClientEnrollment,
+    ) -> BoxFuture<'a, Result<ClientSummary, RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Invalid(
+                "enrollment control is unsupported".into(),
+            ))
+        })
+    }
+    /// Approves (`true`) or denies (`false`) a device.
+    fn review_device<'a>(
+        &'a self,
+        _id: &'a str,
+        _device_id: &'a str,
+        _approve: bool,
+    ) -> BoxFuture<'a, Result<ClientSummary, RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Invalid(
+                "enrollment control is unsupported".into(),
             ))
         })
     }
@@ -314,6 +359,33 @@ impl AdminService {
                     Err(response) => return response,
                 };
                 match self.registry.set_client_limits(&client_id, limits).await {
+                    Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
+                    Err(error) => registry_error(error),
+                }
+            }
+            ("PUT", [_, "enrollment"]) => {
+                let enrollment: ClientEnrollment = match decode_json(request) {
+                    Ok(enrollment) => enrollment,
+                    Err(response) => return response,
+                };
+                match self
+                    .registry
+                    .set_client_enrollment(&client_id, enrollment)
+                    .await
+                {
+                    Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
+                    Err(error) => registry_error(error),
+                }
+            }
+            ("POST", [_, "devices", device, action @ ("approve" | "deny")]) => {
+                let Some(device) = path_unescape(device) else {
+                    return Response::not_found();
+                };
+                match self
+                    .registry
+                    .review_device(&client_id, &device, *action == "approve")
+                    .await
+                {
                     Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
                     Err(error) => registry_error(error),
                 }

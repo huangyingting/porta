@@ -530,6 +530,29 @@ disconnects it, but a device with a still-valid shared token can enroll again.
 Use **Disconnect now** to end current sessions without changing credentials;
 clients with automatic reconnect enabled may reconnect immediately.
 
+### Device enrollment
+
+A client token can enroll devices, so a leaked token could otherwise add
+devices until the account's device limit is reached. Each account has a policy
+for device keys it has not seen before, set under **New devices** in the client
+dialog or with `PUT /api/clients/{id}/enrollment`:
+
+- **Enroll automatically** (`open`, the default): new devices enroll on first
+  connection, up to the device limit.
+- **Wait for my approval** (`approval`): a new device is recorded as *awaiting
+  approval* and cannot connect. **Approve** it in the device list (it then
+  counts toward the device limit) or **Deny** it.
+- **Block new devices** (`closed`): new devices are refused.
+
+**Allow new devices for 15 min** opens a temporary window in which new devices
+enroll directly whatever the policy, which suits setting up a new phone or
+laptop. Already enrolled devices are unaffected by the policy. Denied devices
+stay refused until approved or forgotten. At most 16 pending or denied devices
+are kept per account; beyond that, new devices are refused. Clients explain
+these refusals in their own language. The forward proxy has no device identity
+and is not subject to enrollment policy; disable it with
+`--disable-forward-proxy` if token-only proxy access is unwanted.
+
 ### Account limits
 
 Each client account can have three optional limits, set in the client dialog

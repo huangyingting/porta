@@ -58,6 +58,9 @@
     <string name="connection_rejected">Connection rejected</string>
     <string name="account_expired_denied">This account has expired. Ask your administrator to renew it.</string>
     <string name="quota_exceeded_denied">This account has used its monthly data allowance. Access resumes next month or when your administrator raises it.</string>
+    <string name="device_pending_denied">This device is waiting for administrator approval. Connect again once it is approved.</string>
+    <string name="enrollment_closed_denied">This account accepts no new devices. Ask your administrator to allow enrollment.</string>
+    <string name="device_denied_denied">Your administrator has not allowed this device to connect.</string>
     <string name="account_expires">Access until %1$s</string>
     <string name="account_expires_soon">Access ends %1$s</string>
     <string name="quota_usage">%1$s of %2$s used this month</string>

@@ -347,6 +347,9 @@ fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
             let body = match reason {
                 DenialReason::AccountExpired => "account-expired\n",
                 DenialReason::QuotaExceeded => "quota-exceeded\n",
+                DenialReason::DevicePending => "device-pending\n",
+                DenialReason::EnrollmentClosed => "enrollment-closed\n",
+                DenialReason::DeviceDenied => "device-denied\n",
             };
             let mut response = plain_response(StatusCode::FORBIDDEN, body);
             response.headers_mut().insert(

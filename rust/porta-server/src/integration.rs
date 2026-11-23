@@ -9,8 +9,8 @@ use crate::proxy::service::{
 };
 use crate::state::pool::{Lease as PoolLease, Pool, PoolError};
 use crate::state::registry::{
-    AccountLimits, ClientRegistry as StateRegistry, RegistryError as StateRegistryError,
-    UsagePeriod,
+    AccountLimits, ClientRegistry as StateRegistry, EnrollmentPolicy,
+    RegistryError as StateRegistryError, UsagePeriod,
 };
 use crate::state::sessions::SessionGuard;
 use crate::state::usage;
@@ -21,7 +21,8 @@ use crate::transport::session::{
     RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata, UsageSession,
 };
 use crate::web::admin::{
-    ClientIdentity as WebIdentity, ClientLimits as WebClientLimits, ClientRegistry as WebRegistry,
+    ClientEnrollment as WebClientEnrollment, ClientIdentity as WebIdentity,
+    ClientLimits as WebClientLimits, ClientRegistry as WebRegistry,
     ClientSummary as WebClientSummary, DeviceSummary as WebDeviceSummary,
     RegistryError as WebRegistryError,
 };
@@ -139,6 +140,15 @@ impl Authenticator for NativeAuthenticator {
                 }
                 StateRegistryError::QuotaExceeded => {
                     AuthenticationError::Forbidden(DenialReason::QuotaExceeded)
+                }
+                StateRegistryError::DevicePending => {
+                    AuthenticationError::Forbidden(DenialReason::DevicePending)
+                }
+                StateRegistryError::EnrollmentClosed => {
+                    AuthenticationError::Forbidden(DenialReason::EnrollmentClosed)
+                }
+                StateRegistryError::DeviceDenied => {
+                    AuthenticationError::Forbidden(DenialReason::DeviceDenied)
                 }
                 StateRegistryError::Unauthorized
                 | StateRegistryError::Disabled
@@ -641,6 +651,62 @@ impl WebRegistry for WebRegistryAdapter {
         })
     }
 
+    fn set_client_enrollment<'a>(
+        &'a self,
+        id: &'a str,
+        enrollment: WebClientEnrollment,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        Box::pin(async move {
+            let policy = match enrollment.policy.as_str() {
+                "open" => EnrollmentPolicy::Open,
+                "approval" => EnrollmentPolicy::Approval,
+                "closed" => EnrollmentPolicy::Closed,
+                _ => {
+                    return Err(WebRegistryError::Invalid(
+                        "policy must be open, approval, or closed".into(),
+                    ))
+                }
+            };
+            let window = enrollment
+                .open_for_minutes
+                .map(|minutes| std::time::Duration::from_secs(u64::from(minutes) * 60));
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_enrollment(&owned_id, policy, window)
+                    .await
+                    .map(|_| ())
+                    .map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
+    fn review_device<'a>(
+        &'a self,
+        id: &'a str,
+        device_id: &'a str,
+        approve: bool,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        let device_id = device_id.to_owned();
+        Box::pin(async move {
+            join_web_mutation(tokio::spawn(async move {
+                let result = if approve {
+                    registry.approve_device(&owned_id, &device_id).await
+                } else {
+                    registry.deny_device(&owned_id, &device_id).await
+                };
+                result.map(|_| ()).map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
     fn reset_client_usage<'a>(
         &'a self,
         id: &'a str,
@@ -685,6 +751,7 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
         StateRegistryError::Disabled
         | StateRegistryError::Expired
         | StateRegistryError::QuotaExceeded => WebRegistryError::Disabled,
+        StateRegistryError::EnrollmentClosed => WebRegistryError::Invalid(error.to_string()),
         StateRegistryError::InvalidInput(message) => WebRegistryError::Invalid(message),
         error => {
             tracing::error!(%error, "client registry operation failed");
@@ -714,6 +781,9 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
         rate_limit_kbps: summary.limits.rate_limit_kbps,
         quota_used_bytes: summary.quota_used_bytes,
         status: summary.status.to_owned(),
+        enrollment: summary.enrollment.to_owned(),
+        enrollment_open_until: summary.enrollment_open_until.map(format_time),
+        pending_devices: summary.pending_devices,
         devices: summary
             .devices
             .into_iter()
@@ -730,6 +800,7 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
                 packets_downloaded: device.packets_downloaded,
                 last_connected: device.last_connected.map(format_time),
                 last_disconnected: device.last_disconnected.map(format_time),
+                status: device.status.to_owned(),
                 transport: device.transport,
                 assigned_address: device.assigned_address,
                 target: device.target,
