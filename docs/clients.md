@@ -219,6 +219,36 @@ traffic is blocked rather than leaked.
 Use `--ca` for a private CA or `--thumbprint` for an exact certificate pin;
 do not disable verification in production.
 
+## Linux desktop app
+
+The Linux desktop app is the Windows app's window and tray on Linux. Because
+networking needs root, the window runs as your user and controls a root
+service, `porta-client --daemon`, through the Unix socket
+`/run/porta-client/control.sock`. The service keeps the profiles, with their
+tokens, in the root-only `/var/lib/porta-client/profiles.json` and owns the
+tunnel, so closing or quitting the window leaves the connection up; only
+root and members of the `porta-client` group may use the socket.
+
+Build and install it from a checkout (it needs the GTK and WebKitGTK
+development files, such as `libwebkit2gtk-4.1-dev` and `libgtk-3-dev` on
+Debian and Ubuntu):
+
+```sh
+make build build-linux-desktop
+sudo ./scripts/install-linux-desktop.sh
+```
+
+The installer copies `porta-client` and `porta-desktop` to
+`/usr/local/bin`, creates the `porta-client` group and adds the invoking
+user (sign out and in again for it to apply), enables `porta-client.service`,
+and adds **Porta** to the applications menu. The app then adds, edits and
+deletes profiles, connects and disconnects, shows live traffic, the
+address, account limits and split routes, and restores the network after a
+failure, like the Windows app. The tray icon needs a status-notifier host
+and `libayatana-appindicator3`; without one, closing the window quits the
+app. For a gateway with a private certificate, add `--ca PATH` or
+`--thumbprint SHA256` to the service's `ExecStart` line.
+
 ## Windows
 
 Extract `porta-client-windows-amd64.zip`. It contains:

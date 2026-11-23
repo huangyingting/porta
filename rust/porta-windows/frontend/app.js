@@ -38,6 +38,7 @@ const messages = {
     accessToken: "Access token",
     accessTokenPlaceholder: "Paste the token from your administrator",
     tokenHelpNew: "Stored securely for this Windows account.",
+    tokenHelpNewLinux: "Stored by the Porta service in a file only root can read.",
     tokenHelpEdit: "Leave blank to keep the current protected token.",
     delete: "Delete",
     confirmDelete: "Confirm delete",
@@ -139,6 +140,7 @@ const messages = {
     accessToken: "访问令牌",
     accessTokenPlaceholder: "粘贴管理员提供的令牌",
     tokenHelpNew: "令牌将为当前 Windows 账户安全存储。",
+    tokenHelpNewLinux: "令牌由 Porta 服务保存在仅 root 可读的文件中。",
     tokenHelpEdit: "留空可继续使用当前受保护的令牌。",
     delete: "删除",
     confirmDelete: "确认删除",
@@ -706,7 +708,8 @@ function openEditor(profile = null) {
 
 function updateEditorLabels() {
   setText("editor-title", t(state.editorProfile ? "editProfileTitle" : "addProfileTitle"));
-  setText("token-help", t(state.editorProfile ? "tokenHelpEdit" : "tokenHelpNew"));
+  const newTokenHelp = state.snapshot?.platform === "linux" ? "tokenHelpNewLinux" : "tokenHelpNew";
+  setText("token-help", t(state.editorProfile ? "tokenHelpEdit" : newTokenHelp));
   if (!state.deleteArmed) setText("delete-profile", t("delete"));
 }
 

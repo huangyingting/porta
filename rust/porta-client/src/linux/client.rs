@@ -68,6 +68,8 @@ pub struct Event {
     pub transport: Transport,
     pub delivery_mode: DeliveryMode,
     pub connected_at: Option<SystemTime>,
+    /// Routes and DNS domains of the current tunnel.
+    pub routing: crate::tunnel::Routing,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub packets_uploaded: u64,
@@ -111,13 +113,14 @@ struct Counters {
 }
 
 /// Connection fields reported with an event.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EventDetails {
     lease: Option<Lease>,
     account: AccountStatus,
     transport: Transport,
     delivery_mode: DeliveryMode,
     connected_at: Option<SystemTime>,
+    routing: crate::tunnel::Routing,
 }
 
 impl Counters {
@@ -130,6 +133,7 @@ impl Counters {
             transport: details.transport,
             delivery_mode: details.delivery_mode,
             connected_at: details.connected_at,
+            routing: details.routing,
             bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: self.bytes_downloaded.load(Ordering::Relaxed),
             packets_uploaded: self.packets_uploaded.load(Ordering::Relaxed),
@@ -208,6 +212,7 @@ struct Runtime {
     transport: Transport,
     delivery_mode: DeliveryMode,
     connected_at: Option<SystemTime>,
+    routing: crate::tunnel::Routing,
     counters: Arc<Counters>,
 }
 
@@ -229,6 +234,7 @@ impl Runtime {
             transport,
             delivery_mode: DeliveryMode::Unknown,
             connected_at: None,
+            routing: crate::tunnel::Routing::default(),
             counters: Arc::new(Counters::default()),
         }
     }
@@ -276,6 +282,7 @@ impl Runtime {
                 transport: self.transport,
                 delivery_mode: self.delivery_mode,
                 connected_at: self.connected_at,
+                routing: self.routing.clone(),
             },
         )
     }
@@ -340,6 +347,7 @@ pub async fn run(
         bytes_downloaded: 0,
         packets_uploaded: 0,
         packets_downloaded: 0,
+        routing: crate::tunnel::Routing::default(),
     });
     observer(Event {
         state: State::Connecting,
@@ -353,6 +361,7 @@ pub async fn run(
         bytes_downloaded: 0,
         packets_uploaded: 0,
         packets_downloaded: 0,
+        routing: crate::tunnel::Routing::default(),
     });
 
     let network = if config.manual_network {
@@ -621,6 +630,7 @@ async fn run_loop(
                     transport: connection.transport,
                     delivery_mode: connection.delivery_mode,
                     connected_at: runtime.connected_at,
+                    routing: connection.routing.clone(),
                 },
             ));
             if let Err(error) = network
@@ -641,6 +651,7 @@ async fn run_loop(
             }
         }
         runtime.lease = Some(connection.lease);
+        runtime.routing = connection.routing.clone();
         runtime.account = connection.account();
         runtime.ensure_reader(cancellation);
         runtime.connected_at.get_or_insert_with(SystemTime::now);

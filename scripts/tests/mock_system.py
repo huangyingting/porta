@@ -378,9 +378,11 @@ elif name == "adb":
         if state.get("porta_service", True):
             print("ServiceRecord{porta dev.porta.android/.TunnelService}")
 elif name == "getent":
-    if args[0] != "passwd":
+    if args[0] == "group":
+        code = 0 if args[1] in state.get("groups", []) else 2
+    elif args[0] != "passwd":
         raise RuntimeError(f"unexpected getent invocation: {args}")
-    if args[1] == "porta":
+    elif args[1] == "porta":
         code = 0 if args[1] in state.get("users", []) else 2
     else:
         code = subprocess.run(["/usr/bin/getent", *args], check=False).returncode
@@ -388,6 +390,14 @@ elif name == "useradd":
     if "--system" not in args or args[-1] in state.get("users", []):
         raise RuntimeError(f"unexpected useradd invocation: {args}")
     state.setdefault("users", []).append(args[-1])
+elif name == "groupadd":
+    if "--system" not in args or args[-1] in state.get("groups", []):
+        raise RuntimeError(f"unexpected groupadd invocation: {args}")
+    state.setdefault("groups", []).append(args[-1])
+elif name == "usermod":
+    if args[:3] != ["--append", "--groups", args[2]] or args[2] not in state.get("groups", []):
+        raise RuntimeError(f"unexpected usermod invocation: {args}")
+    state.setdefault("members", []).append([args[2], args[3]])
 elif name == "systemd-tmpfiles":
     if args[0] != "--create":
         raise RuntimeError(f"unexpected systemd-tmpfiles invocation: {args}")

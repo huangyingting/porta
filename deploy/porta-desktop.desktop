@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Porta
+GenericName=VPN client
+Comment=Private access, simply.
+Exec=porta-desktop
+Icon=porta
+Terminal=false
+Categories=Network;
+Keywords=VPN;Porta;

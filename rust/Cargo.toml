@@ -3,6 +3,7 @@ members = [
     "porta-android",
     "porta-client",
     "porta-keygen",
+    "porta-linux",
     "porta-loadgen",
     "porta-server",
     "porta-windows",

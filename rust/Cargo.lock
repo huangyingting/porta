@@ -3469,6 +3469,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "porta-linux"
+version = "0.1.41"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tempfile",
+]
+
+[[package]]
 name = "porta-loadgen"
 version = "0.1.41"
 dependencies = [

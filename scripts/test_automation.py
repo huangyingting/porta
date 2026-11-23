@@ -51,7 +51,7 @@ class AutomationTests(unittest.TestCase):
         for command in (
             "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "ip6tables", "openssl",
             "curl", "ss", "make", "mv", "git", "adb", "sleep", "gh", "uname",
-            "sudo", "unshare", "getent", "useradd", "chown", "chgrp", "systemd-tmpfiles",
+            "sudo", "unshare", "getent", "useradd", "groupadd", "usermod", "chown", "chgrp", "systemd-tmpfiles",
         ):
             (self.bin / command).symlink_to(MOCK)
 
@@ -1159,6 +1159,51 @@ class AutomationTests(unittest.TestCase):
                         ("--ipv6", "--mtu", "1200")):
             with self.subTest(options=options):
                 self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_linux_desktop_installer_sets_up_service_group_and_menu_entry(self):
+        checkout = self.root / "checkout"
+        shutil.copytree(ROOT / "scripts", checkout / "scripts")
+        shutil.copytree(ROOT / "deploy", checkout / "deploy")
+        script = checkout / "scripts/install-linux-desktop.sh"
+        source = script.read_text().replace("[[ $EUID -eq 0 ]]", "true")
+        for prefix in ("/usr/local/bin", "/etc/systemd/system", "/usr/share"):
+            source = source.replace(prefix, str(self.root / "system" / prefix[1:]))
+        script.write_text(source)
+        for directory in ("usr/local/bin", "etc/systemd/system"):
+            (self.root / "system" / directory).mkdir(parents=True, exist_ok=True)
+        binaries = checkout / "bin"
+        binaries.mkdir()
+        for name in ("porta-client", "porta-desktop"):
+            (binaries / name).write_text("#!/bin/sh\n")
+            (binaries / name).chmod(0o755)
+
+        result = subprocess.run(["bash", str(script), "--user", "root"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("added root", result.stdout)
+        system = self.root / "system"
+        unit = (system / "etc/systemd/system/porta-client.service").read_text()
+        self.assertIn("--daemon --control-group porta-client", unit)
+        self.assertIn("RuntimeDirectory=porta-client", unit)
+        self.assertTrue((system / "usr/local/bin/porta-desktop").exists())
+        entry = (system / "usr/share/applications/porta-desktop.desktop").read_text()
+        self.assertIn("Exec=porta-desktop", entry)
+        self.assertTrue((system / "usr/share/icons/hicolor/256x256/apps/porta.png").exists())
+        state = self.state()
+        self.assertEqual(state["groups"], ["porta-client"])
+        self.assertEqual(state["members"], [["porta-client", "root"]])
+        self.assertTrue(state["active"]["porta-client.service"])
+        self.assertEqual(state["enabled"]["porta-client.service"], "enabled")
+
+        # Reinstalling keeps the existing group.
+        result = subprocess.run(["bash", str(script), "--user", "root"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state()["groups"], ["porta-client"])
+        for options in (["--user", "no such user"], ["--client", str(checkout / "missing")]):
+            result = subprocess.run(["bash", str(script), *options], cwd=self.root,
+                                    env=self.env, text=True, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0, options)
 
     def test_deploy_relay_without_token_fails_before_stopping_service(self):
         deploy = self.prepare_deploy(timer=False)

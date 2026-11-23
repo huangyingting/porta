@@ -9,9 +9,9 @@ WINTUN_VERSION := 0.14.1
 WINTUN_ZIP := bin/wintun-$(WINTUN_VERSION).zip
 WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
 
-.PHONY: all build build-rust-server build-rust-clients build-windows android android-debug \
+.PHONY: all build build-rust-server build-rust-clients build-windows build-linux-desktop android android-debug \
 	check-version clean test test-automation test-rust test-rust-server test-rust-client \
-	test-rust-interop test-live-vpn test-cascade test-split-tunnel test-subnet-router test-exit-selection test-dns-resolver test-admin-identity test-gateway-failover test-ipv6 test-graceful-restart test-service-user test-windows-cross test-native-firewall test-server-web \
+	test-rust-interop test-live-vpn test-cascade test-split-tunnel test-subnet-router test-exit-selection test-dns-resolver test-admin-identity test-gateway-failover test-ipv6 test-graceful-restart test-client-daemon test-service-user test-windows-cross test-native-firewall test-server-web \
 	verify-wintun vet
 
 all: build
@@ -116,6 +116,18 @@ test-graceful-restart:
 	sudo -n ./scripts/test-graceful-restart.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
 	sudo -n env PORTA_RESTART_TRANSPORT=h2 ./scripts/test-graceful-restart.sh \
 		$(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+
+test-client-daemon:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-server-rust --package porta-client-rust --locked
+	sudo -n ./scripts/test-client-daemon.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+
+# Needs GTK and WebKitGTK development files, for example on Debian/Ubuntu:
+# sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev
+build-linux-desktop:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) --release --package porta-linux --features gui --locked
+	install -d bin
+	install -m 0755 $(RUST_TARGET)/release/porta-desktop bin/porta-desktop
 
 test-service-user:
 	$(CARGO) build --manifest-path $(RUST_MANIFEST) \

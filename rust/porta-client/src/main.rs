@@ -109,6 +109,29 @@ mod linux {
             help = "Network recovery state file"
         )]
         network_state: PathBuf,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            help = "Run as the background service of the desktop app: keep profiles and connect on request over --control-socket"
+        )]
+        daemon: bool,
+        #[arg(
+            long,
+            default_value = "/run/porta-client/control.sock",
+            help = "Control socket of --daemon"
+        )]
+        control_socket: PathBuf,
+        #[arg(
+            long,
+            default_value = "/var/lib/porta-client/profiles.json",
+            help = "Root-only profile store of --daemon"
+        )]
+        profiles: PathBuf,
+        #[arg(
+            long,
+            help = "Group whose members may control --daemon; root only without it"
+        )]
+        control_group: Option<String>,
     }
 
     fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -132,6 +155,21 @@ mod linux {
 
         let result = if arguments.cleanup_network {
             client::cleanup_network(arguments.network_state, &cancellation).await
+        } else if arguments.daemon {
+            porta_client::linux::daemon::run(
+                porta_client::linux::daemon::DaemonConfig {
+                    control_socket: arguments.control_socket,
+                    profiles: arguments.profiles,
+                    network_state: arguments.network_state,
+                    identity_path: arguments.identity,
+                    interface_name: arguments.interface,
+                    group: arguments.control_group,
+                    ca_path: arguments.ca,
+                    thumbprint: arguments.thumbprint,
+                },
+                &cancellation,
+            )
+            .await
         } else {
             let token =
                 super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;

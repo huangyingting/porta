@@ -148,6 +148,9 @@ For unattended use, store the token in an owner-only file and pass
 `--token-file /etc/porta/client.token` instead of `PORTA_TOKEN`; see the
 [client guide](docs/clients.md#linux-cli) for a systemd unit.
 
+For a window and tray instead of a terminal, install the
+[Linux desktop app](docs/clients.md#linux-desktop-app).
+
 Linux configures routes, DNS, and an owned fail-closed firewall automatically;
 root, iproute2, nftables, and systemd-resolved's local stub are required.
 Desktop clients default to HTTP/3 with safe HTTP/2 fallback. See the

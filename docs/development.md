@@ -30,10 +30,12 @@ make test-admin-identity
 make test-gateway-failover
 make test-ipv6
 make test-graceful-restart
+make test-client-daemon
 make test-service-user
 make vet
 make build
 make build-windows
+make build-linux-desktop
 make android-debug
 make android
 ```
@@ -93,6 +95,14 @@ transports: it replaces the gateway binary, sends `SIGHUP`, and checks that
 the same process re-executes the new binary, keeps its TUN interface,
 addresses and firewall rules, and that the client resumes within five
 seconds with the same lease and transport, twice in a row.
+
+`make test-client-daemon` runs `scripts/test-client-daemon.sh`: it drives the
+Linux desktop service's control socket like the app, saving a profile,
+connecting, checking traffic and the reported state, disconnecting,
+reporting a rejected token, and checking that only root and the control
+group may use the socket. `make build-linux-desktop` builds the window
+itself (`porta-linux --features gui`); workspace builds leave it out so
+they need no GTK files.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that
