@@ -66,6 +66,10 @@ pub enum RegistryError {
     EnrollmentClosed,
     #[error("device enrollment was denied")]
     DeviceDenied,
+    #[error("this gateway mirrors its accounts from a primary gateway; change them there")]
+    ReadOnly,
+    #[error("new devices enroll on the primary gateway first")]
+    EnrollOnPrimary,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -435,6 +439,16 @@ struct RegistryInner {
     metadata_debounce: Mutex<Duration>,
     metadata_stop: CancellationToken,
     metadata_worker: Mutex<Option<JoinHandle<()>>>,
+    /// Accounts are mirrored from a primary gateway and read-only here.
+    replica: AtomicBool,
+}
+
+/// Sessions a replica sync ended because their access was revoked.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReplicaSync {
+    pub clients: usize,
+    pub ended_accounts: usize,
+    pub ended_devices: usize,
 }
 
 #[derive(Clone)]
@@ -559,6 +573,7 @@ impl ClientRegistry {
                 metadata_debounce: Mutex::new(DEFAULT_METADATA_DEBOUNCE),
                 metadata_stop: CancellationToken::new(),
                 metadata_worker: Mutex::new(None),
+                replica: AtomicBool::new(false),
             }),
         };
 
@@ -571,6 +586,132 @@ impl ClientRegistry {
 
     pub fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    /// Opens a registry that mirrors a primary gateway's accounts. Until the
+    /// first sync it serves the last mirrored copy, or no accounts.
+    pub async fn open_replica(path: impl Into<PathBuf>) -> Result<Self, RegistryError> {
+        let path = path.into();
+        if !tokio::fs::try_exists(&path).await? {
+            let mut data = serde_json::to_vec_pretty(&RegistryFile {
+                version: REGISTRY_VERSION,
+                clients: Vec::new(),
+            })?;
+            data.push(b'\n');
+            if let Some(parent) = path.parent() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+        }
+        let registry = Self::open(path, "").await?;
+        registry.inner.replica.store(true, Ordering::Release);
+        Ok(registry)
+    }
+
+    pub fn is_replica(&self) -> bool {
+        self.inner.replica.load(Ordering::Acquire)
+    }
+
+    fn ensure_writable(&self) -> Result<(), RegistryError> {
+        if self.is_replica() {
+            Err(RegistryError::ReadOnly)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Every account, as the primary serves it to replicas.
+    pub fn export(&self) -> RegistryFile {
+        RegistryFile {
+            version: REGISTRY_VERSION,
+            clients: self.inner.state.lock().clients.clone(),
+        }
+    }
+
+    /// Replaces a replica's accounts with the primary's. Each gateway keeps
+    /// its own quota period, and sessions whose account, token or device was
+    /// revoked end.
+    pub async fn replace_from_primary(
+        &self,
+        file: RegistryFile,
+    ) -> Result<ReplicaSync, RegistryError> {
+        if file.version != REGISTRY_VERSION {
+            return Err(RegistryError::UnsupportedVersion(file.version));
+        }
+        for (index, client) in file.clients.iter().enumerate() {
+            validate_stored_client(client).map_err(|error| {
+                RegistryError::InvalidInput(format!(
+                    "primary registry entry {}: {error}",
+                    index + 1
+                ))
+            })?;
+        }
+        self.ensure_open()?;
+        let _mutation = self.inner.mutations.lock().await;
+        self.ensure_open()?;
+        let (candidate, previous) = {
+            let state = self.inner.state.lock();
+            let previous = state.clients.clone();
+            let mut candidate = file.clients;
+            for client in &mut candidate {
+                client.usage_period = previous
+                    .iter()
+                    .find(|local| local.id == client.id)
+                    .and_then(|local| local.usage_period.clone());
+            }
+            (candidate, previous)
+        };
+        if candidate == previous {
+            return Ok(ReplicaSync {
+                clients: candidate.len(),
+                ..ReplicaSync::default()
+            });
+        }
+        self.persist_clients(&candidate).await?;
+        {
+            let mut state = self.inner.state.lock();
+            state.clients.clone_from(&candidate);
+            rebuild_token_index(&mut state);
+        }
+        let mut sync = ReplicaSync {
+            clients: candidate.len(),
+            ..ReplicaSync::default()
+        };
+        for old in &previous {
+            let current = candidate.iter().find(|client| client.id == old.id);
+            let account_revoked =
+                current.is_none_or(|client| !client.enabled || client.token_hash != old.token_hash);
+            if account_revoked {
+                let _drain = self.begin_account_drain(&old.id);
+                if self.inner.sessions.cancel_account(&old.id).await > 0 {
+                    sync.ended_accounts += 1;
+                }
+                continue;
+            }
+            let current = current.expect("account is present");
+            for device in &old.devices {
+                let still_approved = current.devices.iter().any(|candidate| {
+                    candidate.id == device.id && candidate.status == DeviceStatus::Approved
+                });
+                if !still_approved {
+                    let key = DeviceKey::new(&old.id, &device.id);
+                    let _drain = self.begin_device_drain(&key);
+                    if self.inner.sessions.cancel_device(&old.id, &device.id).await > 0 {
+                        sync.ended_devices += 1;
+                    }
+                }
+            }
+        }
+        Ok(sync)
     }
 
     pub fn list(&self) -> Vec<ClientSummary> {
@@ -629,6 +770,7 @@ impl ClientRegistry {
         name: impl AsRef<str>,
         max_devices: usize,
     ) -> Result<(ClientSummary, String), RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         let name = validate_client_input(name.as_ref(), max_devices)?;
         let token = random_token();
@@ -672,6 +814,7 @@ impl ClientRegistry {
         max_devices: usize,
         enabled: bool,
     ) -> Result<ClientSummary, RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         let name = validate_client_input(name.as_ref(), max_devices)?;
         let _mutation = self.inner.mutations.lock().await;
@@ -737,6 +880,7 @@ impl ClientRegistry {
         id: &str,
         limits: AccountLimits,
     ) -> Result<ClientSummary, RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         validate_limits(&limits)?;
         let _mutation = self.inner.mutations.lock().await;
@@ -881,6 +1025,7 @@ impl ClientRegistry {
         id: &str,
         change: impl Fn(&mut [ClientRecord]) -> Result<(), RegistryError>,
     ) -> Result<ClientSummary, RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -1091,6 +1236,7 @@ impl ClientRegistry {
     }
 
     pub async fn rotate_token(&self, id: &str) -> Result<String, RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         let token = random_token();
         let new_hash = hash_token(&token);
@@ -1128,6 +1274,7 @@ impl ClientRegistry {
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -1178,6 +1325,7 @@ impl ClientRegistry {
         account_id: &str,
         device_id: &str,
     ) -> Result<DeviceRetirement, RegistryError> {
+        self.ensure_writable()?;
         self.ensure_open()?;
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -1374,6 +1522,9 @@ impl ClientRegistry {
                 device.last_seen = now;
                 (account_id, clients, Some(device_index), false)
             } else {
+                if self.is_replica() {
+                    return Err(RegistryError::EnrollOnPrimary);
+                }
                 let client = &state.clients[client_index];
                 let status = enrollment_decision(client, now)?;
                 if status.is_approved() && approved_devices(client) >= client.max_devices {
@@ -2928,6 +3079,85 @@ mod tests {
                 "/v1/tunnel",
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn replicas_mirror_the_primary_read_only_and_end_revoked_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = ClientRegistry::open(directory.path().join("primary.json"), BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let account = primary.list()[0].id.clone();
+        let laptop = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let laptop_id = enroll(&primary, &laptop, 1).await.unwrap().device_id;
+
+        let path = directory.path().join("replica").join("clients.json");
+        let replica = ClientRegistry::open_replica(&path).await.unwrap();
+        assert!(replica.is_replica() && replica.list().is_empty());
+        let sync = replica
+            .replace_from_primary(primary.export())
+            .await
+            .unwrap();
+        assert_eq!(sync.clients, 1);
+
+        // Known devices connect; new devices and changes go to the primary.
+        let session = enroll(&replica, &laptop, 2).await.unwrap();
+        let cancelled = session.cancellation.clone();
+        // Like a transport, end the session once it is cancelled.
+        let held = tokio::spawn(async move {
+            session.cancellation.cancelled().await;
+            drop(session);
+        });
+        let phone = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        assert!(matches!(
+            enroll(&replica, &phone, 3).await,
+            Err(RegistryError::EnrollOnPrimary)
+        ));
+        assert!(matches!(
+            replica.create("Other", 1).await,
+            Err(RegistryError::ReadOnly)
+        ));
+        assert!(matches!(
+            replica
+                .set_access(&account, AccessPolicy::default(), &[])
+                .await,
+            Err(RegistryError::ReadOnly)
+        ));
+
+        // Each gateway keeps its own quota period.
+        let period = UsagePeriod {
+            month: "2026-11".into(),
+            baseline_bytes: 42,
+        };
+        replica
+            .set_usage_period(&account, period.clone())
+            .await
+            .unwrap();
+
+        // Revoking the device on the primary ends its replica session.
+        primary.deny_device(&account, &laptop_id).await.unwrap();
+        let sync = replica
+            .replace_from_primary(primary.export())
+            .await
+            .unwrap();
+        assert_eq!(sync.ended_devices, 1);
+        assert!(cancelled.is_cancelled());
+        held.await.unwrap();
+        assert!(matches!(
+            enroll(&replica, &laptop, 4).await,
+            Err(RegistryError::DeviceDenied)
+        ));
+        assert_eq!(
+            replica.account_policy(&account).unwrap().usage_period,
+            Some(period)
+        );
+
+        // The mirrored copy survives a restart without the primary.
+        replica.close().await.unwrap();
+        let replica = ClientRegistry::open_replica(&path).await.unwrap();
+        assert_eq!(replica.list()[0].id, account);
+        replica.close().await.unwrap();
+        primary.close().await.unwrap();
     }
 
     #[test]

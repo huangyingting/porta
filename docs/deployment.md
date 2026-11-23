@@ -334,6 +334,42 @@ cascade relay, forwarded queries leave from the relay itself, not through the
 exit; point `--dns-upstream` at a resolver you trust there. The daemon needs
 `CAP_NET_BIND_SERVICE` for port 53, which `deploy.sh` grants.
 
+## Several gateways for one account (federation)
+
+To give users more than one gateway, for capacity, nearby regions or
+availability, run one gateway as the **primary** and the others as
+**replicas** that mirror its accounts, devices and access policies. Use the
+same secret of at least 32 characters on all of them:
+
+```sh
+# On the primary:
+sudo PORTA_FEDERATION_TOKEN=... ./scripts/deploy.sh --domain eu.example.com
+# On each replica:
+sudo PORTA_FEDERATION_TOKEN=... ./scripts/deploy.sh --domain us.example.com \
+  --federation-primary https://eu.example.com
+```
+
+The daemon options are `PORTA_FEDERATION_TOKEN` and, on replicas,
+`--federation-primary URL` and `--federation-ca PATH` (`deploy.sh` passes
+`--upstream-ca` for a privately signed primary). The primary serves its
+accounts to replicas at `GET /federation/v1/registry` on its public
+listener, only to the federation token. Replicas poll every 15 seconds and
+keep the last copy, so they keep working while the primary is down:
+
+- Accounts are read-only on a replica; the admin page says so and changes
+  are refused. Manage accounts on the primary.
+- A device that a replica does not know yet is refused with a retryable
+  `503`, so the client tries the next gateway; it enrolls on the primary and
+  can use the replicas once they have synced.
+- Disabling an account, rotating its token, or denying or forgetting a
+  device on the primary ends the matching sessions on every replica at the
+  next sync.
+- Leases, usage statistics and monthly quotas are counted per gateway.
+
+`deploy.sh --disable-federation` stops a primary from serving replicas and
+forgets the token. Client profiles then list every gateway; see
+[Multi-gateway profiles](clients.md#multi-gateway-profiles).
+
 ## Exit selection
 
 A gateway can offer several exits and let each account choose one in its

@@ -964,6 +964,29 @@ class AutomationTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.run_deploy(deploy, "--build-local", *options, success=False)
 
+    def test_deploy_federation_saves_the_token_and_points_replicas_at_the_primary(self):
+        deploy = self.prepare_deploy(timer=False)
+        token = "federation-token-0123456789abcdefghij"
+        self.env["PORTA_FEDERATION_TOKEN"] = token
+        result = self.run_deploy(deploy, "--build-local", "--federation-primary", "https://primary.example/")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--federation-primary https://primary.example --mtu", unit)
+        environment = self.root / "system/etc/porta/porta.env"
+        self.assertIn(f"PORTA_FEDERATION_TOKEN={token}\n", environment.read_text())
+        self.assertNotIn(token, unit + result.stdout + result.stderr)
+        self.assertIn("mirrored from https://primary.example", result.stdout)
+        del self.env["PORTA_FEDERATION_TOKEN"]
+        # The primary keeps serving replicas with the saved token.
+        self.run_deploy(deploy, "--build-local", "--federation-primary=")
+        self.assertIn("PORTA_FEDERATION_TOKEN=", environment.read_text())
+        self.assertNotIn("--federation-primary", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        self.run_deploy(deploy, "--build-local", "--disable-federation")
+        self.assertNotIn("PORTA_FEDERATION_TOKEN", environment.read_text())
+        self.env["PORTA_FEDERATION_TOKEN"] = "short"
+        self.run_deploy(deploy, "--build-local", success=False)
+        del self.env["PORTA_FEDERATION_TOKEN"]
+        self.run_deploy(deploy, "--build-local", "--federation-primary", "https://primary.example", success=False)
+
     def test_deploy_client_to_client_is_passed_to_the_daemon(self):
         deploy = self.prepare_deploy(timer=False)
         result = self.run_deploy(deploy, "--build-local", "--client-to-client")

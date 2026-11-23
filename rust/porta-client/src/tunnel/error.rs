@@ -60,6 +60,10 @@ pub enum ClientError {
     TransportUnavailable(String),
     #[error("retryable: {0}")]
     Retryable(String),
+    /// The gateway answered but cannot admit this client now, for example a
+    /// replica that sends new devices to its primary; another gateway may.
+    #[error("retryable: {0}")]
+    Refused(String),
     #[error("{0}")]
     Permanent(String),
     /// Permanent refusal of a valid account; see [`AccountDenial`].
@@ -101,7 +105,7 @@ impl ClientError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::TransportUnavailable(_) | Self::Retryable(_) | Self::Closed
+            Self::TransportUnavailable(_) | Self::Retryable(_) | Self::Refused(_) | Self::Closed
         )
     }
 }

@@ -153,6 +153,10 @@ impl Authenticator for NativeAuthenticator {
                 StateRegistryError::DeviceDenied => {
                     AuthenticationError::Forbidden(DenialReason::DeviceDenied)
                 }
+                // A client with several gateways moves on to the primary.
+                StateRegistryError::EnrollOnPrimary => AuthenticationError::Unavailable(
+                    "new devices enroll on the primary gateway first",
+                ),
                 StateRegistryError::Unauthorized
                 | StateRegistryError::Disabled
                 | StateRegistryError::DeviceLimit
@@ -869,7 +873,9 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
         StateRegistryError::Disabled
         | StateRegistryError::Expired
         | StateRegistryError::QuotaExceeded => WebRegistryError::Disabled,
-        StateRegistryError::EnrollmentClosed => WebRegistryError::Invalid(error.to_string()),
+        StateRegistryError::EnrollmentClosed | StateRegistryError::ReadOnly => {
+            WebRegistryError::Invalid(error.to_string())
+        }
         StateRegistryError::InvalidInput(message) => WebRegistryError::Invalid(message),
         error => {
             tracing::error!(%error, "client registry operation failed");

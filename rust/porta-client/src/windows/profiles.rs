@@ -28,6 +28,9 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub server_url: String,
+    /// Further gateways sharing the account; the fastest one is used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<String>,
     #[serde(with = "transport_serde")]
     pub transport: Transport,
     #[serde(default)]
@@ -51,6 +54,7 @@ impl Profile {
             id: String::new(),
             name: name.into(),
             server_url: server_url.into(),
+            backup_servers: Vec::new(),
             transport,
             ca_path: String::new(),
             thumbprint: String::new(),
@@ -168,6 +172,10 @@ impl Store {
         }
         profile.name = profile.name.trim().to_owned();
         profile.server_url = profile.server_url.trim().to_owned();
+        for server in &mut profile.backup_servers {
+            *server = server.trim().to_owned();
+        }
+        profile.backup_servers.retain(|server| !server.is_empty());
         validate(&profile)?;
 
         let mut state = self.state.lock().map_err(|_| ProfileError::Poisoned)?;
@@ -254,6 +262,11 @@ fn validate(profile: &Profile) -> Result<(), ProfileError> {
     }
     if profile.server_url.is_empty() {
         return Err(ProfileError::Invalid("server URL is required".to_owned()));
+    }
+    if profile.backup_servers.len() > 7 {
+        return Err(ProfileError::Invalid(
+            "a profile lists at most 7 backup gateways".to_owned(),
+        ));
     }
     Ok(())
 }

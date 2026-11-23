@@ -34,11 +34,10 @@ mod linux {
     )]
     struct Arguments {
         #[arg(
-            long,
-            default_value = "",
-            help = "Gateway origin, for example https://vpn.example.com:8443"
+            long = "server",
+            help = "Gateway origin, for example https://vpn.example.com:8443; repeat it for gateways that share accounts to use the fastest and fail over"
         )]
-        server: String,
+        servers: Vec<String>,
         #[arg(
             long,
             value_enum,
@@ -138,7 +137,7 @@ mod linux {
                 super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;
             client::run(
                 client::Config {
-                    server_url: arguments.server,
+                    server_urls: arguments.servers,
                     token,
                     transport: arguments.transport.into(),
                     interface_name: arguments.interface,
@@ -260,11 +259,10 @@ mod windows {
     )]
     struct Arguments {
         #[arg(
-            long,
-            default_value = "",
-            help = "Gateway origin, for example https://vpn.example.com:8443"
+            long = "server",
+            help = "Gateway origin, for example https://vpn.example.com:8443; repeat it for gateways that share accounts to use the fastest and fail over"
         )]
-        server: String,
+        servers: Vec<String>,
         #[arg(
             long,
             value_enum,
@@ -339,7 +337,14 @@ mod windows {
             return manager.down().await.map_err(client::RunError::Network);
         }
 
-        let server = parse_origin(&arguments.server)?;
+        if arguments.servers.is_empty() {
+            return Err(client::RunError::Invalid("--server is required".to_owned()));
+        }
+        let servers = arguments
+            .servers
+            .iter()
+            .map(|server| parse_origin(server))
+            .collect::<Result<Vec<_>, _>>()?;
         let token =
             super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;
         if token.is_empty() {
@@ -362,7 +367,7 @@ mod windows {
         });
         let result = client::run(
             client::Config {
-                server,
+                servers,
                 token,
                 tls,
                 transport: arguments.transport.into(),
@@ -434,8 +439,11 @@ mod windows {
             }
             Event::Connecting {
                 attempt,
+                gateway,
                 remote_address,
-            } => eprintln!("porta-client: connecting attempt={attempt} endpoint={remote_address}"),
+            } => eprintln!(
+                "porta-client: connecting attempt={attempt} gateway={gateway} endpoint={remote_address}"
+            ),
             Event::ConfiguringNetwork => eprintln!("porta-client: configuring network"),
             Event::Connected(info) => eprintln!(
                 "porta-client: connected address={} dns={} mtu={} transport={:?}{}{}",

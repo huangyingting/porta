@@ -373,7 +373,11 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         let connection = match connection {
             Ok(connection) => connection,
             Err(error) => {
-                if error.is_permanent() {
+                // A refusal before the group is up means another gateway
+                // should be tried now rather than after the setup timeout.
+                let refused_setup = matches!(error, ClientError::Refused(_))
+                    && !group.established.load(Ordering::Acquire);
+                if error.is_permanent() || refused_setup {
                     group.fail(error);
                     return;
                 }
@@ -625,7 +629,10 @@ fn validate_response(
         {
             return Err(denial);
         }
-        let detail = format!("gateway returned HTTP {status}");
+        let detail = match header(response.headers(), super::REASON_HEADER) {
+            Some(reason) => format!("gateway returned HTTP {status} ({reason})"),
+            None => format!("gateway returned HTTP {status}"),
+        };
         return match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
@@ -634,6 +641,11 @@ fn validate_response(
             | StatusCode::HTTP_VERSION_NOT_SUPPORTED => Err(ClientError::unavailable(detail)),
             StatusCode::UPGRADE_REQUIRED if versions == (None, None) => {
                 Err(ClientError::unavailable(detail))
+            }
+            StatusCode::SERVICE_UNAVAILABLE
+                if header(response.headers(), super::REASON_HEADER).is_some() =>
+            {
+                Err(ClientError::Refused(detail))
             }
             StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_EARLY

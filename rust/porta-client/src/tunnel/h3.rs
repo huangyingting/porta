@@ -456,7 +456,10 @@ fn validate_response(response: &http::Response<()>) -> Result<(), ClientError> {
         {
             return Err(denial);
         }
-        let detail = format!("gateway returned HTTP {status}");
+        let detail = match header(response.headers(), super::REASON_HEADER) {
+            Some(reason) => format!("gateway returned HTTP {status} ({reason})"),
+            None => format!("gateway returned HTTP {status}"),
+        };
         return match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
@@ -465,6 +468,11 @@ fn validate_response(response: &http::Response<()>) -> Result<(), ClientError> {
             | StatusCode::HTTP_VERSION_NOT_SUPPORTED => Err(ClientError::unavailable(detail)),
             StatusCode::UPGRADE_REQUIRED if versions == (None, None) => {
                 Err(ClientError::unavailable(detail))
+            }
+            StatusCode::SERVICE_UNAVAILABLE
+                if header(response.headers(), super::REASON_HEADER).is_some() =>
+            {
+                Err(ClientError::Refused(detail))
             }
             StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_EARLY

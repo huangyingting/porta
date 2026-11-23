@@ -79,6 +79,20 @@ same limits under **Your access**. Fail-closed protection behaves as for any
 other permanent rejection: disconnect, or run `--cleanup-network` on Linux, to
 use the network without the tunnel.
 
+## Multi-gateway profiles
+
+A profile can list several gateways that share accounts (see
+[federation](deployment.md#several-gateways-for-one-account-federation)).
+Linux and Windows CLIs take `--server` more than once; the Windows app and
+Android take **Backup gateways**, one per line. Before connecting, clients
+measure how quickly each gateway endpoint accepts a TCP connection and try
+the fastest first; on any retryable failure, including a replica that does
+not know the device yet, they move to the next endpoint. Fail-closed
+protection stays on while they fail over: only the profile's gateway endpoints are
+reachable outside the tunnel. While protection is active the order is not
+re-measured and DNS is unavailable, so failover uses the endpoints resolved
+when the client started.
+
 ## Split tunnels
 
 When the gateway advertises split-tunnel routes, clients route only those

@@ -710,6 +710,14 @@ class MainActivity : Activity() {
             R.string.gateway_hint,
             initial?.server.orEmpty(),
         )
+        val backups = dialogField(
+            R.string.backup_gateways_hint,
+            initial?.backupServers.orEmpty().joinToString("\n"),
+        ).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 1
+        }
         val token = dialogField(
             if (existing == null) R.string.token_hint else R.string.token_unchanged_hint,
             imported?.token.orEmpty(),
@@ -729,6 +737,8 @@ class MainActivity : Activity() {
             addView(name)
             addView(dialogLabel(R.string.gateway_label))
             addView(server)
+            addView(dialogLabel(R.string.backup_gateways_label))
+            addView(backups)
             addView(dialogLabel(R.string.token_label))
             addView(token)
             addView(TextView(this@MainActivity).apply {
@@ -757,6 +767,10 @@ class MainActivity : Activity() {
                     server = server.text.toString().trim().trimEnd('/'),
                     token = token.text.toString().ifBlank { existing?.token.orEmpty() },
                     autoConnect = autoConnect.isChecked,
+                    backupServers = parseBackupServers(backups.text.toString()) ?: run {
+                        backups.error = getString(R.string.https_required)
+                        return@setOnClickListener
+                    },
                 )
                 val error = profileValidationError(profile)
                 if (error != null) {
@@ -916,6 +930,7 @@ class MainActivity : Activity() {
                 .putExtra(TunnelService.EXTRA_PROFILE_ID, profile.id)
                 .putExtra(TunnelService.EXTRA_PROFILE_NAME, profile.name)
                 .putExtra(TunnelService.EXTRA_SERVER, profile.server)
+                .putExtra(TunnelService.EXTRA_BACKUP_SERVERS, profile.backupServers.toTypedArray())
                 .putExtra(TunnelService.EXTRA_TOKEN, profile.token),
         )
         render("Connecting")

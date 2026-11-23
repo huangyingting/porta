@@ -12,6 +12,7 @@ use tokio::time::{interval_at, timeout, Instant as TokioInstant, MissedTickBehav
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::failover::{self, Candidate};
 use crate::identity::{self, IdentityError};
 use crate::tls::{self, TlsConfigError};
 use crate::tunnel::{
@@ -25,10 +26,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 const PACKET_QUEUE: usize = 256;
+const MAX_GATEWAYS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub server_url: String,
+    /// Gateways sharing one account registry, tried fastest first.
+    pub server_urls: Vec<String>,
     pub token: String,
     pub transport: Transport,
     pub interface_name: String,
@@ -314,7 +317,11 @@ pub async fn run(
     mut observer: impl FnMut(Event),
 ) -> Result<(), RunError> {
     validate_config(&config)?;
-    let endpoint = parse_origin(&config.server_url)?;
+    let gateways = config
+        .server_urls
+        .iter()
+        .map(|url| parse_origin(url))
+        .collect::<Result<Vec<_>, _>>()?;
     let tls = tls::config(
         config.ca_path.as_deref(),
         config.thumbprint.as_deref(),
@@ -356,13 +363,13 @@ pub async fn run(
         Some(network)
     };
     let mut runtime = Runtime::new(network, config.transport);
-    let mut endpoints = if let Some(network) = runtime.network.as_ref() {
+    let mut candidates = if let Some(network) = runtime.network.as_ref() {
         let recovered = network.recovery_endpoints()?;
         if recovered.is_empty() {
             Vec::new()
         } else {
             runtime.network_started = true;
-            restored_endpoints(&endpoint, recovered)?
+            restored_candidates(&gateways, recovered)?
         }
     } else {
         Vec::new()
@@ -372,7 +379,7 @@ pub async fn run(
     let proof_identity = identity.clone();
     let proof_token = token.clone();
     let base_tunnel_config = ClientConfig {
-        url: config.server_url.clone(),
+        url: gateways[0].to_string(),
         token: config.token.clone(),
         transport: config.transport,
         tls,
@@ -389,10 +396,10 @@ pub async fn run(
 
     let result = run_loop(
         &config,
-        &endpoint,
+        &gateways,
         &base_tunnel_config,
         &mut runtime,
-        &mut endpoints,
+        &mut candidates,
         cancellation,
         &mut observer,
     )
@@ -451,14 +458,16 @@ pub async fn run(
 
 async fn run_loop(
     config: &Config,
-    endpoint: &Url,
+    gateways: &[Url],
     base_tunnel_config: &ClientConfig,
     runtime: &mut Runtime,
-    endpoints: &mut Vec<SocketAddr>,
+    candidates: &mut Vec<Candidate>,
     cancellation: &CancellationToken,
     observer: &mut impl FnMut(Event),
 ) -> Result<(), RunError> {
     let mut failures = 0_u32;
+    // Rotates through gateways and their endpoints on every failed attempt.
+    let mut attempts = 0_usize;
     let mut retry_error: Option<ClientError> = None;
     loop {
         if cancellation.is_cancelled() {
@@ -470,7 +479,11 @@ async fn run_loop(
             }
             let delay = reconnect_delay(failures, config.reconnect_max_delay);
             failures = failures.saturating_add(1);
-            observer(runtime.event(State::Reconnecting, format!("Reconnecting in {delay:?}")));
+            attempts = attempts.wrapping_add(1);
+            observer(runtime.event(
+                State::Reconnecting,
+                format!("Reconnecting in {delay:?} after: {error}"),
+            ));
             tokio::select! {
                 _ = cancellation.cancelled() => return Err(RunError::Cancelled),
                 error = runtime.device_error_rx.recv(), if runtime.reader.is_some() => {
@@ -480,19 +493,44 @@ async fn run_loop(
             }
         }
 
-        let dial_address = if runtime.network.is_some() {
-            if endpoints.is_empty() {
-                match resolve_endpoints(endpoint, cancellation).await {
-                    Ok(resolved) => *endpoints = resolved,
+        let (gateway, dial_address) = if runtime.network.is_some() {
+            if candidates.is_empty() {
+                match gateway_candidates(gateways, cancellation).await {
+                    Ok(resolved) => {
+                        // Before protection is active, every gateway can be
+                        // measured; fail over in that order afterwards.
+                        *candidates = if resolved.len() > 1 && !runtime.network_started {
+                            let addresses = resolved
+                                .iter()
+                                .map(|candidate| candidate.address)
+                                .collect::<Vec<_>>();
+                            let latencies =
+                                failover::probe(&addresses, failover::PROBE_TIMEOUT, cancellation)
+                                    .await;
+                            observer(runtime.event(
+                                State::Connecting,
+                                format!(
+                                    "gateway order: {}",
+                                    failover::describe(&resolved, &latencies, |index| {
+                                        gateways[index].host_str().unwrap_or_default().to_owned()
+                                    })
+                                ),
+                            ));
+                            failover::order(&resolved, &latencies)
+                        } else {
+                            resolved
+                        };
+                    }
                     Err(error) => {
                         retry_error = Some(error);
                         continue;
                     }
                 }
             }
-            Some(endpoints[failures as usize % endpoints.len()])
+            let candidate = candidates[attempts % candidates.len()];
+            (candidate.gateway, Some(candidate.address))
         } else {
-            None
+            (attempts % gateways.len(), None)
         };
 
         if runtime.network_started {
@@ -505,6 +543,7 @@ async fn run_loop(
         }
 
         let mut tunnel_config = base_tunnel_config.clone();
+        tunnel_config.url = gateways[gateway].to_string();
         tunnel_config.dial_address = dial_address;
         let connection = tokio::select! {
             _ = cancellation.cancelled() => return Err(RunError::Cancelled),
@@ -746,10 +785,18 @@ async fn run_connection(
 }
 
 fn validate_config(config: &Config) -> Result<(), RunError> {
-    if config.server_url.trim().is_empty() || config.token.is_empty() {
+    if config.server_urls.is_empty()
+        || config.server_urls.iter().any(|url| url.trim().is_empty())
+        || config.token.is_empty()
+    {
         return Err(RunError::Invalid(
             "server URL and token are required".to_owned(),
         ));
+    }
+    if config.server_urls.len() > MAX_GATEWAYS {
+        return Err(RunError::Invalid(format!(
+            "a profile lists at most {MAX_GATEWAYS} gateways"
+        )));
     }
     if config.interface_name.is_empty() {
         return Err(RunError::Invalid(
@@ -820,6 +867,53 @@ async fn resolve_endpoints(
         ));
     }
     Ok(addresses)
+}
+
+/// Every endpoint of every gateway, in profile order.
+async fn gateway_candidates(
+    gateways: &[Url],
+    cancellation: &CancellationToken,
+) -> Result<Vec<Candidate>, ClientError> {
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match resolve_endpoints(gateway, cancellation).await {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(ClientError::Closed) => return Err(ClientError::Closed),
+            // Another gateway may still resolve.
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(last_error.unwrap_or_else(|| ClientError::unavailable("no gateway endpoint")));
+    }
+    Ok(candidates)
+}
+
+/// Endpoints cached in the recovery journal, matched to the gateways they
+/// can belong to; protection blocks DNS until a tunnel is up again.
+fn restored_candidates(
+    gateways: &[Url],
+    saved: Vec<SocketAddr>,
+) -> Result<Vec<Candidate>, RunError> {
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match restored_endpoints(gateway, saved.clone()) {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(last_error.expect("at least one gateway is configured"));
+    }
+    Ok(candidates)
 }
 
 fn restored_endpoints(endpoint: &Url, saved: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, RunError> {

@@ -43,6 +43,8 @@
     <string name="token_hint">Access token</string>
     <string name="token_unchanged_hint">Leave blank to keep current token</string>
     <string name="gateway_label">Gateway</string>
+    <string name="backup_gateways_label">Backup gateways</string>
+    <string name="backup_gateways_hint">Optional, one per line: gateways sharing this account</string>
     <string name="token_label">Access token</string>
     <string name="device_identity_automatic">Device identity uses a security key; the device or model name is shown for recognition.</string>
     <string name="device_identity_unavailable">Could not load this device’s security key. See Log for details.</string>

@@ -32,6 +32,8 @@ struct ProfileInput {
     id: String,
     name: String,
     server_url: String,
+    #[serde(default)]
+    backup_servers: Vec<String>,
     transport: String,
     token: String,
 }
@@ -42,6 +44,7 @@ struct DesktopProfile {
     id: String,
     name: String,
     server_url: String,
+    backup_servers: Vec<String>,
     transport: String,
     selected: bool,
     active: bool,
@@ -288,13 +291,23 @@ impl Controller {
         let name = input.name.trim();
         let server_url = input.server_url.trim();
         parse_origin(server_url)?;
+        let backup_servers = input
+            .backup_servers
+            .iter()
+            .map(|server| server.trim())
+            .filter(|server| !server.is_empty())
+            .map(|server| parse_origin(server).map(|_| server.to_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
         let transport = parse_transport(input.transport.trim())?;
         let mut profile = if input.id.trim().is_empty() {
-            Profile::new(name, server_url, transport)
+            let mut profile = Profile::new(name, server_url, transport);
+            profile.backup_servers.clone_from(&backup_servers);
+            profile
         } else {
             let mut profile = self.profile(input.id.trim())?;
             profile.name = name.to_owned();
             profile.server_url = server_url.to_owned();
+            profile.backup_servers.clone_from(&backup_servers);
             profile.transport = transport;
             profile
         };
@@ -438,7 +451,11 @@ impl Controller {
         cancellation: CancellationToken,
     ) {
         let result = async {
-            let server = parse_origin(&profile.server_url).map_err(|error| (error, None))?;
+            let servers = std::iter::once(&profile.server_url)
+                .chain(&profile.backup_servers)
+                .map(|server| parse_origin(server))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| (error, None))?;
             let ca_path = (!profile.ca_path.is_empty()).then(|| Path::new(&profile.ca_path));
             let thumbprint =
                 (!profile.thumbprint.is_empty()).then_some(profile.thumbprint.as_str());
@@ -448,7 +465,7 @@ impl Controller {
             let observer_app = app.clone();
             match client::run(
                 client::Config {
-                    server,
+                    servers,
                     token,
                     tls,
                     transport: profile.transport,
@@ -538,12 +555,16 @@ impl Controller {
                 }
                 Event::Connecting {
                     attempt,
+                    gateway,
                     remote_address,
                 } => {
                     state.status = "Connecting".to_owned();
                     state.detail = format!("Secure endpoint {remote_address}");
                     state.tone = "warning".to_owned();
-                    add_activity(&mut state, &format!("Connection attempt {attempt}"))
+                    add_activity(
+                        &mut state,
+                        &format!("Connection attempt {attempt} to {gateway} ({remote_address})"),
+                    )
                 }
                 Event::ConfiguringNetwork => {
                     state.status = "Configuring network".to_owned();
@@ -1133,6 +1154,7 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
                 id: profile.id,
                 name: profile.name,
                 server_url: profile.server_url,
+                backup_servers: profile.backup_servers,
                 transport: transport_name(profile.transport).to_owned(),
                 status,
             }

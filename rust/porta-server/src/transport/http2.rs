@@ -372,6 +372,17 @@ fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
             );
             response
         }
+        OpenSessionError::Unavailable(message) => {
+            let mut response = plain_response(StatusCode::SERVICE_UNAVAILABLE, message);
+            response.headers_mut().insert(
+                http::header::RETRY_AFTER,
+                http::HeaderValue::from_static("5"),
+            );
+            if let Ok(value) = http::HeaderValue::from_str(message) {
+                response.headers_mut().insert(REASON_HEADER, value);
+            }
+            response
+        }
         OpenSessionError::Lease(LeaseError::Exhausted | LeaseError::Internal) => plain_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "no tunnel addresses available\n",

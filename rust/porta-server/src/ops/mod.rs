@@ -3,6 +3,7 @@ pub mod acme;
 pub mod admission;
 pub mod audit;
 pub mod exits;
+pub mod federation;
 pub mod metrics;
 pub mod readiness;
 pub mod shutdown;

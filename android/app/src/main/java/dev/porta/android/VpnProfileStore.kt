@@ -25,6 +25,8 @@ internal data class VpnProfile(
     val server: String,
     val token: String,
     val autoConnect: Boolean,
+    /** Further gateways sharing the account; the fastest one is used. */
+    val backupServers: List<String> = emptyList(),
 )
 
 internal class VpnProfileStore(private val context: Context) {
@@ -145,6 +147,7 @@ internal class VpnProfileStore(private val context: Context) {
             .put(KEY_NAME, profile.name)
             .put(KEY_SERVER, profile.server)
             .put(KEY_AUTO_CONNECT, profile.autoConnect)
+            .put(KEY_BACKUP_SERVERS, org.json.JSONArray(profile.backupServers))
             .put(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .put(KEY_TOKEN, Base64.encodeToString(encrypted, Base64.NO_WRAP))
     }
@@ -160,6 +163,9 @@ internal class VpnProfileStore(private val context: Context) {
                 server = entry.getString(KEY_SERVER),
                 token = "",
                 autoConnect = entry.optBoolean(KEY_AUTO_CONNECT),
+                backupServers = entry.optJSONArray(KEY_BACKUP_SERVERS)?.let { array ->
+                    (0 until array.length()).map { array.getString(it) }.filter(::isHttpsOrigin)
+                }.orEmpty(),
             )
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
@@ -220,6 +226,7 @@ internal class VpnProfileStore(private val context: Context) {
         private const val KEY_ID = "id"
         private const val KEY_NAME = "name"
         private const val KEY_SERVER = "server"
+        private const val KEY_BACKUP_SERVERS = "backupServers"
         private const val KEY_VERSION = "version"
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_IV = "iv"

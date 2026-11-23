@@ -33,6 +33,8 @@ const messages = {
     profileName: "Profile name",
     profileNamePlaceholder: "Home, work, travel…",
     gateway: "Gateway URL",
+    backupGateways: "Backup gateways",
+    backupGatewaysPlaceholder: "Optional, one per line: gateways that share this account",
     accessToken: "Access token",
     accessTokenPlaceholder: "Paste the token from your administrator",
     tokenHelpNew: "Stored securely for this Windows account.",
@@ -132,6 +134,8 @@ const messages = {
     profileName: "配置名称",
     profileNamePlaceholder: "家庭、工作、旅行…",
     gateway: "网关地址",
+    backupGateways: "备用网关",
+    backupGatewaysPlaceholder: "可选，每行一个：共享此账户的网关",
     accessToken: "访问令牌",
     accessTokenPlaceholder: "粘贴管理员提供的令牌",
     tokenHelpNew: "令牌将为当前 Windows 账户安全存储。",
@@ -691,6 +695,7 @@ function openEditor(profile = null) {
   resetDeleteAction();
   $("profile-name").value = profile?.name || "";
   $("profile-server").value = profile?.serverUrl || "https://";
+  $("profile-backups").value = (profile?.backupServers || []).join("\n");
   $("profile-token").value = "";
   $("delete-profile").classList.toggle("hidden", !profile);
   $("editor-error").classList.add("hidden");
@@ -760,6 +765,7 @@ async function saveProfile(event) {
     id: state.editorProfile?.id || "",
     name: $("profile-name").value,
     serverUrl: $("profile-server").value,
+    backupServers: $("profile-backups").value.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean),
     transport: state.editorProfile?.transport || "auto",
     token: $("profile-token").value,
   };
@@ -797,6 +803,16 @@ function validateProfileInput(input) {
     }
   } catch (_) {
     return { field: "profile-server", message: t("invalidServer") };
+  }
+  for (const backup of input.backupServers) {
+    try {
+      const url = new URL(backup);
+      if (url.protocol !== "https:" || !url.hostname || (url.pathname !== "" && url.pathname !== "/")) {
+        return { field: "profile-backups", message: t("httpsOriginRequired") };
+      }
+    } catch (_) {
+      return { field: "profile-backups", message: t("invalidServer") };
+    }
   }
   if (!state.editorProfile && !input.token.trim()) {
     return { field: "profile-token", message: t("tokenRequired") };

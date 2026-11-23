@@ -61,6 +61,17 @@ pub struct Config {
     pub oidc_ca: Option<PathBuf>,
     #[arg(skip)]
     pub oidc_client_secret: String,
+    /// Mirror accounts from this primary gateway (HTTPS origin) instead of
+    /// managing them here. Needs PORTA_FEDERATION_TOKEN.
+    #[arg(long)]
+    pub federation_primary: Option<String>,
+    /// Extra CA certificate for a privately signed primary.
+    #[arg(long, value_parser = parse_path)]
+    pub federation_ca: Option<PathBuf>,
+    /// Shared secret between a primary and its replicas; on a primary it
+    /// enables serving accounts to replicas.
+    #[arg(skip)]
+    pub federation_token: String,
     #[arg(long, default_value = "porta0")]
     pub interface: String,
     #[arg(long, default_value = "10.66.0.0/24")]
@@ -256,6 +267,9 @@ impl fmt::Debug for Config {
             .field("oidc_redirect_url", &self.oidc_redirect_url)
             .field("oidc_ca", &self.oidc_ca)
             .field("oidc_client_secret", &redacted(&self.oidc_client_secret))
+            .field("federation_primary", &self.federation_primary)
+            .field("federation_ca", &self.federation_ca)
+            .field("federation_token", &redacted(&self.federation_token))
             .field("admin_token", &redacted(&self.admin_token))
             .field("upstream_token", &redacted(&self.upstream_token))
             .finish()
@@ -305,6 +319,7 @@ impl Config {
         self.admin_token = std::env::var("PORTA_ADMIN_TOKEN").unwrap_or_default();
         self.upstream_token = std::env::var("PORTA_UPSTREAM_TOKEN").unwrap_or_default();
         self.oidc_client_secret = std::env::var("PORTA_OIDC_CLIENT_SECRET").unwrap_or_default();
+        self.federation_token = std::env::var("PORTA_FEDERATION_TOKEN").unwrap_or_default();
         self.exit_tokens = std::env::vars()
             .filter_map(|(name, value)| {
                 name.strip_prefix("PORTA_EXIT_TOKEN_")
@@ -372,6 +387,7 @@ impl Config {
         }
         self.validate_resolver()?;
         self.validate_identity()?;
+        self.validate_federation()?;
         if !self.dns.is_empty() {
             let dns = self.dns.parse::<Ipv4Addr>().context(
                 "advertised DNS must be a unicast IPv4 address, not loopback or link-local",
@@ -443,6 +459,29 @@ impl Config {
             .parent()
             .unwrap_or_else(|| std::path::Path::new(""))
             .join(name)
+    }
+
+    fn validate_federation(&mut self) -> Result<()> {
+        if !self.federation_token.is_empty()
+            && self.federation_token.len() < crate::ops::federation::MIN_TOKEN_LENGTH
+        {
+            bail!(
+                "PORTA_FEDERATION_TOKEN must contain at least {} characters",
+                crate::ops::federation::MIN_TOKEN_LENGTH
+            );
+        }
+        if let Some(primary) = &self.federation_primary {
+            self.federation_primary =
+                Some(normalize_https_origin(primary).context(
+                    "--federation-primary must be the HTTPS origin of the primary gateway",
+                )?);
+            if self.federation_token.is_empty() {
+                bail!("PORTA_FEDERATION_TOKEN is required with --federation-primary");
+            }
+        } else if self.federation_ca.is_some() {
+            bail!("--federation-ca requires --federation-primary");
+        }
+        Ok(())
     }
 
     fn validate_identity(&mut self) -> Result<()> {

@@ -1388,6 +1388,39 @@ fn success_response(
     response
 }
 
+/// A retryable refusal whose reason tells a multi-gateway client to try
+/// another gateway.
+async fn send_unavailable<S, B>(
+    stream: &mut h3::server::RequestStream<S, B>,
+    message: &'static str,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<B>,
+    B: Buf + From<Bytes>,
+{
+    let mut response = http::Response::new(());
+    *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+    for (name, value) in [
+        (http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+        (http::header::CACHE_CONTROL, "no-store"),
+        (http::header::RETRY_AFTER, "5"),
+    ] {
+        response
+            .headers_mut()
+            .insert(name, http::HeaderValue::from_static(value));
+    }
+    response
+        .headers_mut()
+        .insert(REASON_HEADER, http::HeaderValue::from_static(message));
+    set_security_headers(response.headers_mut());
+    stream.send_response(response).await?;
+    stream
+        .send_data(Bytes::from_static(message.as_bytes()).into())
+        .await?;
+    stream.finish().await?;
+    Ok(())
+}
+
 async fn send_error<S, B>(
     stream: &mut h3::server::RequestStream<S, B>,
     status: http::StatusCode,
@@ -1547,6 +1580,7 @@ where
             stream.finish().await?;
             Ok(())
         }
+        OpenSessionError::Unavailable(message) => send_unavailable(stream, message).await,
         OpenSessionError::Lease(LeaseError::Exhausted | LeaseError::Internal) => {
             send_error(
                 stream,

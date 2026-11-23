@@ -81,6 +81,13 @@ pub struct Portal {
     admins: Option<Arc<AdminStore>>,
     audit: Option<Arc<AuditLog>>,
     oidc: Option<Arc<OidcClient>>,
+    federation: Option<FederationSource>,
+}
+
+/// What a primary gateway serves to replicas that present its token.
+pub struct FederationSource {
+    pub token: Zeroizing<String>,
+    pub export: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
 
 impl Portal {
@@ -111,7 +118,59 @@ impl Portal {
             admins: None,
             audit: None,
             oidc: None,
+            federation: None,
         })
+    }
+
+    /// Serves this primary gateway's accounts to replicas.
+    pub fn set_federation(&mut self, federation: Option<FederationSource>) {
+        self.federation = federation;
+    }
+
+    fn serve_federation(&self, request: &RequestContext) -> Response {
+        let Some(federation) = &self.federation else {
+            return Response::not_found();
+        };
+        let reservation = match self.reserve_authentication(request, Surface::Portal) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                return Response::text(
+                    429,
+                    "text/plain; charset=utf-8",
+                    b"too many attempts\n".to_vec(),
+                )
+            }
+        };
+        let presented = request
+            .header("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        if !constant_time_eq(presented.as_bytes(), federation.token.as_bytes()) {
+            self.record(
+                AuditEvent::new(
+                    Actor {
+                        kind: "replica",
+                        id: String::new(),
+                        name: String::new(),
+                    },
+                    "federation.sync",
+                    "",
+                )
+                .outcome("denied")
+                .address(request.client_ip.or(request.peer_ip)),
+            );
+            return Response::text(
+                401,
+                "text/plain; charset=utf-8",
+                b"invalid federation token\n".to_vec(),
+            );
+        }
+        if let Some(reservation) = reservation {
+            reservation.refund();
+        }
+        let mut response = Response::json(200, (federation.export)());
+        response.set_header("Cache-Control", "no-store");
+        response
     }
 
     /// Named administrators, the audit log, and single sign-on.
@@ -195,6 +254,9 @@ impl Portal {
                 Some(access_page_response(request, false, 200))
             }
             "/access" if request.method == "POST" => Some(self.sign_in(request, now)),
+            crate::ops::federation::REGISTRY_PATH if request.method == "GET" => {
+                Some(self.serve_federation(request))
+            }
             "/admin/sign-in" if request.is_get_or_head() => Some(admin_sign_in_page(
                 request,
                 self.oidc.is_some(),

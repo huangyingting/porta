@@ -716,7 +716,8 @@ h2 {
   font-weight: 650;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   min-height: 46px;
   padding: 0 13px;
@@ -724,18 +725,27 @@ input {
   border-radius: 13px;
   color: var(--text);
   background: var(--field);
+  font: inherit;
 }
 
-input:hover {
+textarea {
+  padding: 11px 13px;
+  resize: vertical;
+}
+
+input:hover,
+textarea:hover {
   border-color: var(--border-strong);
 }
 
-input:focus {
+input:focus,
+textarea:focus {
   border-color: var(--accent-strong);
   box-shadow: 0 0 0 3px rgba(110, 231, 183, 0.09);
 }
 
-input::placeholder {
+input::placeholder,
+textarea::placeholder {
   color: #60748b;
 }
 

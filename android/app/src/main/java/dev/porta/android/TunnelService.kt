@@ -87,6 +87,8 @@ class TunnelService : VpnService() {
         val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
         val profileId = intent.getStringExtra(EXTRA_PROFILE_ID).orEmpty()
         val profileLabel = intent.getStringExtra(EXTRA_PROFILE_NAME).orEmpty()
+        val backupServers = intent.getStringArrayExtra(EXTRA_BACKUP_SERVERS)
+            ?.filter(::isHttpsOrigin)?.take(7).orEmpty()
         if (!isHttpsOrigin(server) || !isValidToken(token)) {
             logEvent("Connection rejected: invalid profile configuration")
             stopTunnel("Invalid tunnel configuration")
@@ -124,7 +126,7 @@ class TunnelService : VpnService() {
         sendStatus("Connecting")
         startStats(runGeneration)
         worker = Thread(
-            { runTunnel(server, token, deviceIdentity, runGeneration, startId) },
+            { runTunnel(listOf(server) + backupServers, token, deviceIdentity, runGeneration, startId) },
             "porta-transport",
         ).also { it.start() }
         return START_NOT_STICKY
@@ -141,7 +143,7 @@ class TunnelService : VpnService() {
     }
 
     private fun runTunnel(
-        server: String,
+        servers: List<String>,
         token: String,
         deviceIdentity: AndroidDeviceIdentity,
         runGeneration: Long,
@@ -185,7 +187,7 @@ class TunnelService : VpnService() {
                     updateConnectionStatus(if (reconnecting) "Reconnecting" else "Connecting", runGeneration)
                     logEvent(formatAttemptEvent("Automatic HTTP/3 or HTTP/2", selectedNetworkType))
                     connectNativeOnce(
-                        server,
+                        servers,
                         token,
                         deviceIdentity,
                         network,
@@ -235,7 +237,7 @@ class TunnelService : VpnService() {
     }
 
     private fun connectNativeOnce(
-        server: String,
+        servers: List<String>,
         token: String,
         deviceIdentity: AndroidDeviceIdentity,
         network: Network,
@@ -246,16 +248,36 @@ class TunnelService : VpnService() {
         onConnected: () -> Unit,
     ) {
         val attemptStartedAt = System.nanoTime()
-        val host = gatewayHost(server)
-            ?: throw PermanentTunnelException("Gateway URL has no hostname")
         if (!attemptActive.get()) throw IOException("Underlying network changed before connection")
-        val remoteAddresses = try {
-            network.getAllByName(host).mapNotNull { it.hostAddress }.distinct()
-        } catch (error: UnknownHostException) {
-            throw IOException("Could not resolve the gateway on the underlying network", error)
+        var resolveFailure: Exception? = null
+        val resolved = servers.flatMap { server ->
+            val host = gatewayHost(server)
+                ?: throw PermanentTunnelException("Gateway URL has no hostname")
+            try {
+                network.getAllByName(host).mapNotNull { it.hostAddress }.distinct()
+                    .map { GatewayCandidate(server, it) }
+            } catch (error: UnknownHostException) {
+                // Another gateway of the profile may still resolve.
+                resolveFailure = error
+                emptyList()
+            }
         }
-        if (remoteAddresses.isEmpty()) {
-            throw IOException("Gateway hostname resolved to no addresses")
+        if (resolved.isEmpty()) {
+            throw IOException("Could not resolve the gateway on the underlying network", resolveFailure)
+        }
+        // Try the fastest gateway first; this app's sockets bypass the VPN.
+        val candidates = if (resolved.size > 1) {
+            val latencies = probeCandidates(resolved) { candidate ->
+                tcpConnectMillis(network.socketFactory.createSocket(), candidate.address, gatewayPort(candidate.server))
+            }
+            orderCandidates(resolved, latencies).also { ordered ->
+                logEvent("Gateway order: " + ordered.joinToString { candidate ->
+                    val latency = latencies[resolved.indexOf(candidate)]
+                    "${gatewayHost(candidate.server)} " + (latency?.let { "$it ms" } ?: "no answer")
+                })
+            }
+        } else {
+            resolved
         }
 
         val protector = object : Protector {
@@ -297,9 +319,12 @@ class TunnelService : VpnService() {
         }
         var session: Session? = null
         var unavailable: Exception? = null
+        var retryable: Exception? = null
         var connected = false
         try {
-            for (remoteAddress in remoteAddresses) {
+            for (candidate in candidates) {
+                val server = candidate.server
+                val remoteAddress = candidate.address
                 try {
                     if (!isRunActive(runGeneration)) throw InterruptedException("Tunnel stopped")
                     if (!attemptActive.get()) {
@@ -325,7 +350,8 @@ class TunnelService : VpnService() {
                     val message = error.message.orEmpty()
                     when {
                         Portamobile.isTransportUnavailable(message) -> unavailable = error
-                        Portamobile.isRetryable(message) -> throw IOException(message, error)
+                        // Fail over to the next gateway or endpoint.
+                        Portamobile.isRetryable(message) -> retryable = error
                         else -> throw PermanentTunnelException(message.ifBlank { "Native tunnel rejected" })
                     }
                 }
@@ -337,6 +363,7 @@ class TunnelService : VpnService() {
             }
         }
         val activeSession = session
+            ?: retryable?.let { throw IOException(it.message, it) }
             ?: throw IOException(unavailable?.message ?: "No supported tunnel transport is available")
         synchronized(this) {
             if (!isRunActive(runGeneration) || !nativeSession.compareAndSet(null, activeSession)) {
@@ -1005,6 +1032,7 @@ class TunnelService : VpnService() {
         const val ACTION_STATUS = "dev.porta.android.STATUS"
         const val ACTION_STATS = "dev.porta.android.STATS"
         const val EXTRA_SERVER = "server"
+        const val EXTRA_BACKUP_SERVERS = "backupServers"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
@@ -1069,6 +1097,13 @@ internal fun gatewayHost(server: String): String? = try {
     URI(server).host?.removePrefix("[")?.removeSuffix("]")?.takeIf { it.isNotBlank() }
 } catch (_: Exception) {
     null
+}
+
+/** The gateway's HTTPS port. */
+internal fun gatewayPort(server: String): Int = try {
+    URI(server).port.takeIf { it > 0 } ?: 443
+} catch (_: Exception) {
+    443
 }
 
 internal fun parseIPv4Address(value: String): ByteArray? {

@@ -369,6 +369,17 @@ pub struct GatewayStatus {
     /// Exit names an account's access policy may select.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exits: Vec<String>,
+    /// Account federation with other gateways.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation: Option<FederationInfo>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct FederationInfo {
+    /// `primary` serves accounts to replicas; `replica` mirrors them.
+    pub role: &'static str,
+    #[serde(flatten)]
+    pub status: crate::ops::federation::FederationStatus,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

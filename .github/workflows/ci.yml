@@ -70,6 +70,8 @@ jobs:
         run: make test-dns-resolver
       - name: Test administrator identities, SSO and the audit log end to end
         run: make test-admin-identity
+      - name: Test multi-gateway failover and account federation end to end
+        run: make test-gateway-failover
       - name: Test the unprivileged systemd service end to end
         run: make test-service-user
       - run: make build

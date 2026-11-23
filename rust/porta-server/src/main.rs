@@ -16,6 +16,7 @@ use porta_server_rust::ops::acme::{AutomaticCertificateConfig, AutomaticCertific
 use porta_server_rust::ops::admission::{ConnectionAdmission, RetryController};
 use porta_server_rust::ops::audit::AuditLog;
 use porta_server_rust::ops::exits::ExitRules;
+use porta_server_rust::ops::federation::FederationSync;
 use porta_server_rust::ops::metrics::Metrics;
 use porta_server_rust::ops::shutdown::Drain;
 use porta_server_rust::ops::system_readiness::{
@@ -34,12 +35,14 @@ use porta_server_rust::state::usage::Store as UsageStore;
 use porta_server_rust::transport::http2::{Http2Config, Http2Handler};
 use porta_server_rust::transport::http3::{serve_quinn, Http3Config, Http3Server};
 use porta_server_rust::transport::session::{Services, TunnelRouting};
+use porta_server_rust::web::admin::FederationInfo;
 use porta_server_rust::web::admin::{
     AdminService, ClientRegistry as WebClientRegistry, GatewayStatus, GatewayStatusProvider,
     UpstreamStatus,
 };
 use porta_server_rust::web::landing::{load_landing_template_set, LandingSite};
 use porta_server_rust::web::oidc::{OidcClient, OidcConfig};
+use porta_server_rust::web::portal::FederationSource;
 use porta_server_rust::web::portal::Portal;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -96,8 +99,15 @@ async fn run() -> Result<()> {
         let tables = config.exit_tables();
         (!tables.is_empty()).then(|| ExitRules::new(config.interface.clone(), tables))
     };
+    let federation_status = config
+        .federation_primary
+        .as_deref()
+        .map(FederationSync::status_for);
     let gateway_status = {
         let base = upstream::gateway_status(&relays);
+        let federation = federation_status.clone();
+        let serves_replicas =
+            config.federation_primary.is_none() && !config.federation_token.is_empty();
         let routes = config
             .routes
             .iter()
@@ -113,6 +123,16 @@ async fn run() -> Result<()> {
             client_to_client,
             dns_resolver,
             exits: exits.clone(),
+            federation: match &federation {
+                Some(status) => Some(FederationInfo {
+                    role: "replica",
+                    status: status.lock().clone(),
+                }),
+                None => serves_replicas.then(|| FederationInfo {
+                    role: "primary",
+                    ..FederationInfo::default()
+                }),
+            },
             ..base()
         });
         provider
@@ -120,9 +140,25 @@ async fn run() -> Result<()> {
     let device = Arc::new(NativeTun::open(&config.interface, usize::from(config.mtu))?);
     let router = Arc::new(Router::new(device, Some(metrics.clone())));
     let bootstrap_token = Zeroizing::new(std::mem::take(&mut config.token));
-    let registry =
-        Arc::new(ClientRegistry::open(&config.client_registry, bootstrap_token.as_str()).await?);
+    let registry = Arc::new(match &config.federation_primary {
+        Some(primary) => {
+            tracing::info!(%primary, "mirroring accounts from the primary gateway");
+            ClientRegistry::open_replica(&config.client_registry).await?
+        }
+        None => ClientRegistry::open(&config.client_registry, bootstrap_token.as_str()).await?,
+    });
     drop(bootstrap_token);
+    let federation_token = Zeroizing::new(std::mem::take(&mut config.federation_token));
+    let federation_sync = match (&config.federation_primary, &federation_status) {
+        (Some(primary), Some(status)) => Some(FederationSync::new(
+            primary,
+            federation_token.clone(),
+            config.federation_ca.as_deref(),
+            registry.clone(),
+            status.clone(),
+        )?),
+        _ => None,
+    };
     let abuse = Arc::new(AbuseGuard::default_with_metrics(metrics.clone()));
     let admins = Arc::new(
         AdminStore::open(
@@ -285,6 +321,13 @@ async fn run() -> Result<()> {
     portal.set_abuse_guard(Some(abuse.clone()));
     portal.set_gateway_status(gateway_status.clone());
     portal.set_identity(Some(admins.clone()), Some(audit.clone()), oidc);
+    if config.federation_primary.is_none() && !federation_token.is_empty() {
+        let source = registry.clone();
+        portal.set_federation(Some(FederationSource {
+            token: federation_token.clone(),
+            export: Arc::new(move || serde_json::to_vec(&source.export()).unwrap_or_default()),
+        }));
+    }
     let portal = Arc::new(portal);
     let landing = Arc::new(match &config.landing_template_dir {
         Some(directory) => LandingSite::with_templates(
@@ -379,6 +422,9 @@ async fn run() -> Result<()> {
     });
     let exit_shutdown = tokio_util::sync::CancellationToken::new();
     let exit_task = exit_rules.map(|rules| tokio::spawn(rules.run(exit_shutdown.clone())));
+    let federation_shutdown = tokio_util::sync::CancellationToken::new();
+    let federation_task =
+        federation_sync.map(|sync| tokio::spawn(sync.run(federation_shutdown.clone())));
     let resolver_shutdown = tokio_util::sync::CancellationToken::new();
     let mut resolver_task = match resolver {
         Some(resolver) => {
@@ -570,6 +616,13 @@ async fn run() -> Result<()> {
     if let Err(error) = policy_task.await {
         if run_error.is_none() {
             run_error = Some(error.into());
+        }
+    }
+    federation_shutdown.cancel();
+    if let Some(task) = federation_task {
+        let error = task_error(task.await);
+        if run_error.is_none() {
+            run_error = error;
         }
     }
     resolver_shutdown.cancel();

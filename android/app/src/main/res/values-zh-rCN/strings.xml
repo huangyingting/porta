@@ -43,6 +43,8 @@
     <string name="token_hint">访问令牌</string>
     <string name="token_unchanged_hint">留空可继续使用当前令牌</string>
     <string name="gateway_label">网关</string>
+    <string name="backup_gateways_label">备用网关</string>
+    <string name="backup_gateways_hint">可选，每行一个：共享此账户的网关</string>
     <string name="token_label">访问令牌</string>
     <string name="device_identity_automatic">设备身份使用安全密钥，并显示设备或型号名称以便识别。</string>
     <string name="device_identity_unavailable">无法加载此设备的安全密钥。请查看日志了解详情。</string>

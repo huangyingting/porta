@@ -205,6 +205,9 @@ pub enum AuthenticationError {
     Forbidden(DenialReason),
     #[error("too many authentication attempts")]
     RateLimited { retry_after_seconds: u64 },
+    /// This gateway cannot admit the client now; another gateway may.
+    #[error("{0}")]
+    Unavailable(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -571,6 +574,8 @@ pub enum OpenSessionError {
     Forbidden(DenialReason),
     #[error("too many authentication attempts")]
     RateLimited { retry_after_seconds: u64 },
+    #[error("{0}")]
+    Unavailable(&'static str),
     #[error(transparent)]
     Lease(#[from] LeaseError),
     #[error(transparent)]
@@ -605,6 +610,9 @@ impl Services {
                 return Err(OpenSessionError::RateLimited {
                     retry_after_seconds,
                 });
+            }
+            Err(AuthenticationError::Unavailable(message)) => {
+                return Err(OpenSessionError::Unavailable(message));
             }
         };
         let lease_request = LeaseRequest {

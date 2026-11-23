@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::failover::{self, Candidate};
 use crate::identity::IdentityError;
 use crate::tunnel::{self, ClientError, Connection, DeliveryMode, Lease, Transport};
 
@@ -22,7 +23,8 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Config {
-    pub server: Url,
+    /// Gateways sharing one account registry, tried fastest first.
+    pub servers: Vec<Url>,
     pub token: String,
     pub tls: Arc<RustlsClientConfig>,
     pub transport: Transport,
@@ -53,6 +55,8 @@ pub enum Event {
     RecoveringNetwork,
     Connecting {
         attempt: u64,
+        /// The gateway's origin, from the profile's gateways.
+        gateway: String,
         remote_address: SocketAddr,
     },
     ConfiguringNetwork,
@@ -156,17 +160,13 @@ pub async fn run(
                     ),
                 ));
             }
-            resolve_endpoints(&config.server, &cancellation)
-                .await
-                .map_err(RunError::Resolve)?
+            ordered_candidates(&config.servers, &cancellation).await?
         } else {
             observer.event(Event::RecoveringNetwork);
-            restored_endpoints(&config.server, saved)?
+            restored_candidates(&config.servers, saved)?
         }
     } else {
-        resolve_endpoints(&config.server, &cancellation)
-            .await
-            .map_err(RunError::Resolve)?
+        ordered_candidates(&config.servers, &cancellation).await?
     };
 
     let mut attempt = 0_u64;
@@ -190,10 +190,13 @@ pub async fn run(
         }
 
         attempt += 1;
-        let remote_address = endpoints[endpoint_index % endpoints.len()];
+        let candidate = endpoints[endpoint_index % endpoints.len()];
+        let remote_address = candidate.address;
+        let gateway = &config.servers[candidate.gateway];
         endpoint_index += 1;
         observer.event(Event::Connecting {
             attempt,
+            gateway: gateway.to_string(),
             remote_address,
         });
 
@@ -214,7 +217,7 @@ pub async fn run(
         }
 
         let connected = tunnel::connect(tunnel::ClientConfig {
-            url: config.server.to_string(),
+            url: gateway.to_string(),
             token: config.token.clone(),
             transport: config.transport,
             tls: Arc::clone(&config.tls),
@@ -540,6 +543,66 @@ fn retained_if_needed(
     } else {
         RunError::Runtime(Box::new(source))
     }
+}
+
+/// Every endpoint of every gateway, fastest first; protection is not yet
+/// active, so each can be measured.
+async fn ordered_candidates(
+    gateways: &[Url],
+    cancellation: &CancellationToken,
+) -> Result<Vec<Candidate>, RunError> {
+    if gateways.is_empty() {
+        return Err(RunError::Invalid("a profile needs a gateway".to_owned()));
+    }
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match resolve_endpoints(gateway, cancellation).await {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(ClientError::Closed) => return Err(RunError::Resolve(ClientError::Closed)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(RunError::Resolve(last_error.unwrap_or_else(|| {
+            ClientError::unavailable("no gateway endpoint")
+        })));
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates);
+    }
+    let addresses = candidates
+        .iter()
+        .map(|candidate| candidate.address)
+        .collect::<Vec<_>>();
+    let latencies = failover::probe(&addresses, failover::PROBE_TIMEOUT, cancellation).await;
+    Ok(failover::order(&candidates, &latencies))
+}
+
+fn restored_candidates(
+    gateways: &[Url],
+    saved: Vec<SocketAddr>,
+) -> Result<Vec<Candidate>, RunError> {
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match restored_endpoints(gateway, saved.clone()) {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(
+            last_error.unwrap_or_else(|| RunError::Invalid("a profile needs a gateway".to_owned()))
+        );
+    }
+    Ok(candidates)
 }
 
 async fn resolve_endpoints(

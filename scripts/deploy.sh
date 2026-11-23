@@ -66,6 +66,13 @@ Options:
   --oidc-client-id ID       Client ID registered with the issuer; the secret, if
                             any, comes from $PORTA_OIDC_CLIENT_SECRET or the
                             saved one. Register https://DOMAIN[:PORT]/auth/oidc/callback
+  --federation-primary URL  Mirror accounts from this primary gateway, so one
+                            profile can fail over between them; --federation-primary=
+                            makes this gateway manage its own accounts again
+  --disable-federation      Stop serving accounts to replicas and forget
+                            $PORTA_FEDERATION_TOKEN
+                            (Set $PORTA_FEDERATION_TOKEN, at least 32 characters, on the
+                            primary and every replica; it is saved.)
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
   --help                    Show this help
@@ -128,6 +135,8 @@ local_exit=false
 dns_resolver=false
 oidc_issuer=
 oidc_client_id=
+federation_primary=
+disable_federation=false
 dns_upstreams=
 dns_forwards=
 dns_blocklist=
@@ -140,7 +149,7 @@ saved_option_names=(
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client client_host_access routes
   dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist oidc_issuer
-  oidc_client_id
+  oidc_client_id federation_primary
 )
 declare -A saved_options=()
 if [[ -e $deploy_config || -L $deploy_config ]]; then
@@ -199,6 +208,9 @@ while [[ $# -gt 0 ]]; do
     --client-to-client=*) client_to_client=$(parse_bool --client-to-client "${1#*=}"); shift ;;
     --client-host-access) client_host_access=true; shift ;;
     --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
+    --federation-primary) require_value "$@"; federation_primary=$2; shift 2 ;;
+    --federation-primary=*) federation_primary=${1#*=}; shift ;;
+    --disable-federation) disable_federation=true; shift ;;
     --oidc-issuer) require_value "$@"; oidc_issuer=$2; shift 2 ;;
     --oidc-issuer=*) oidc_issuer=${1#*=}; shift ;;
     --oidc-client-id) require_value "$@"; oidc_client_id=$2; shift 2 ;;
@@ -284,6 +296,16 @@ if [[ -n $dns_domains ]]; then
 fi
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
+federation_arguments=
+if [[ -n $federation_primary ]]; then
+  [[ $federation_primary =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] ||
+    die "--federation-primary must be an HTTPS origin such as https://primary.example.com"
+  federation_primary=${federation_primary%/}
+  federation_arguments=" --federation-primary $federation_primary"
+  if [[ -n $upstream_ca ]]; then
+    federation_arguments+=" --federation-ca /etc/porta/upstream-ca.pem"
+  fi
+fi
 oidc_arguments=
 if [[ -n $oidc_issuer || -n $oidc_client_id ]]; then
   [[ $oidc_issuer =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] ||
@@ -405,6 +427,19 @@ if [[ -n $upstream ]]; then
   [[ ${#upstream_token} -ge 16 && $upstream_token =~ ^[[:graph:]]+$ ]] ||
     die "--upstream requires a client token issued by the next hop: set PORTA_UPSTREAM_TOKEN or use --upstream-token-file"
 fi
+federation_token=${PORTA_FEDERATION_TOKEN:-}
+if [[ -z $federation_token ]] && ! $disable_federation && [[ -f /etc/porta/porta.env ]]; then
+  federation_token=$(sed -n 's/^PORTA_FEDERATION_TOKEN=//p' /etc/porta/porta.env | tail -n 1)
+fi
+if $disable_federation; then
+  [[ -z $federation_primary ]] || die "--disable-federation cannot be combined with --federation-primary"
+  federation_token=
+fi
+if [[ -n $federation_token && ( ${#federation_token} -lt 32 || ! $federation_token =~ ^[[:graph:]]+$ ) ]]; then
+  die "PORTA_FEDERATION_TOKEN must contain at least 32 printable characters"
+fi
+[[ -z $federation_primary || -n $federation_token ]] ||
+  die "--federation-primary needs PORTA_FEDERATION_TOKEN, the token the primary uses"
 exit_tokens=()
 for exit_name in "${exit_names[@]}"; do
   exit_variable=PORTA_EXIT_TOKEN_$(tr 'a-z-' 'A-Z_' <<<"$exit_name")
@@ -903,7 +938,11 @@ oidc_client_secret=${PORTA_OIDC_CLIENT_SECRET:-}
 if [[ -z $oidc_client_secret && -n $oidc_arguments ]]; then
   oidc_client_secret=$(sed -n 's/^PORTA_OIDC_CLIENT_SECRET=//p' "$environment_file" | tail -n 1)
 fi
-grep -v '^PORTA_EXIT_TOKEN_\|^PORTA_OIDC_CLIENT_SECRET=' "$environment_file" >"$environment_file.new" || true
+grep -v '^PORTA_EXIT_TOKEN_\|^PORTA_OIDC_CLIENT_SECRET=\|^PORTA_FEDERATION_TOKEN=' "$environment_file" >"$environment_file.new" || true
+if [[ -n $federation_token ]]; then
+  printf 'PORTA_FEDERATION_TOKEN=%s\n' "$federation_token" >>"$environment_file.new"
+fi
+unset federation_token
 if [[ -n $oidc_arguments && -n $oidc_client_secret ]]; then
   printf 'PORTA_OIDC_CLIENT_SECRET=%s\n' "$oidc_client_secret" >>"$environment_file.new"
 fi
@@ -1029,7 +1068,7 @@ User=$service_user
 Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments$federation_arguments --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -1169,6 +1208,7 @@ Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $poo
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
 Client DNS:      $([[ $dns_resolver == true ]] && echo "built-in resolver on ${gateway_cidr%/*} with names under porta.internal" || echo "$dns")
 Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_domains:+ (DNS for ${dns_domains//,/, })}" || echo "full tunnel")
+Accounts:        $([[ -n $federation_primary ]] && echo "mirrored from $federation_primary (read-only here)" || echo "managed here")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Admin sign-in:   https://$domain$([[ $port == 443 ]] || printf ':%s' "$port")/admin/sign-in$([[ -n $oidc_arguments ]] && echo " (single sign-on through $oidc_issuer)")
 Browser portal:  https://$domain:$port

@@ -27,6 +27,7 @@ make test-subnet-router
 make test-exit-selection
 make test-dns-resolver
 make test-admin-identity
+make test-gateway-failover
 make test-service-user
 make vet
 make build
@@ -72,6 +73,11 @@ fake OpenID provider that enforces PKCE and signs RS256 ID tokens. It checks
 local sign-in, TOTP enrollment and replay protection, role limits, single
 sign-on for a mapped and an unknown email, that disabling an administrator
 ends their session's rights, and the audit log's contents and permissions.
+
+`make test-gateway-failover` runs `scripts/test-gateway-failover.sh` over both
+transports: a client lists a primary and a faster replica, enrolls through
+the primary, fails over to the replica when the primary stops, and loses its
+replica session when the primary disables the account.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

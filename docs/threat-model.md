@@ -160,6 +160,10 @@ not conceal transport fingerprints from network inspection.
   every client of a gateway, across all accounts, a peer. Leave it off unless
   all clients are mutually trusted; client hosts must protect their own
   services from their peers.
+- `PORTA_FEDERATION_TOKEN` lets its holder download every account's token
+  hash, devices and policies from a primary; token hashes are SHA-256 of
+  random tokens and cannot be reversed, but treat the federation token like
+  the admin token. Replicas trust what the primary serves.
 - The built-in resolver reveals device names and addresses only to a
   device's peers, but every name a client looks up is visible to the gateway
   and to the resolvers it forwards to.

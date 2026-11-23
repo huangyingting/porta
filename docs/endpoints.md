@@ -208,6 +208,15 @@ stops routing them; the device reconnects. Device summaries include
 `X-Porta-Subnets` response header, and adds other devices' subnets and the
 client pool to split-tunnel `X-Porta-Routes`.
 
+## Federation
+
+`GET /federation/v1/registry` on a primary's public listener returns its
+client registry (accounts, token hashes, devices and policies) as JSON to
+`Authorization: Bearer <PORTA_FEDERATION_TOKEN>`; anything else gets `401`
+and is rate limited and audited. A replica that does not know a device
+answers tunnel requests with `503` and `X-Porta-Reason`, which multi-gateway
+clients treat as a signal to try another gateway.
+
 ## Gateway status
 
 `GET /api/gateway` returns the server version and, on a cascade relay, the
@@ -216,7 +225,9 @@ While disconnected, `connected` is `false` and `error` holds the last failure.
 A split-tunnel gateway adds `routes` and `dns_domains`, `client_to_client`
 reports `--client-to-client`, `exits` lists the exit names access policies
 may select, and `upstreams` lists every next hop, with `name` set for named
-exits. The admin page shows the routing and next hop as
+exits. `federation` reports `role` (`primary` or `replica`) and, on a
+replica, the `primary`, whether it is `connected`, the `last_sync` time,
+the mirrored `clients` count and the last `error`. The admin page shows the routing and next hop as
 banners.
 
 ## Administrators and audit
