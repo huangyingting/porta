@@ -27,12 +27,16 @@ state_directory=${PORTA_RUNTIME_DIRECTORY:-/run/porta}
   exit 2
 }
 ip_forward_state="$state_directory/ip-forward-$tun_interface"
+ip6_forward_state="$state_directory/ip6-forward-$tun_interface"
+accept_ra_state="$state_directory/accept-ra-$tun_interface"
 docker_rules_state="$state_directory/docker-rules-$tun_interface"
+docker6_rules_state="$state_directory/docker6-rules-$tun_interface"
 
+docker_tool=iptables
 remove_docker_rule() {
   while true; do
-    if iptables -w -C DOCKER-USER "$@" 2>/dev/null; then
-      iptables -w -D DOCKER-USER "$@" || return
+    if "$docker_tool" -w -C DOCKER-USER "$@" 2>/dev/null; then
+      "$docker_tool" -w -D DOCKER-USER "$@" || return
       continue
     else
       check_status=$?
@@ -93,9 +97,32 @@ fi
 if $docker_tracked && $docker_cleanup_complete; then
   rm -f "$docker_rules_state"
 fi
+if [[ -e $docker6_rules_state ]]; then
+  ipv6_docker_interface=$(<"$docker6_rules_state")
+  if [[ ! $ipv6_docker_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
+    echo "saved IPv6 Docker rule interface is invalid" >&2
+    status=1
+  elif ! command -v ip6tables >/dev/null; then
+    echo "ip6tables is required to remove Porta IPv6 Docker rules" >&2
+    status=1
+  elif ! docker6_rules=$(ip6tables -w -S); then
+    echo "could not inspect Porta IPv6 Docker rules" >&2
+    status=1
+  else
+    docker_tool=ip6tables
+    if ! grep -Fxq -- '-N DOCKER-USER' <<<"$docker6_rules" ||
+       { remove_docker_rule -i "$tun_interface" -o "$ipv6_docker_interface" -m comment --comment porta -j ACCEPT &&
+         remove_docker_rule -i "$ipv6_docker_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT; }; then
+      rm -f "$docker6_rules_state"
+    else
+      status=1
+    fi
+    docker_tool=iptables
+  fi
+fi
 nft_cleanup=
 if nft_tables=$(nft list tables); then
-  for table in 'ip porta' 'inet porta_guard'; do
+  for table in 'ip porta' 'ip6 porta' 'inet porta_guard'; do
     if grep -Fxq "table $table" <<<"$nft_tables"; then
       nft_cleanup+="delete table $table"$'\n'
     fi
@@ -181,6 +208,38 @@ if [[ -e $ip_forward_state ]]; then
     else
       rm -f "$ip_forward_state"
     fi
+  fi
+fi
+if [[ -e $ip6_forward_state ]]; then
+  if ! command -v sysctl >/dev/null; then
+    echo "sysctl is required to restore IPv6 forwarding" >&2
+    status=1
+  else
+    original_ip6_forward=$(<"$ip6_forward_state")
+    current_ip6_forward=$(sysctl -n net.ipv6.conf.all.forwarding) || current_ip6_forward=
+    if [[ $original_ip6_forward != 0 && $original_ip6_forward != 1 ||
+          $current_ip6_forward != 0 && $current_ip6_forward != 1 ]]; then
+      echo "could not validate the IPv6 forwarding state" >&2
+      status=1
+    elif [[ $current_ip6_forward == 1 ]] &&
+         ! sysctl -w "net.ipv6.conf.all.forwarding=$original_ip6_forward"; then
+      status=1
+    else
+      rm -f "$ip6_forward_state"
+    fi
+  fi
+fi
+if [[ -e $accept_ra_state ]]; then
+  read -r ra_interface original_accept_ra <"$accept_ra_state" || true
+  if [[ $original_accept_ra == 1 && $ra_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
+    # Leave a value something else changed since.
+    current_accept_ra=$(sysctl -n "net/ipv6/conf/$ra_interface/accept_ra" 2>/dev/null) || current_accept_ra=
+    if [[ $current_accept_ra == 2 ]] && ! sysctl -w "net/ipv6/conf/$ra_interface/accept_ra=1"; then
+      status=1
+    fi
+  fi
+  if [[ $status -eq 0 ]]; then
+    rm -f "$accept_ra_state"
   fi
 fi
 if [[ $status -eq 0 ]]; then

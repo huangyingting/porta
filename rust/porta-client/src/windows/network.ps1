@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 $Operation = [string]$env:PORTA_NETWORK_OPERATION
 $StatePath = [string]$env:PORTA_NETWORK_STATE_PATH
 $AddressCidr = [string]$env:PORTA_NETWORK_ADDRESS_CIDR
+$AddressCidr6 = [string]$env:PORTA_NETWORK_ADDRESS6_CIDR
 $DnsServer = [string]$env:PORTA_NETWORK_DNS_SERVER
 $SplitRoutes = @(([string]$env:PORTA_NETWORK_ROUTES).Split(",") | Where-Object { $_ })
 $DnsDomains = @(([string]$env:PORTA_NETWORK_DNS_DOMAINS).Split(",") | Where-Object { $_ })
@@ -16,7 +17,11 @@ if (-not [int]::TryParse([string]$env:PORTA_NETWORK_MTU, [ref]$Mtu) -or $Mtu -lt
     throw "Invalid tunnel MTU."
 }
 foreach ($prefix in $SplitRoutes) {
-    if ($prefix -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') { throw "Invalid split-tunnel route." }
+    if ($prefix -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$' -and
+        -not ($AddressCidr6 -and $prefix -match '^[0-9A-Fa-f:]+/\d{1,3}$')) { throw "Invalid split-tunnel route." }
+}
+if ($AddressCidr6 -and $AddressCidr6 -notmatch '^[0-9A-Fa-f:]+/128$') {
+    throw "Invalid IPv6 tunnel address."
 }
 foreach ($domain in $DnsDomains) {
     if ($domain -notmatch '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$') { throw "Invalid split DNS domain." }
@@ -50,6 +55,16 @@ function Save-State {
     } finally { $file.Dispose() }
     Protect-StateFile "$StatePath.pending"
     [IO.File]::Replace("$StatePath.pending", $StatePath, [NullString]::Value)
+}
+function Get-AddressFamily($cidr) {
+    if ($cidr.Contains(":")) { return "IPv6" }
+    return "IPv4"
+}
+function Remove-OwnedAddress($owned, $interfaceIndex) {
+    $ownedParts = $owned.Split("/")
+    Get-NetIPAddress -AddressFamily (Get-AddressFamily $owned) -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $interfaceIndex -and $_.IPAddress -eq $ownedParts[0] -and $_.PrefixLength -eq [int]$ownedParts[1] } |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
 }
 function Get-Routes {
     @(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop)
@@ -143,6 +158,7 @@ if ($Operation -eq "retire-interface") {
     Set-StateField "addresses" @()
     Set-StateField "dns" $null
     Set-StateField "mtu" $null
+    Set-StateField "mtu6" $null
     Set-StateField "original_dhcp" ""
     Save-State
     return
@@ -180,10 +196,7 @@ if ($Operation -eq "down") {
     Set-StateField "dns" $null
     Save-State
     foreach ($owned in @($state.addresses | Where-Object { $_ -and $sameInterface })) {
-        $parts = $owned.Split("/")
-        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-            Where-Object { $_.InterfaceIndex -eq $restoreIndex -and $_.IPAddress -eq $parts[0] -and $_.PrefixLength -eq [int]$parts[1] } |
-            Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+        Remove-OwnedAddress $owned $restoreIndex
         Set-StateField "addresses" @($state.addresses | Where-Object { $_ -ne $owned })
         Save-State
     }
@@ -252,6 +265,21 @@ if ($existing.Count -eq 0) {
     Save-State
     New-NetIPAddress -InterfaceIndex $index -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) -ErrorAction Stop | Out-Null
 }
+if ($AddressCidr6) {
+    # Porta's own adapter has no neighbors: skip duplicate address detection
+    # and router discovery so the address is usable at once.
+    Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv6 -DadTransmits 0 -RouterDiscovery Disabled -ErrorAction Stop
+    $parts6 = $AddressCidr6.Split("/")
+    $existing6 = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $index -and $_.IPAddress -eq $parts6[0] -and $_.PrefixLength -eq 128 })
+    if ($existing6.Count -eq 0) {
+        if ($AddressCidr6 -notin @($state.addresses)) {
+            Set-StateField "addresses" (@($state.addresses | Where-Object { $_ }) + @($AddressCidr6))
+            Save-State
+        }
+        New-NetIPAddress -InterfaceIndex $index -IPAddress $parts6[0] -PrefixLength 128 -ErrorAction Stop | Out-Null
+    }
+}
 if ($Operation -eq "configure-interface") { return }
 if (-not ($state.mtu -and $state.mtu.applied -eq $Mtu -and -not $state.mtu.pending)) {
     if (-not $state.mtu) {
@@ -272,6 +300,7 @@ if (-not ($state.mtu -and $state.mtu.applied -eq $Mtu -and -not $state.mtu.pendi
 $split = $SplitRoutes.Count -gt 0
 if (-not $split -and -not $DnsServer) { throw "A full tunnel requires a tunnel resolver." }
 $tunnelPrefixes = @("0.0.0.0/1", "128.0.0.0/1")
+if ($AddressCidr6) { $tunnelPrefixes += @("::/1", "8000::/1") }
 if ($split) { $tunnelPrefixes = $SplitRoutes }
 if ($DnsServer) { Add-OwnedRoute "dns" "$DnsServer/32" $index "0.0.0.0" 1 }
 if ($split) {
@@ -312,7 +341,11 @@ if ($split) {
     $state.dns.pending = ""
     Save-State
 }
-foreach ($prefix in $tunnelPrefixes) { Add-OwnedRoute "tunnel" $prefix $index "0.0.0.0" 5 }
+foreach ($prefix in $tunnelPrefixes) {
+    $nextHop = "0.0.0.0"
+    if ($prefix.Contains(":")) { $nextHop = "::" }
+    Add-OwnedRoute "tunnel" $prefix $index $nextHop 5
+}
 foreach ($owned in @($state.routes | Where-Object {
     $_ -and $_.kind -eq "tunnel" -and
     ($_.prefix -notin $tunnelPrefixes -or $_.interface_index -ne $index -or $_.interface_guid -ne $state.interface_guid)
@@ -325,11 +358,8 @@ foreach ($owned in @($state.routes | Where-Object {
 })) {
     Retire-OwnedRoute $owned
 }
-foreach ($old in @($state.addresses | Where-Object { $_ -and $_ -ne $AddressCidr })) {
-    $oldParts = $old.Split("/")
-    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.InterfaceIndex -eq $index -and $_.IPAddress -eq $oldParts[0] -and $_.PrefixLength -eq [int]$oldParts[1] } |
-        Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+foreach ($old in @($state.addresses | Where-Object { $_ -and $_ -ne $AddressCidr -and $_ -ne $AddressCidr6 })) {
+    Remove-OwnedAddress $old $index
     Set-StateField "addresses" @($state.addresses | Where-Object { $_ -ne $old })
     Save-State
 }

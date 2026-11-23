@@ -725,11 +725,25 @@ fn lease_from_headers(headers: &HeaderMap) -> Result<Lease, ClientError> {
         }
         None => None,
     };
+    let address6 = match header(headers, "x-porta-address6") {
+        Some(value) => {
+            let address6 = value
+                .parse::<ipnet::Ipv6Net>()
+                .ok()
+                .filter(|prefix| prefix.prefix_len() == 128 && super::valid_unicast6(prefix.addr()))
+                .ok_or_else(|| {
+                    ClientError::permanent("gateway returned an invalid IPv6 tunnel address")
+                })?;
+            Some(address6)
+        }
+        None => None,
+    };
     Ok(Lease {
         address,
         gateway: Some(gateway),
         dns,
         mtu,
+        address6,
     })
 }
 
@@ -873,10 +887,10 @@ async fn download_lane(
             if packet.is_empty() || packet.len() > usize::from(lease.mtu) {
                 continue;
             }
-            let Ok(info) = porta_wire::ip::parse_ipv4(&packet) else {
+            let Ok(info) = porta_wire::ip::parse_ip(&packet) else {
                 continue;
             };
-            if info.destination != lease.address.addr() && !routing.serves(info.destination) {
+            if !lease.owns(info.destination) && !routing.serves(info.destination) {
                 continue;
             }
             tokio::select! {
@@ -1029,7 +1043,7 @@ impl Group {
         if self.cancellation.is_cancelled() {
             return Err(ClientError::Closed);
         }
-        let metadata = porta_wire::ip::classify_ipv4(&packet);
+        let metadata = porta_wire::ip::classify_packet(&packet);
         let lane = if metadata.class == PacketClass::Control {
             self.control_lane()
         } else {
@@ -1356,8 +1370,10 @@ mod tests {
     #[test]
     fn flow_table_evicts_the_least_recent_assignment_in_constant_time() {
         fn flow(index: u32) -> FlowKey {
+            let mut source = [0; 16];
+            source[..4].copy_from_slice(&index.to_be_bytes());
             FlowKey {
-                source: index.to_be_bytes(),
+                source,
                 destination_port: index as u16,
                 protocol: 17,
                 ..FlowKey::default()
@@ -1382,7 +1398,7 @@ mod tests {
     fn saturated_upload_queues_drop_a_packet_without_failing_the_tunnel() {
         let (group, _receivers) = test_group_with_full_upload_queues();
         let queued = tcp_packet(443);
-        let metadata = porta_wire::ip::classify_ipv4(&queued);
+        let metadata = porta_wire::ip::classify_packet(&queued);
         assert_eq!(metadata.class, PacketClass::Tcp);
         for lane in &group.lanes {
             assert!(lane
@@ -1400,7 +1416,7 @@ mod tests {
     fn saturated_healthy_lane_preserves_tcp_flow_affinity() {
         let (group, _receivers) = test_group_with_full_upload_queues();
         let packet = tcp_packet(443);
-        let metadata = porta_wire::ip::classify_ipv4(&packet);
+        let metadata = porta_wire::ip::classify_packet(&packet);
         group
             .flows
             .lock()

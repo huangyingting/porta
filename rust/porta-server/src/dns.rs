@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ const BLOCKLIST_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 const TYPE_A: u16 = 1;
 const TYPE_PTR: u16 = 12;
+const TYPE_AAAA: u16 = 28;
 const TYPE_ANY: u16 = 255;
 const RCODE_FORMERR: u8 = 1;
 const RCODE_SERVFAIL: u8 = 2;
@@ -41,12 +42,19 @@ const RCODE_NOTIMP: u8 = 4;
 pub trait Directory: Send + Sync {
     /// Whether `address` is a live client that may use the resolver.
     fn is_client(&self, address: Ipv4Addr) -> bool;
-    /// The address of the device `name` (relative to [`ZONE`]) when
+    /// The addresses of the device `name` (relative to [`ZONE`]) when
     /// `querier` may reach it.
-    fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<Ipv4Addr>;
+    fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<DeviceAddresses>;
     /// The name (relative to [`ZONE`]) of the device at `address` when
     /// `querier` may reach it.
-    fn reverse(&self, querier: Ipv4Addr, address: Ipv4Addr) -> Option<String>;
+    fn reverse(&self, querier: Ipv4Addr, address: IpAddr) -> Option<String>;
+}
+
+/// A live device's addresses: IPv6 only on a dual-stack gateway.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceAddresses {
+    pub ipv4: Ipv4Addr,
+    pub ipv6: Option<Ipv6Addr>,
 }
 
 pub struct ResolverConfig {
@@ -216,13 +224,16 @@ impl Resolver {
                 None => None,
             };
             return Some(match (address, question.kind) {
-                (Some(address), TYPE_A | TYPE_ANY) => reply(
-                    query,
-                    &question,
-                    0,
-                    true,
-                    &[record(TYPE_A, &address.octets())],
-                ),
+                (Some(address), TYPE_A | TYPE_AAAA | TYPE_ANY) => {
+                    let mut records = Vec::new();
+                    if question.kind != TYPE_AAAA {
+                        records.push(record(TYPE_A, &address.ipv4.octets()));
+                    }
+                    if let Some(ipv6) = address.ipv6.filter(|_| question.kind != TYPE_A) {
+                        records.push(record(TYPE_AAAA, &ipv6.octets()));
+                    }
+                    reply(query, &question, 0, true, &records)
+                }
                 // The name exists but has no record of the requested type.
                 (Some(_), _) => reply(query, &question, 0, true, &[]),
                 (None, _) if relative.is_none() => reply(query, &question, 0, true, &[]),
@@ -369,8 +380,29 @@ fn zone_relative(name: &str) -> Option<Option<&str>> {
         .map(Some)
 }
 
-/// The IPv4 address of an `in-addr.arpa` name.
-fn reverse_address(name: &str) -> Option<Ipv4Addr> {
+/// The address of an `in-addr.arpa` or `ip6.arpa` name.
+fn reverse_address(name: &str) -> Option<IpAddr> {
+    if let Some(nibbles) = name.strip_suffix(".ip6.arpa") {
+        let nibbles = nibbles
+            .split('.')
+            .map(|nibble| match nibble.as_bytes() {
+                [digit] => (*digit as char).to_digit(16),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if nibbles.len() != 32 {
+            return None;
+        }
+        let value = nibbles
+            .iter()
+            .rev()
+            .fold(0_u128, |value, nibble| (value << 4) | u128::from(*nibble));
+        return Some(IpAddr::V6(Ipv6Addr::from(value)));
+    }
+    reverse_ipv4(name).map(IpAddr::V4)
+}
+
+fn reverse_ipv4(name: &str) -> Option<Ipv4Addr> {
     let octets = name.strip_suffix(".in-addr.arpa")?;
     let mut parts = octets
         .split('.')
@@ -552,13 +584,25 @@ mod tests {
             address == Ipv4Addr::new(10, 66, 0, 2)
         }
 
-        fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<Ipv4Addr> {
-            (self.is_client(querier) && name == "laptop.alice")
-                .then_some(Ipv4Addr::new(10, 66, 0, 3))
+        fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<DeviceAddresses> {
+            let ipv6 = || Some("fd66::3".parse().unwrap());
+            match name {
+                "laptop.alice" if self.is_client(querier) => Some(DeviceAddresses {
+                    ipv4: Ipv4Addr::new(10, 66, 0, 3),
+                    ipv6: None,
+                }),
+                "desktop.alice" if self.is_client(querier) => Some(DeviceAddresses {
+                    ipv4: Ipv4Addr::new(10, 66, 0, 3),
+                    ipv6: ipv6(),
+                }),
+                _ => None,
+            }
         }
 
-        fn reverse(&self, _querier: Ipv4Addr, address: Ipv4Addr) -> Option<String> {
-            (address == Ipv4Addr::new(10, 66, 0, 3)).then(|| "laptop.alice".to_owned())
+        fn reverse(&self, _querier: Ipv4Addr, address: IpAddr) -> Option<String> {
+            (address == IpAddr::V4(Ipv4Addr::new(10, 66, 0, 3))
+                || address == IpAddr::V6("fd66::3".parse().unwrap()))
+            .then(|| "laptop.alice".to_owned())
         }
     }
 
@@ -631,6 +675,45 @@ mod tests {
             .unwrap();
         assert_eq!(answers(&reverse), 1);
         assert!(reverse.ends_with(&encode_name("laptop.alice.porta.internal")));
+
+        // Dual-stack devices also have AAAA records and ip6.arpa names.
+        let aaaa = resolver
+            .answer(
+                client,
+                &query("desktop.alice.porta.internal", TYPE_AAAA),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!((rcode(&aaaa), answers(&aaaa)), (0, 1));
+        assert_eq!(
+            &aaaa[aaaa.len() - 16..],
+            &"fd66::3".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        let any = resolver
+            .answer(
+                client,
+                &query("desktop.alice.porta.internal", TYPE_ANY),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(answers(&any), 2);
+        let only_a = resolver
+            .answer(
+                client,
+                &query("desktop.alice.porta.internal", TYPE_A),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(answers(&only_a), 1);
+        let nibbles = "3.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.6.d.f.ip6.arpa";
+        let reverse6 = resolver
+            .answer(client, &query(nibbles, TYPE_PTR), false)
+            .await
+            .unwrap();
+        assert_eq!(answers(&reverse6), 1);
 
         // Malformed and response messages.
         assert!(resolver.answer(client, &[0; 4], false).await.is_none());
@@ -713,10 +796,12 @@ mod tests {
         assert_eq!(zone_relative("a.b.porta.internal"), Some(Some("a.b")));
         assert_eq!(zone_relative("evilporta.internal"), None);
         assert_eq!(
-            reverse_address("4.3.2.1.in-addr.arpa"),
+            reverse_ipv4("4.3.2.1.in-addr.arpa"),
             Some(Ipv4Addr::new(1, 2, 3, 4))
         );
         assert_eq!(reverse_address("3.2.1.in-addr.arpa"), None);
+        assert_eq!(reverse_address("1.0.ip6.arpa"), None);
+        assert_eq!(reverse_address("x.ip6.arpa"), None);
         let domains =
             parse_blocklist("127.0.0.1 localhost\nbad_domain.example\n::1 v6.example # comment\n");
         assert!(domains.contains("bad_domain.example") && domains.contains("v6.example"));

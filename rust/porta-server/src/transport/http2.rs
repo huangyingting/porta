@@ -23,11 +23,11 @@ use crate::transport::session::{
     bearer_token, fragment_ipv4, icmp_fragmentation_needed, parse_lane_config, set_account_headers,
     AuthenticationRequest, DenialReason, DeviceProof, LaneConfig, LeaseError, MtuError,
     OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES,
-    CONTENT_TYPE, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION, HEADER_MAX_VERSION,
-    HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH, PACKET_BATCH,
-    PROTOCOL_VERSION, REASON_HEADER, TUNNEL_PATH,
+    CONTENT_TYPE, HEADER_ADDRESS6, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION,
+    HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH,
+    PACKET_BATCH, PROTOCOL_VERSION, REASON_HEADER, TUNNEL_PATH,
 };
-use crate::wire::ip::parse_ipv4;
+use crate::wire::ip::parse_ip;
 use crate::wire::masque::{
     decode_address_assign, decode_route_advertisement, CAPSULE_ADDRESS_ASSIGN,
     CAPSULE_ADDRESS_REQUEST, CAPSULE_DATAGRAM, CAPSULE_ROUTE_ADVERTISEMENT, MAX_CAPSULE_SIZE,
@@ -429,6 +429,12 @@ fn success_response(
         "X-Porta-Gateway",
         session.lease.gateway.to_string().parse().unwrap(),
     );
+    if let Some(ipv6) = session.lease.ipv6 {
+        headers.insert(
+            HEADER_ADDRESS6,
+            format!("{}/128", ipv6.address).parse().unwrap(),
+        );
+    }
     headers.insert("X-Porta-MTU", mtu.to_string().parse().unwrap());
     headers.insert(HEADER_LANE_SESSION, lanes.session_id.parse().unwrap());
     headers.insert(HEADER_LANE, lanes.index.to_string().parse().unwrap());
@@ -695,7 +701,7 @@ async fn consume_uploads(input: &mut BytesMut, session: &Session, mtu: u16) -> R
             session.services().metrics.dropped_from_client();
             continue;
         }
-        let Ok(info) = parse_ipv4(&packet) else {
+        let Ok(info) = parse_ip(&packet) else {
             session.services().metrics.dropped_from_client();
             continue;
         };
@@ -871,6 +877,7 @@ mod tests {
                     prefix_len: 24,
                     gateway: "10.66.0.1".parse().unwrap(),
                     opaque_id: 1,
+                    ipv6: None,
                 })
             })
         }

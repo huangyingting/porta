@@ -143,7 +143,10 @@ struct NetworkState {
     dns: Option<DnsState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mtu: Option<MtuState>,
-    /// Tunneled IPv4 prefixes of a split tunnel; empty for a full tunnel.
+    /// The tunnel interface's IPv6 MTU, owned like `mtu` with an IPv6 lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtu6: Option<MtuState>,
+    /// Tunneled prefixes of a split tunnel; empty for a full tunnel.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     split_prefixes: Vec<String>,
     /// Domains whose NRPT rules send queries to the tunnel resolver.
@@ -158,7 +161,10 @@ struct GuardSpec {
     endpoint: EndpointState,
     application: String,
     /// When non-empty only these prefixes are guarded (split tunnel).
-    split_prefixes: Vec<ipnet::Ipv4Net>,
+    split_prefixes: Vec<IpNet>,
+    /// IPv6 may leave through the tunnel interface (an IPv6 lease); otherwise
+    /// a full tunnel blocks IPv6 everywhere.
+    ipv6: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,7 +238,7 @@ impl NetworkManager {
         interface_name: &str,
         remote_address: &SocketAddr,
     ) -> Result<(), NetworkError> {
-        self.prepare_inner(interface_name, remote_address, false, None)
+        self.prepare_inner(interface_name, remote_address, false, None, false)
             .await
     }
 
@@ -247,10 +253,24 @@ impl NetworkManager {
         let dns = lease
             .dns
             .filter(|_| routing.is_full_tunnel() || !routing.dns_domains.is_empty());
+        // IPv6 rides the tunnel only with an IPv6 lease on an adapter that
+        // has IPv6; otherwise a full tunnel keeps blocking it.
+        let address6 = lease.ipv6().filter(|_| {
+            native_interface_luid(interface_name)
+                .and_then(|luid| native_interface_mtu(luid, Family::Ipv6))
+                .is_ok()
+        });
         let mut split_prefixes = routing
             .routes
             .iter()
             .map(ToString::to_string)
+            .chain(
+                routing
+                    .routes6
+                    .iter()
+                    .filter(|_| address6.is_some())
+                    .map(ToString::to_string),
+            )
             .collect::<Vec<_>>();
         if let Some(dns) = dns.filter(|_| !routing.is_full_tunnel()) {
             let dns = format!("{dns}/32");
@@ -258,16 +278,32 @@ impl NetworkManager {
                 split_prefixes.push(dns);
             }
         }
-        self.prepare_inner(interface_name, remote_address, true, Some(split_prefixes))
-            .await?;
+        self.prepare_inner(
+            interface_name,
+            remote_address,
+            true,
+            Some(split_prefixes),
+            address6.is_some(),
+        )
+        .await?;
 
         let dns = dns.map(|dns| dns.to_string()).unwrap_or_default();
         let routes = routing
             .routes
             .iter()
             .map(ToString::to_string)
+            .chain(
+                routing
+                    .routes6
+                    .iter()
+                    .filter(|_| address6.is_some())
+                    .map(ToString::to_string),
+            )
             .collect::<Vec<_>>()
             .join(",");
+        let address6 = address6
+            .map(|address| address.to_string())
+            .unwrap_or_default();
         let domains = routing.dns_domains.join(",");
         let configure = self
             .invoke([
@@ -278,12 +314,18 @@ impl NetworkManager {
                 OsString::from(lease.mtu.to_string()),
                 OsString::from(&routes),
                 OsString::from(&domains),
+                OsString::from(&address6),
             ])
             .await;
         let reload = self.reload_required();
         combine(configure.map(|_| ()), reload)?;
 
         self.apply_mtu(u32::from(lease.mtu))?;
+        if address6.is_empty() {
+            self.restore_mtu6()?;
+        } else {
+            self.apply_mtu6(u32::from(lease.mtu))?;
+        }
 
         let up = self
             .invoke([
@@ -294,6 +336,7 @@ impl NetworkManager {
                 OsString::from(lease.mtu.to_string()),
                 OsString::from(routes),
                 OsString::from(domains),
+                OsString::from(address6),
             ])
             .await;
         let reload = self.reload_required();
@@ -322,6 +365,7 @@ impl NetworkManager {
         }
 
         self.restore_mtu()?;
+        self.restore_mtu6()?;
         let down = self
             .invoke([
                 OsString::from("down"),
@@ -350,6 +394,7 @@ impl NetworkManager {
         remote_address: &SocketAddr,
         require_interface: bool,
         split_prefixes: Option<Vec<String>>,
+        ipv6: bool,
     ) -> Result<(), NetworkError> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() || interface_name.contains('\0') {
@@ -436,6 +481,7 @@ impl NetworkManager {
             endpoint,
             application: self.state.application.clone(),
             split_prefixes: guarded,
+            ipv6,
         };
         replace_guard(&spec).map_err(|error| {
             NetworkError::Combined(format!(
@@ -548,7 +594,7 @@ impl NetworkManager {
             ));
         }
         if self.state.mtu.is_none() {
-            let original = native_interface_mtu(self.state.interface_luid)?;
+            let original = native_interface_mtu(self.state.interface_luid, Family::Ipv4)?;
             if original == 0 {
                 return Err(NetworkError::Invalid(
                     "Windows IP Helper API returned a zero tunnel interface MTU".to_owned(),
@@ -563,7 +609,7 @@ impl NetworkManager {
         self.state.version = NATIVE_MTU_STATE_VERSION;
         self.state.mtu.as_mut().expect("MTU state").pending = mtu as i32;
         self.persist()?;
-        set_native_interface_mtu(self.state.interface_luid, mtu)?;
+        set_native_interface_mtu(self.state.interface_luid, Family::Ipv4, mtu)?;
         let state = self.state.mtu.as_mut().expect("MTU state");
         state.applied = mtu as i32;
         state.pending = 0;
@@ -583,13 +629,68 @@ impl NetworkManager {
         if !current_guid.eq_ignore_ascii_case(&self.state.interface_guid) {
             return Ok(());
         }
-        let current = native_interface_mtu(self.state.interface_luid)?;
+        let current = native_interface_mtu(self.state.interface_luid, Family::Ipv4)?;
         let owned = (mtu.applied != 0 && current == mtu.applied as u32)
             || (mtu.pending != 0 && current == mtu.pending as u32);
         if owned {
-            set_native_interface_mtu(self.state.interface_luid, mtu.original)?;
+            set_native_interface_mtu(self.state.interface_luid, Family::Ipv4, mtu.original)?;
         }
         self.state.mtu = None;
+        self.persist()
+    }
+
+    /// Sets the tunnel interface's IPv6 MTU, which Windows keeps apart from
+    /// the IPv4 one, journaling the value it replaces.
+    fn apply_mtu6(&mut self, mtu: u32) -> Result<(), NetworkError> {
+        if self.state.interface_luid == 0 {
+            return Err(NetworkError::Invalid(
+                "tunnel interface identity is unavailable for native MTU configuration".to_owned(),
+            ));
+        }
+        if self.state.mtu6.is_none() {
+            let original = native_interface_mtu(self.state.interface_luid, Family::Ipv6)?;
+            if original == 0 {
+                return Err(NetworkError::Invalid(
+                    "Windows IP Helper API returned a zero tunnel IPv6 MTU".to_owned(),
+                ));
+            }
+            self.state.mtu6 = Some(MtuState {
+                original,
+                applied: 0,
+                pending: 0,
+            });
+        }
+        self.state.mtu6.as_mut().expect("IPv6 MTU state").pending = mtu as i32;
+        self.persist()?;
+        set_native_interface_mtu(self.state.interface_luid, Family::Ipv6, mtu)?;
+        let state = self.state.mtu6.as_mut().expect("IPv6 MTU state");
+        state.applied = mtu as i32;
+        state.pending = 0;
+        self.persist()
+    }
+
+    fn restore_mtu6(&mut self) -> Result<(), NetworkError> {
+        let Some(mtu) = self.state.mtu6.clone() else {
+            return Ok(());
+        };
+        if self.state.interface_luid != 0 && !self.state.interface_guid.is_empty() {
+            let same = native_interface_guid(self.state.interface_luid)
+                .is_ok_and(|guid| guid.eq_ignore_ascii_case(&self.state.interface_guid));
+            if same {
+                if let Ok(current) = native_interface_mtu(self.state.interface_luid, Family::Ipv6) {
+                    let owned = (mtu.applied != 0 && current == mtu.applied as u32)
+                        || (mtu.pending != 0 && current == mtu.pending as u32);
+                    if owned {
+                        set_native_interface_mtu(
+                            self.state.interface_luid,
+                            Family::Ipv6,
+                            mtu.original,
+                        )?;
+                    }
+                }
+            }
+        }
+        self.state.mtu6 = None;
         self.persist()
     }
 
@@ -769,6 +870,7 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
     let owns_tunnel_interface = !state.addresses.is_empty()
         || state.dns.is_some()
         || state.mtu.is_some()
+        || state.mtu6.is_some()
         || state
             .routes
             .iter()
@@ -798,7 +900,7 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
         }
         match route.kind.as_str() {
             "tunnel" => {
-                if !prefix.addr().is_ipv4() || prefix.prefix_len() == 0 {
+                if prefix.prefix_len() == 0 {
                     return Err(NetworkError::Invalid("invalid tunnel route".to_owned()));
                 }
             }
@@ -827,14 +929,18 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
         ));
     }
     for address in &state.addresses {
-        let prefix: ipnet::Ipv4Net = address
+        let prefix: IpNet = address
             .parse()
             .map_err(|_| NetworkError::Invalid("invalid owned address".to_owned()))?;
-        if !valid_ipv4_unicast(prefix.addr()) {
+        let valid = match prefix {
+            IpNet::V4(prefix) => valid_ipv4_unicast(prefix.addr()),
+            IpNet::V6(prefix) => prefix.prefix_len() == 128 && valid_ipv6_unicast(prefix.addr()),
+        };
+        if !valid {
             return Err(NetworkError::Invalid("invalid owned address".to_owned()));
         }
     }
-    if let Some(mtu) = &state.mtu {
+    for mtu in [&state.mtu, &state.mtu6].into_iter().flatten() {
         if mtu.original == 0 || !optional_mtu(mtu.applied) || !optional_mtu(mtu.pending) {
             return Err(NetworkError::Invalid(
                 "invalid MTU recovery state".to_owned(),
@@ -877,7 +983,7 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
     Ok(())
 }
 
-fn parse_split_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, NetworkError> {
+fn parse_split_prefixes(values: &[String]) -> Result<Vec<IpNet>, NetworkError> {
     if values.len() > MAX_SPLIT_PREFIXES {
         return Err(NetworkError::Invalid(
             "too many split-tunnel prefixes".to_owned(),
@@ -887,7 +993,7 @@ fn parse_split_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, Networ
         .iter()
         .map(|value| {
             value
-                .parse::<ipnet::Ipv4Net>()
+                .parse::<IpNet>()
                 .ok()
                 .filter(|prefix| prefix.prefix_len() > 0 && prefix.trunc() == *prefix)
                 .ok_or_else(|| NetworkError::Invalid("invalid split-tunnel prefix".to_owned()))
@@ -945,7 +1051,7 @@ fn guard_filters(spec: &GuardSpec) -> Vec<Filter> {
                 permit: true,
                 conditions: vec![Condition::Loopback],
             });
-            if family == 4 && spec.interface_luid != 0 {
+            if (family == 4 || spec.ipv6) && spec.interface_luid != 0 {
                 filters.push(Filter {
                     layer,
                     permit: true,
@@ -1023,62 +1129,71 @@ fn guard_filters(spec: &GuardSpec) -> Vec<Filter> {
     filters
 }
 
-/// A split tunnel guards only the tunneled IPv4 prefixes: traffic to them may
+/// A split tunnel guards only the tunneled prefixes: traffic to them may
 /// leave through loopback, the tunnel adapter, or the pinned transport, and
 /// is blocked everywhere else. All other destinations keep the host's normal
-/// routing, so no catch-all, IPv6, or forwarding blocks are installed. WFP
-/// ORs conditions on the same field, so one filter blocks every prefix.
+/// routing, so no catch-all or forwarding blocks are installed, and IPv6
+/// layers only when IPv6 prefixes are tunneled. WFP ORs conditions on the
+/// same field, so one filter blocks every prefix of a family.
 fn split_guard_filters(spec: &GuardSpec) -> Vec<Filter> {
     let mut filters = Vec::new();
-    for kind in ["packet", "transport", "connect", "accept"] {
-        let layer = layer_name(kind, 4);
-        filters.push(Filter {
-            layer,
-            permit: true,
-            conditions: vec![Condition::Loopback],
-        });
-        if spec.interface_luid != 0 {
+    for family in [4_u8, 6_u8] {
+        let prefixes = spec
+            .split_prefixes
+            .iter()
+            .filter(|prefix| prefix.addr().is_ipv4() == (family == 4))
+            .copied()
+            .collect::<Vec<_>>();
+        if prefixes.is_empty() {
+            continue;
+        }
+        for kind in ["packet", "transport", "connect", "accept"] {
+            let layer = layer_name(kind, family);
             filters.push(Filter {
                 layer,
                 permit: true,
-                conditions: vec![Condition::Interface(spec.interface_luid)],
+                conditions: vec![Condition::Loopback],
             });
-        }
-        if let IpAddr::V4(endpoint) = spec.endpoint.ip {
-            let endpoint = IpNet::V4(ipnet::Ipv4Net::new(endpoint, 32).expect("host prefix"));
-            if kind == "packet" {
+            if spec.interface_luid != 0 {
                 filters.push(Filter {
                     layer,
                     permit: true,
-                    conditions: vec![Condition::Address(endpoint)],
+                    conditions: vec![Condition::Interface(spec.interface_luid)],
                 });
-            } else {
-                for protocol in [6_u8, 17_u8] {
-                    let mut conditions = vec![
-                        Condition::Address(endpoint),
-                        Condition::Protocol(protocol),
-                        Condition::RemotePort(spec.endpoint.port),
-                    ];
-                    if kind == "connect" || kind == "accept" {
-                        conditions.push(Condition::Application(spec.application.clone()));
-                    }
+            }
+            if spec.endpoint.ip.is_ipv4() == (family == 4) {
+                let endpoint = IpNet::new(spec.endpoint.ip, if family == 4 { 32 } else { 128 })
+                    .expect("host prefix");
+                if kind == "packet" {
                     filters.push(Filter {
                         layer,
                         permit: true,
-                        conditions,
+                        conditions: vec![Condition::Address(endpoint)],
                     });
+                } else {
+                    for protocol in [6_u8, 17_u8] {
+                        let mut conditions = vec![
+                            Condition::Address(endpoint),
+                            Condition::Protocol(protocol),
+                            Condition::RemotePort(spec.endpoint.port),
+                        ];
+                        if kind == "connect" || kind == "accept" {
+                            conditions.push(Condition::Application(spec.application.clone()));
+                        }
+                        filters.push(Filter {
+                            layer,
+                            permit: true,
+                            conditions,
+                        });
+                    }
                 }
             }
+            filters.push(Filter {
+                layer,
+                permit: false,
+                conditions: prefixes.iter().copied().map(Condition::Address).collect(),
+            });
         }
-        filters.push(Filter {
-            layer,
-            permit: false,
-            conditions: spec
-                .split_prefixes
-                .iter()
-                .map(|prefix| Condition::Address(IpNet::V4(*prefix)))
-                .collect(),
-        });
     }
     filters
 }
@@ -1297,7 +1412,7 @@ where
     let operation_text = operation.to_string_lossy();
     let expected = match operation_text.as_ref() {
         "prepare" | "down" | "retire-interface" => 2,
-        "configure-interface" | "up" => 7,
+        "configure-interface" | "up" => 8,
         _ => {
             return Err(NetworkError::Invalid(
                 "invalid network helper operation".to_owned(),
@@ -1371,6 +1486,10 @@ where
         .env(
             "PORTA_NETWORK_DNS_DOMAINS",
             arguments.get(6).map_or_else(OsString::new, Clone::clone),
+        )
+        .env(
+            "PORTA_NETWORK_ADDRESS6_CIDR",
+            arguments.get(7).map_or_else(OsString::new, Clone::clone),
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1600,16 +1719,33 @@ fn native_interface_guid(_luid: u64) -> Result<String, NetworkError> {
     Err(NetworkError::Unsupported)
 }
 
+/// An address family of the tunnel interface's IP configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Family {
+    Ipv4,
+    Ipv6,
+}
+
 #[cfg(windows)]
-fn native_interface_mtu(luid: u64) -> Result<u32, NetworkError> {
+impl Family {
+    fn native(self) -> windows_sys::Win32::Networking::WinSock::ADDRESS_FAMILY {
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+        match self {
+            Self::Ipv4 => AF_INET,
+            Self::Ipv6 => AF_INET6,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn native_interface_mtu(luid: u64, family: Family) -> Result<u32, NetworkError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-    use windows_sys::Win32::Networking::WinSock::AF_INET;
 
     let mut row = MIB_IPINTERFACE_ROW {
-        Family: AF_INET,
+        Family: family.native(),
         InterfaceLuid: NET_LUID_LH { Value: luid },
         ..Default::default()
     };
@@ -1624,20 +1760,19 @@ fn native_interface_mtu(luid: u64) -> Result<u32, NetworkError> {
 }
 
 #[cfg(not(windows))]
-fn native_interface_mtu(_luid: u64) -> Result<u32, NetworkError> {
+fn native_interface_mtu(_luid: u64, _family: Family) -> Result<u32, NetworkError> {
     Err(NetworkError::Unsupported)
 }
 
 #[cfg(windows)]
-fn set_native_interface_mtu(luid: u64, mtu: u32) -> Result<(), NetworkError> {
+fn set_native_interface_mtu(luid: u64, family: Family, mtu: u32) -> Result<(), NetworkError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-    use windows_sys::Win32::Networking::WinSock::AF_INET;
 
     let mut row = MIB_IPINTERFACE_ROW {
-        Family: AF_INET,
+        Family: family.native(),
         InterfaceLuid: NET_LUID_LH { Value: luid },
         ..Default::default()
     };
@@ -1661,7 +1796,7 @@ fn set_native_interface_mtu(luid: u64, mtu: u32) -> Result<(), NetworkError> {
 }
 
 #[cfg(not(windows))]
-fn set_native_interface_mtu(_luid: u64, _mtu: u32) -> Result<(), NetworkError> {
+fn set_native_interface_mtu(_luid: u64, _family: Family, _mtu: u32) -> Result<(), NetworkError> {
     Err(NetworkError::Unsupported)
 }
 
@@ -2248,6 +2383,7 @@ mod tests {
             }),
             split_prefixes: Vec::new(),
             nrpt_domains: Vec::new(),
+            mtu6: None,
         }
     }
 
@@ -2362,6 +2498,7 @@ mod tests {
             },
             application: r"C:\Porta\porta.exe".to_owned(),
             split_prefixes: Vec::new(),
+            ipv6: false,
         }
     }
 
@@ -3037,10 +3174,54 @@ mod tests {
         // The maximum advertised route set still fits one filter per layer.
         spec.split_prefixes = (0..MAX_SPLIT_PREFIXES as u32)
             .map(|index| {
-                ipnet::Ipv4Net::new(Ipv4Addr::from(0x0a00_0000 + (index << 8)), 24).unwrap()
+                IpNet::V4(
+                    ipnet::Ipv4Net::new(Ipv4Addr::from(0x0a00_0000 + (index << 8)), 24).unwrap(),
+                )
             })
             .collect();
         assert!(guard_filters(&spec).len() <= MAX_GUARD_FILTERS);
+    }
+
+    #[test]
+    fn ipv6_leases_open_the_tunnel_interface_on_ipv6_layers() {
+        let mut spec = test_spec("192.0.2.1");
+        let interface_permits = |filters: &[Filter], layer: &str| {
+            filters.iter().any(|filter| {
+                filter.layer == layer
+                    && filter.permit
+                    && filter.conditions == vec![Condition::Interface(77)]
+            })
+        };
+        let full = guard_filters(&spec);
+        assert!(interface_permits(&full, "connect4"));
+        assert!(!interface_permits(&full, "connect6"));
+        spec.ipv6 = true;
+        let dual = guard_filters(&spec);
+        assert!(interface_permits(&dual, "connect6"));
+        assert!(dual
+            .iter()
+            .any(|filter| filter.layer == "forward6" && !filter.permit));
+
+        // Split tunnels guard IPv6 prefixes on the IPv6 layers only.
+        spec.split_prefixes = vec![
+            "10.20.0.0/16".parse().unwrap(),
+            "2001:db8::/32".parse().unwrap(),
+        ];
+        let split = guard_filters(&spec);
+        let block6 = split
+            .iter()
+            .filter(|filter| filter.layer == "connect6" && !filter.permit)
+            .collect::<Vec<_>>();
+        assert_eq!(block6.len(), 1);
+        assert_eq!(
+            block6[0].conditions,
+            vec![Condition::Address("2001:db8::/32".parse().unwrap())]
+        );
+        assert!(interface_permits(&split, "connect6"));
+        spec.split_prefixes.pop();
+        assert!(!guard_filters(&spec)
+            .iter()
+            .any(|filter| filter.layer.ends_with('6')));
     }
 
     #[test]
@@ -3063,7 +3244,7 @@ mod tests {
         let damages: Vec<StateDamage> = vec![
             Box::new(|state| state.split_prefixes.push("0.0.0.0/0".to_owned())),
             Box::new(|state| state.split_prefixes.push("10.20.0.1/16".to_owned())),
-            Box::new(|state| state.split_prefixes.push("2001:db8::/32".to_owned())),
+            Box::new(|state| state.split_prefixes.push("2001:db8::1/32".to_owned())),
             Box::new(|state| state.nrpt_domains.push("bad domain;".to_owned())),
             Box::new(|state| state.routes.last_mut().unwrap().prefix = "0.0.0.0/0".to_owned()),
             Box::new(|state| state.routes.last_mut().unwrap().prefix = "2001:db8::/32".to_owned()),
@@ -3083,6 +3264,7 @@ mod tests {
             gateway: None,
             dns: None,
             mtu: 1280,
+            address6: None,
         };
         let mut routing = Routing {
             routes: vec!["10.20.0.0/16".parse().unwrap()],

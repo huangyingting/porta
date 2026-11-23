@@ -379,14 +379,51 @@ impl NetworkManager {
             )
             .await?;
         }
-        let destinations = if routing.is_full_tunnel() {
+        // IPv6 rides the tunnel only with an IPv6 lease; otherwise a full
+        // tunnel keeps blocking it and a split tunnel leaves it alone.
+        let address6 = match lease.ipv6() {
+            Some(address6) if self.enable_ipv6(interface).await? => Some(address6.to_string()),
+            _ => None,
+        };
+        if let Some(address6) = &address6 {
+            if !self.has_action("address", interface, address6) {
+                let mut action = link_action("address", &link, &alias);
+                action.address = address6.clone();
+                self.record(action).await?;
+            }
+            if !self.addresses(interface).await?.contains(address6) {
+                self.invoke(
+                    "ip",
+                    &[
+                        "-6",
+                        "address",
+                        "add",
+                        address6,
+                        "dev",
+                        interface,
+                        "nodad",
+                        "noprefixroute",
+                    ],
+                    "",
+                )
+                .await?;
+            }
+        }
+        let mut destinations: Vec<String> = if routing.is_full_tunnel() {
             vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
         } else {
             routing.routes.iter().map(ToString::to_string).collect()
         };
+        if address6.is_some() {
+            if routing.is_full_tunnel() {
+                destinations.extend(["::/1".to_owned(), "8000::/1".to_owned()]);
+            } else {
+                destinations.extend(routing.routes6.iter().map(ToString::to_string));
+            }
+        }
         for destination in &destinations {
             let mut action = link_action("route", &link, &alias);
-            action.family = 4;
+            action.family = if destination.contains(':') { 6 } else { 4 };
             action.destination = destination.clone();
             self.ensure_route(action).await?;
         }
@@ -442,15 +479,33 @@ impl NetworkManager {
                 .await?;
         }
         let address_copy = address.clone();
+        let address6_copy = address6.unwrap_or_default();
         let dns_copy = dns_destination.unwrap_or_default();
         let endpoint_prefix = endpoint.prefix()?;
         self.cleanup_matching(move |action| {
-            (action.kind == "address" && action.address != address_copy)
+            (action.kind == "address"
+                && action.address != address_copy
+                && action.address != address6_copy)
                 || (action.kind == "route" && !destinations.contains(&action.destination))
                 || (action.kind == "dns-route" && action.destination != dns_copy)
                 || (action.kind == "escape" && action.destination != endpoint_prefix)
         })
         .await
+    }
+
+    /// Turns IPv6 on for the TUN, which hosts may disable for new interfaces.
+    /// The setting belongs to the TUN and disappears with it. Returns false
+    /// when the kernel has no IPv6.
+    async fn enable_ipv6(&self, interface: &str) -> Result<bool, NetworkError> {
+        let key = format!("net/ipv6/conf/{interface}/disable_ipv6");
+        let Ok(current) = self.invoke("sysctl", &["-n", &key], "").await else {
+            return Ok(false);
+        };
+        if current.trim() != "0" {
+            self.invoke("sysctl", &["-w", &format!("{key}=0")], "")
+                .await?;
+        }
+        Ok(true)
     }
 
     /// Enables IPv4 forwarding for a subnet router, journaling the value it
@@ -655,12 +710,20 @@ impl NetworkManager {
         }
         if split {
             // Only tunneled destinations are guarded: they may not leave
-            // through any other interface. Other traffic, including IPv6,
-            // uses the device's own network.
-            add(&format!(
-                "ip daddr {{ {} }} drop",
-                self.state.split_prefixes.join(", ")
-            ));
+            // through any other interface. Other traffic, including IPv6
+            // without an IPv6 lease, uses the device's own network.
+            let (ipv6, ipv4): (Vec<_>, Vec<_>) = self
+                .state
+                .split_prefixes
+                .iter()
+                .map(String::as_str)
+                .partition(|prefix| prefix.contains(':'));
+            if !ipv4.is_empty() {
+                add(&format!("ip daddr {{ {} }} drop", ipv4.join(", ")));
+            }
+            if !ipv6.is_empty() {
+                add(&format!("ip6 daddr {{ {} }} drop", ipv6.join(", ")));
+            }
             self.invoke("nft", &["-f", "-"], &script).await?;
             return Ok(());
         }
@@ -1021,9 +1084,14 @@ impl NetworkManager {
             }
             "address" => {
                 if self.addresses(&link.name).await?.contains(&action.address) {
+                    let family = if action.address.contains(':') {
+                        "-6"
+                    } else {
+                        "-4"
+                    };
                     self.invoke(
                         "ip",
-                        &["-4", "address", "del", &action.address, "dev", &link.name],
+                        &[family, "address", "del", &action.address, "dev", &link.name],
                         "",
                     )
                     .await?;
@@ -1534,7 +1602,7 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
     }
     if state.split_prefixes.len() > 128
         || state.split_prefixes.iter().any(|prefix| {
-            prefix.parse::<ipnet::Ipv4Net>().map_or(true, |parsed| {
+            prefix.parse::<IpNet>().map_or(true, |parsed| {
                 parsed.prefix_len() == 0 || parsed != parsed.trunc()
             })
         })
@@ -1594,9 +1662,17 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
         "link" if (68..=u16::MAX).contains(&action.mtu) => Ok(()),
         "address" => action
             .address
-            .parse::<ipnet::Ipv4Net>()
+            .parse::<IpNet>()
             .ok()
-            .filter(|prefix| valid_unicast(prefix.addr()))
+            .filter(|prefix| match prefix {
+                IpNet::V4(prefix) => valid_unicast(prefix.addr()),
+                IpNet::V6(prefix) => {
+                    prefix.prefix_len() == 128
+                        && !prefix.addr().is_multicast()
+                        && !prefix.addr().is_unspecified()
+                        && !prefix.addr().is_loopback()
+                }
+            })
             .map(|_| ())
             .ok_or_else(|| NetworkError::Invalid("invalid network journal address".to_owned())),
         "route" | "escape" | "dns-route" => {
@@ -1614,7 +1690,7 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
             if !matches!(action.family, 4 | 6)
                 || prefix.addr().is_ipv4() != (action.family == 4)
                 || (action.kind == "route"
-                    && (action.family != 4 || prefix.prefix_len() == 0 || prefix != prefix.trunc()))
+                    && (prefix.prefix_len() == 0 || prefix != prefix.trunc()))
                 || (action.kind == "escape"
                     && prefix.prefix_len() != if action.family == 4 { 32 } else { 128 })
                 || (action.kind == "dns-route"

@@ -362,6 +362,9 @@ pub struct GatewayStatus {
     pub routes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dns_domains: Vec<String>,
+    /// IPv6 prefix of dual-stack clients (`--ipv6-pool`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv6_pool: Option<String>,
     /// Every client reaches every other client (`--client-to-client`).
     pub client_to_client: bool,
     /// The built-in resolver serves device names (`--dns-resolver`).

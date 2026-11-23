@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway: Some("10.66.0.1".parse()?),
         dns: Some("1.1.1.1".parse()?),
         mtu: 1280,
+        address6: None,
     };
 
     let device = Tun::open("porta0", lease.mtu)?;

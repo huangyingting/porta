@@ -2,8 +2,9 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--exit-interface IF]... [--local-exit] [--client-host-access]" >&2
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--exit-interface IF]... [--local-exit] [--client-host-access] [--ipv6 GATEWAY6-CIDR POOL6-CIDR [--ipv6-routed]]" >&2
   echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443" >&2
+  echo "dual stack: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --ipv6 fd66::1/64 fd66::/64" >&2
   echo "cascade relay: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --upstream-interface porta-up0" >&2
   exit 2
 }
@@ -19,6 +20,9 @@ upstream_interface=
 exit_interfaces=()
 local_exit=false
 client_host_access=false
+ipv6_gateway=
+ipv6_pool=
+ipv6_routed=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --upstream-interface)
@@ -33,9 +37,31 @@ while [[ $# -gt 0 ]]; do
       ;;
     --local-exit) local_exit=true; shift ;;
     --client-host-access) client_host_access=true; shift ;;
+    --ipv6)
+      [[ $# -ge 3 && -z $ipv6_pool ]] || usage
+      ipv6_gateway=$2
+      ipv6_pool=$3
+      shift 3
+      ;;
+    --ipv6-routed) ipv6_routed=true; shift ;;
     *) usage ;;
   esac
 done
+if [[ -n $ipv6_pool ]]; then
+  [[ $ipv6_gateway =~ ^[0-9A-Fa-f:]+/[0-9]{1,3}$ && $ipv6_pool =~ ^[0-9A-Fa-f:]+/[0-9]{1,3}$ ]] || {
+    echo "invalid IPv6 gateway or pool CIDR" >&2
+    exit 2
+  }
+  # The next hop of a cascade relay carries IPv4 only; IPv6 would leave
+  # through this host instead.
+  [[ -z $upstream_interface ]] || {
+    echo "--ipv6 is not supported with --upstream-interface" >&2
+    exit 2
+  }
+elif $ipv6_routed; then
+  echo "--ipv6-routed requires --ipv6" >&2
+  exit 2
+fi
 for exit_interface in "${exit_interfaces[@]}"; do
   [[ $exit_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
      $exit_interface != "$tun_interface" &&
@@ -104,12 +130,18 @@ mkdir -p "$state_directory"
 }
 chmod 0700 "$state_directory"
 ip_forward_state="$state_directory/ip-forward-$tun_interface"
+ip6_forward_state="$state_directory/ip6-forward-$tun_interface"
+accept_ra_state="$state_directory/accept-ra-$tun_interface"
 docker_rules_state="$state_directory/docker-rules-$tun_interface"
+docker6_rules_state="$state_directory/docker6-rules-$tun_interface"
 
+# Docker's DOCKER-USER chain runs before its FORWARD drop policy; IPv6
+# rules use ip6tables.
+docker_tool=iptables
 remove_docker_rule() {
   while true; do
-    if iptables -w -C DOCKER-USER "$@" 2>/dev/null; then
-      iptables -w -D DOCKER-USER "$@" || return
+    if "$docker_tool" -w -C DOCKER-USER "$@" 2>/dev/null; then
+      "$docker_tool" -w -D DOCKER-USER "$@" || return
       continue
     else
       check_status=$?
@@ -122,13 +154,13 @@ remove_docker_rule() {
 ensure_docker_rule() {
   position=$1
   shift
-  if iptables -w -C DOCKER-USER "$@" 2>/dev/null; then
+  if "$docker_tool" -w -C DOCKER-USER "$@" 2>/dev/null; then
     return 0
   else
     check_status=$?
   fi
   [[ $check_status -eq 1 ]] || return "$check_status"
-  iptables -w -I DOCKER-USER "$position" "$@"
+  "$docker_tool" -w -I DOCKER-USER "$position" "$@"
 }
 
 nft_tables=$(nft list tables) || {
@@ -161,7 +193,40 @@ sysctl -w net.ipv4.ip_forward=1
 # Permit gateway ICMP only on the owned TUN, not physical interfaces.
 sysctl -w "net/ipv4/conf/$tun_interface/accept_local=1"
 sysctl -w "net/ipv4/conf/$tun_interface/rp_filter=2"
-if [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
+if [[ -n $ipv6_pool ]]; then
+  if [[ -e $ip6_forward_state ]]; then
+    original_ip6_forward=$(<"$ip6_forward_state")
+  else
+    original_ip6_forward=$(sysctl -n net.ipv6.conf.all.forwarding) || {
+      echo "could not read the IPv6 forwarding state; is IPv6 enabled in the kernel?" >&2
+      exit 1
+    }
+    [[ $original_ip6_forward == 0 || $original_ip6_forward == 1 ]] || {
+      echo "could not read the original IPv6 forwarding state" >&2
+      exit 1
+    }
+    printf '%s\n' "$original_ip6_forward" >"$ip6_forward_state"
+  fi
+  [[ $original_ip6_forward == 0 || $original_ip6_forward == 1 ]] || {
+    echo "invalid saved IPv6 forwarding state" >&2
+    exit 1
+  }
+  # With forwarding on, the kernel ignores router advertisements on
+  # interfaces with accept_ra=1, and the host would lose its own IPv6
+  # default route; accept_ra=2 keeps accepting them.
+  if [[ ! -e $accept_ra_state ]]; then
+    original_accept_ra=$(sysctl -n "net/ipv6/conf/$external_interface/accept_ra") || original_accept_ra=
+    printf '%s %s\n' "$external_interface" "$original_accept_ra" >"$accept_ra_state"
+  fi
+  read -r saved_ra_interface saved_accept_ra <"$accept_ra_state" || true
+  if [[ $saved_ra_interface == "$external_interface" && $saved_accept_ra == 1 ]]; then
+    sysctl -w "net/ipv6/conf/$external_interface/accept_ra=2"
+  fi
+  sysctl -w net.ipv6.conf.all.forwarding=1
+  sysctl -w "net/ipv6/conf/$tun_interface/disable_ipv6=0"
+  sysctl -w "net/ipv6/conf/$tun_interface/accept_ra=0"
+  ip -6 address replace "$ipv6_gateway" dev "$tun_interface" nodad
+elif [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
   sysctl -w "net/ipv6/conf/$tun_interface/disable_ipv6=1"
 fi
 for relay_interface in "${relay_interfaces[@]}"; do
@@ -182,6 +247,9 @@ done
   fi
   if grep -Fxq 'table inet porta_guard' <<<"$nft_tables"; then
     echo "delete table inet porta_guard"
+  fi
+  if grep -Fxq 'table ip6 porta' <<<"$nft_tables"; then
+    echo "delete table ip6 porta"
   fi
   cat <<EOF
 table ip porta {
@@ -250,8 +318,52 @@ EOF
   }
 EOF
   fi
+  echo "}"
+  if [[ -n $ipv6_pool ]]; then
+    # IPv6 leaves only through the physical interface: named exits and
+    # cascade next hops carry IPv4 only.
+    cat <<EOF
+table ip6 porta {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    iifname "$tun_interface" oifname "$external_interface" accept
+    iifname "$external_interface" oifname "$tun_interface" ct state established,related accept
+    iifname "$tun_interface" drop
+    oifname "$tun_interface" drop
+  }
+EOF
+    if ! $ipv6_routed; then
+      cat <<EOF
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "$external_interface" ip6 saddr $ipv6_pool masquerade
+  }
+EOF
+    fi
+    cat <<EOF
+  chain client_forward_guard {
+    type filter hook forward priority -10; policy accept;
+    iifname "$tun_interface" ip6 daddr { fe80::/10, ff00::/8, fd00:ec2::254 } drop
+  }
+  chain gateway_guard {
+    type filter hook input priority -5; policy accept;
+    iifname != { "lo", "$tun_interface" } ip6 daddr ${ipv6_gateway%/*} drop
+  }
+EOF
+    if ! $client_host_access; then
+      cat <<EOF
+  chain client_input {
+    type filter hook input priority filter; policy accept;
+    iifname "$tun_interface" ct state established,related accept
+    iifname "$tun_interface" icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
+    iifname "$tun_interface" meta l4proto { tcp, udp } th dport 53 accept
+    iifname "$tun_interface" drop
+  }
+EOF
+    fi
+    echo "}"
+  fi
   cat <<EOF
-}
 table inet porta_guard {
   # Per-source rate tracking uses explicit dynamic sets, the form current
   # nftables lists for the deprecated meter syntax as well.
@@ -317,6 +429,44 @@ else
   rm -f "$docker_rules_state"
 fi
 
+tracked_ipv6_interface=
+if [[ -e $docker6_rules_state ]]; then
+  tracked_ipv6_interface=$(<"$docker6_rules_state")
+  [[ $tracked_ipv6_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || {
+    echo "saved IPv6 Docker rule interface is invalid" >&2
+    exit 1
+  }
+fi
+if [[ -n $tracked_ipv6_interface || -n $ipv6_pool ]] && command -v ip6tables >/dev/null; then
+  docker_tool=ip6tables
+  docker_rules=$(ip6tables -w -S) || {
+    echo "could not inspect existing IPv6 Docker rules" >&2
+    exit 1
+  }
+  if ! grep -Fxq -- '-N DOCKER-USER' <<<"$docker_rules"; then
+    rm -f "$docker6_rules_state"
+  else
+    if [[ -n $tracked_ipv6_interface && ( -z $ipv6_pool || $tracked_ipv6_interface != "$external_interface" ) ]]; then
+      remove_docker_rule -i "$tun_interface" -o "$tracked_ipv6_interface" -m comment --comment porta -j ACCEPT ||
+        { echo "could not remove previous Porta IPv6 Docker rule" >&2; exit 1; }
+      remove_docker_rule -i "$tracked_ipv6_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
+        { echo "could not remove previous Porta IPv6 Docker rule" >&2; exit 1; }
+      rm -f "$docker6_rules_state"
+    fi
+    if [[ -n $ipv6_pool ]]; then
+      printf '%s\n' "$external_interface" >"$docker6_rules_state"
+      ensure_docker_rule 1 -i "$tun_interface" -o "$external_interface" -m comment --comment porta -j ACCEPT ||
+        { echo "could not install Porta IPv6 Docker rule" >&2; exit 1; }
+      ensure_docker_rule 2 -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
+        { echo "could not install Porta IPv6 Docker rule" >&2; exit 1; }
+    fi
+  fi
+  docker_tool=iptables
+elif [[ -n $tracked_ipv6_interface ]]; then
+  echo "ip6tables is required to reconcile previously installed IPv6 Docker rules" >&2
+  exit 1
+fi
+
 relay_rule_present() {
   local rules line
   rules=$(ip -4 rule show) || return 2
@@ -361,4 +511,11 @@ if [[ -n $upstream_interface ]]; then
   fi
 else
   echo "configured $tun_interface; Porta nftables forwarding and public-input guards are active"
+fi
+if [[ -n $ipv6_pool ]]; then
+  if $ipv6_routed; then
+    echo "IPv6 clients in $ipv6_pool are routed through $external_interface"
+  else
+    echo "IPv6 clients in $ipv6_pool are masqueraded through $external_interface"
+  fi
 fi

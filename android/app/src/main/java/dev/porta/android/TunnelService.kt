@@ -14,6 +14,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.OsConstants
 import android.util.Log
 import portamobile.Portamobile
 import portamobile.Dialer
@@ -405,12 +406,14 @@ class TunnelService : VpnService() {
 
         try {
             val address = "${activeSession.address()}/${activeSession.prefixLength()}"
+            val address6 = activeSession.address6()
             val routing = parseTunnelRouting(activeSession.routing())
                 ?: throw PermanentTunnelException("Gateway returned an invalid split-tunnel advertisement")
             val dns = activeSession.dns()
             val mtu = activeSession.mtu()
             configureVpn(
                 address,
+                address6,
                 dns,
                 mtu.toString(),
                 routing,
@@ -426,7 +429,7 @@ class TunnelService : VpnService() {
                 mtu = mtu,
                 automaticMtu = activeSession.automaticMTU(),
                 mtuCeiling = activeSession.maximumMTU().takeIf { it > 0 },
-                address = address,
+                address = if (address6.isEmpty()) address else "$address · $address6",
                 dns = dns,
                 deliveryMode = when (activeSession.packetDeliveryMode()) {
                     "datagram" -> "datagrams"
@@ -499,17 +502,19 @@ class TunnelService : VpnService() {
 
     private fun configureVpn(
         addressHeader: String?,
+        address6: String,
         dnsHeader: String?,
         mtuHeader: String?,
         routing: TunnelRouting,
         runGeneration: Long,
     ) = configureVpn(
-        parseVpnConfiguration(addressHeader, dnsHeader, mtuHeader, routing),
+        parseVpnConfiguration(addressHeader, address6, dnsHeader, mtuHeader, routing),
         runGeneration,
     )
 
     private fun parseVpnConfiguration(
         addressHeader: String?,
+        address6: String,
         dnsHeader: String?,
         mtuHeader: String?,
         routing: TunnelRouting,
@@ -529,7 +534,10 @@ class TunnelService : VpnService() {
         if (!routing.isFullTunnel && routing.dnsDomains.isNotEmpty() && parseIPv4Address(dns) == null) {
             throw PermanentTunnelException("Gateway advertised split DNS without a resolver")
         }
-        return VpnConfiguration(addressParts[0], prefix, dns, mtu, routing)
+        if (address6.isNotEmpty() && (parseIPv6Address(address6) == null || mtu < 1280)) {
+            throw PermanentTunnelException("Gateway returned an invalid IPv6 address")
+        }
+        return VpnConfiguration(addressParts[0], address6, prefix, dns, mtu, routing)
     }
 
     @Synchronized
@@ -539,18 +547,28 @@ class TunnelService : VpnService() {
 
         val sourceAddress = parseIPv4Address(configuration.address)
             ?: throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
+        val sourceAddress6 = configuration.address6.takeIf { it.isNotEmpty() }?.let {
+            parseIPv6Address(it) ?: throw PermanentTunnelException("Gateway returned an invalid IPv6 address")
+        }
         val builder = Builder()
             .setSession(currentProfileName ?: "Porta")
             .setMtu(configuration.mtu)
             .addAddress(configuration.address, configuration.prefix)
             .setBlocking(true)
+        if (sourceAddress6 != null) builder.addAddress(configuration.address6, 128)
         if (configuration.routing.isFullTunnel) {
             builder.addRoute("0.0.0.0", 0)
+            // Without an IPv6 address Android blocks IPv6 for a VPN that
+            // claims none, so a full tunnel never leaks it.
+            if (sourceAddress6 != null) builder.addRoute("::", 0)
         } else {
             // A split tunnel only claims the advertised prefixes; other traffic
             // keeps using the underlying network.
-            configuration.routing.routes.forEach { builder.addRoute(it.address, it.prefixLength) }
+            configuration.routing.routes
+                .filter { sourceAddress6 != null || !it.isIPv6 }
+                .forEach { builder.addRoute(it.address, it.prefixLength) }
             if (configuration.dns.isNotBlank()) builder.addRoute(configuration.dns, 32)
+            if (sourceAddress6 == null) builder.allowFamily(OsConstants.AF_INET6)
         }
         // Platform certificate checks create Java sockets outside the native socket protector.
         builder.addDisallowedApplication(packageName)
@@ -574,10 +592,10 @@ class TunnelService : VpnService() {
             throw error
         }
         if (previousVpn != null) outboundPackets.discardForRecovery()
-        startVpnReader(sourceAddress)
+        startVpnReader(sourceAddress, sourceAddress6)
     }
 
-    private fun startVpnReader(sourceAddress: ByteArray) {
+    private fun startVpnReader(sourceAddress: ByteArray, sourceAddress6: ByteArray?) {
         val readerDescriptor = descriptor.get() ?: return
         val readerInput = input ?: return
         vpnReader = Thread({
@@ -606,7 +624,9 @@ class TunnelService : VpnService() {
                         uplinkPacketPool.recycle(buffer)
                         continue
                     }
-                    if (!isAssignedIPv4Packet(buffer, count, sourceAddress)) {
+                    if (!isAssignedIPv4Packet(buffer, count, sourceAddress) &&
+                        (sourceAddress6 == null || !isAssignedIPv6Packet(buffer, count, sourceAddress6))
+                    ) {
                         uplinkPacketPool.recycle(buffer)
                         continue
                     }
@@ -1069,6 +1089,8 @@ class TunnelService : VpnService() {
 
     private data class VpnConfiguration(
         val address: String,
+        /** Empty without IPv6. */
+        val address6: String,
         val prefix: Int,
         val dns: String,
         val mtu: Int,
@@ -1120,6 +1142,45 @@ internal fun parseIPv4Address(value: String): ByteArray? {
         result[index] = octet.toByte()
     }
     return result
+}
+
+/** Parses a numeric IPv6 address without zone or embedded IPv4. */
+internal fun parseIPv6Address(value: String): ByteArray? {
+    if (value.isEmpty() || value.length > 39 ||
+        value.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' && it != ':' }
+    ) return null
+    val halves = value.split("::")
+    if (halves.size > 2) return null
+    fun groups(part: String): List<Int>? {
+        if (part.isEmpty()) return emptyList()
+        return part.split(':').map { group ->
+            if (group.isEmpty() || group.length > 4) return null
+            group.toInt(16)
+        }
+    }
+    val head = groups(halves[0]) ?: return null
+    val tail = if (halves.size == 2) groups(halves[1]) ?: return null else emptyList()
+    val count = head.size + tail.size
+    if ((halves.size == 1 && count != 8) || (halves.size == 2 && count > 7)) return null
+    val words = head + List(8 - count) { 0 } + tail
+    val result = ByteArray(16)
+    for (index in words.indices) {
+        result[index * 2] = (words[index] shr 8).toByte()
+        result[index * 2 + 1] = words[index].toByte()
+    }
+    return result
+}
+
+internal fun isAssignedIPv6Packet(packet: ByteArray, length: Int, sourceAddress: ByteArray): Boolean {
+    if (length < 40 || length > packet.size || sourceAddress.size != 16 ||
+        (packet[0].toInt() ushr 4) != 6
+    ) return false
+    val payloadLength = ((packet[4].toInt() and 0xff) shl 8) or (packet[5].toInt() and 0xff)
+    if (payloadLength + 40 != length) return false
+    for (index in sourceAddress.indices) {
+        if (packet[8 + index] != sourceAddress[index]) return false
+    }
+    return true
 }
 
 internal fun isAssignedIPv4Packet(packet: ByteArray, length: Int, sourceAddress: ByteArray): Boolean {

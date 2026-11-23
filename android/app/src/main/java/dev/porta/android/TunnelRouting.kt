@@ -1,7 +1,10 @@
 package dev.porta.android
 
-/** An IPv4 destination prefix the gateway routes through the tunnel. */
+/** A destination prefix the gateway routes through the tunnel. */
 internal data class RoutePrefix(val address: String, val prefixLength: Int) {
+    val isIPv6: Boolean
+        get() = address.contains(':')
+
     override fun toString(): String = "$address/$prefixLength"
 }
 
@@ -30,11 +33,17 @@ internal fun parseTunnelRouting(value: String): TunnelRouting? {
     if (fields.size != 2) return null
     val routes = fields[0].split(',').filter { it.isNotEmpty() }.map { route ->
         val parts = route.split('/')
-        if (parts.size != 2 || parseIPv4Address(parts[0]) == null) return null
-        val length = parts[1].toIntOrNull()?.takeIf { it in 1..32 } ?: return null
+        if (parts.size != 2) return null
+        val maximum = when {
+            parseIPv4Address(parts[0]) != null -> 32
+            parseIPv6Address(parts[0]) != null -> 128
+            else -> return null
+        }
+        val length = parts[1].toIntOrNull()?.takeIf { it in 1..maximum } ?: return null
         RoutePrefix(parts[0], length)
     }
     val domains = fields[1].split(',').filter { it.isNotEmpty() }
-    if (domains.isNotEmpty() && routes.isEmpty()) return null
+    val ipv4Routes = routes.count { !it.isIPv6 }
+    if ((domains.isNotEmpty() || routes.isNotEmpty()) && ipv4Routes == 0) return null
     return TunnelRouting(routes, domains)
 }

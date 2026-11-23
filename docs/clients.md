@@ -105,6 +105,23 @@ line to the connection details. See
 [Split tunneling](deployment.md#split-tunneling) for per-platform DNS
 behavior.
 
+## IPv6
+
+When the gateway offers IPv6 (see
+[IPv6](deployment.md#ipv6-dual-stack)), every client configures the IPv6
+address alongside the IPv4 one: Linux adds it to the TUN and routes `::/1` and
+`8000::/1` (or the advertised IPv6 split prefixes) through it, Windows adds it
+to the Wintun adapter and sets the adapter's IPv6 MTU and filters, and Android
+adds it to the VPN with a `::/0` route. The Linux CLI logs `ipv6=ADDRESS` on
+the connected line, and the Windows app and Android show both addresses.
+Clients use IPv6 only when the tunnel MTU is at least 1280 bytes.
+
+Without IPv6 from the gateway, full tunnels keep blocking IPv6 on every
+platform so it cannot leave through the physical network. Split tunnels leave
+IPv6 on the device's own network unless the gateway routes IPv6 prefixes; on
+Android this now also applies to split tunnels, which previously blocked IPv6
+for all apps.
+
 ## Subnet routers
 
 The Linux CLI can publish the network behind its device. After an
@@ -286,8 +303,9 @@ route, and a DNS change installs its replacement before retiring the old route.
 
 Windows uses persistent Windows Filtering Platform filters in Porta's own
 sublayer, not changes to global Windows Firewall defaults. The physical endpoint
-exception is executable/IP/port scoped; IPv4 TUN traffic and loopback are allowed,
-while other IPv4/IPv6 payload and forwarding are blocked. Required IPv6 neighbor
+exception is executable/IP/port scoped; IPv4 TUN traffic (and IPv6 TUN traffic
+with an IPv6 lease) and loopback are allowed, while other IPv4/IPv6 payload and
+forwarding are blocked. Required IPv6 neighbor
 discovery is permitted when using an IPv6 transport endpoint. Other firewall
 blocks remain effective.
 
@@ -333,8 +351,9 @@ all setup and restoration. Do not delete the automatic-networking journal to
 bypass failed cleanup.
 Linux guard persistence covers a process crash, not a reboot or external
 firewall removal.
-Payload tunneling remains IPv4-only; necessary endpoint/control exceptions do
-not provide general IPv6 connectivity.
+IPv6 payload is tunneled only when the gateway assigns an IPv6 address;
+otherwise the necessary endpoint/control exceptions do not provide general
+IPv6 connectivity.
 
 Advertised DNS must be a numeric unicast IPv4 resolver reachable through the
 tunnel; private addresses are supported, but loopback and link-local resolvers

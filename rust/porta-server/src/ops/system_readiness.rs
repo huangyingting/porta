@@ -31,6 +31,9 @@ pub struct SystemReadinessConfig {
     /// Named exits; an exit that is down blackholes only its accounts, so
     /// it does not make the gateway unready.
     pub exits: Vec<(String, UpstreamReadiness)>,
+    /// The gateway's IPv6 address and the IPv6 client pool, when clients
+    /// get IPv6.
+    pub ipv6: Option<(std::net::Ipv6Addr, ipnet::Ipv6Net)>,
 }
 
 /// Cascade relay state: client traffic is forwarded through `interface`
@@ -148,6 +151,39 @@ pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
             Ok(())
         }
     }));
+    if let Some((gateway, prefix)) = config.ipv6 {
+        checks.push(required_probe("tun_ipv6_address", {
+            let config = config.clone();
+            move |cancellation| {
+                let config = config.clone();
+                async move {
+                    let link = read_link_family(&config.interface, "-6", cancellation).await?;
+                    if link.addr_info.iter().any(|address| {
+                        address.family == "inet6"
+                            && address.local == IpAddr::V6(gateway)
+                            && address.prefix_len == prefix.prefix_len()
+                    }) {
+                        return Ok(());
+                    }
+                    bail!(
+                        "{} lacks IPv6 gateway address {gateway}/{}",
+                        config.interface,
+                        prefix.prefix_len()
+                    )
+                }
+            }
+        }));
+        checks.push(required_probe("ipv6_forwarding", {
+            move |cancellation| async move {
+                let value =
+                    read_file("/proc/sys/net/ipv6/conf/all/forwarding", cancellation).await?;
+                if value.trim() != "1" {
+                    bail!("net.ipv6.conf.all.forwarding is not enabled");
+                }
+                Ok(())
+            }
+        }));
+    }
     checks.push(required_probe("porta_forward_rules", {
         let config = config.clone();
         move |cancellation| {
@@ -326,13 +362,21 @@ struct Link {
 #[derive(Debug, Deserialize)]
 struct LinkAddress {
     family: String,
-    local: Ipv4Addr,
+    local: IpAddr,
     #[serde(rename = "prefixlen")]
     prefix_len: u8,
 }
 
 async fn read_link(interface: &str, cancellation: CancellationToken) -> Result<Link> {
-    let arguments = ["-j", "-4", "address", "show", "dev", interface];
+    read_link_family(interface, "-4", cancellation).await
+}
+
+async fn read_link_family(
+    interface: &str,
+    family: &str,
+    cancellation: CancellationToken,
+) -> Result<Link> {
+    let arguments = ["-j", family, "address", "show", "dev", interface];
     let data = run_command("ip", &arguments, cancellation).await?;
     let mut links: Vec<Link> = serde_json::from_slice(&data).context("decode interface state")?;
     if links.len() != 1 || links[0].ifname != interface {
@@ -1289,6 +1333,7 @@ mod tests {
             dns_address: None,
             upstream: None,
             exits: Vec::new(),
+            ipv6: None,
         };
         assert!(validate_config(&base).is_ok());
         assert!(system_readiness(base.clone()).is_ok());
@@ -1330,6 +1375,7 @@ mod tests {
                 status: Arc::new(|| Err("next-hop tunnel is down: 401".to_string())),
             }),
             exits: Vec::new(),
+            ipv6: None,
         };
         let report = system_readiness(config).unwrap().check().await;
         assert_eq!(report.status, "not_ready");

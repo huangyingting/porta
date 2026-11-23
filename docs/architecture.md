@@ -373,9 +373,9 @@ and reports that condition.
 The following changes require coordinated protocol and operational design, not
 isolated transport patches:
 
-1. **IPv6:** add IPv6 lease and route capsules, dual-stack source validation,
-   Android/Windows interface configuration, IPv6 forwarding, and tests that
-   prevent traffic leaks when only one address family is available.
+1. **IPv6 across relays:** carry IPv6 through cascade next hops and named
+   exits, which today stay IPv4-only. Gateways otherwise lease IPv6 addresses
+   that mirror the IPv4 leases (see [IPv6](deployment.md#ipv6-dual-stack)).
 2. **Split routing:** authenticate server-defined route policy, advertise only
    authorized prefixes, configure platform-specific route exclusions, and
    define DNS behavior for included and excluded destinations.

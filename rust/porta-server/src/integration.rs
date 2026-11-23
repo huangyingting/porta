@@ -9,7 +9,7 @@ use crate::proxy::service::{
     Authorizer as ProxyAuthorizer, BoxError as ProxyError, Identity as ProxyIdentity,
     UsageHooks as ProxyUsage, UsageSession as ProxyUsageSession, DEVICE_ID as PROXY_DEVICE_ID,
 };
-use crate::state::pool::{Lease as PoolLease, Pool, PoolError};
+use crate::state::pool::{Ipv6Pool, Lease as PoolLease, Pool, PoolError};
 use crate::state::registry::{
     AccessPolicy, AccountLimits, ClientRegistry as StateRegistry, EnrollmentPolicy,
     RegistryError as StateRegistryError, UsagePeriod,
@@ -18,10 +18,10 @@ use crate::state::sessions::SessionGuard;
 use crate::state::usage;
 use crate::transport::session::{
     AccountStatus, Authenticated, AuthenticationError, AuthenticationRequest, Authenticator,
-    Cleanup, ClientIdentity as TransportIdentity, DenialReason, Lease, LeaseAllocator, LeaseError,
-    LeaseMode, LeaseRequest, Metrics, NetworkPolicy, PacketRouter, PacketSource, QueueDrop,
-    RouteError, RouteKind, RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata,
-    UsageSession,
+    Cleanup, ClientIdentity as TransportIdentity, DenialReason, Ipv6Lease, Lease, LeaseAllocator,
+    LeaseError, LeaseMode, LeaseRequest, Metrics, NetworkPolicy, PacketRouter, PacketSource,
+    QueueDrop, RouteError, RouteKind, RouteRequest, RouteSession, TokenCancellation, Usage,
+    UsageMetadata, UsageSession,
 };
 use crate::web::admin::{
     ClientAccess as WebClientAccess, ClientEnrollment as WebClientEnrollment,
@@ -34,7 +34,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -765,8 +765,8 @@ impl WebRegistry for WebRegistryAdapter {
         let exits = self.network.exits.clone();
         Box::pin(async move {
             let access = AccessPolicy {
-                allow: parse_prefixes(&access.allow)?,
-                deny: parse_prefixes(&access.deny)?,
+                allow: parse_access_prefixes(&access.allow)?,
+                deny: parse_access_prefixes(&access.deny)?,
                 group: access.group,
                 exit: access.exit,
             };
@@ -884,6 +884,21 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
     }
 }
 
+/// Parses IPv4 or IPv6 prefixes, or bare addresses as host prefixes.
+fn parse_access_prefixes(values: &[String]) -> Result<Vec<ipnet::IpNet>, WebRegistryError> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| value.parse::<IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|_| WebRegistryError::Invalid(format!("{value:?} is not an IP prefix")))
+        })
+        .collect()
+}
+
 fn parse_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, WebRegistryError> {
     values
         .iter()
@@ -981,14 +996,21 @@ fn format_time(value: time::OffsetDateTime) -> String {
 #[derive(Clone)]
 pub struct PoolAdapter {
     pool: Arc<Pool>,
+    ipv6: Option<Ipv6Pool>,
     next_id: Arc<AtomicU64>,
     active: Arc<Mutex<HashMap<u64, PoolLease>>>,
 }
 
 impl PoolAdapter {
     pub fn new(pool: Arc<Pool>) -> Arc<Self> {
+        Self::with_ipv6(pool, None)
+    }
+
+    /// Dual-stack leases: each also carries the paired address in `ipv6`.
+    pub fn with_ipv6(pool: Arc<Pool>, ipv6: Option<Ipv6Pool>) -> Arc<Self> {
         Arc::new(Self {
             pool,
+            ipv6,
             next_id: Arc::new(AtomicU64::new(0)),
             active: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -1005,6 +1027,13 @@ impl PoolAdapter {
             prefix_len: lease.prefix_bits,
             gateway: lease.gateway,
             opaque_id,
+            ipv6: self.ipv6.and_then(|ipv6| {
+                Some(Ipv6Lease {
+                    address: ipv6.address(lease.address)?,
+                    prefix_len: ipv6.prefix().prefix_len(),
+                    gateway: ipv6.gateway(),
+                })
+            }),
         };
         self.active.lock().insert(opaque_id, lease);
         value
@@ -1092,8 +1121,8 @@ pub struct SwitchConfig {
     /// Every client may reach every other client, as if in one group.
     pub client_to_client: bool,
     /// Destinations that access policies never block, such as the gateway
-    /// address and its DNS server.
-    pub always_reachable: Vec<Ipv4Addr>,
+    /// addresses and its DNS server.
+    pub always_reachable: Vec<IpAddr>,
     /// Policy routing for accounts that select an exit.
     pub exits: Option<Arc<ExitRules>>,
     /// Device names for the built-in resolver.
@@ -1110,6 +1139,8 @@ struct RouteContext {
     account_id: String,
     device_id: String,
     network: NetworkPolicy,
+    /// The session's IPv6 address, when it has one.
+    ipv6: Option<std::net::Ipv6Addr>,
 }
 
 /// What happens to a packet a client sent.
@@ -1162,9 +1193,9 @@ impl RouterAdapter {
     /// Whether `querier` may learn about the device at `address`.
     fn visible(
         &self,
-        querier: Ipv4Addr,
+        querier: IpAddr,
         asker: &RouteContext,
-        address: Ipv4Addr,
+        address: IpAddr,
         target: &RouteContext,
     ) -> bool {
         self.peers(asker, target)
@@ -1175,12 +1206,23 @@ impl RouterAdapter {
     /// Applies source validation, access policy and client-to-client rules
     /// to a packet from the session at `lease`.
     fn classify(&self, lease: Ipv4Addr, packet: &[u8]) -> Result<Verdict, RouterError> {
-        let info = porta_wire::ip::parse_ipv4(packet)
+        let info = porta_wire::ip::parse_ip(packet)
             .map_err(|_| RouterError::InvalidPacket("client packet"))?;
         let (source, destination) = (info.source, info.destination);
         let contexts = self.contexts.read();
         let sender = contexts.get(&lease);
-        let from_subnet = source != lease;
+        let own_source = match source {
+            IpAddr::V4(source) => source == lease,
+            IpAddr::V6(source) => {
+                sender.is_some_and(|sender| sender.ipv6.is_some())
+                    && self
+                        .router
+                        .ipv6()
+                        .and_then(|ipv6| ipv6.ipv4_address(source))
+                        == Some(lease)
+            }
+        };
+        let from_subnet = !own_source;
         if from_subnet && !sender.is_some_and(|sender| sender.network.routes_subnet(source)) {
             return Err(RouterError::SourceSpoofed {
                 got: source,
@@ -1375,6 +1417,7 @@ impl PacketRouter for RouterAdapter {
                 account_id: request.account_id,
                 device_id: request.device_id,
                 network: request.network,
+                ipv6: request.lease.ipv6.map(|ipv6| ipv6.address),
             });
             contexts.write().insert(address, context.clone());
             router.set_subnets(address, &context.network.subnets);
@@ -1452,7 +1495,7 @@ impl crate::dns::Directory for RouterAdapter {
         self.contexts.read().contains_key(&address)
     }
 
-    fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<Ipv4Addr> {
+    fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<crate::dns::DeviceAddresses> {
         let names = self.switching.names.as_ref()?.names();
         let contexts = self.contexts.read();
         let asker = contexts.get(&querier)?;
@@ -1463,16 +1506,37 @@ impl crate::dns::Directory for RouterAdapter {
                     .get(&(target.account_id.clone(), target.device_id.clone()))
                     .is_some_and(|candidate| candidate == name)
             })
-            .find(|(address, target)| self.visible(querier, asker, **address, target))
-            .map(|(address, _)| *address)
+            .find(|(address, target)| {
+                self.visible(IpAddr::V4(querier), asker, IpAddr::V4(**address), target)
+            })
+            .map(|(address, target)| crate::dns::DeviceAddresses {
+                ipv4: *address,
+                // Only devices that both have IPv6 reach each other over it.
+                ipv6: target.ipv6.zip(asker.ipv6).and_then(|(ipv6, own)| {
+                    self.visible(IpAddr::V6(own), asker, IpAddr::V6(ipv6), target)
+                        .then_some(ipv6)
+                }),
+            })
     }
 
-    fn reverse(&self, querier: Ipv4Addr, address: Ipv4Addr) -> Option<String> {
+    fn reverse(&self, querier: Ipv4Addr, address: IpAddr) -> Option<String> {
         let names = self.switching.names.as_ref()?.names();
         let contexts = self.contexts.read();
         let asker = contexts.get(&querier)?;
-        let target = contexts.get(&address)?;
-        if !self.visible(querier, asker, address, target) {
+        let (lease, own) = match address {
+            IpAddr::V4(address) => (address, IpAddr::V4(querier)),
+            IpAddr::V6(address) => (
+                self.router.ipv6()?.ipv4_address(address)?,
+                IpAddr::V6(asker.ipv6?),
+            ),
+        };
+        let target = contexts.get(&lease)?;
+        if let IpAddr::V6(address) = address {
+            if target.ipv6 != Some(address) {
+                return None;
+            }
+        }
+        if !self.visible(own, asker, address, target) {
             return None;
         }
         names
@@ -1481,17 +1545,11 @@ impl crate::dns::Directory for RouterAdapter {
     }
 }
 
-/// A copy of `packet` with its TTL decremented, as a router forwards it, or
-/// `None` once the TTL is exhausted.
+/// A copy of `packet` with its TTL or hop limit decremented, as a router
+/// forwards it, or `None` once the limit is exhausted.
 fn forwarded(packet: &[u8]) -> Option<Bytes> {
-    let ttl = *packet.get(8)?;
-    if ttl <= 1 {
-        return None;
-    }
     let mut packet = packet.to_vec();
-    packet[8] = ttl - 1;
-    porta_wire::ip::set_ipv4_header_checksum(&mut packet).ok()?;
-    Some(Bytes::from(packet))
+    porta_wire::ip::decrement_hop_limit(&mut packet).then(|| Bytes::from(packet))
 }
 
 fn map_route_error(error: RouterError) -> RouteError {
@@ -1593,7 +1651,10 @@ impl Usage for UsageAdapter {
                 metadata.account_id,
                 metadata.device_id,
                 metadata.transport,
-                metadata.address.to_string(),
+                match metadata.address6 {
+                    Some(address6) => format!("{}, {address6}", metadata.address),
+                    None => metadata.address.to_string(),
+                },
                 "",
             ),
         })
@@ -1796,6 +1857,7 @@ mod tests {
             account_id: account_id.into(),
             device_id: format!("{account_id}-device"),
             network,
+            ipv6: None,
         })
     }
 
@@ -1817,7 +1879,7 @@ mod tests {
                 RateLimiters::new(),
                 SwitchConfig {
                     client_to_client,
-                    always_reachable: vec![gateway],
+                    always_reachable: vec![IpAddr::V4(gateway)],
                     exits: None,
                     names: None,
                 },
@@ -1894,7 +1956,7 @@ mod tests {
             "alpha",
             NetworkPolicy {
                 group: team.clone(),
-                deny: vec![subnet],
+                deny: vec![subnet.into()],
                 ..NetworkPolicy::default()
             },
         );
@@ -1912,7 +1974,7 @@ mod tests {
             a,
             "alpha",
             NetworkPolicy {
-                allow: vec![subnet],
+                allow: vec![subnet.into()],
                 ..NetworkPolicy::default()
             },
         );
@@ -1936,6 +1998,122 @@ mod tests {
         assert_eq!(
             adapter.classify(a, &addressed_packet(a, b)).unwrap(),
             Verdict::Deliver(b)
+        );
+    }
+
+    fn ipv6_packet(source: std::net::Ipv6Addr, destination: std::net::Ipv6Addr) -> Bytes {
+        let mut packet = vec![0; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8_u16.to_be_bytes());
+        packet[6] = 17;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source.octets());
+        packet[24..40].copy_from_slice(&destination.octets());
+        Bytes::from(packet)
+    }
+
+    #[tokio::test]
+    async fn dual_stack_leases_switch_route_and_validate_ipv6() {
+        let pool = Arc::new(Pool::new("10.66.0.0/24").unwrap());
+        let ipv6 = Ipv6Pool::new(
+            "10.66.0.0/24".parse().unwrap(),
+            "fd66::/64".parse().unwrap(),
+        )
+        .unwrap();
+        let leases = PoolAdapter::with_ipv6(pool, Some(ipv6));
+        let device = Arc::new(MemoryDevice::default());
+        let router = Arc::new(Router::with_ipv6(device.clone(), None, Some(ipv6)));
+        let adapter = RouterAdapter::with_switching(
+            router.clone(),
+            leases.clone(),
+            RateLimiters::new(),
+            SwitchConfig {
+                always_reachable: vec![IpAddr::V6(ipv6.gateway())],
+                ..SwitchConfig::default()
+            },
+        );
+        let mut sessions = Vec::new();
+        let mut addresses = Vec::new();
+        for (name, account) in [("first", "alpha"), ("second", "alpha"), ("third", "beta")] {
+            let lease = leases
+                .acquire(LeaseRequest {
+                    lease_id: name.into(),
+                    group_id: None,
+                    mode: LeaseMode::Exclusive,
+                })
+                .await
+                .unwrap();
+            let lease6 = lease.ipv6.unwrap();
+            assert_eq!(Some(lease6.address), ipv6.address(lease.address));
+            assert_eq!((lease6.prefix_len, lease6.gateway), (64, ipv6.gateway()));
+            sessions.push(
+                adapter
+                    .register(RouteRequest {
+                        lease: lease.clone(),
+                        kind: RouteKind::ConnectIp,
+                        parent: CancellationToken::new(),
+                        account_id: account.into(),
+                        device_id: name.into(),
+                        network: NetworkPolicy::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+            addresses.push((lease.address, lease6.address));
+        }
+        let [(a, a6), (b, b6), (c, c6)] = addresses[..] else {
+            unreachable!()
+        };
+        let internet: std::net::Ipv6Addr = "2001:db8::80".parse().unwrap();
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, internet)).unwrap(),
+            Verdict::Kernel
+        );
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, b6)).unwrap(),
+            Verdict::Deliver(b)
+        );
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, c6)).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert!(matches!(
+            adapter.classify(a, &ipv6_packet(b6, internet)),
+            Err(RouterError::SourceSpoofed { .. })
+        ));
+        assert_eq!(router.owner(IpAddr::V6(c6)), Some(c));
+
+        // Switched IPv6 packets reach the peer with a decremented hop limit.
+        adapter
+            .inject_from_client(sessions[1].cancellation.clone(), b, ipv6_packet(b6, a6))
+            .await
+            .unwrap();
+        let switched = sessions[0].downlink.try_packet().unwrap();
+        assert_eq!(switched[7], 63);
+
+        // IPv6 allow lists confine IPv6 destinations; the gateway stays
+        // reachable.
+        adapter.contexts.write().insert(
+            a,
+            Arc::new(RouteContext {
+                account_id: "alpha".into(),
+                device_id: "first".into(),
+                network: NetworkPolicy {
+                    allow: vec!["2001:db8:1::/48".parse().unwrap()],
+                    ..NetworkPolicy::default()
+                },
+                ipv6: Some(a6),
+            }),
+        );
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, internet)).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(
+            adapter
+                .classify(a, &ipv6_packet(a6, ipv6.gateway()))
+                .unwrap(),
+            Verdict::Kernel
         );
     }
 

@@ -13,7 +13,7 @@ use h3::ext::Protocol;
 use h3::ConnectionState;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
-use ipnet::{IpNet, Ipv4Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use porta_wire::frame;
 use porta_wire::masque::{
     self, Address, MasqueError, MtuProbe, CAPSULE_ADDRESS_ASSIGN, CAPSULE_ADDRESS_REQUEST,
@@ -44,6 +44,7 @@ const MTU_ATTEMPT: Duration = Duration::from_millis(150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const DATAGRAM_RACE_RETRIES: usize = 2;
 const REQUEST_ID: u64 = 1;
+const REQUEST_ID6: u64 = 2;
 
 pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
     let deadline = Instant::now() + config.timeout;
@@ -274,13 +275,22 @@ async fn connect_address(
                 &mut lease,
             )
             .await?;
-            let address_request = masque::encode_address_request(&[Address {
-                request_id: REQUEST_ID,
-                prefix: IpNet::V4(
-                    Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32)
-                        .expect("the IPv4 unspecified /32 is valid"),
-                ),
-            }])
+            let address_request = masque::encode_address_request(&[
+                Address {
+                    request_id: REQUEST_ID,
+                    prefix: IpNet::V4(
+                        Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32)
+                            .expect("the IPv4 unspecified /32 is valid"),
+                    ),
+                },
+                Address {
+                    request_id: REQUEST_ID6,
+                    prefix: IpNet::V6(
+                        Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128)
+                            .expect("the IPv6 unspecified /128 is valid"),
+                    ),
+                },
+            ])
             .map_err(ClientError::permanent)?;
             send_capsule(
                 &outbound_tx,
@@ -289,7 +299,9 @@ async fn connect_address(
                 Bytes::from(address_request),
             )
             .await?;
-            lease.address = wait_for_address(config.timeout, &mut inbound_rx, &failure).await?;
+            let assignment = wait_for_address(config.timeout, &mut inbound_rx, &failure).await?;
+            lease.address = assignment.ipv4;
+            lease.address6 = assignment.ipv6;
             if lease.gateway == Some(lease.address.addr()) {
                 return Err(ClientError::permanent("gateway returned the leased address as gateway"));
             }
@@ -543,6 +555,7 @@ fn response_lease(headers: &HeaderMap) -> Result<Lease, ClientError> {
         gateway,
         dns,
         mtu,
+        address6: None,
     })
 }
 
@@ -677,7 +690,7 @@ async fn wait_for_address(
     duration: Duration,
     inbound: &mut mpsc::Receiver<Inbound>,
     failure: &FailureSignal,
-) -> Result<Ipv4Net, ClientError> {
+) -> Result<super::Assignment, ClientError> {
     timeout(duration, async {
         loop {
             match failure.next(inbound).await? {
@@ -964,6 +977,12 @@ impl PacketWriter {
                 send_ip_capsule(transport, &packet).await?;
                 continue;
             }
+            if packet.len() > self.mtu.limit() && porta_wire::ip::ip_version(&packet) == Some(6) {
+                // IPv6 is never fragmented on the way, and the interface MTU
+                // already bounds it, so it takes the reliable stream.
+                send_ip_capsule(transport, &packet).await?;
+                continue;
+            }
             if packet.len() > self.mtu.limit() {
                 match fragment_ipv4(&packet, self.mtu.limit()) {
                     Ok(fragments) => {
@@ -991,6 +1010,7 @@ impl PacketWriter {
                         races += 1;
                         pending.push_front(packet);
                     } else if packet.len() > self.mtu.limit()
+                        && porta_wire::ip::ip_version(&packet) == Some(4)
                         && u16::from_be_bytes([packet[6], packet[7]]) & 0x4000 != 0
                         && self.use_datagrams
                     {
@@ -1283,6 +1303,44 @@ fn take_capsule(buffer: &mut BytesMut) -> Result<Option<(u64, Bytes)>, ClientErr
     Ok(Some((capsule_type, buffer.split_to(length).freeze())))
 }
 
+/// The client's addresses in an ADDRESS_ASSIGN capsule, which lists all of
+/// them: answers to its requests, or request ID zero for later updates.
+/// Capsules without an IPv4 address are ignored; an IPv6 address is
+/// optional.
+fn parse_assignment(value: &[u8]) -> Result<Option<super::Assignment>, ClientError> {
+    let mut ipv4 = None;
+    let mut ipv6 = None;
+    for address in masque::decode_address_assign(value).map_err(ClientError::permanent)? {
+        match address.prefix {
+            IpNet::V4(prefix) if matches!(address.request_id, REQUEST_ID | 0) => {
+                if prefix.addr().is_unspecified() && address.request_id == REQUEST_ID {
+                    return Err(ClientError::permanent("gateway refused an IPv4 address"));
+                }
+                if prefix.prefix_len() != 32 || !valid_unicast(prefix.addr()) {
+                    return Err(ClientError::permanent(format!(
+                        "gateway returned an invalid IPv4 /32 lease: {prefix}"
+                    )));
+                }
+                ipv4.get_or_insert(prefix);
+            }
+            // The unspecified address means the gateway has no IPv6.
+            IpNet::V6(prefix)
+                if matches!(address.request_id, REQUEST_ID6 | 0)
+                    && !prefix.addr().is_unspecified() =>
+            {
+                if prefix.prefix_len() != 128 || !super::valid_unicast6(prefix.addr()) {
+                    return Err(ClientError::permanent(format!(
+                        "gateway returned an invalid IPv6 /128 lease: {prefix}"
+                    )));
+                }
+                ipv6.get_or_insert(prefix);
+            }
+            _ => {}
+        }
+    }
+    Ok(ipv4.map(|ipv4| super::Assignment { ipv4, ipv6 }))
+}
+
 async fn handle_capsule(
     capsule_type: u64,
     value: Bytes,
@@ -1294,21 +1352,8 @@ async fn handle_capsule(
             deliver_inbound(inbound, cancellation, Inbound::MtuSelected(value)).await?;
         }
         CAPSULE_ADDRESS_ASSIGN => {
-            for address in masque::decode_address_assign(&value).map_err(ClientError::permanent)? {
-                if address.request_id != REQUEST_ID {
-                    continue;
-                }
-                let IpNet::V4(prefix) = address.prefix else {
-                    return Err(ClientError::permanent(
-                        "gateway returned an invalid IPv4 /32 lease",
-                    ));
-                };
-                if prefix.prefix_len() != 32 || !valid_unicast(prefix.addr()) {
-                    return Err(ClientError::permanent(format!(
-                        "gateway returned an invalid IPv4 /32 lease: {prefix}"
-                    )));
-                }
-                deliver_inbound(inbound, cancellation, Inbound::Address(prefix)).await?;
+            if let Some(assignment) = parse_assignment(&value)? {
+                deliver_inbound(inbound, cancellation, Inbound::Address(assignment)).await?;
             }
         }
         CAPSULE_ROUTE_ADVERTISEMENT => {
@@ -1516,6 +1561,7 @@ mod tests {
                     gateway: gateway.then_some(Ipv4Addr::new(10, 66, 0, 1)),
                     dns: None,
                     mtu: 1400,
+                    address6: None,
                 },
                 remote_address: "192.0.2.1:443".parse().unwrap(),
                 transport: Transport::Http3,
@@ -2260,8 +2306,56 @@ mod tests {
         .unwrap();
         assert!(matches!(
             received.recv().await,
-            Some(Inbound::Address(address)) if address == "10.0.0.2/32".parse().unwrap()
+            Some(Inbound::Address(address))
+                if address.ipv4 == "10.0.0.2/32".parse().unwrap() && address.ipv6.is_none()
         ));
+
+        // Dual-stack assignments list both addresses; the unspecified IPv6
+        // address means the gateway has none.
+        let dual = masque::encode_address_assign(&[
+            Address {
+                request_id: REQUEST_ID6,
+                prefix: "fd66::2/128".parse().unwrap(),
+            },
+            Address {
+                request_id: REQUEST_ID,
+                prefix: "10.0.0.2/32".parse().unwrap(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            parse_assignment(&dual).unwrap(),
+            Some(crate::tunnel::Assignment {
+                ipv4: "10.0.0.2/32".parse().unwrap(),
+                ipv6: Some("fd66::2/128".parse().unwrap()),
+            })
+        );
+        let none = masque::encode_address_assign(&[
+            Address {
+                request_id: REQUEST_ID6,
+                prefix: "::/128".parse().unwrap(),
+            },
+            Address {
+                request_id: 0,
+                prefix: "10.0.0.2/32".parse().unwrap(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(parse_assignment(&none).unwrap().unwrap().ipv6, None);
+        for invalid in ["fd66::/64", "fe80::1/128", "ff02::1/128"] {
+            let value = masque::encode_address_assign(&[
+                Address {
+                    request_id: REQUEST_ID,
+                    prefix: "10.0.0.2/32".parse().unwrap(),
+                },
+                Address {
+                    request_id: REQUEST_ID6,
+                    prefix: invalid.parse().unwrap(),
+                },
+            ])
+            .unwrap();
+            assert!(parse_assignment(&value).is_err(), "{invalid}");
+        }
 
         let invalid = masque::encode_address_assign(&[Address {
             request_id: REQUEST_ID,
@@ -2360,6 +2454,7 @@ mod tests {
                 gateway: None,
                 dns: None,
                 mtu: SAFE_MTU,
+                address6: None,
             },
             remote_address: "192.0.2.1:443".parse().unwrap(),
             transport: Transport::Http3,

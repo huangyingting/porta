@@ -215,7 +215,7 @@ elif name == "nft":
             tables = dict(state.get("nft_tables", {}))
             if not tables and state.get("nft_table"):
                 tables["ip porta"] = state["nft_table"]
-            for table in ("ip porta", "inet porta_guard"):
+            for table in ("ip porta", "ip6 porta", "inet porta_guard"):
                 if f"delete table {table}" in transaction:
                     tables.pop(table, None)
                 if f"table {table} {{" in transaction:
@@ -233,7 +233,9 @@ elif name == "nft":
             state["nft_table"] = "" if not tables else state.get("nft_table", "")
     else:
         raise RuntimeError(f"nontransactional nft invocation: {args}")
-elif name == "iptables":
+elif name in ("iptables", "ip6tables"):
+    # ip6tables keeps its own rules and Docker chain state.
+    family = "" if name == "iptables" else "6"
     args = [arg for arg in args if arg != "-w"]
     operation = args[0]
     if operation == "-S":
@@ -241,12 +243,12 @@ elif name == "iptables":
             code = 2
         elif len(args) == 1:
             print("-P FORWARD ACCEPT")
-            if state.get("docker"):
+            if state.get("docker" + family):
                 print("-N DOCKER-USER")
         else:
-            code = 0 if state.get("docker") else 1
+            code = 0 if state.get("docker" + family) else 1
     else:
-        rules = state.setdefault("iptables_rules", [])
+        rules = state.setdefault(name + "_rules", [])
         rule = args[2:] if operation != "-I" else args[3:]
         if operation == "-C":
             code = 2 if state.get("fail_iptables_check") else (0 if rule in rules else 1)

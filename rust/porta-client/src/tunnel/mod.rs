@@ -3,13 +3,13 @@ mod h2;
 mod h2_queue;
 mod h3;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use porta_wire::device_auth::Proof;
 use rustls::ClientConfig as RustlsClientConfig;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -45,6 +45,27 @@ pub struct Lease {
     pub gateway: Option<Ipv4Addr>,
     pub dns: Option<Ipv4Addr>,
     pub mtu: u16,
+    /// The device's IPv6 /128 on a dual-stack gateway.
+    pub address6: Option<Ipv6Net>,
+}
+
+impl Lease {
+    /// The IPv6 address the device configures: only when the tunnel MTU
+    /// meets the IPv6 minimum, below which operating systems disable IPv6
+    /// on the interface. Without it, clients keep IPv6 off the tunnel and
+    /// guarded.
+    pub fn ipv6(&self) -> Option<Ipv6Net> {
+        self.address6
+            .filter(|_| usize::from(self.mtu) >= porta_wire::ip::IPV6_MIN_MTU)
+    }
+
+    /// Whether `address` is one of the lease's own addresses.
+    pub fn owns(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => address == self.address.addr(),
+            IpAddr::V6(address) => self.ipv6().is_some_and(|ipv6| ipv6.addr() == address),
+        }
+    }
 }
 
 pub trait ProofProvider: Send + Sync {
@@ -118,6 +139,8 @@ pub fn parse_account_status(headers: &http::HeaderMap) -> AccountStatus {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Routing {
     pub routes: Vec<Ipv4Net>,
+    /// IPv6 split-tunnel prefixes; they apply only with an IPv6 lease.
+    pub routes6: Vec<Ipv6Net>,
     pub dns_domains: Vec<String>,
     /// Networks behind this device that the gateway routes to it, when the
     /// device is a subnet router.
@@ -130,8 +153,11 @@ impl Routing {
     }
 
     /// Whether `address` lies in a network this device routes for others.
-    pub fn serves(&self, address: Ipv4Addr) -> bool {
-        self.subnets.iter().any(|subnet| subnet.contains(&address))
+    pub fn serves(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => self.subnets.iter().any(|subnet| subnet.contains(&address)),
+            IpAddr::V6(_) => false,
+        }
     }
 
     /// Whether `address` is sent through the tunnel.
@@ -161,7 +187,7 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
             })
             .transpose()
     };
-    let prefixes = |name: &str| -> Result<Vec<Ipv4Net>, ClientError> {
+    let prefixes = |name: &str| -> Result<Vec<IpNet>, ClientError> {
         let mut prefixes = Vec::new();
         if let Some(value) = text(name)? {
             for item in value
@@ -170,7 +196,7 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
                 .filter(|item| !item.is_empty())
             {
                 let prefix = item
-                    .parse::<Ipv4Net>()
+                    .parse::<IpNet>()
                     .ok()
                     .filter(|prefix| prefix.prefix_len() > 0 && *prefix == prefix.trunc())
                     .ok_or_else(|| {
@@ -181,8 +207,23 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
         }
         Ok(prefixes)
     };
-    let routes = prefixes(HEADER_ROUTES)?;
-    let subnets = prefixes(HEADER_SUBNETS)?;
+    let mut routes = Vec::new();
+    let mut routes6 = Vec::new();
+    for route in prefixes(HEADER_ROUTES)? {
+        match route {
+            IpNet::V4(route) => routes.push(route),
+            IpNet::V6(route) => routes6.push(route),
+        }
+    }
+    let subnets = prefixes(HEADER_SUBNETS)?
+        .into_iter()
+        .map(|subnet| match subnet {
+            IpNet::V4(subnet) => Ok(subnet),
+            IpNet::V6(subnet) => Err(ClientError::permanent(format!(
+                "gateway sent an IPv6 subnet {subnet}; subnet routing is IPv4"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if subnets.len() > MAX_SUBNETS {
         return Err(ClientError::permanent("gateway sent too many subnets"));
     }
@@ -209,7 +250,7 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
             dns_domains.push(item.to_ascii_lowercase());
         }
     }
-    if routes.len() > MAX_ROUTES || dns_domains.len() > MAX_DNS_DOMAINS {
+    if routes.len() + routes6.len() > MAX_ROUTES || dns_domains.len() > MAX_DNS_DOMAINS {
         return Err(ClientError::permanent(
             "gateway sent too many routes or DNS domains",
         ));
@@ -219,8 +260,14 @@ pub fn parse_routing(headers: &http::HeaderMap) -> Result<Routing, ClientError> 
             "gateway sent DNS domains without split routes",
         ));
     }
+    if routes.is_empty() && !routes6.is_empty() {
+        return Err(ClientError::permanent(
+            "gateway sent IPv6 routes without IPv4 split routes",
+        ));
+    }
     Ok(Routing {
         routes,
+        routes6,
         dns_domains,
         subnets,
     })
@@ -341,11 +388,18 @@ enum DatagramSend {
     TooLarge,
 }
 
+/// The addresses an ADDRESS_ASSIGN capsule gives the client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Assignment {
+    ipv4: Ipv4Net,
+    ipv6: Option<Ipv6Net>,
+}
+
 enum Inbound {
     Packet(Bytes),
     MtuProbe(porta_wire::masque::MtuProbe),
     MtuSelected(Bytes),
-    Address(Ipv4Net),
+    Address(Assignment),
     Failure(ClientError),
 }
 
@@ -369,9 +423,9 @@ impl Connection {
                 self.lease.mtu
             )));
         }
-        let info = porta_wire::ip::parse_ipv4(packet)
+        let info = porta_wire::ip::parse_ip(packet)
             .map_err(|error| ClientError::permanent(error.to_string()))?;
-        if info.source != self.lease.address.addr() && !self.routing.serves(info.source) {
+        if !self.lease.owns(info.source) && !self.routing.serves(info.source) {
             return Err(ClientError::permanent(format!(
                 "packet source {} does not match lease {}",
                 info.source, self.lease.address
@@ -394,12 +448,10 @@ impl Connection {
                     if packet.len() > usize::from(self.lease.mtu) {
                         continue;
                     }
-                    let Ok(info) = porta_wire::ip::parse_ipv4(&packet) else {
+                    let Ok(info) = porta_wire::ip::parse_ip(&packet) else {
                         continue;
                     };
-                    if info.destination == self.lease.address.addr()
-                        || self.routing.serves(info.destination)
-                    {
+                    if self.lease.owns(info.destination) || self.routing.serves(info.destination) {
                         return Ok(packet);
                     }
                 }
@@ -481,6 +533,14 @@ fn account_denial(status: http::StatusCode, reason: Option<&str>) -> Option<Clie
         .map(ClientError::Denied)
 }
 
+fn valid_unicast6(address: std::net::Ipv6Addr) -> bool {
+    !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && !address.is_unicast_link_local()
+        && address.to_ipv4_mapped().is_none()
+}
+
 fn valid_unicast(address: Ipv4Addr) -> bool {
     !address.is_unspecified()
         && !address.is_loopback()
@@ -511,6 +571,7 @@ mod tests {
                     gateway: None,
                     dns: None,
                     mtu: 1100,
+                    address6: None,
                 },
                 remote_address: "127.0.0.1:443".parse().unwrap(),
                 transport: Transport::Http3,
@@ -621,10 +682,43 @@ mod tests {
         headers.insert(HEADER_SUBNETS, "10.30.0.0/24".parse().unwrap());
         let router = parse_routing(&headers).unwrap();
         assert!(router.is_full_tunnel());
-        assert!(router.serves(Ipv4Addr::new(10, 30, 0, 5)));
-        assert!(!router.serves(Ipv4Addr::new(10, 31, 0, 5)));
+        assert!(router.serves(IpAddr::V4(Ipv4Addr::new(10, 30, 0, 5))));
+        assert!(!router.serves(IpAddr::V4(Ipv4Addr::new(10, 31, 0, 5))));
         headers.insert(HEADER_SUBNETS, "10.30.0.1/24".parse().unwrap());
         assert!(parse_routing(&headers).is_err());
+        headers.insert(HEADER_SUBNETS, "fd00::/64".parse().unwrap());
+        assert!(parse_routing(&headers).is_err());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            HEADER_ROUTES,
+            "10.0.0.0/8,2001:db8::/32,fd66::/64".parse().unwrap(),
+        );
+        let dual = parse_routing(&headers).unwrap();
+        assert_eq!(dual.routes.len(), 1);
+        assert_eq!(dual.routes6.len(), 2);
+        headers.insert(HEADER_ROUTES, "2001:db8::/32".parse().unwrap());
+        assert!(parse_routing(&headers).is_err());
+        headers.insert(HEADER_ROUTES, "10.0.0.0/8,::/0".parse().unwrap());
+        assert!(parse_routing(&headers).is_err());
+    }
+
+    #[test]
+    fn ipv6_leases_need_the_ipv6_minimum_mtu() {
+        let mut lease = Lease {
+            address: "10.66.0.2/32".parse().unwrap(),
+            gateway: None,
+            dns: None,
+            mtu: 1400,
+            address6: Some("fd66::2/128".parse().unwrap()),
+        };
+        assert_eq!(lease.ipv6(), lease.address6);
+        assert!(lease.owns("fd66::2".parse().unwrap()));
+        assert!(lease.owns("10.66.0.2".parse().unwrap()));
+        assert!(!lease.owns("fd66::3".parse().unwrap()));
+        lease.mtu = 1200;
+        assert_eq!(lease.ipv6(), None);
+        assert!(!lease.owns("fd66::2".parse().unwrap()));
     }
 
     #[test]

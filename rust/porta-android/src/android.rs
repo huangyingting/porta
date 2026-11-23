@@ -533,6 +533,25 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAddress(
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
+/// The session's IPv6 address, or an empty string without one.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAddress6(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        let session = get_session(id)?;
+        let address = session
+            .connection
+            .lease
+            .ipv6()
+            .map_or_else(String::new, |address| address.addr().to_string());
+        Ok(JString::from_str(env, address)?.into_raw())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_portamobile_Portamobile_nativeSessionPrefixLength(
     mut env: EnvUnowned<'_>,
@@ -603,16 +622,25 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeSessionRouting(
 ) -> jstring {
     env.with_env(|env| -> Result<jstring, BridgeError> {
         let session = get_session(id)?;
-        Ok(JString::from_str(env, encode_routing(&session.connection.routing))?.into_raw())
+        let ipv6 = session.connection.lease.ipv6().is_some();
+        Ok(JString::from_str(env, encode_routing(&session.connection.routing, ipv6))?.into_raw())
     })
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
-fn encode_routing(routing: &porta_client::tunnel::Routing) -> String {
+/// IPv6 routes are included only for a session with an IPv6 address.
+fn encode_routing(routing: &porta_client::tunnel::Routing, ipv6: bool) -> String {
     let routes = routing
         .routes
         .iter()
         .map(ToString::to_string)
+        .chain(
+            routing
+                .routes6
+                .iter()
+                .filter(|_| ipv6)
+                .map(ToString::to_string),
+        )
         .collect::<Vec<_>>();
     format!("{}|{}", routes.join(","), routing.dns_domains.join(","))
 }

@@ -56,9 +56,15 @@ Options:
   --client-host-access[=BOOL]
                             Let clients reach all services on this host; by
                             default they may only ping it and use DNS port 53
-  --routes CIDR[,CIDR...]   Split tunnel: clients route only these IPv4
-                            prefixes through Porta; --routes= restores a full
-                            tunnel
+  --routes CIDR[,CIDR...]   Split tunnel: clients route only these prefixes
+                            through Porta (IPv6 ones need IPv6); --routes=
+                            restores a full tunnel
+  --ipv6                    Give clients IPv6 too, from a random unique local
+                            /64 masqueraded through the external interface
+  --ipv6-pool CIDR          Use this IPv6 prefix instead, such as one routed to
+                            this host; --no-ipv6 turns IPv6 off again
+  --ipv6-routed[=BOOL]      The IPv6 prefix is routed to this host: forward it
+                            without NAT
   --dns-domains D[,D...]    Split DNS: clients resolve only these domains with
                             --dns; requires --routes
   --oidc-issuer URL         OpenID Connect issuer for administrator single
@@ -140,6 +146,9 @@ disable_federation=false
 dns_upstreams=
 dns_forwards=
 dns_blocklist=
+ipv6_pool=
+ipv6_routed=false
+generate_ipv6=false
 
 # Options persisted across upgrades. Values are parsed, never sourced, and
 # validated below exactly like command-line input.
@@ -149,7 +158,7 @@ saved_option_names=(
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client client_host_access routes
   dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist oidc_issuer
-  oidc_client_id federation_primary
+  oidc_client_id federation_primary ipv6_pool ipv6_routed
 )
 declare -A saved_options=()
 if [[ -e $deploy_config || -L $deploy_config ]]; then
@@ -159,7 +168,7 @@ if [[ -e $deploy_config || -L $deploy_config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
     line_number=$((line_number + 1))
     [[ -z $line || $line == \#* ]] && continue
-    [[ $line =~ ^([a-z_]+)=([A-Za-z0-9_./:@+,=-]*)$ ]] ||
+    [[ $line =~ ^([a-z][a-z0-9_]*)=([A-Za-z0-9_./:@+,=-]*)$ ]] ||
       die "invalid line $line_number in $deploy_config"
     key=${BASH_REMATCH[1]}
     value=${BASH_REMATCH[2]}
@@ -227,6 +236,11 @@ while [[ $# -gt 0 ]]; do
     --exits=*) exits=${1#*=}; shift ;;
     --local-exit) local_exit=true; shift ;;
     --local-exit=*) local_exit=$(parse_bool --local-exit "${1#*=}"); shift ;;
+    --ipv6) generate_ipv6=true; shift ;;
+    --ipv6-pool) require_value "$@"; ipv6_pool=$2; shift 2 ;;
+    --no-ipv6) ipv6_pool=; ipv6_routed=false; generate_ipv6=false; shift ;;
+    --ipv6-routed) ipv6_routed=true; shift ;;
+    --ipv6-routed=*) ipv6_routed=$(parse_bool --ipv6-routed "${1#*=}"); shift ;;
     --routes) require_value "$@"; routes=$2; shift 2 ;;
     --routes=*) routes=${1#*=}; shift ;;
     --dns-domains) require_value "$@"; dns_domains=$2; shift 2 ;;
@@ -239,7 +253,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
-for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access local_exit dns_resolver; do
+for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access local_exit dns_resolver ipv6_routed; do
   [[ ${!option} == true || ${!option} == false ]] || die "invalid saved value for $option"
 done
 [[ -n $domain ]] || die "--domain is required on the first deployment"
@@ -276,11 +290,44 @@ mtu=$((10#$mtu))
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
+if $generate_ipv6 && [[ -z $ipv6_pool ]]; then
+  # A random unique local prefix (RFC 4193), kept across upgrades.
+  ipv6_pool=$(python3 -c 'import secrets; g = secrets.token_bytes(5); print("fd%02x:%02x%02x:%02x%02x::/64" % tuple(g))')
+fi
+ipv6_arguments=
+ipv6_gateway_cidr=
+if [[ -n $ipv6_pool ]]; then
+  [[ -z $upstream ]] || die "IPv6 is not supported on a cascade relay (--upstream) yet"
+  (( mtu >= 1280 )) || die "IPv6 needs --mtu of at least 1280"
+  ipv6_gateway_cidr=$(python3 - "$ipv6_pool" "$pool" <<'PY'
+import ipaddress
+import sys
+
+try:
+    prefix = ipaddress.IPv6Network(sys.argv[1], strict=True)
+    pool = ipaddress.IPv4Network(sys.argv[2], strict=False)
+except ValueError as error:
+    raise SystemExit(str(error))
+if prefix.prefixlen > 128 - (32 - pool.prefixlen) or prefix.prefixlen < 8:
+    raise SystemExit("the IPv6 pool is too small to mirror the IPv4 pool")
+if prefix.is_multicast or prefix.is_link_local or prefix.is_loopback:
+    raise SystemExit("the IPv6 pool must be unicast")
+print(f"{prefix.network_address + 1}/{prefix.prefixlen}")
+PY
+) || die "invalid --ipv6-pool $ipv6_pool"
+  ipv6_arguments=" --ipv6-pool $ipv6_pool"
+elif $ipv6_routed; then
+  die "--ipv6-routed requires --ipv6 or --ipv6-pool"
+fi
 route_arguments=
 if [[ -n $routes ]]; then
   IFS=, read -ra route_list <<<"$routes"
   for route in "${route_list[@]}"; do
-    [[ $route =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "invalid --routes entry: $route"
+    if [[ $route =~ ^[0-9A-Fa-f:]+/[0-9]{1,3}$ && $route == *:* ]]; then
+      [[ -n $ipv6_pool ]] || die "IPv6 --routes entry $route needs --ipv6 or --ipv6-pool"
+    else
+      [[ $route =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "invalid --routes entry: $route"
+    fi
     route_arguments+=" --route $route"
   done
 fi
@@ -1051,6 +1098,12 @@ fi
 if $client_host_access; then
   network_up_options+=" --client-host-access"
 fi
+if [[ -n $ipv6_pool ]]; then
+  network_up_options+=" --ipv6 $ipv6_gateway_cidr $ipv6_pool"
+  if $ipv6_routed; then
+    network_up_options+=" --ipv6-routed"
+  fi
+fi
 
 if systemctl cat docker.service >/dev/null 2>&1; then
   unit_wants+=" docker.service"
@@ -1068,7 +1121,7 @@ User=$service_user
 Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments$federation_arguments --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments$federation_arguments$ipv6_arguments --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
@@ -1205,6 +1258,7 @@ Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "
 Exit traffic:    $([[ -n $upstream ]] && echo "relayed through $upstream via $upstream_interface" || echo "this host via $external_interface")
 Selectable exits: ${selectable_exits:-none}
 Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
+Client IPv6:     $([[ -n $ipv6_pool ]] && echo "$ipv6_pool, $([[ $ipv6_routed == true ]] && echo "routed" || echo "masqueraded") through $external_interface" || echo "off (clients keep IPv6 off the tunnel)")
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
 Client DNS:      $([[ $dns_resolver == true ]] && echo "built-in resolver on ${gateway_cidr%/*} with names under porta.internal" || echo "$dns")
 Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_domains:+ (DNS for ${dns_domains//,/, })}" || echo "full tunnel")

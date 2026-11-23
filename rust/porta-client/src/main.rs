@@ -165,8 +165,9 @@ mod linux {
         if event.state == State::Connected {
             let lease = event.lease.expect("connected event includes a lease");
             eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={} uploaded={} downloaded={}{}",
+                "porta-client: connected address={}{} dns={} mtu={} transport={} uploaded={} downloaded={}{}",
                 lease.address,
+                super::ipv6_summary(&lease),
                 lease
                     .dns
                     .map_or_else(|| "-".to_owned(), |address| address.to_string()),
@@ -446,8 +447,9 @@ mod windows {
             ),
             Event::ConfiguringNetwork => eprintln!("porta-client: configuring network"),
             Event::Connected(info) => eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={:?}{}{}",
+                "porta-client: connected address={}{} dns={} mtu={} transport={:?}{}{}",
                 info.lease.address,
+                super::ipv6_summary(&info.lease),
                 info.lease
                     .dns
                     .map_or_else(|| "-".to_owned(), |address| address.to_string()),
@@ -486,6 +488,17 @@ mod windows {
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
     }
+}
+
+/// The IPv6 address of a dual-stack lease, for the connected line.
+#[cfg(any(
+    all(target_os = "linux", not(target_os = "android")),
+    target_os = "windows"
+))]
+fn ipv6_summary(lease: &porta_client::tunnel::Lease) -> String {
+    lease
+        .ipv6()
+        .map_or_else(String::new, |address| format!(" ipv6={address}"))
 }
 
 /// Formats gateway-reported account limits for status lines, or nothing for

@@ -49,7 +49,7 @@ class AutomationTests(unittest.TestCase):
             }
         )
         for command in (
-            "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "openssl",
+            "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "ip6tables", "openssl",
             "curl", "ss", "make", "mv", "git", "adb", "sleep", "gh", "uname",
             "sudo", "unshare", "getent", "useradd", "chown", "chgrp", "systemd-tmpfiles",
         ):
@@ -436,6 +436,63 @@ class AutomationTests(unittest.TestCase):
         self.run_script("server-down.sh", "porta0", success=False)
         self.assertTrue((self.root / "runtime/docker-rules-porta0").exists())
         self.assertEqual(len(self.state()["iptables_rules"]), 2)
+
+    def test_server_up_forwards_and_guards_ipv6_and_server_down_restores_it(self):
+        sysctl = self.state()["sysctl"] | {
+            "net.ipv6.conf.all.forwarding": "0",
+            "net.ipv6.conf.eth0.accept_ra": "1",
+        }
+        self.update_state(sysctl=sysctl, docker=True, docker6=True)
+        dual = ("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                "--ipv6", "fd66::1/64", "fd66::/64")
+        result = self.run_script(*dual)
+        self.assertIn("masqueraded through eth0", result.stdout)
+        state = self.state()
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.all.forwarding"], "1")
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.eth0.accept_ra"], "2")
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.porta0.disable_ipv6"], "0")
+        self.assertIn(["ip", "-6", "address", "replace", "fd66::1/64", "dev", "porta0", "nodad"],
+                      self.commands())
+        transaction = state["nft_transaction"]
+        self.assertIn("table ip6 porta {", transaction)
+        self.assertIn('iifname "porta0" oifname "eth0" accept', transaction)
+        self.assertIn('oifname "eth0" ip6 saddr fd66::/64 masquerade', transaction)
+        self.assertIn("fd00:ec2::254", transaction)
+        self.assertIn('iifname != { "lo", "porta0" } ip6 daddr fd66::1 drop', transaction)
+        self.assertIn("packet-too-big", transaction)
+        self.assertEqual(len(state["ip6tables_rules"]), 2)
+        self.assertEqual(len(state["iptables_rules"]), 2)
+
+        # Restarting keeps the saved originals; routed prefixes skip NAT.
+        self.run_script(*dual, "--ipv6-routed")
+        state = self.state()
+        self.assertNotIn("ip6 saddr fd66::/64 masquerade", state["nft_transaction"])
+        self.assertEqual(len(state["ip6tables_rules"]), 2)
+
+        self.run_script("server-down.sh", "porta0", "eth0")
+        state = self.state()
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.all.forwarding"], "0")
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.eth0.accept_ra"], "1")
+        self.assertNotIn("ip6 porta", state["nft_tables"])
+        self.assertEqual(state["ip6tables_rules"], [])
+        self.assertFalse(any((self.root / "runtime").glob("*6*")))
+
+        # Without --ipv6 a later start removes the IPv6 table and rules.
+        self.run_script(*dual)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
+        state = self.state()
+        self.assertNotIn("ip6 porta", state["nft_tables"])
+        self.assertEqual(state["ip6tables_rules"], [])
+
+    def test_server_up_rejects_ipv6_on_a_cascade_relay(self):
+        result = self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                 "eth0", "8443", "--upstream-interface", "porta-up0",
+                                 "--ipv6", "fd66::1/64", "fd66::/64", success=False)
+        self.assertIn("not supported with --upstream-interface", result.stderr)
+        result = self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                 "eth0", "8443", "--ipv6", "10.0.0.1/24", "fd66::/64",
+                                 success=False)
+        self.assertIn("invalid IPv6", result.stderr)
 
     def test_server_up_reconciles_previous_docker_interface(self):
         self.update_state(docker=True)
@@ -1067,6 +1124,39 @@ class AutomationTests(unittest.TestCase):
         for options in (("--routes", "10.20.0.0/16;reboot"), ("--routes", "corp"),
                         ("--dns-domains", "corp.example"),
                         ("--routes", "10.20.0.0/16", "--dns-domains", "bad_domain")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_deploy_ipv6_pool_is_generated_passed_saved_and_cleared(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local", "--ipv6",
+                                 "--routes", "10.20.0.0/16,2001:db8::/32")
+        unit_path = self.root / "system/etc/systemd/system/porta.service"
+        unit = unit_path.read_text()
+        match = re.search(r"--ipv6-pool (fd[0-9a-f]{2}:[0-9a-f]{4}:[0-9a-f]{4}::/64) ", unit)
+        self.assertIsNotNone(match, unit)
+        prefix = match.group(1)
+        gateway = prefix.replace("::/64", "::1/64")
+        self.assertIn(f"--ipv6 {gateway} {prefix};", unit)
+        self.assertIn("--route 2001:db8::/32", unit)
+        self.assertIn(f"Client IPv6:     {prefix}, masqueraded through eth0", result.stdout)
+        config_path = self.root / "system/etc/porta/deploy.conf"
+        self.assertIn(f"ipv6_pool={prefix}\n", config_path.read_text())
+
+        # Upgrades keep the generated prefix; a routed prefix skips NAT.
+        self.run_deploy(deploy, "--build-local", "--ipv6")
+        self.assertIn(f"--ipv6-pool {prefix} ", unit_path.read_text())
+        self.run_deploy(deploy, "--build-local", "--ipv6-pool", "2001:db8:66::/64",
+                        "--ipv6-routed", "--routes=")
+        unit = unit_path.read_text()
+        self.assertIn("--ipv6 2001:db8:66::1/64 2001:db8:66::/64 --ipv6-routed;", unit)
+
+        result = self.run_deploy(deploy, "--build-local", "--no-ipv6")
+        self.assertNotIn("ipv6", unit_path.read_text())
+        self.assertIn("Client IPv6:     off", result.stdout)
+        for options in (("--ipv6-pool", "fd66::/121"), ("--ipv6-pool", "10.0.0.0/8"),
+                        ("--routes", "2001:db8::/32"), ("--ipv6-routed",),
+                        ("--ipv6", "--mtu", "1200")):
             with self.subTest(options=options):
                 self.run_deploy(deploy, "--build-local", *options, success=False)
 

@@ -589,7 +589,10 @@ impl Controller {
                     };
                     state.tone = "connected".to_owned();
                     state.connected = true;
-                    state.address = info.lease.address.to_string();
+                    state.address = match info.lease.ipv6() {
+                        Some(ipv6) => format!("{} · {}", info.lease.address.addr(), ipv6.addr()),
+                        None => info.lease.address.to_string(),
+                    };
                     state.transport = transport_name(info.transport).to_owned();
                     state.mtu = info.lease.mtu;
                     state.account = info.account;

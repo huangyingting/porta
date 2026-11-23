@@ -74,6 +74,10 @@ class Session internal constructor(handle: Long) : AutoCloseable {
     fun address(): String =
         Portamobile.callNative { Portamobile.sessionAddress(requireHandle()) }
 
+    /** The tunnel's IPv6 address, or an empty string without IPv6. */
+    fun address6(): String =
+        Portamobile.callNative { Portamobile.sessionAddress6(requireHandle()) }
+
     fun prefixLength(): Int =
         Portamobile.callNative { Portamobile.sessionPrefixLength(requireHandle()) }
 
@@ -181,6 +185,7 @@ object Portamobile {
     internal fun sessionSend(handle: Long, packet: ByteArray) = nativeSessionSend(handle, packet)
     internal fun sessionReceive(handle: Long): ByteArray = nativeSessionReceive(handle)
     internal fun sessionAddress(handle: Long): String = nativeSessionAddress(handle)
+    internal fun sessionAddress6(handle: Long): String = nativeSessionAddress6(handle)
     internal fun sessionPrefixLength(handle: Long): Int = nativeSessionPrefixLength(handle)
     internal fun sessionMTU(handle: Long): Int = nativeSessionMTU(handle)
     internal fun sessionDNS(handle: Long): String = nativeSessionDNS(handle)
@@ -221,6 +226,7 @@ object Portamobile {
     @JvmStatic private external fun nativeSessionSend(handle: Long, packet: ByteArray)
     @JvmStatic private external fun nativeSessionReceive(handle: Long): ByteArray
     @JvmStatic private external fun nativeSessionAddress(handle: Long): String
+    @JvmStatic private external fun nativeSessionAddress6(handle: Long): String
     @JvmStatic private external fun nativeSessionPrefixLength(handle: Long): Int
     @JvmStatic private external fun nativeSessionMTU(handle: Long): Int
     @JvmStatic private external fun nativeSessionDNS(handle: Long): String

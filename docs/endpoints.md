@@ -17,7 +17,7 @@
 
 ## Tunnel and proxy routes
 
-- `CONNECT /.well-known/masque/ip/*/*/` is the RFC 9484 unrestricted IPv4
+- `CONNECT /.well-known/masque/ip/*/*/` is the RFC 9484 unrestricted
   MASQUE endpoint. It requires Extended CONNECT with `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, a signed native-device proof, and a
   supported Porta protocol version.
@@ -52,12 +52,22 @@ requests do not use this protocol.
 
 Porta sends optional `X-Porta-Gateway`, `X-Porta-DNS` and `X-Porta-MTU` response
 extensions because RFC 9484 does not define that interface configuration.
-A split-tunnel gateway also sends `X-Porta-Routes` (comma-separated IPv4
-prefixes, also advertised as a ROUTE_ADVERTISEMENT capsule on HTTP/3) and
+A split-tunnel gateway also sends `X-Porta-Routes` (comma-separated IPv4 and,
+with IPv6, IPv6 prefixes, also advertised as a ROUTE_ADVERTISEMENT capsule on
+HTTP/3) and
 `X-Porta-DNS-Domains` (comma-separated names). Clients treat a malformed or
 oversized value as a permanent error rather than guessing a routing policy. The
 authenticated gateway address also identifies the source of client-local ICMP
 MTU feedback; it is not inferred from an unrelated public endpoint address.
+
+On a dual-stack gateway, HTTP/3 clients request an IPv6 address alongside the
+IPv4 one in their ADDRESS_REQUEST capsule. Every ADDRESS_ASSIGN capsule lists
+all of the client's addresses, as RFC 9484 requires: answers carry the request
+ID, addresses the client did not request carry ID zero, and a request the
+gateway cannot satisfy gets the unspecified address. Full tunnels advertise
+`::`–`ffff:…` in addition to the IPv4 range. HTTP/2 lanes receive the IPv6
+address as `X-Porta-Address6: ADDRESS/128`. Gateways without IPv6, and devices
+whose access policy selects a named exit, get no IPv6 address.
 
 HTTP/3 clients additionally request the optional
 `X-Porta-MTU-Discovery: 1` capability. Server-side `--auto-mtu` is enabled by
@@ -222,7 +232,8 @@ clients treat as a signal to try another gateway.
 `GET /api/gateway` returns the server version and, on a cascade relay, the
 next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","interface":"porta-up0","connected":true,"address":"10.66.0.2","transport":"h3"}}`.
 While disconnected, `connected` is `false` and `error` holds the last failure.
-A split-tunnel gateway adds `routes` and `dns_domains`, `client_to_client`
+A split-tunnel gateway adds `routes` and `dns_domains`, a dual-stack gateway
+adds `ipv6_pool`, `client_to_client`
 reports `--client-to-client`, `exits` lists the exit names access policies
 may select, and `upstreams` lists every next hop, with `name` set for named
 exits. `federation` reports `role` (`primary` or `replica`) and, on a

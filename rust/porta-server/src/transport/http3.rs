@@ -27,6 +27,8 @@ use crate::transport::session::{
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
 use crate::web::session::{normalized_headers, RequestContext, Response as WebResponse};
+use crate::wire::ip::parse_ip;
+#[cfg(test)]
 use crate::wire::ip::parse_ipv4;
 use crate::wire::masque::{
     decode_address_assign, decode_address_request, decode_mtu_probe, decode_mtu_selection,
@@ -1633,36 +1635,48 @@ pub(crate) fn address_response(
     value: &[u8],
 ) -> Result<(Bytes, bool)> {
     let requests = decode_address_request(value)?;
-    let mut responses = Vec::with_capacity(requests.len() + 1);
-    let mut requested_ipv4 = false;
+    let mut responses = Vec::with_capacity(requests.len() + 2);
+    let mut requested_ipv4 = None;
+    let mut requested_ipv6 = None;
     for request in requests {
-        let prefix = match request.prefix {
-            IpNet::V4(_) if !requested_ipv4 => {
-                requested_ipv4 = true;
-                IpNet::V4(Ipv4Net::new(lease.address, 32).expect("IPv4 /32 is valid"))
+        match request.prefix {
+            IpNet::V4(_) if requested_ipv4.is_none() => requested_ipv4 = Some(request.request_id),
+            IpNet::V6(_) if requested_ipv6.is_none() && lease.ipv6.is_some() => {
+                requested_ipv6 = Some(request.request_id);
             }
-            IpNet::V4(_) => {
-                IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).expect("IPv4 /32 is valid"))
-            }
-            IpNet::V6(_) => {
-                IpNet::V6(Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128).expect("IPv6 /128 is valid"))
-            }
-        };
-        responses.push(Address {
-            request_id: request.request_id,
-            prefix,
-        });
+            // Requests this gateway cannot satisfy get the unspecified address.
+            IpNet::V4(_) => responses.push(Address {
+                request_id: request.request_id,
+                prefix: IpNet::V4(
+                    Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).expect("IPv4 /32 is valid"),
+                ),
+            }),
+            IpNet::V6(_) => responses.push(Address {
+                request_id: request.request_id,
+                prefix: IpNet::V6(
+                    Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128).expect("IPv6 /128 is valid"),
+                ),
+            }),
+        }
     }
-    if assigned && !requested_ipv4 {
+    let becomes_assigned = assigned || requested_ipv4.is_some() || requested_ipv6.is_some();
+    // Every assignment lists all of the client's addresses (RFC 9484 4.7.2);
+    // addresses it did not request carry request ID zero.
+    if becomes_assigned {
         responses.push(Address {
-            request_id: 0,
+            request_id: requested_ipv4.unwrap_or(0),
             prefix: IpNet::V4(Ipv4Net::new(lease.address, 32).expect("IPv4 /32 is valid")),
         });
+        if let Some(ipv6) = lease.ipv6 {
+            responses.push(Address {
+                request_id: requested_ipv6.unwrap_or(0),
+                prefix: IpNet::V6(Ipv6Net::new(ipv6.address, 128).expect("IPv6 /128 is valid")),
+            });
+        }
     }
     let assignment = encode_address_assign(&responses)?;
     let mut control = BytesMut::with_capacity(assignment.len() + 32);
     append_capsule(&mut control, CAPSULE_ADDRESS_ASSIGN, &assignment)?;
-    let becomes_assigned = assigned || requested_ipv4;
     if becomes_assigned {
         let routes = encode_route_advertisement(&routing.advertisement())?;
         append_capsule(&mut control, CAPSULE_ROUTE_ADVERTISEMENT, &routes)?;
@@ -1675,7 +1689,7 @@ pub(crate) async fn inject_packet(session: &Session, packet: Bytes, mtu: u16) ->
         session.services().metrics.dropped_from_client();
         return Ok(());
     }
-    let Ok(info) = parse_ipv4(&packet) else {
+    let Ok(info) = parse_ip(&packet) else {
         session.services().metrics.dropped_from_client();
         return Ok(());
     };
@@ -1764,6 +1778,20 @@ async fn send_downlink(
         } else {
             usize::from(mtu)
         };
+        if packet.len() > limit
+            && diagnostics.datagrams_enabled
+            && limit < crate::wire::ip::IPV6_MIN_MTU
+            && packet.len() <= usize::from(mtu)
+            && crate::wire::ip::ip_version(&packet) == Some(6)
+        {
+            // IPv6 senders cannot go below 1280 bytes, so a smaller datagram
+            // path carries the packet on the reliable stream instead.
+            writer.packet(&packet)?;
+            session.services().metrics.datagram_oversize();
+            diagnostics.fallback(DatagramErrorKind::TooLarge, packet.len());
+            diagnostics.sends.capsule_submitted(packet.len(), 1);
+            continue;
+        }
         if packet.len() > limit {
             match fragment_ipv4(&packet, limit) {
                 Ok(fragments) => {
@@ -3255,6 +3283,7 @@ mod tests {
             prefix_len: 24,
             gateway: "10.66.0.1".parse().unwrap(),
             opaque_id: 1,
+            ipv6: None,
         }
     }
 
@@ -3323,6 +3352,74 @@ mod tests {
         let (kind, value) = take_capsule(&mut datagram).unwrap().unwrap();
         assert_eq!(kind, CAPSULE_DATAGRAM);
         assert_eq!(value[0], 0);
+    }
+
+    #[test]
+    fn dual_stack_assignment_lists_both_addresses_and_routes() {
+        let mut lease = lease();
+        lease.ipv6 = Some(crate::transport::session::Ipv6Lease {
+            address: "fd66::2".parse().unwrap(),
+            prefix_len: 64,
+            gateway: "fd66::1".parse().unwrap(),
+        });
+        let routing = crate::transport::session::TunnelRouting {
+            ipv6: true,
+            ..Default::default()
+        };
+        let request = crate::wire::masque::encode_address_request(&[
+            Address {
+                request_id: 1,
+                prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).unwrap()),
+            },
+            Address {
+                request_id: 2,
+                prefix: IpNet::V6(Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128).unwrap()),
+            },
+        ])
+        .unwrap();
+        let (control, assigned) = address_response(&lease, &routing, false, &request).unwrap();
+        assert!(assigned);
+        let mut buffered = BytesMut::from(control.as_ref());
+        let (_, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
+        let assignment = decode_address_assign(&assignment).unwrap();
+        assert_eq!(
+            assignment
+                .iter()
+                .map(|address| (address.request_id, address.prefix.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(1, "10.66.0.2/32".into()), (2, "fd66::2/128".into())]
+        );
+        let (_, routes) = take_capsule(&mut buffered).unwrap().unwrap();
+        let routes = decode_route_advertisement(&routes).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[1].end, IpAddr::V6(Ipv6Addr::from(u128::MAX)));
+
+        // A later IPv4-only request still lists the IPv6 address.
+        let again = crate::wire::masque::encode_address_request(&[Address {
+            request_id: 3,
+            prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).unwrap()),
+        }])
+        .unwrap();
+        let (control, _) = address_response(&lease, &routing, true, &again).unwrap();
+        let mut buffered = BytesMut::from(control.as_ref());
+        let (_, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
+        let assignment = decode_address_assign(&assignment).unwrap();
+        assert_eq!(assignment[1].request_id, 0);
+        assert_eq!(assignment[1].prefix.to_string(), "fd66::2/128");
+
+        // Without an IPv6 lease the request gets the unspecified address.
+        let (control, _) =
+            address_response(&super::tests::lease(), &Default::default(), false, &request).unwrap();
+        let mut buffered = BytesMut::from(control.as_ref());
+        let (_, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
+        let assignment = decode_address_assign(&assignment).unwrap();
+        assert_eq!(
+            assignment
+                .iter()
+                .map(|address| (address.request_id, address.prefix.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(2, "::/128".into()), (1, "10.66.0.2/32".into())]
+        );
     }
 
     #[test]

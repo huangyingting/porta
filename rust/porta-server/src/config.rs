@@ -76,16 +76,21 @@ pub struct Config {
     pub interface: String,
     #[arg(long, default_value = "10.66.0.0/24")]
     pub pool: ipnet::Ipv4Net,
+    /// IPv6 prefix for dual-stack clients, such as a unique local /64. Each
+    /// device's IPv6 address mirrors its IPv4 lease (10.66.0.5 becomes
+    /// PREFIX::5); scripts/server-up.sh forwards and masquerades it.
+    #[arg(long, value_name = "CIDR")]
+    pub ipv6_pool: Option<ipnet::Ipv6Net>,
     #[arg(long, num_args = 0..=1, default_missing_value = "", value_parser = parse_path)]
     pub lease_state: Option<PathBuf>,
     #[arg(long, default_value = "1.1.1.1")]
     pub dns: String,
     #[arg(long, default_value_t = 1400)]
     pub mtu: u16,
-    /// IPv4 prefix routed through the tunnel (repeatable). Without any, clients
-    /// use a full tunnel.
+    /// IPv4 or IPv6 prefix routed through the tunnel (repeatable). Without
+    /// any, clients use a full tunnel. IPv6 prefixes need --ipv6-pool.
     #[arg(long = "route", value_name = "CIDR")]
-    pub routes: Vec<ipnet::Ipv4Net>,
+    pub routes: Vec<ipnet::IpNet>,
     /// With --route: DNS domain resolved through the tunnel's DNS server
     /// (repeatable). Other names keep using the device's resolver.
     #[arg(long = "dns-domain", value_name = "DOMAIN")]
@@ -236,6 +241,7 @@ impl fmt::Debug for Config {
             .field("usage_state", &self.usage_state)
             .field("interface", &self.interface)
             .field("pool", &self.pool)
+            .field("ipv6_pool", &self.ipv6_pool)
             .field("lease_state", &self.lease_state)
             .field("dns", &self.dns)
             .field("mtu", &self.mtu)
@@ -382,6 +388,7 @@ impl Config {
         if self.mtu < 576 || self.mtu > 9000 {
             bail!("MTU {} is outside 576..9000", self.mtu);
         }
+        self.validate_ipv6()?;
         if self.readiness_timeout.is_zero() {
             bail!("--readiness-timeout must be positive");
         }
@@ -526,6 +533,27 @@ impl Config {
         Ok(())
     }
 
+    fn validate_ipv6(&mut self) -> Result<()> {
+        let Some(prefix) = self.ipv6_pool else {
+            return Ok(());
+        };
+        crate::state::pool::Ipv6Pool::new(self.pool, prefix)
+            .map_err(|error| anyhow::anyhow!("--ipv6-pool: {error}"))?;
+        if usize::from(self.mtu) < porta_wire::ip::IPV6_MIN_MTU {
+            bail!("--ipv6-pool needs --mtu of at least 1280, the IPv6 minimum");
+        }
+        if self.upstream.is_some() {
+            bail!("--ipv6-pool is not supported on a cascade relay (--upstream) yet; its next hop carries IPv4 only");
+        }
+        Ok(())
+    }
+
+    /// IPv6 addresses for dual-stack leases.
+    pub fn ipv6(&self) -> Option<crate::state::pool::Ipv6Pool> {
+        self.ipv6_pool
+            .and_then(|prefix| crate::state::pool::Ipv6Pool::new(self.pool, prefix).ok())
+    }
+
     /// The gateway's address on the client pool.
     pub fn gateway_address(&self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.pool.network()) + 1)
@@ -628,10 +656,18 @@ impl Config {
         for route in &mut self.routes {
             *route = route.trunc();
             if route.prefix_len() == 0 {
-                bail!("--route 0.0.0.0/0 is a full tunnel; omit --route instead");
+                bail!("--route {route} is a full tunnel; omit --route instead");
             }
             if route.addr().is_loopback() || route.addr().is_multicast() {
                 bail!("--route {route} is not a routable unicast prefix");
+            }
+            if let ipnet::IpNet::V6(route) = route {
+                if self.ipv6_pool.is_none() {
+                    bail!("--route {route} is IPv6 and needs --ipv6-pool");
+                }
+                if route.addr().is_unicast_link_local() {
+                    bail!("--route {route} is not a routable unicast prefix");
+                }
             }
         }
         self.routes.sort();
@@ -1106,9 +1142,43 @@ mod tests {
             ]
         );
         assert_eq!(config.dns_domains, vec!["corp.example", "internal"]);
+        let dual_stack = relay_config(
+            &[
+                "--ipv6-pool",
+                "fd66:0:0:1::/64",
+                "--route",
+                "2001:db8:1::5/48",
+            ],
+            "",
+        )
+        .unwrap();
+        assert_eq!(dual_stack.routes, vec!["2001:db8:1::/48".parse().unwrap()]);
+        assert_eq!(
+            dual_stack.ipv6().unwrap().gateway(),
+            "fd66:0:0:1::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
         for (arguments, message) in [
             (vec!["--route", "0.0.0.0/0"], "full tunnel"),
             (vec!["--route", "127.0.0.0/8"], "routable"),
+            (vec!["--route", "2001:db8::/32"], "needs --ipv6-pool"),
+            (
+                vec!["--ipv6-pool", "fd66::/64", "--route", "::/0"],
+                "full tunnel",
+            ),
+            (vec!["--ipv6-pool", "fd66::/121"], "mirror the IPv4 pool"),
+            (
+                vec![
+                    "--ipv6-pool",
+                    "fd66::/64",
+                    "--upstream",
+                    "https://next.example",
+                ],
+                "cascade relay",
+            ),
+            (
+                vec!["--ipv6-pool", "fd66::/64", "--mtu", "1200"],
+                "at least 1280",
+            ),
             (vec!["--dns-domain", "corp.example"], "requires --route"),
             (
                 vec!["--route", "10.0.0.0/8", "--dns-domain", "bad_domain"],

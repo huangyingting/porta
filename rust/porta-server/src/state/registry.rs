@@ -3,7 +3,7 @@ use crate::state::usage;
 use crate::wire::device_auth;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net};
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -106,10 +106,10 @@ pub struct ClientRecord {
 pub struct AccessPolicy {
     /// Destinations the account may reach; empty allows every destination.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<Ipv4Net>,
+    pub allow: Vec<IpNet>,
     /// Destinations the account may never reach; takes precedence over `allow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny: Vec<Ipv4Net>,
+    pub deny: Vec<IpNet>,
     /// Accounts in the same group reach each other's devices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -2335,7 +2335,7 @@ fn prefixes_overlap(left: &Ipv4Net, right: &Ipv4Net) -> bool {
     left.contains(&right.network()) || right.contains(&left.network())
 }
 
-fn normalize_prefixes(prefixes: Vec<Ipv4Net>) -> Vec<Ipv4Net> {
+fn normalize_prefixes<T: Ord + Copy + Truncate>(prefixes: Vec<T>) -> Vec<T> {
     let mut prefixes = prefixes
         .into_iter()
         .map(|prefix| prefix.trunc())
@@ -2343,6 +2343,23 @@ fn normalize_prefixes(prefixes: Vec<Ipv4Net>) -> Vec<Ipv4Net> {
     prefixes.sort();
     prefixes.dedup();
     prefixes
+}
+
+/// Prefixes whose host bits can be cleared.
+trait Truncate {
+    fn trunc(&self) -> Self;
+}
+
+impl Truncate for Ipv4Net {
+    fn trunc(&self) -> Self {
+        Ipv4Net::trunc(self)
+    }
+}
+
+impl Truncate for IpNet {
+    fn trunc(&self) -> Self {
+        IpNet::trunc(self)
+    }
 }
 
 fn validate_access(access: AccessPolicy, exits: &[String]) -> Result<AccessPolicy, RegistryError> {
@@ -3223,12 +3240,17 @@ mod tests {
         let pool: Ipv4Net = "10.66.0.0/24".parse().unwrap();
         let exits = vec!["local".to_owned()];
         let net = |value: &str| -> Ipv4Net { value.parse().unwrap() };
+        let prefix = |value: &str| -> IpNet { value.parse().unwrap() };
 
         let summary = registry
             .set_access(
                 &id,
                 AccessPolicy {
-                    allow: vec![net("10.30.0.9/24"), net("10.30.0.0/24")],
+                    allow: vec![
+                        prefix("10.30.0.9/24"),
+                        prefix("10.30.0.0/24"),
+                        prefix("2001:db8::1/64"),
+                    ],
                     deny: Vec::new(),
                     group: Some(" Team ".into()),
                     exit: Some("local".into()),
@@ -3237,7 +3259,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(summary.access.allow, vec![net("10.30.0.0/24")]);
+        assert_eq!(
+            summary.access.allow,
+            vec![prefix("10.30.0.0/24"), prefix("2001:db8::/64")]
+        );
         assert_eq!(summary.access.group.as_deref(), Some("team"));
         for invalid in [
             AccessPolicy {
@@ -3249,7 +3274,7 @@ mod tests {
                 ..AccessPolicy::default()
             },
             AccessPolicy {
-                deny: vec![net("10.0.0.0/8"); MAX_ACCESS_PREFIXES + 1],
+                deny: vec![prefix("10.0.0.0/8"); MAX_ACCESS_PREFIXES + 1],
                 ..AccessPolicy::default()
             },
         ] {

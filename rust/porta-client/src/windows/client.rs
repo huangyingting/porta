@@ -463,7 +463,7 @@ async fn run_session(
 
 fn packet_matches_lease(packet: &[u8], lease: Lease) -> bool {
     packet.len() <= usize::from(lease.mtu)
-        && porta_wire::ip::parse_ipv4(packet).is_ok_and(|info| info.source == lease.address.addr())
+        && porta_wire::ip::parse_ip(packet).is_ok_and(|info| lease.owns(info.source))
 }
 
 async fn wait_or_cancel(delay: Duration, cancellation: &CancellationToken) -> bool {
@@ -722,6 +722,7 @@ mod tests {
             gateway: None,
             dns: Some("10.0.0.1".parse().unwrap()),
             mtu: 1280,
+            address6: None,
         };
         let mut packet = vec![0; usize::from(lease.mtu)];
         packet[0] = 0x45;
@@ -744,6 +745,20 @@ mod tests {
         assert!(!packet_matches_lease(&packet, lease));
         assert!(!packet_matches_lease(&[], lease));
         assert!(!packet_matches_lease(&packet[..19], lease));
+
+        // IPv6 packets need the IPv6 lease as their source.
+        let mut ipv6 = vec![0; 40];
+        ipv6[0] = 0x60;
+        ipv6[6] = 59;
+        ipv6[8..24].copy_from_slice(&"fd66::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert!(!packet_matches_lease(&ipv6, lease));
+        let dual = Lease {
+            address6: Some("fd66::2/128".parse().unwrap()),
+            ..lease
+        };
+        assert!(packet_matches_lease(&ipv6, dual));
+        ipv6[23] = 9;
+        assert!(!packet_matches_lease(&ipv6, dual));
     }
 
     #[test]

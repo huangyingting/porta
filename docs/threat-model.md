@@ -194,7 +194,11 @@ not conceal transport fingerprints from network inspection.
   traffic. Its exact endpoint TCP/UDP exceptions are not process-specific.
   Windows endpoint exceptions are application scoped and forwarding is blocked.
   Neither implementation overrides unrelated firewall blocks.
-- IPv6 payload is blocked, not tunneled. Loopback and narrowly required
+- IPv6 payload is tunneled only with an IPv6 lease and otherwise blocked in
+  full tunnels; split tunnels leave untunneled IPv6 on the device's network.
+  On the gateway IPv6 leaves only through the physical interface, never a
+  named exit or cascade next hop: those devices get no IPv6 address and a
+  cascade relay refuses an IPv6 pool. Loopback and narrowly required
   transport/control exceptions remain. Protected retries use cached literal
   endpoints and retain TLS hostname verification; arbitrary DNS changes,
   physical DHCP renewal, and unrestricted network handover are not guaranteed.

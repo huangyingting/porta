@@ -117,8 +117,10 @@ async fn run() -> Result<()> {
         let client_to_client = config.client_to_client;
         let dns_resolver = config.dns_resolver;
         let exits = config.exit_names();
+        let ipv6_pool = config.ipv6_pool.map(|prefix| prefix.to_string());
         let provider: GatewayStatusProvider = Arc::new(move || GatewayStatus {
             routes: routes.clone(),
+            ipv6_pool: ipv6_pool.clone(),
             dns_domains: dns_domains.clone(),
             client_to_client,
             dns_resolver,
@@ -137,8 +139,9 @@ async fn run() -> Result<()> {
         });
         provider
     };
+    let ipv6 = config.ipv6();
     let device = Arc::new(NativeTun::open(&config.interface, usize::from(config.mtu))?);
-    let router = Arc::new(Router::new(device, Some(metrics.clone())));
+    let router = Arc::new(Router::with_ipv6(device, Some(metrics.clone()), ipv6));
     let bootstrap_token = Zeroizing::new(std::mem::take(&mut config.token));
     let registry = Arc::new(match &config.federation_primary {
         Some(primary) => {
@@ -194,7 +197,7 @@ async fn run() -> Result<()> {
             .map_err(anyhow::Error::msg)?,
         ))
     };
-    let leases = PoolAdapter::new(pool.clone());
+    let leases = PoolAdapter::with_ipv6(pool.clone(), ipv6);
     let rate_limits = RateLimiters::with_metrics(metrics.clone());
     let packet_router = RouterAdapter::with_switching(
         router.clone(),
@@ -202,10 +205,14 @@ async fn run() -> Result<()> {
         rate_limits.clone(),
         SwitchConfig {
             client_to_client: config.client_to_client,
-            always_reachable: [Some(pool.gateway()), config.dns_address()?]
-                .into_iter()
-                .flatten()
-                .collect(),
+            always_reachable: [
+                Some(IpAddr::V4(pool.gateway())),
+                config.dns_address()?.map(IpAddr::V4),
+                ipv6.map(|ipv6| IpAddr::V6(ipv6.gateway())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             exits: exit_rules.clone(),
             names: Some(registry.clone()),
         },
@@ -240,13 +247,15 @@ async fn run() -> Result<()> {
                 Vec::new()
             } else {
                 let mut routes = config.routes.clone();
-                if !routes.contains(&config.pool.trunc()) {
-                    routes.push(config.pool.trunc());
+                let pool = ipnet::IpNet::V4(config.pool.trunc());
+                if !routes.contains(&pool) {
+                    routes.push(pool);
                 }
                 routes
             },
             dns_domains: config.dns_domains.clone(),
             subnets: Vec::new(),
+            ipv6: false,
         },
     });
     let dns = config.dns_address()?;
@@ -287,6 +296,7 @@ async fn run() -> Result<()> {
             .iter()
             .filter_map(|relay| Some((relay.name()?.to_owned(), relay.readiness())))
             .collect(),
+        ipv6: ipv6.map(|ipv6| (ipv6.gateway(), ipv6.prefix())),
     })?;
     let metrics_token = Zeroizing::new(std::mem::take(&mut config.metrics_token));
     let operations: Arc<dyn Handler> = Arc::new(OperationsHandler::new(

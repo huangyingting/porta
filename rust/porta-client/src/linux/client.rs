@@ -166,7 +166,7 @@ impl DeviceReader {
                         }
                     },
                 };
-                if porta_wire::ip::parse_ipv4(&packet).is_err() {
+                if porta_wire::ip::parse_ip(&packet).is_err() {
                     continue;
                 }
                 tokio::select! {
@@ -678,7 +678,7 @@ async fn run_connection(
     let upload_errors = errors_tx.clone();
     let outbound = runtime.outbound_rx.clone();
     let upload_counters = runtime.counters.clone();
-    let leased_source = connection.lease.address.addr();
+    let lease = connection.lease;
     let routing = connection.routing.clone();
     let upload = tokio::spawn(async move {
         loop {
@@ -692,7 +692,7 @@ async fn run_connection(
                     None => return,
                 }
             };
-            if !packet_has_source(&packet, leased_source, &routing) {
+            if !packet_has_source(&packet, &lease, &routing) {
                 continue;
             }
             let result = tokio::select! {
@@ -951,9 +951,9 @@ fn restored_endpoints(endpoint: &Url, saved: Vec<SocketAddr>) -> Result<Vec<Sock
 
 /// Whether the tunnel may carry `packet`: it comes from the lease or, on a
 /// subnet router, from a network behind this device.
-fn packet_has_source(packet: &[u8], source: Ipv4Addr, routing: &crate::tunnel::Routing) -> bool {
-    porta_wire::ip::parse_ipv4(packet)
-        .is_ok_and(|info| info.source == source || routing.serves(info.source))
+fn packet_has_source(packet: &[u8], lease: &Lease, routing: &crate::tunnel::Routing) -> bool {
+    porta_wire::ip::parse_ip(packet)
+        .is_ok_and(|info| lease.owns(info.source) || routing.serves(info.source))
 }
 
 fn normalize_ip(address: IpAddr) -> IpAddr {
@@ -1018,23 +1018,31 @@ mod tests {
         packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
         packet[12..16].copy_from_slice(&[10, 66, 0, 2]);
         packet[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let lease = |address: &str| Lease {
+            address: address.parse().unwrap(),
+            gateway: None,
+            dns: None,
+            mtu: 1400,
+            address6: Some("fd66::2/128".parse().unwrap()),
+        };
 
         let full = crate::tunnel::Routing::default();
-        assert!(packet_has_source(
-            &packet,
-            Ipv4Addr::new(10, 66, 0, 2),
-            &full
-        ));
-        assert!(!packet_has_source(
-            &packet,
-            Ipv4Addr::new(192, 0, 2, 10),
-            &full
-        ));
+        assert!(packet_has_source(&packet, &lease("10.66.0.2/32"), &full));
+        assert!(!packet_has_source(&packet, &lease("192.0.2.10/32"), &full));
         assert!(!packet_has_source(
             &packet[..10],
-            Ipv4Addr::new(10, 66, 0, 2),
+            &lease("10.66.0.2/32"),
             &full
         ));
+
+        // IPv6 packets must come from the IPv6 lease.
+        let mut ipv6 = vec![0_u8; 40];
+        ipv6[0] = 0x60;
+        ipv6[6] = 59;
+        ipv6[8..24].copy_from_slice(&"fd66::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert!(packet_has_source(&ipv6, &lease("10.66.0.2/32"), &full));
+        ipv6[23] = 3;
+        assert!(!packet_has_source(&ipv6, &lease("10.66.0.2/32"), &full));
 
         // A subnet router also carries packets from the networks behind it.
         packet[12..16].copy_from_slice(&[10, 30, 0, 5]);
@@ -1042,16 +1050,8 @@ mod tests {
             subnets: vec!["10.30.0.0/24".parse().unwrap()],
             ..crate::tunnel::Routing::default()
         };
-        assert!(!packet_has_source(
-            &packet,
-            Ipv4Addr::new(10, 66, 0, 2),
-            &full
-        ));
-        assert!(packet_has_source(
-            &packet,
-            Ipv4Addr::new(10, 66, 0, 2),
-            &router
-        ));
+        assert!(!packet_has_source(&packet, &lease("10.66.0.2/32"), &full));
+        assert!(packet_has_source(&packet, &lease("10.66.0.2/32"), &router));
     }
 
     #[tokio::test]

@@ -493,6 +493,50 @@ it reconnects, and everything else is unaffected. DNS behaves per platform:
 The admin page shows a **Split tunnel** banner listing the advertised routes,
 and every client shows whether its connection is a full or split tunnel.
 
+## IPv6 (dual stack)
+
+Clients are IPv4-only by default: full tunnels block IPv6 so it cannot leak
+around the tunnel. To give clients IPv6 as well:
+
+```sh
+sudo ./scripts/deploy.sh --ipv6
+```
+
+`--ipv6` picks a random unique local /64 (RFC 4193) once and keeps it across
+upgrades; `--ipv6-pool CIDR` uses a prefix of your choice instead, and
+`--no-ipv6` turns IPv6 off again. The daemon option is `--ipv6-pool CIDR`.
+Each device's IPv6 address mirrors its IPv4 lease: `10.66.0.5` becomes
+`PREFIX::5`, and the gateway is `PREFIX::1`. Both families therefore share one
+allocator and one lease file, a device keeps both addresses across
+reconnects, and the prefix must leave at least as many host bits as the IPv4
+pool (`/64` through `/120` for the default `/24`).
+
+`scripts/server-up.sh` (with `--ipv6 GATEWAY6/LEN POOL6`) enables IPv6 on the
+TUN, turns on IPv6 forwarding, and masquerades the pool through the external
+interface. A prefix routed to this host by your provider can skip NAT with
+`--ipv6-routed`. Forwarding makes the kernel ignore router advertisements on
+interfaces with `accept_ra=1`; the helper sets the external interface to
+`accept_ra=2` so the host keeps its own IPv6 default route, and
+`server-down.sh` restores both settings. It applies the same guards as for
+IPv4: clients cannot reach link-local or multicast destinations or the AWS
+`fd00:ec2::254` metadata address, only ping and DNS reach the gateway host,
+and Docker's `ip6tables` `DOCKER-USER` chain gets matching accept rules.
+
+With a unique local pool, operating systems prefer IPv4 for destinations that
+have both families and use IPv6 for IPv6-only destinations; a routed global
+prefix makes clients prefer IPv6 as usual. The tunnel MTU must be at least
+1280, the IPv6 minimum. When a QUIC path cannot carry 1280-byte datagrams,
+IPv6 packets take the reliable stream instead of being told to shrink.
+
+IPv6 is not yet available on a cascade relay (`--upstream`): its next hop
+carries IPv4 only, and the gateway refuses the combination rather than let
+IPv6 leave locally. Devices whose access policy selects a named exit get no
+IPv6 address for the same reason. Split-tunnel `--routes` may include IPv6
+prefixes once IPv6 is on; split tunnels also route the IPv6 client pool so
+peers stay reachable, and access-policy allow and deny lists accept IPv6
+prefixes. The built-in resolver answers `AAAA` and `ip6.arpa` queries for
+devices that both have IPv6. The admin page shows a **Dual stack** banner.
+
 ## Token portal and client downloads
 
 Release clients are mirrored from the private GitHub release to the deployed

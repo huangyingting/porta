@@ -442,6 +442,7 @@ mod tests {
             gateway: Some(Ipv4Addr::new(10, 77, 0, 1)),
             dns: None,
             mtu: 1280,
+            address6: None,
         }
     }
 

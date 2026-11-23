@@ -445,6 +445,7 @@ fn test_lease() -> Lease {
         gateway: Some("10.77.0.1".parse().unwrap()),
         dns: Some("1.1.1.1".parse().unwrap()),
         mtu: 1280,
+        address6: None,
     }
 }
 
@@ -535,6 +536,97 @@ async fn split_tunnel_routes_only_advertised_prefixes_and_scopes_dns_and_guard()
     }
     manager.down().await.unwrap();
     assert!(snapshot(&commands).tables.is_empty());
+}
+
+#[tokio::test]
+async fn dual_stack_leases_route_ipv6_through_the_tunnel() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    snapshot(&commands).sysctl.insert(
+        "net/ipv6/conf/porta0/disable_ipv6".to_owned(),
+        "1".to_owned(),
+    );
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let lease = Lease {
+        address6: Some("fd66::2/128".parse().unwrap()),
+        ..test_lease()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            lease,
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.sysctl["net/ipv6/conf/porta0/disable_ipv6"], "0");
+        assert_eq!(
+            state.addresses["porta0"],
+            vec!["10.77.0.2/24".to_owned(), "fd66::2/128".to_owned()]
+        );
+        for route in ["-6 ::/1", "-6 8000::/1", "-4 0.0.0.0/1"] {
+            assert!(
+                state.routes.contains_key(route),
+                "{:?}",
+                state.routes.keys()
+            );
+        }
+        assert!(state.scripts.last().unwrap().contains("policy drop"));
+    }
+
+    // Split tunnels route and guard only the advertised IPv6 prefixes.
+    let routing = crate::tunnel::Routing {
+        routes: vec!["10.20.0.0/16".parse().unwrap()],
+        routes6: vec![
+            "fd66::/64".parse().unwrap(),
+            "2001:db8::/32".parse().unwrap(),
+        ],
+        ..crate::tunnel::Routing::default()
+    };
+    manager
+        .up("porta0", endpoint, lease, &routing)
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert!(!state.routes.contains_key("-6 ::/1"));
+        assert!(state.routes.contains_key("-6 fd66::/64"));
+        assert!(state.routes.contains_key("-6 2001:db8::/32"));
+        let rules = state.scripts.last().unwrap();
+        assert!(
+            rules.contains("ip6 daddr { fd66::/64, 2001:db8::/32 } drop"),
+            "{rules}"
+        );
+        assert!(rules.contains("ip daddr { 10.20.0.0/16 } drop"), "{rules}");
+    }
+
+    // Below the IPv6 minimum MTU the IPv6 address and routes go away.
+    let small = Lease { mtu: 1200, ..lease };
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            small,
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.addresses["porta0"], vec!["10.77.0.2/24".to_owned()]);
+        assert!(!state.routes.keys().any(|route| route.starts_with("-6 ")));
+    }
+    manager
+        .up("porta0", endpoint, lease, &routing)
+        .await
+        .unwrap();
+    manager.down().await.unwrap();
+    let state = snapshot(&commands);
+    assert!(state.routes.is_empty());
+    assert!(state.addresses.get("porta0").is_none_or(Vec::is_empty));
 }
 
 #[tokio::test]

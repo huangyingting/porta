@@ -28,6 +28,7 @@ make test-exit-selection
 make test-dns-resolver
 make test-admin-identity
 make test-gateway-failover
+make test-ipv6
 make test-service-user
 make vet
 make build
@@ -78,6 +79,13 @@ ends their session's rights, and the audit log's contents and permissions.
 transports: a client lists a primary and a faster replica, enrolls through
 the primary, fails over to the replica when the primary stops, and loses its
 replica session when the primary disables the account.
+
+`make test-ipv6` runs `scripts/test-ipv6.sh` over both transports: a
+dual-stack gateway's clients reach an IPv6 web server through the gateway's
+NAT66 address and never through their own IPv6 network, download a large
+file over IPv6, and reach each other's IPv6 addresses; an IPv4-only gateway's
+full tunnel blocks IPv6 instead of leaking it; and a dual-stack split tunnel
+routes only its IPv6 prefixes.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

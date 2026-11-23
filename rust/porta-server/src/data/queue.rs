@@ -80,30 +80,7 @@ pub enum EnqueueResult {
     Closed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum PacketClass {
-    Tcp,
-    Datagram,
-    Control,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct FlowKey {
-    source: [u8; 4],
-    destination: [u8; 4],
-    source_port: u16,
-    destination_port: u16,
-    fragment_id: u16,
-    protocol: u8,
-    fragmented: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PacketMetadata {
-    pub class: PacketClass,
-    pub flow: FlowKey,
-    pub hash: u32,
-}
+pub(crate) use crate::wire::ip::{classify_packet, FlowKey, PacketClass};
 
 struct QueuedPacket {
     data: Bytes,
@@ -208,7 +185,7 @@ impl PacketQueue {
     }
 
     fn enqueue_at(&self, packet: Bytes, now: Instant) -> EnqueueResult {
-        let metadata = classify_ipv4(&packet);
+        let metadata = classify_packet(&packet);
         let mut state = self.state.lock();
         if state.closed {
             return EnqueueResult::Closed;
@@ -345,98 +322,6 @@ fn oldest_replaceable(items: &VecDeque<QueuedPacket>, incoming: PacketClass) -> 
                 })
                 .flatten()
         })
-}
-
-pub(crate) fn classify_ipv4(packet: &[u8]) -> PacketMetadata {
-    let mut metadata = PacketMetadata {
-        class: PacketClass::Datagram,
-        flow: FlowKey {
-            source: [0; 4],
-            destination: [0; 4],
-            source_port: 0,
-            destination_port: 0,
-            fragment_id: 0,
-            protocol: 0,
-            fragmented: false,
-        },
-        hash: 0,
-    };
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return metadata;
-    }
-    let header_length = usize::from(packet[0] & 0x0f) * 4;
-    if header_length < 20 || header_length > packet.len() {
-        return metadata;
-    }
-    metadata.flow.source.copy_from_slice(&packet[12..16]);
-    metadata.flow.destination.copy_from_slice(&packet[16..20]);
-    metadata.flow.protocol = packet[9];
-    let flags_and_offset = u16::from_be_bytes([packet[6], packet[7]]);
-    metadata.flow.fragmented = flags_and_offset & 0x3fff != 0;
-    if metadata.flow.fragmented {
-        metadata.flow.fragment_id = u16::from_be_bytes([packet[4], packet[5]]);
-    }
-    let has_ports = !metadata.flow.fragmented
-        && matches!(metadata.flow.protocol, 6 | 17)
-        && packet.len() >= header_length + 4;
-    if has_ports {
-        metadata.flow.source_port =
-            u16::from_be_bytes([packet[header_length], packet[header_length + 1]]);
-        metadata.flow.destination_port =
-            u16::from_be_bytes([packet[header_length + 2], packet[header_length + 3]]);
-    }
-    metadata.class = match metadata.flow.protocol {
-        1 => PacketClass::Control,
-        6 if has_ports
-            && (metadata.flow.source_port == 53
-                || metadata.flow.destination_port == 53
-                || tcp_ack_only(packet, header_length)) =>
-        {
-            PacketClass::Control
-        }
-        6 => PacketClass::Tcp,
-        17 if has_ports
-            && (metadata.flow.source_port == 53
-                || metadata.flow.destination_port == 53
-                || packet.len() <= 256) =>
-        {
-            PacketClass::Control
-        }
-        _ => PacketClass::Datagram,
-    };
-    metadata.hash = hash_flow(metadata.flow);
-    metadata
-}
-
-fn tcp_ack_only(packet: &[u8], ip_header_length: usize) -> bool {
-    if packet.len() < ip_header_length + 20 {
-        return false;
-    }
-    let tcp_header_length = usize::from(packet[ip_header_length + 12] >> 4) * 4;
-    if tcp_header_length < 20 || packet.len() < ip_header_length + tcp_header_length {
-        return false;
-    }
-    let flags = packet[ip_header_length + 13];
-    flags & 0x10 != 0
-        && flags & (0x01 | 0x02 | 0x04) == 0
-        && packet.len() == ip_header_length + tcp_header_length
-}
-
-fn hash_flow(flow: FlowKey) -> u32 {
-    let mut hash = 2_166_136_261_u32;
-    for value in flow
-        .source
-        .into_iter()
-        .chain(flow.destination)
-        .chain(flow.source_port.to_be_bytes())
-        .chain(flow.destination_port.to_be_bytes())
-        .chain(flow.fragment_id.to_be_bytes())
-        .chain([flow.protocol, u8::from(flow.fragmented)])
-    {
-        hash ^= u32::from(value);
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash
 }
 
 #[cfg(test)]
@@ -589,10 +474,10 @@ mod tests {
         packet.truncate(40);
         packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
         packet[33] = 0x10;
-        assert_eq!(classify_ipv4(&packet).class, PacketClass::Control);
+        assert_eq!(classify_packet(&packet).class, PacketClass::Control);
         packet.push(1);
         packet[2..4].copy_from_slice(&41_u16.to_be_bytes());
-        assert_eq!(classify_ipv4(&packet).class, PacketClass::Tcp);
+        assert_eq!(classify_packet(&packet).class, PacketClass::Tcp);
     }
 
     #[test]

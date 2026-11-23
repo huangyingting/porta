@@ -31,5 +31,16 @@ class TunnelRoutingTest {
         assertNull(parseTunnelRouting("10.20.0.0|"))
         assertNull(parseTunnelRouting("example.com/24|"))
         assertNull(parseTunnelRouting("|corp.example"))
+        assertNull(parseTunnelRouting("2001:db8::/32|"))
+        assertNull(parseTunnelRouting("10.20.0.0/16,2001:db8::/129|"))
+        assertNull(parseTunnelRouting("10.20.0.0/16,2001:db8::1::/32|"))
+    }
+
+    @Test
+    fun parsesIPv6SplitRoutesAlongsideIPv4() {
+        val split = parseTunnelRouting("10.20.0.0/16,fd66::/64,2001:db8::/32|")!!
+        assertEquals(3, split.routes.size)
+        assertEquals(listOf(false, true, true), split.routes.map { it.isIPv6 })
+        assertEquals("fd66::/64", split.routes[1].toString())
     }
 }
