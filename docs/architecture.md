@@ -237,6 +237,10 @@ forwarding work:
   route is `porta-up0`, whose `unreachable` fallback covers a missing
   interface, and whose `throw` route for the pool keeps client-to-client
   traffic in the main table;
+- named exits get their own TUN (`porta-up1`, ...) and table (`10067`, ...);
+  the daemon adds a priority-`10065` rule `from <lease> iif porta0` for each
+  lease whose account selects an exit (`lookup main` for the local exit),
+  reconciles those rules every 30 seconds, and removes them on shutdown;
 - the Porta forward chain accepts client traffic only toward `porta-up0`, and
   masquerades it to the relay address; a mangle chain clamps TCP MSS to the
   route MTU; unsolicited input from `porta-up0` is dropped.

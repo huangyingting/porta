@@ -311,6 +311,47 @@ class AutomationTests(unittest.TestCase):
         self.assertIn('oifname "eth0" ip saddr 10.66.0.0/24 masquerade',
                       self.state()["nft_transaction"])
 
+    def test_named_and_local_exits_get_tables_forwarding_and_cleanup(self):
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                        "--upstream-interface", "porta-up0", "--exit-interface", "porta-up1",
+                        "--local-exit")
+        state = self.state()
+        transaction = state["nft_transaction"]
+        forward = transaction.split("chain forward {", 1)[1].split("}", 1)[0]
+        rules = [line.strip() for line in forward.splitlines()
+                 if line.strip() and "type filter" not in line and not line.strip().startswith("#")]
+        # The default egress stays first for readiness.
+        self.assertEqual(rules[:6], [
+            'iifname "porta0" oifname "porta-up0" accept',
+            'iifname "porta-up0" oifname "porta0" ct state established,related accept',
+            'iifname "porta0" oifname "porta-up1" accept',
+            'iifname "porta-up1" oifname "porta0" ct state established,related accept',
+            'iifname "porta0" oifname "eth0" accept',
+            'iifname "eth0" oifname "porta0" ct state established,related accept',
+        ])
+        for interface in ("porta-up0", "porta-up1", "eth0"):
+            self.assertIn(f'oifname "{interface}" ip saddr 10.66.0.0/24 masquerade', transaction)
+        self.assertIn('iifname "porta-up1" drop', transaction.split("chain relay_input {", 1)[1])
+        self.assertEqual(state["ip_routes"]["10067"],
+                         ["default dev porta-up1", "unreachable default metric 4294967295"])
+        self.assertEqual(state["sysctl"]["net.ipv4.conf.porta-up1.rp_filter"], "2")
+
+        # A stopped daemon's per-lease exit rules are removed with the tables.
+        self.update_state(ip_rules=self.state()["ip_rules"] + [
+            "10065:\tfrom 10.66.0.5 iif porta0 lookup 10067",
+            "10065:\tfrom 10.66.0.6 iif porta0 lookup main",
+        ])
+        self.run_script("server-down.sh", "porta0", "eth0")
+        state = self.state()
+        self.assertEqual(state["ip_rules"], [])
+        self.assertNotIn("10067", state["ip_routes"])
+
+        for options in (["--local-exit"], ["--exit-interface", "porta0"],
+                        ["--exit-interface", "porta-up1", "--exit-interface", "porta-up1"]):
+            with self.subTest(options=options):
+                self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                "eth0", "8443", *options, success=False)
+
     def test_relay_rejects_reused_interfaces_before_mutation(self):
         for options in (["--upstream-interface", "porta0"], ["--upstream-interface", "eth0"],
                         ["--upstream-interface", "bad/name"], ["--upstream-interface"],
@@ -835,6 +876,40 @@ class AutomationTests(unittest.TestCase):
         self.run_deploy(deploy, "--build-local", "--upstream", "https://exit.example:8443")
         self.assertEqual(environment.read_text().count("PORTA_UPSTREAM_TOKEN="), 1)
         self.assertIn(f"PORTA_UPSTREAM_TOKEN={token}\n", environment.read_text())
+
+    def test_deploy_named_exits_get_tokens_interfaces_and_local_exit(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.env["PORTA_UPSTREAM_TOKEN"] = "relay-account-token-0123456789"
+        self.env["PORTA_EXIT_TOKEN_US_WEST"] = "us-west-account-token-0123456789"
+        result = self.run_deploy(deploy, "--build-local", "--upstream", "https://eu.example",
+                                 "--exits", "us-west=https://us.example:8443", "--local-exit")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn("--exit us-west=https://us.example:8443 --local-exit", start)
+        self.assertIn("--upstream-interface porta-up0 --exit-interface porta-up1 --local-exit;",
+                      unit)
+        environment = (self.root / "system/etc/porta/porta.env").read_text()
+        self.assertIn("PORTA_EXIT_TOKEN_US_WEST=us-west-account-token-0123456789\n", environment)
+        self.assertNotIn("us-west-account-token", unit + result.stdout + result.stderr)
+        self.assertIn("Selectable exits: local, us-west", result.stdout)
+        config = (self.root / "system/etc/porta/deploy.conf").read_text()
+        self.assertIn("exits=us-west=https://us.example:8443\n", config)
+
+        # Upgrades reuse the saved exit token; --exits= removes exits and tokens.
+        del self.env["PORTA_EXIT_TOKEN_US_WEST"]
+        self.run_deploy(deploy, "--build-local")
+        self.assertIn("PORTA_EXIT_TOKEN_US_WEST=",
+                      (self.root / "system/etc/porta/porta.env").read_text())
+        self.run_deploy(deploy, "--build-local", "--exits=", "--local-exit=false")
+        self.assertNotIn("PORTA_EXIT_TOKEN_", (self.root / "system/etc/porta/porta.env").read_text())
+        self.assertNotIn("--exit", (self.root / "system/etc/systemd/system/porta.service").read_text())
+
+        for options in (("--exits", "us=https://us.example"),
+                        ("--exits", "local=https://us.example"),
+                        ("--exits", "us=http://us.example"),
+                        ("--no-upstream", "--local-exit")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
 
     def test_deploy_client_to_client_is_passed_to_the_daemon(self):
         deploy = self.prepare_deploy(timer=False)

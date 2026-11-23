@@ -260,6 +260,9 @@ pub struct GatewayStatus {
     pub version: String,
     /// Present when this gateway is a cascade relay.
     pub upstream: Option<UpstreamStatus>,
+    /// Every next hop: the default upstream and the named exits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<UpstreamStatus>,
     /// Split-tunnel prefixes advertised to clients; empty for a full tunnel.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<String>,
@@ -274,6 +277,9 @@ pub struct GatewayStatus {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct UpstreamStatus {
+    /// Exit name; empty for the default upstream.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub url: String,
     pub interface: String,
     pub connected: bool,

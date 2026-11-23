@@ -38,6 +38,12 @@ Options:
   --upstream-ca PATH        PEM CA for a next hop with a private certificate
   --upstream-interface IF   Upstream TUN interface (default: porta-up0)
   --no-upstream             Stop relaying and exit traffic from this host again
+  --exits NAME=URL[,...]    Named next-hop gateways that access policies can
+                            select as an account's exit; each token comes from
+                            $PORTA_EXIT_TOKEN_<NAME> or the saved one. --exits=
+                            removes them
+  --local-exit[=BOOL]       With --upstream, also offer this host's egress as
+                            the "local" exit
   --client-to-client[=BOOL] Let connected clients reach each other's addresses
   --client-host-access[=BOOL]
                             Let clients reach all services on this host; by
@@ -104,6 +110,8 @@ client_to_client=false
 client_host_access=false
 routes=
 dns_domains=
+exits=
+local_exit=false
 
 # Options persisted across upgrades. Values are parsed, never sourced, and
 # validated below exactly like command-line input.
@@ -112,7 +120,7 @@ saved_option_names=(
   domain certificate private_key acme_email port admin_port external_interface
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client client_host_access routes
-  dns_domains
+  dns_domains exits local_exit
 )
 declare -A saved_options=()
 if [[ -e $deploy_config || -L $deploy_config ]]; then
@@ -122,7 +130,7 @@ if [[ -e $deploy_config || -L $deploy_config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
     line_number=$((line_number + 1))
     [[ -z $line || $line == \#* ]] && continue
-    [[ $line =~ ^([a-z_]+)=([A-Za-z0-9_./:@+,-]*)$ ]] ||
+    [[ $line =~ ^([a-z_]+)=([A-Za-z0-9_./:@+,=-]*)$ ]] ||
       die "invalid line $line_number in $deploy_config"
     key=${BASH_REMATCH[1]}
     value=${BASH_REMATCH[2]}
@@ -171,6 +179,10 @@ while [[ $# -gt 0 ]]; do
     --client-to-client=*) client_to_client=$(parse_bool --client-to-client "${1#*=}"); shift ;;
     --client-host-access) client_host_access=true; shift ;;
     --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
+    --exits) require_value "$@"; exits=$2; shift 2 ;;
+    --exits=*) exits=${1#*=}; shift ;;
+    --local-exit) local_exit=true; shift ;;
+    --local-exit=*) local_exit=$(parse_bool --local-exit "${1#*=}"); shift ;;
     --routes) require_value "$@"; routes=$2; shift 2 ;;
     --routes=*) routes=${1#*=}; shift ;;
     --dns-domains) require_value "$@"; dns_domains=$2; shift 2 ;;
@@ -183,7 +195,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
-for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access; do
+for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access local_exit; do
   [[ ${!option} == true || ${!option} == false ]] || die "invalid saved value for $option"
 done
 [[ -n $domain ]] || die "--domain is required on the first deployment"
@@ -240,9 +252,32 @@ if [[ -n $dns_domains ]]; then
 fi
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
+exit_names=()
+exit_urls=()
+if [[ -n $exits ]]; then
+  IFS=, read -ra exit_specs <<<"$exits"
+  for exit_spec in "${exit_specs[@]}"; do
+    exit_name=${exit_spec%%=*}
+    exit_url=${exit_spec#*=}
+    [[ $exit_spec == *=* && $exit_name =~ ^[a-z0-9-]{1,16}$ && $exit_name != local ]] ||
+      die "--exits entries must be NAME=URL with a lower-case name other than local: $exit_spec"
+    [[ $exit_url =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] ||
+      die "--exits $exit_name must be an HTTPS origin such as https://exit.example.com:8443"
+    [[ " ${exit_names[*]} " != *" $exit_name "* ]] || die "--exits names $exit_name twice"
+    exit_names+=("$exit_name")
+    exit_urls+=("$exit_url")
+  done
+  (( ${#exit_names[@]} <= 8 )) || die "--exits supports at most 8 exits"
+fi
+if $local_exit && [[ -z $upstream ]]; then
+  die "--local-exit requires --upstream; without it traffic already exits from this host"
+fi
 if [[ -z $upstream ]]; then
-  [[ -z $upstream_token_file && -z $upstream_ca ]] ||
-    die "--upstream-token-file and --upstream-ca require --upstream"
+  [[ -z $upstream_token_file ]] || die "--upstream-token-file requires --upstream"
+  [[ -z $upstream_ca || ${#exit_names[@]} -gt 0 ]] || die "--upstream-ca requires --upstream or --exits"
+  if [[ -n $upstream_ca ]]; then
+    [[ $upstream_ca == /* && -f $upstream_ca ]] || die "--upstream-ca must name an existing absolute path"
+  fi
 else
   [[ $upstream =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] ||
     die "--upstream must be an HTTPS origin such as https://exit.example.com:8443"
@@ -302,6 +337,18 @@ if [[ -n $upstream ]]; then
   [[ ${#upstream_token} -ge 16 && $upstream_token =~ ^[[:graph:]]+$ ]] ||
     die "--upstream requires a client token issued by the next hop: set PORTA_UPSTREAM_TOKEN or use --upstream-token-file"
 fi
+exit_tokens=()
+for exit_name in "${exit_names[@]}"; do
+  exit_variable=PORTA_EXIT_TOKEN_$(tr 'a-z-' 'A-Z_' <<<"$exit_name")
+  exit_token=${!exit_variable:-}
+  if [[ -z $exit_token && -f /etc/porta/porta.env ]]; then
+    exit_token=$(sed -n "s/^$exit_variable=//p" /etc/porta/porta.env | tail -n 1)
+  fi
+  exit_token=${exit_token//[$'\r\n\t ']/}
+  [[ ${#exit_token} -ge 16 && $exit_token =~ ^[[:graph:]]+$ ]] ||
+    die "exit $exit_name needs a client token issued by its gateway: set $exit_variable"
+  exit_tokens+=("$exit_variable=$exit_token")
+done
 
 if [[ -z $external_interface ]]; then
   external_interface=$(ip -4 route show default | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
@@ -780,6 +827,15 @@ if [[ -n $upstream ]]; then
   chmod 0600 "$environment_file.new"
   mv "$environment_file.new" "$environment_file"
   unset upstream_token
+fi
+grep -v '^PORTA_EXIT_TOKEN_' "$environment_file" >"$environment_file.new" || true
+for exit_token in "${exit_tokens[@]}"; do
+  printf '%s\n' "$exit_token" >>"$environment_file.new"
+done
+chmod 0600 "$environment_file.new"
+mv "$environment_file.new" "$environment_file"
+unset exit_tokens
+if [[ -n $upstream || ${#exit_names[@]} -gt 0 ]]; then
   if [[ -n $upstream_ca ]]; then
     if [[ $(realpath "$upstream_ca") != "$(realpath -m /etc/porta/upstream-ca.pem)" ]]; then
       install -m 0644 "$upstream_ca" /etc/porta/upstream-ca.pem
@@ -845,11 +901,23 @@ auto_mtu_argument="--auto-mtu=$auto_mtu"
 upstream_arguments=
 network_up_options=
 if [[ -n $upstream ]]; then
-  upstream_arguments="--upstream $upstream --upstream-interface $upstream_interface --upstream-identity /var/lib/porta/upstream-identity.json"
+  upstream_arguments="--upstream $upstream --upstream-interface $upstream_interface"
+  network_up_options=" --upstream-interface $upstream_interface"
+fi
+if [[ -n $upstream || ${#exit_names[@]} -gt 0 ]]; then
+  # Every next hop enrolls this gateway with the same device key.
+  upstream_arguments+="${upstream_arguments:+ }--upstream-identity /var/lib/porta/upstream-identity.json"
   if [[ -n $upstream_ca ]]; then
     upstream_arguments+=" --upstream-ca /etc/porta/upstream-ca.pem"
   fi
-  network_up_options=" --upstream-interface $upstream_interface"
+fi
+for index in "${!exit_names[@]}"; do
+  upstream_arguments+=" --exit ${exit_names[$index]}=${exit_urls[$index]}"
+  network_up_options+=" --exit-interface porta-up$((index + 1))"
+done
+if $local_exit; then
+  upstream_arguments+=" --local-exit"
+  network_up_options+=" --local-exit"
 fi
 client_to_client_argument=
 if $client_to_client; then
@@ -993,6 +1061,14 @@ else
   client_download_summary="Client downloads: unavailable until a release deployment publishes artifacts"
 fi
 
+selectable_exits=
+if $local_exit || [[ -z $upstream && ${#exit_names[@]} -gt 0 ]]; then
+  selectable_exits=local
+fi
+for exit_name in "${exit_names[@]}"; do
+  selectable_exits+="${selectable_exits:+, }$exit_name"
+done
+
 cat <<EOF
 Porta is ready.
 
@@ -1002,6 +1078,7 @@ Forward proxy:   $([[ $forward_proxy == true ]] && echo "enabled (HTTPS CONNECT 
 TLS mode:        $tls_mode
 Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "GitHub release $release")
 Exit traffic:    $([[ -n $upstream ]] && echo "relayed through $upstream via $upstream_interface" || echo "this host via $external_interface")
+Selectable exits: ${selectable_exits:-none}
 Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
 Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_domains:+ (DNS for ${dns_domains//,/, })}" || echo "full tunnel")

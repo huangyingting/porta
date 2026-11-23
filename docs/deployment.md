@@ -176,9 +176,10 @@ The deployment script accepts MTUs from 576 through 1400.
 MTU feedback requires Linux to accept gateway-sourced ICMP injected through
 TUN, in both automatic and fixed interface-MTU modes. Deployment passes
 `--auto-mtu` to the daemon; `server-up.sh` takes five positional arguments plus
-the optional `--upstream-interface IF` (cascade relay) and `--client-to-client`
-flags. It always sets `accept_local=1` and loose `rp_filter=2` only on the
-owned TUN, and on a relay's upstream TUN. It does not change global or
+the optional `--upstream-interface IF` (cascade relay), repeatable
+`--exit-interface IF`, `--local-exit` and `--client-host-access` options. It
+always sets `accept_local=1` and loose `rp_filter=2` only on the owned TUN,
+and on a relay's upstream and exit TUNs. It does not change global or
 physical-interface reverse-path
 filtering. These interface-local settings disappear with the TUN. The helper
 records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
@@ -303,6 +304,35 @@ limit on the next hop's account, or an unreachable next hop. Monitor
 
 Avoid loops: a chain that eventually points back to an earlier hop forwards
 packets until their TTL expires.
+
+## Exit selection
+
+A gateway can offer several exits and let each account choose one in its
+access policy, for example to route some customers through another region.
+Name each additional next hop with `--exits`, and offer this host's own
+egress with `--local-exit` on a relay:
+
+```sh
+sudo PORTA_UPSTREAM_TOKEN=... PORTA_EXIT_TOKEN_US=... ./scripts/deploy.sh \
+  --upstream https://eu.example.com --exits us=https://us.example.com --local-exit
+```
+
+The daemon options are `--exit NAME=URL` (repeatable, at most 8) with the
+client token in `PORTA_EXIT_TOKEN_<NAME>` (upper case, `-` as `_`), and
+`--local-exit`. All next hops share `--upstream-ca`, `--upstream-transport`
+and the gateway's upstream device key, which each next hop enrolls like any
+other device. Exit *i* uses the TUN `porta-up<i>` and routing table
+`10066+i`; `server-up.sh` takes the matching `--exit-interface` and
+`--local-exit` options. Without `--upstream`, traffic exits locally by
+default and `local` is selectable next to the named exits.
+
+Pick an account's exit in the admin page's **Network access** section or set
+`exit` with `PUT /api/clients/{id}/access`. The gateway installs a policy
+routing rule for each of the account's leases before its tunnel carries
+traffic, and removes it when the tunnel ends. A selected exit that is down
+blackholes that account's traffic instead of falling back to another path;
+readiness reports each named exit as an optional `exit_<name>` component,
+and the admin page shows every next hop.
 
 ## Client isolation
 

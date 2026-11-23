@@ -236,6 +236,9 @@ start_client() {
   install -d "/etc/netns/$(ns "$node")"
   printf 'nameserver 127.0.0.53\n' >"/etc/netns/$(ns "$node")/resolv.conf"
   install -d -m 0700 "$work/$node"
+  # Truncate first: the background redirection may happen after the wait
+  # loop below has already read a previous run's log.
+  : >"$work/$node.log"
   ip netns exec "$(ns "$node")" env PORTA_TOKEN="$(<"$work/gateway-1/token")" PATH="$work/bin:$PATH" \
     "$client_binary" \
     --server "https://$(link_address 0 2):$port" --ca "$work/ca.pem" \

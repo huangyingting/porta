@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--client-host-access]" >&2
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--exit-interface IF]... [--local-exit] [--client-host-access]" >&2
   echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443" >&2
   echo "cascade relay: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --upstream-interface porta-up0" >&2
   exit 2
@@ -16,6 +16,8 @@ external_interface=$4
 public_port=$5
 shift 5
 upstream_interface=
+exit_interfaces=()
+local_exit=false
 client_host_access=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,10 +26,33 @@ while [[ $# -gt 0 ]]; do
       upstream_interface=$2
       shift 2
       ;;
+    --exit-interface)
+      [[ $# -ge 2 && ${#exit_interfaces[@]} -lt 8 ]] || usage
+      exit_interfaces+=("$2")
+      shift 2
+      ;;
+    --local-exit) local_exit=true; shift ;;
     --client-host-access) client_host_access=true; shift ;;
     *) usage ;;
   esac
 done
+for exit_interface in "${exit_interfaces[@]}"; do
+  [[ $exit_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
+     $exit_interface != "$tun_interface" &&
+     $exit_interface != "$external_interface" &&
+     $exit_interface != "$upstream_interface" ]] || {
+    echo "invalid or reused exit interface" >&2
+    exit 2
+  }
+done
+if [[ -n $(printf '%s\n' "${exit_interfaces[@]}" | sort | uniq -d) ]]; then
+  echo "exit interfaces must be distinct" >&2
+  exit 2
+fi
+if $local_exit && [[ -z $upstream_interface ]]; then
+  echo "--local-exit only applies with --upstream-interface" >&2
+  exit 2
+fi
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $tun_interface != "$external_interface" &&
@@ -44,9 +69,22 @@ done
 # Client traffic leaves through the physical interface, or through the
 # next-hop gateway's tunnel when this gateway is a cascade relay.
 forward_interface=${upstream_interface:-$external_interface}
-# Cascade policy routing; server-down.sh removes the same entries.
+# Cascade policy routing; server-down.sh removes the same entries. Named
+# exit i uses table 10067+i; the daemon routes selected leases to it.
 relay_table=10066
 relay_priority=10066
+first_exit_table=10067
+max_exits=8
+# Every interface client traffic may leave through: the default egress, the
+# named exits, and on a relay with --local-exit the physical interface.
+egress_interfaces=("$forward_interface" "${exit_interfaces[@]}")
+if $local_exit; then
+  egress_interfaces+=("$external_interface")
+fi
+relay_interfaces=("${exit_interfaces[@]}")
+if [[ -n $upstream_interface ]]; then
+  relay_interfaces=("$upstream_interface" "${exit_interfaces[@]}")
+fi
 public_port=$((10#$public_port))
 (( public_port >= 1 && public_port <= 65535 )) || {
   echo "invalid public port" >&2
@@ -99,9 +137,9 @@ nft_tables=$(nft list tables) || {
 }
 ip link show dev "$tun_interface" >/dev/null
 ip link show dev "$external_interface" >/dev/null
-if [[ -n $upstream_interface ]]; then
-  ip link show dev "$upstream_interface" >/dev/null
-fi
+for relay_interface in "${relay_interfaces[@]}"; do
+  ip link show dev "$relay_interface" >/dev/null
+done
 ip address replace "$gateway_cidr" dev "$tun_interface"
 ip link set dev "$tun_interface" up
 if [[ -e $ip_forward_state ]]; then
@@ -126,17 +164,17 @@ sysctl -w "net/ipv4/conf/$tun_interface/rp_filter=2"
 if [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
   sysctl -w "net/ipv6/conf/$tun_interface/disable_ipv6=1"
 fi
-if [[ -n $upstream_interface ]]; then
+for relay_interface in "${relay_interfaces[@]}"; do
   # Relayed replies arrive on the upstream tunnel although the main table
   # routes their Internet sources through the physical interface. The next
   # hop's gateway may share this gateway's address when pools overlap, so its
   # MTU feedback must not be discarded as a martian.
-  sysctl -w "net/ipv4/conf/$upstream_interface/rp_filter=2"
-  sysctl -w "net/ipv4/conf/$upstream_interface/accept_local=1"
-  if [[ -e "/proc/sys/net/ipv6/conf/$upstream_interface/disable_ipv6" ]]; then
-    sysctl -w "net/ipv6/conf/$upstream_interface/disable_ipv6=1"
+  sysctl -w "net/ipv4/conf/$relay_interface/rp_filter=2"
+  sysctl -w "net/ipv4/conf/$relay_interface/accept_local=1"
+  if [[ -e "/proc/sys/net/ipv6/conf/$relay_interface/disable_ipv6" ]]; then
+    sysctl -w "net/ipv6/conf/$relay_interface/disable_ipv6=1"
   fi
-fi
+done
 
 {
   if grep -Fxq 'table ip porta' <<<"$nft_tables"; then
@@ -149,8 +187,13 @@ fi
 table ip porta {
   chain forward {
     type filter hook forward priority filter; policy accept;
-    iifname "$tun_interface" oifname "$forward_interface" accept
-    iifname "$forward_interface" oifname "$tun_interface" ct state established,related accept
+EOF
+  # The default egress rules stay first; readiness checks their order.
+  for egress_interface in "${egress_interfaces[@]}"; do
+    printf '    iifname "%s" oifname "%s" accept\n' "$tun_interface" "$egress_interface"
+    printf '    iifname "%s" oifname "%s" ct state established,related accept\n' "$egress_interface" "$tun_interface"
+  done
+  cat <<EOF
     # Traffic between clients never reaches the kernel: the daemon switches
     # it between sessions under each account's access policy.
     iifname "$tun_interface" drop
@@ -158,22 +201,26 @@ table ip porta {
   }
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "$forward_interface" ip saddr $pool_cidr masquerade
-  }
 EOF
-  if [[ -n $upstream_interface ]]; then
-    cat <<EOF
-  chain relay_mss {
-    type filter hook forward priority mangle; policy accept;
-    iifname "$tun_interface" oifname "$upstream_interface" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
-    iifname "$upstream_interface" oifname "$tun_interface" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
-  }
-  chain relay_input {
-    type filter hook input priority filter; policy accept;
-    iifname "$upstream_interface" ct state established,related accept
-    iifname "$upstream_interface" drop
-  }
-EOF
+  for egress_interface in "${egress_interfaces[@]}"; do
+    printf '    oifname "%s" ip saddr %s masquerade\n' "$egress_interface" "$pool_cidr"
+  done
+  echo "  }"
+  if [[ ${#relay_interfaces[@]} -gt 0 ]]; then
+    echo "  chain relay_mss {"
+    echo "    type filter hook forward priority mangle; policy accept;"
+    for relay_interface in "${relay_interfaces[@]}"; do
+      printf '    iifname "%s" oifname "%s" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu\n' "$tun_interface" "$relay_interface"
+      printf '    iifname "%s" oifname "%s" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu\n' "$relay_interface" "$tun_interface"
+    done
+    echo "  }"
+    echo "  chain relay_input {"
+    echo "    type filter hook input priority filter; policy accept;"
+    for relay_interface in "${relay_interfaces[@]}"; do
+      printf '    iifname "%s" ct state established,related accept\n' "$relay_interface"
+      printf '    iifname "%s" drop\n' "$relay_interface"
+    done
+    echo "  }"
   fi
   # Clients never reach link-local services such as cloud instance metadata,
   # which would otherwise disclose the gateway VM's credentials. The forward
@@ -241,20 +288,24 @@ if command -v iptables >/dev/null; then
   else
     {
       printf '%s\n' "${tracked_external_interfaces[@]}"
-      printf '%s\n' "$forward_interface"
+      printf '%s\n' "${egress_interfaces[@]}"
     } | awk 'NF && !seen[$0]++' >"$docker_rules_state"
     for tracked_external_interface in "${tracked_external_interfaces[@]}"; do
-      [[ $tracked_external_interface == "$forward_interface" ]] && continue
+      [[ " ${egress_interfaces[*]} " == *" $tracked_external_interface "* ]] && continue
       remove_docker_rule -i "$tun_interface" -o "$tracked_external_interface" -m comment --comment porta -j ACCEPT ||
         { echo "could not remove previous Porta Docker rule" >&2; exit 1; }
       remove_docker_rule -i "$tracked_external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
         { echo "could not remove previous Porta Docker rule" >&2; exit 1; }
     done
-    ensure_docker_rule 1 -i "$tun_interface" -o "$forward_interface" -m comment --comment porta -j ACCEPT ||
-      { echo "could not install Porta Docker rule" >&2; exit 1; }
-    ensure_docker_rule 2 -i "$forward_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
-      { echo "could not install Porta Docker rule" >&2; exit 1; }
-    printf '%s\n' "$forward_interface" >"$docker_rules_state"
+    position=1
+    for egress_interface in "${egress_interfaces[@]}"; do
+      ensure_docker_rule "$position" -i "$tun_interface" -o "$egress_interface" -m comment --comment porta -j ACCEPT ||
+        { echo "could not install Porta Docker rule" >&2; exit 1; }
+      ensure_docker_rule "$((position + 1))" -i "$egress_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
+        { echo "could not install Porta Docker rule" >&2; exit 1; }
+      position=$((position + 2))
+    done
+    printf '%s\n' "${egress_interfaces[@]}" >"$docker_rules_state"
   fi
 else
   rm -f "$docker_rules_state"
@@ -278,6 +329,16 @@ for _ in 1 2 3 4 5 6 7 8; do
   fi
 done
 ip -4 route flush table "$relay_table" 2>/dev/null || true
+for ((index = 0; index < max_exits; index++)); do
+  ip -4 route flush table "$((first_exit_table + index))" 2>/dev/null || true
+done
+for index in "${!exit_interfaces[@]}"; do
+  # Leases the daemon routes to this exit never fall back to another path.
+  exit_table=$((first_exit_table + index))
+  ip link set dev "${exit_interfaces[$index]}" up
+  ip -4 route replace default dev "${exit_interfaces[$index]}" table "$exit_table"
+  ip -4 route replace unreachable default metric 4294967295 table "$exit_table"
+done
 if [[ -n $upstream_interface ]]; then
   # Send client traffic to the next hop. The unreachable fallback keeps it
   # from reaching the main table's physical default route while the upstream
@@ -289,6 +350,9 @@ if [[ -n $upstream_interface ]]; then
   ip -4 route replace throw "$pool_cidr" table "$relay_table"
   ip -4 rule add priority "$relay_priority" iif "$tun_interface" lookup "$relay_table"
   echo "configured $tun_interface; client traffic is relayed through $upstream_interface"
+  if $local_exit; then
+    echo "accounts may select the local exit through $external_interface"
+  fi
 else
   echo "configured $tun_interface; Porta nftables forwarding and public-input guards are active"
 fi

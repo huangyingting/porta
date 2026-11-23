@@ -28,6 +28,9 @@ pub struct SystemReadinessConfig {
     pub dns_name: Option<String>,
     pub dns_address: Option<IpAddr>,
     pub upstream: Option<UpstreamReadiness>,
+    /// Named exits; an exit that is down blackholes only its accounts, so
+    /// it does not make the gateway unready.
+    pub exits: Vec<(String, UpstreamReadiness)>,
 }
 
 /// Cascade relay state: client traffic is forwarded through `interface`
@@ -209,6 +212,16 @@ pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
                 async move { check_upstream_route(&config, cancellation).await }
             }
         }));
+    }
+
+    for (name, exit) in config.exits.clone() {
+        checks.push(optional_probe(
+            &format!("exit_{name}"),
+            Some(move |_| {
+                let result = (exit.status)().map_err(|error| anyhow!(error));
+                async move { result }
+            }),
+        ));
     }
 
     Ok(Readiness::new(checks, config.timeout))
@@ -1275,6 +1288,7 @@ mod tests {
             dns_name: None,
             dns_address: None,
             upstream: None,
+            exits: Vec::new(),
         };
         assert!(validate_config(&base).is_ok());
         assert!(system_readiness(base.clone()).is_ok());
@@ -1315,6 +1329,7 @@ mod tests {
                 interface: "porta-up0".to_string(),
                 status: Arc::new(|| Err("next-hop tunnel is down: 401".to_string())),
             }),
+            exits: Vec::new(),
         };
         let report = system_readiness(config).unwrap().check().await;
         assert_eq!(report.status, "not_ready");

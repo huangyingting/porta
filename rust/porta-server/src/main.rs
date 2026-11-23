@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use porta_server_rust::app::OperationsHandler;
 use porta_server_rust::config::{version_requested, Config};
 use porta_server_rust::data::ratelimit::RateLimiters;
@@ -13,6 +13,7 @@ use porta_server_rust::integration::{
 use porta_server_rust::ops::abuse::AbuseGuard;
 use porta_server_rust::ops::acme::{AutomaticCertificateConfig, AutomaticCertificateManager};
 use porta_server_rust::ops::admission::{ConnectionAdmission, RetryController};
+use porta_server_rust::ops::exits::ExitRules;
 use porta_server_rust::ops::metrics::Metrics;
 use porta_server_rust::ops::shutdown::Drain;
 use porta_server_rust::ops::system_readiness::{
@@ -86,9 +87,13 @@ async fn run() -> Result<()> {
     )?);
     // The upstream TUN must exist before the client TUN appears: the network
     // helper starts once the client TUN exists and routes through both.
-    let upstream = upstream::open(&mut config, &metrics)?;
+    let relays = upstream::open(&mut config, &metrics)?;
+    let exit_rules = {
+        let tables = config.exit_tables();
+        (!tables.is_empty()).then(|| ExitRules::new(config.interface.clone(), tables))
+    };
     let gateway_status = {
-        let base = upstream::gateway_status(upstream.as_ref());
+        let base = upstream::gateway_status(&relays);
         let routes = config
             .routes
             .iter()
@@ -96,10 +101,12 @@ async fn run() -> Result<()> {
             .collect::<Vec<_>>();
         let dns_domains = config.dns_domains.clone();
         let client_to_client = config.client_to_client;
+        let exits = config.exit_names();
         let provider: GatewayStatusProvider = Arc::new(move || GatewayStatus {
             routes: routes.clone(),
             dns_domains: dns_domains.clone(),
             client_to_client,
+            exits: exits.clone(),
             ..base()
         });
         provider
@@ -130,6 +137,7 @@ async fn run() -> Result<()> {
                     .into_iter()
                     .flatten()
                     .collect(),
+                exits: exit_rules.clone(),
             },
         ),
         usage: UsageAdapter::new(usage.clone()),
@@ -180,7 +188,14 @@ async fn run() -> Result<()> {
         dns_name: (!config.readiness_dns_name.is_empty())
             .then(|| config.readiness_dns_name.clone()),
         dns_address: config.dns_address()?.map(IpAddr::V4),
-        upstream: upstream.as_ref().map(|upstream| upstream.readiness()),
+        upstream: relays
+            .iter()
+            .find(|relay| relay.name().is_none())
+            .map(|relay| relay.readiness()),
+        exits: relays
+            .iter()
+            .filter_map(|relay| Some((relay.name()?.to_owned(), relay.readiness())))
+            .collect(),
     })?;
     let metrics_token = Zeroizing::new(std::mem::take(&mut config.metrics_token));
     let operations: Arc<dyn Handler> = Arc::new(OperationsHandler::new(
@@ -194,7 +209,7 @@ async fn run() -> Result<()> {
         registry.clone(),
         usage.clone(),
         GatewayNetwork {
-            exits: Vec::new(),
+            exits: config.exit_names(),
             reserved: vec![config.pool.trunc()],
         },
     );
@@ -293,10 +308,20 @@ async fn run() -> Result<()> {
         async move { enforcer.run(cancellation).await }
     });
     let upstream_shutdown = tokio_util::sync::CancellationToken::new();
-    let mut upstream_task = upstream.map(|upstream| {
+    let mut upstream_task = (!relays.is_empty()).then(|| {
         let cancellation = upstream_shutdown.clone();
-        tokio::spawn(async move { upstream.run(cancellation).await })
+        tokio::spawn(async move {
+            futures_util::future::try_join_all(
+                relays
+                    .into_iter()
+                    .map(|relay| relay.run(cancellation.clone())),
+            )
+            .await
+            .map(|_| ())
+        })
     });
+    let exit_shutdown = tokio_util::sync::CancellationToken::new();
+    let exit_task = exit_rules.map(|rules| tokio::spawn(rules.run(exit_shutdown.clone())));
     let admission = Arc::new(ConnectionAdmission::new(metrics.clone()));
     let retry = Arc::new(RetryController::new(admission.as_ref(), metrics));
     let mut acme_manager = None;
@@ -480,6 +505,13 @@ async fn run() -> Result<()> {
             run_error = Some(error.into());
         }
     }
+    exit_shutdown.cancel();
+    if let Some(task) = exit_task {
+        let error = task_error(task.await);
+        if run_error.is_none() {
+            run_error = error;
+        }
+    }
     upstream_shutdown.cancel();
     if let Some(task) = upstream_task {
         if !upstream_completed {
@@ -539,78 +571,126 @@ mod upstream {
     use porta_server_rust::upstream::{Upstream, UpstreamConfig};
     use tokio_util::sync::CancellationToken;
 
-    pub struct Relay(Arc<Upstream>);
-
-    pub fn open(config: &mut Config, metrics: &Arc<Metrics>) -> Result<Option<Relay>> {
-        let Some(url) = config.upstream.clone() else {
-            return Ok(None);
-        };
-        let upstream = Upstream::open(
-            UpstreamConfig {
-                url,
-                token: Zeroizing::new(std::mem::take(&mut config.upstream_token)),
-                transport: match config.upstream_transport {
-                    UpstreamTransport::Auto => Transport::Auto,
-                    UpstreamTransport::H3 => Transport::Http3,
-                    UpstreamTransport::H2 => Transport::Http2,
-                },
-                interface: config.upstream_interface.clone(),
-                local_address: config.upstream_address,
-                identity_path: config
-                    .upstream_identity
-                    .clone()
-                    .expect("validated upstream configuration has an identity path"),
-                ca_path: config.upstream_ca.clone(),
-                thumbprint: (!config.upstream_thumbprint.is_empty())
-                    .then(|| config.upstream_thumbprint.clone()),
-            },
-            metrics.clone(),
-        )?;
-        if let Some(path) = &config.upstream_ca {
-            tracing::info!(ca = %path.display(), "next-hop gateway uses a private CA");
-        }
-        Ok(Some(Relay(Arc::new(upstream))))
+    /// A next-hop tunnel: the default upstream (no name) or a named exit.
+    pub struct Relay {
+        name: Option<String>,
+        upstream: Arc<Upstream>,
     }
 
-    pub fn gateway_status(relay: Option<&Relay>) -> GatewayStatusProvider {
-        let upstream = relay.map(|relay| {
-            (
-                relay.0.status(),
-                relay.0.url().to_owned(),
-                relay.0.interface().to_owned(),
+    /// Opens the default upstream, if any, followed by every named exit.
+    pub fn open(config: &mut Config, metrics: &Arc<Metrics>) -> Result<Vec<Relay>> {
+        let transport = match config.upstream_transport {
+            UpstreamTransport::Auto => Transport::Auto,
+            UpstreamTransport::H3 => Transport::Http3,
+            UpstreamTransport::H2 => Transport::Http2,
+        };
+        let identity_path = config.upstream_identity.clone();
+        let base = |url: String, token: String, interface: String, local_address| UpstreamConfig {
+            url,
+            token: Zeroizing::new(token),
+            transport,
+            interface,
+            local_address,
+            identity_path: identity_path
+                .clone()
+                .expect("validated upstream configuration has an identity path"),
+            ca_path: config.upstream_ca.clone(),
+            thumbprint: (!config.upstream_thumbprint.is_empty())
+                .then(|| config.upstream_thumbprint.clone()),
+        };
+        let mut relays = Vec::new();
+        if let Some(url) = config.upstream.clone() {
+            let upstream = Upstream::open(
+                base(
+                    url,
+                    std::mem::take(&mut config.upstream_token),
+                    config.upstream_interface.clone(),
+                    config.upstream_address,
+                ),
+                metrics.clone(),
+            )?;
+            relays.push(Relay {
+                name: None,
+                upstream: Arc::new(upstream),
+            });
+        }
+        for exit in &mut config.exits {
+            let upstream = Upstream::open(
+                base(
+                    exit.url.clone(),
+                    std::mem::take(&mut exit.token),
+                    exit.interface.clone(),
+                    exit.address,
+                ),
+                metrics.clone(),
             )
-        });
-        Arc::new(move || GatewayStatus {
-            version: porta_server_rust::VERSION.trim().to_owned(),
-            routes: Vec::new(),
-            dns_domains: Vec::new(),
-            client_to_client: false,
-            exits: Vec::new(),
-            upstream: upstream.as_ref().map(|(status, url, interface)| {
-                let snapshot = status.snapshot();
-                UpstreamStatus {
-                    url: url.clone(),
-                    interface: interface.clone(),
-                    connected: snapshot.connected,
-                    address: snapshot.address,
-                    transport: snapshot.transport.map(str::to_owned),
-                    error: snapshot.error,
-                }
-            }),
+            .with_context(|| format!("open exit {}", exit.name))?;
+            relays.push(Relay {
+                name: Some(exit.name.clone()),
+                upstream: Arc::new(upstream),
+            });
+        }
+        if let (Some(path), false) = (&config.upstream_ca, relays.is_empty()) {
+            tracing::info!(ca = %path.display(), "next-hop gateways use a private CA");
+        }
+        Ok(relays)
+    }
+
+    pub fn gateway_status(relays: &[Relay]) -> GatewayStatusProvider {
+        let relays = relays
+            .iter()
+            .map(|relay| {
+                (
+                    relay.name.clone().unwrap_or_default(),
+                    relay.upstream.status(),
+                    relay.upstream.url().to_owned(),
+                    relay.upstream.interface().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Arc::new(move || {
+            let upstreams = relays
+                .iter()
+                .map(|(name, status, url, interface)| {
+                    let snapshot = status.snapshot();
+                    UpstreamStatus {
+                        name: name.clone(),
+                        url: url.clone(),
+                        interface: interface.clone(),
+                        connected: snapshot.connected,
+                        address: snapshot.address,
+                        transport: snapshot.transport.map(str::to_owned),
+                        error: snapshot.error,
+                    }
+                })
+                .collect::<Vec<_>>();
+            GatewayStatus {
+                version: porta_server_rust::VERSION.trim().to_owned(),
+                upstream: upstreams
+                    .iter()
+                    .find(|upstream| upstream.name.is_empty())
+                    .cloned(),
+                upstreams,
+                ..GatewayStatus::default()
+            }
         })
     }
 
     impl Relay {
+        pub fn name(&self) -> Option<&str> {
+            self.name.as_deref()
+        }
+
         pub fn readiness(&self) -> UpstreamReadiness {
-            let status = self.0.status();
+            let status = self.upstream.status();
             UpstreamReadiness {
-                interface: self.0.interface().to_owned(),
+                interface: self.upstream.interface().to_owned(),
                 status: Arc::new(move || status.check()),
             }
         }
 
         pub async fn run(self, cancellation: CancellationToken) -> Result<()> {
-            self.0.run(cancellation).await
+            self.upstream.run(cancellation).await
         }
     }
 }
@@ -621,21 +701,25 @@ mod upstream {
 
     pub struct Relay;
 
-    pub fn gateway_status(_relay: Option<&Relay>) -> GatewayStatusProvider {
+    pub fn gateway_status(_relays: &[Relay]) -> GatewayStatusProvider {
         Arc::new(|| GatewayStatus {
             version: porta_server_rust::VERSION.trim().to_owned(),
             ..GatewayStatus::default()
         })
     }
 
-    pub fn open(config: &mut Config, _metrics: &Arc<Metrics>) -> Result<Option<Relay>> {
-        if config.upstream.is_some() {
-            anyhow::bail!("--upstream cascade relaying requires Linux");
+    pub fn open(config: &mut Config, _metrics: &Arc<Metrics>) -> Result<Vec<Relay>> {
+        if config.upstream.is_some() || !config.exits.is_empty() {
+            anyhow::bail!("--upstream and --exit relaying require Linux");
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     impl Relay {
+        pub fn name(&self) -> Option<&str> {
+            None
+        }
+
         pub fn readiness(&self) -> UpstreamReadiness {
             unreachable!("non-Linux builds never create an upstream relay")
         }

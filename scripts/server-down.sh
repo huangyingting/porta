@@ -132,6 +132,25 @@ if ! $relay_rules_removed; then
   status=1
 fi
 ip -4 route flush table "$relay_table" 2>/dev/null || true
+# Named exit tables, and any per-lease exit rules a stopped daemon left.
+for ((exit_table = 10067; exit_table < 10075; exit_table++)); do
+  ip -4 route flush table "$exit_table" 2>/dev/null || true
+done
+exit_rules_removed=false
+for _ in $(seq 1 1024); do
+  if ! exit_rule=$(ip -4 rule show priority 10065 iif "$tun_interface"); then
+    break
+  fi
+  if [[ -z $exit_rule ]]; then
+    exit_rules_removed=true
+    break
+  fi
+  ip -4 rule del priority 10065 iif "$tun_interface" || break
+done
+if ! $exit_rules_removed; then
+  echo "could not remove Porta exit selection rules" >&2
+  status=1
+fi
 if links=$(ip -o link show); then
   while read -r index name rest; do
     name=${name%:}

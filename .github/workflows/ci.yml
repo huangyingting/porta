@@ -64,6 +64,8 @@ jobs:
         run: make test-split-tunnel
       - name: Test subnet routing and access policy end to end
         run: make test-subnet-router
+      - name: Test per-account exit selection end to end
+        run: make test-exit-selection
       - name: Test the unprivileged systemd service end to end
         run: make test-service-user
       - run: make build

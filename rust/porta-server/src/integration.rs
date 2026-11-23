@@ -2,6 +2,7 @@ use crate::data::queue::DropReason;
 use crate::data::ratelimit::{AccountRateLimiter, Direction as RateDirection, RateLimiters};
 use crate::data::router::{Router, RouterError, Session as RouterSession};
 use crate::ops::abuse::{AbuseGuard, Surface};
+use crate::ops::exits::ExitRules;
 use crate::ops::metrics::Metrics as OperationalMetrics;
 use crate::proxy::service::{
     AuthenticationLimiter, AuthenticationReservation, AuthorizedSession,
@@ -1065,6 +1066,8 @@ pub struct SwitchConfig {
     /// Destinations that access policies never block, such as the gateway
     /// address and its DNS server.
     pub always_reachable: Vec<Ipv4Addr>,
+    /// Policy routing for accounts that select an exit.
+    pub exits: Option<Arc<ExitRules>>,
 }
 
 struct RouteContext {
@@ -1186,6 +1189,8 @@ struct RouteHandle {
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
     context: Arc<RouteContext>,
     contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
+    /// The exit rule this session installed, released when it closes.
+    exit: Option<(Arc<ExitRules>, u64)>,
 }
 
 impl RouteHandle {
@@ -1241,6 +1246,10 @@ impl Cleanup for RouteHandle {
         {
             contexts.remove(&self.address);
         }
+        drop(contexts);
+        if let Some((exits, generation)) = &self.exit {
+            exits.release(self.address, *generation);
+        }
     }
 }
 
@@ -1256,6 +1265,7 @@ impl PacketRouter for RouterAdapter {
         let limiters = self.limiters.clone();
         let uplink = self.uplink.clone();
         let contexts = self.contexts.clone();
+        let exits = self.switching.exits.clone();
         Box::pin(async move {
             let lease = lease.ok_or(RouteError::Conflict)?;
             let mut registered = None;
@@ -1290,6 +1300,23 @@ impl PacketRouter for RouterAdapter {
                 .map_err(map_route_error)?;
             let cancellation = session.cancellation();
             let address = request.lease.address;
+            // The exit rule is in place before the client can send.
+            let exit = match (&request.network.exit, exits) {
+                (None, _) => None,
+                (Some(exit), Some(exits)) => match exits.assign(address, exit).await {
+                    Ok(generation) => Some((exits, generation)),
+                    Err(error) => {
+                        tracing::warn!(%error, %address, "refusing a tunnel whose exit is unavailable");
+                        session.close();
+                        return Err(RouteError::Unavailable);
+                    }
+                },
+                (Some(exit), None) => {
+                    tracing::warn!(exit, %address, "refusing a tunnel for an exit this gateway does not offer");
+                    session.close();
+                    return Err(RouteError::Unavailable);
+                }
+            };
             uplink.write().insert(address, limiter.clone());
             let context = Arc::new(RouteContext {
                 account_id: request.account_id,
@@ -1305,6 +1332,7 @@ impl PacketRouter for RouterAdapter {
                 uplink,
                 context,
                 contexts,
+                exit,
             });
             Ok(RouteSession {
                 downlink: handle.clone(),
@@ -1653,6 +1681,7 @@ mod tests {
                 SwitchConfig {
                     client_to_client,
                     always_reachable: vec![gateway],
+                    exits: None,
                 },
             );
             (router, adapter)

@@ -210,8 +210,9 @@ client pool to split-tunnel `X-Porta-Routes`.
 next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","interface":"porta-up0","connected":true,"address":"10.66.0.2","transport":"h3"}}`.
 While disconnected, `connected` is `false` and `error` holds the last failure.
 A split-tunnel gateway adds `routes` and `dns_domains`, `client_to_client`
-reports `--client-to-client`, and `exits` lists the exit names access
-policies may select. The admin page shows the routing and next hop as
+reports `--client-to-client`, `exits` lists the exit names access policies
+may select, and `upstreams` lists every next hop, with `name` set for named
+exits. The admin page shows the routing and next hop as
 banners.
 
 ## Session administration

@@ -23,6 +23,8 @@ make test-windows-cross
 make test-native-firewall
 make test-cascade
 make test-split-tunnel
+make test-subnet-router
+make test-exit-selection
 make test-service-user
 make vet
 make build
@@ -48,6 +50,14 @@ systemd. It starts a relay and an exit gateway with every sandbox setting of
 as an unprivileged user. It checks that the daemons hold only
 `CAP_NET_ADMIN`, own their state, relay a client's traffic, and that the root
 network helpers configure and remove the firewall.
+
+`make test-subnet-router` and `make test-exit-selection` run
+`scripts/test-subnet-router.sh` and `scripts/test-exit-selection.sh` over
+both transports. The first routes a LAN behind one client to a client of
+another account and checks access groups, allow and deny lists, and the
+router's forwarding restore. The second relays one account through a default
+upstream, a named exit, and the local exit, and checks that a selected exit
+that is down fails closed.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

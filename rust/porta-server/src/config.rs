@@ -101,11 +101,60 @@ pub struct Config {
     pub upstream_ca: Option<PathBuf>,
     #[arg(long, default_value = "")]
     pub upstream_thumbprint: String,
+    /// Named next-hop gateway that access policies can select as an
+    /// account's exit, as NAME=URL (repeatable). Its client token is read
+    /// from PORTA_EXIT_TOKEN_<NAME>.
+    #[arg(long = "exit", value_name = "NAME=URL")]
+    pub exit_specs: Vec<String>,
+    /// With --upstream: also offer this host's own egress as the "local" exit.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    pub local_exit: bool,
+    #[arg(skip)]
+    pub exits: Vec<NamedExit>,
+    /// Exit client tokens from PORTA_EXIT_TOKEN_<NAME>, by variable suffix.
+    #[arg(skip)]
+    pub exit_tokens: std::collections::HashMap<String, String>,
     #[arg(skip)]
     pub admin_token: String,
     #[arg(skip)]
     pub upstream_token: String,
 }
+
+/// A next-hop gateway an account can select as its exit.
+#[derive(Clone)]
+pub struct NamedExit {
+    pub name: String,
+    pub url: String,
+    pub interface: String,
+    /// Fixed address of the exit's TUN; see `upstream_address`.
+    pub address: Ipv4Addr,
+    pub token: String,
+    /// Policy routing table holding the exit's default route.
+    pub table: u32,
+}
+
+impl std::fmt::Debug for NamedExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NamedExit")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("interface", &self.interface)
+            .field("address", &self.address)
+            .field("token", &redacted(&self.token))
+            .field("table", &self.table)
+            .finish()
+    }
+}
+
+/// Name of the exit through this host's own egress.
+pub const LOCAL_EXIT: &str = "local";
+/// Routing table of the main (local egress) routes.
+pub const MAIN_TABLE: u32 = 254;
+/// First policy routing table used by named exits; `server-up.sh` uses the
+/// same numbering for its `--exit-interface` options.
+pub const FIRST_EXIT_TABLE: u32 = 10067;
+const MAX_EXITS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum UpstreamTransport {
@@ -158,6 +207,9 @@ impl fmt::Debug for Config {
             .field("upstream_identity", &self.upstream_identity)
             .field("upstream_ca", &self.upstream_ca)
             .field("upstream_thumbprint", &self.upstream_thumbprint)
+            .field("exits", &self.exits)
+            .field("exit_tokens", &self.exit_tokens.keys().collect::<Vec<_>>())
+            .field("local_exit", &self.local_exit)
             .field("admin_token", &redacted(&self.admin_token))
             .field("upstream_token", &redacted(&self.upstream_token))
             .finish()
@@ -206,6 +258,12 @@ impl Config {
         }
         self.admin_token = std::env::var("PORTA_ADMIN_TOKEN").unwrap_or_default();
         self.upstream_token = std::env::var("PORTA_UPSTREAM_TOKEN").unwrap_or_default();
+        self.exit_tokens = std::env::vars()
+            .filter_map(|(name, value)| {
+                name.strip_prefix("PORTA_EXIT_TOKEN_")
+                    .map(|suffix| (suffix.to_owned(), value))
+            })
+            .collect();
         Self::normalize_optional_path(&mut self.upstream_identity);
         Self::normalize_optional_path(&mut self.upstream_ca);
         if self
@@ -374,8 +432,96 @@ impl Config {
         Ok(())
     }
 
+    /// Exits an access policy may select, with their routing tables.
+    pub fn exit_tables(&self) -> Vec<(String, u32)> {
+        let mut tables = Vec::new();
+        // Without --upstream the local exit is the default; offering it lets
+        // a policy name it explicitly next to the named exits.
+        if self.local_exit || (self.upstream.is_none() && !self.exits.is_empty()) {
+            tables.push((LOCAL_EXIT.to_owned(), MAIN_TABLE));
+        }
+        tables.extend(
+            self.exits
+                .iter()
+                .map(|exit| (exit.name.clone(), exit.table)),
+        );
+        tables
+    }
+
+    pub fn exit_names(&self) -> Vec<String> {
+        self.exit_tables()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn validate_exits(&mut self) -> Result<()> {
+        if self.local_exit && self.upstream.is_none() {
+            bail!("--local-exit only applies with --upstream; without it traffic already exits locally");
+        }
+        if self.exit_specs.len() > MAX_EXITS {
+            bail!("at most {MAX_EXITS} --exit next hops are supported");
+        }
+        let mut exits = Vec::new();
+        for (index, spec) in self.exit_specs.iter().enumerate() {
+            let (name, url) = spec
+                .split_once('=')
+                .context("--exit must be NAME=URL, for example --exit us=https://us.example.com")?;
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty()
+                || name.len() > 16
+                || name == LOCAL_EXIT
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                bail!("--exit names use 1-16 letters, digits or '-' and cannot be {LOCAL_EXIT:?}");
+            }
+            if exits.iter().any(|exit: &NamedExit| exit.name == name) {
+                bail!("--exit {name} is given twice");
+            }
+            let url = normalize_https_origin(url).with_context(|| {
+                format!("--exit {name} must name the HTTPS origin of a Porta gateway")
+            })?;
+            let suffix = name.to_ascii_uppercase().replace('-', "_");
+            let token = self.exit_tokens.remove(&suffix).unwrap_or_default();
+            if token.is_empty() {
+                bail!("PORTA_EXIT_TOKEN_{suffix} is required with --exit {name}");
+            }
+            let offset = u32::try_from(index).expect("bounded exit count") + 1;
+            let address = Ipv4Addr::from(u32::from(self.upstream_address) + offset);
+            if self.pool.contains(&address) || address.is_broadcast() {
+                bail!("--exit {name} needs {address} outside --pool; move --upstream-address");
+            }
+            let interface = format!("porta-up{offset}");
+            if [
+                self.interface.as_str(),
+                self.egress_interface.as_str(),
+                self.upstream_interface.as_str(),
+            ]
+            .contains(&interface.as_str())
+            {
+                bail!("--exit {name} needs interface {interface}, which is already in use");
+            }
+            exits.push(NamedExit {
+                name,
+                url,
+                interface,
+                address,
+                token,
+                table: FIRST_EXIT_TABLE + offset - 1,
+            });
+        }
+        self.exits = exits;
+        Ok(())
+    }
+
     fn validate_upstream(&mut self) -> Result<()> {
+        self.validate_exits()?;
         let Some(upstream) = self.upstream.as_deref() else {
+            if !self.exits.is_empty() {
+                self.resolve_upstream_identity()?;
+            }
             return Ok(());
         };
         self.upstream = Some(normalize_https_origin(upstream).context(
@@ -402,6 +548,12 @@ impl Config {
         {
             bail!("--upstream-address must be a unicast address outside --pool");
         }
+        self.resolve_upstream_identity()
+    }
+
+    /// Next hops share one device key; it defaults to
+    /// upstream-identity.json beside the client registry.
+    fn resolve_upstream_identity(&mut self) -> Result<()> {
         if let Some(path) = &self.upstream_ca {
             if !path.is_absolute() {
                 bail!("--upstream-ca must be an absolute path");
@@ -752,6 +904,86 @@ mod tests {
             config.upstream_identity,
             Some(PathBuf::from("/var/lib/porta/upstream-identity.json"))
         );
+    }
+
+    #[test]
+    fn named_exits_get_tables_interfaces_and_addresses_in_order() {
+        let parse = |arguments: &[&str], tokens: &[(&str, &str)]| {
+            let mut config = Config::try_parse_from(
+                [
+                    "porta-server",
+                    "--behind-proxy",
+                    "--listen=127.0.0.1:8443",
+                    "--admin-listen=",
+                    "--client-registry=/var/lib/porta/clients.json",
+                ]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+            )
+            .unwrap();
+            config.upstream_token = "token".into();
+            config.exit_tokens = tokens
+                .iter()
+                .map(|(name, token)| ((*name).to_owned(), (*token).to_owned()))
+                .collect();
+            config.validate().map(|()| config)
+        };
+        let config = parse(
+            &[
+                "--upstream",
+                "https://eu.example.com",
+                "--exit",
+                "US=https://us.example.com",
+                "--exit",
+                "ap-1=https://ap.example.com",
+                "--local-exit",
+            ],
+            &[("US", "us-token"), ("AP_1", "ap-token")],
+        )
+        .unwrap();
+        assert_eq!(
+            config.exit_tables(),
+            vec![
+                ("local".to_owned(), MAIN_TABLE),
+                ("us".to_owned(), 10067),
+                ("ap-1".to_owned(), 10068)
+            ]
+        );
+        assert_eq!(config.exits[1].interface, "porta-up2");
+        assert_eq!(config.exits[1].address, Ipv4Addr::new(169, 254, 66, 3));
+        assert!(!format!("{config:?}").contains("ap-token"));
+
+        // Without --upstream, local is the default and also selectable.
+        let config = parse(&["--exit", "us=https://us.example.com"], &[("US", "t")]).unwrap();
+        assert_eq!(config.exit_names(), vec!["local", "us"]);
+        assert!(config.upstream_identity.is_some());
+        assert!(parse(&[], &[]).unwrap().exit_names().is_empty());
+
+        for (arguments, tokens, message) in [
+            (
+                vec!["--exit", "us=https://us.example.com"],
+                vec![],
+                "PORTA_EXIT_TOKEN_US",
+            ),
+            (
+                vec!["--exit", "local=https://us.example.com"],
+                vec![("LOCAL", "t")],
+                "cannot be",
+            ),
+            (vec!["--exit", "us"], vec![], "NAME=URL"),
+            (
+                vec!["--exit", "us=http://us.example.com"],
+                vec![("US", "t")],
+                "HTTPS origin",
+            ),
+            (vec!["--local-exit"], vec![], "only applies with --upstream"),
+        ] {
+            let error = parse(&arguments, &tokens).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{arguments:?}: {error:#}"
+            );
+        }
     }
 
     #[test]

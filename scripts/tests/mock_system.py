@@ -150,19 +150,35 @@ elif name == "ip":
     elif args[:4] == ["-4", "route", "show", "default"]:
         print("default via 192.0.2.1 dev eth0")
     elif args[:3] == ["-4", "rule", "show"]:
+        selectors = dict(zip(args[3::2], args[4::2]))
         for rule in state.get("ip_rules", []):
+            if "priority" in selectors and not rule.startswith(selectors["priority"] + ":"):
+                continue
+            if "iif" in selectors and f" iif {selectors['iif']} " not in rule:
+                continue
             print(rule)
     elif args[:3] in (["-4", "rule", "add"], ["-4", "rule", "del"]):
         options = dict(zip(args[3::2], args[4::2]))
-        rule = (f"{options['priority']}:\tfrom all iif {options['iif']} "
-                f"lookup {options['lookup']}")
         rules = state.setdefault("ip_rules", [])
-        if args[2] == "add":
-            rules.append(rule)
-        elif rule in rules:
-            rules.remove(rule)
+        if args[2] == "del" and "lookup" not in options:
+            # Deletes the first rule matching the given selectors.
+            prefix = f"{options['priority']}:"
+            match = next((rule for rule in rules if rule.startswith(prefix)
+                          and f" iif {options['iif']} " in rule), None)
+            if match:
+                rules.remove(match)
+            else:
+                code = 2
         else:
-            code = 2
+            source = options.get("from", "all")
+            rule = (f"{options['priority']}:\tfrom {source} iif {options['iif']} "
+                    f"lookup {options['lookup']}")
+            if args[2] == "add":
+                rules.append(rule)
+            elif rule in rules:
+                rules.remove(rule)
+            else:
+                code = 2
     elif args[:3] == ["-4", "route", "replace"]:
         table = args[args.index("table") + 1]
         route = " ".join(args[3:args.index("table")])
