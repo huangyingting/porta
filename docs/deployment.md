@@ -152,9 +152,11 @@ The deployment script accepts MTUs from 576 through 1400.
 
 MTU feedback requires Linux to accept gateway-sourced ICMP injected through
 TUN, in both automatic and fixed interface-MTU modes. Deployment passes
-`--auto-mtu` to the daemon; `server-up.sh` now takes only its five positional
-arguments and always sets `accept_local=1` and loose `rp_filter=2` only on the
-owned TUN. It does not change global or physical-interface reverse-path
+`--auto-mtu` to the daemon; `server-up.sh` takes five positional arguments plus
+the optional `--upstream-interface IF` (cascade relay) and `--client-to-client`
+flags. It always sets `accept_local=1` and loose `rp_filter=2` only on the
+owned TUN, and on a relay's upstream TUN. It does not change global or
+physical-interface reverse-path
 filtering. These interface-local settings disappear with the TUN. The helper
 records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
 restores it during normal cleanup when no administrator or other service has
@@ -190,6 +192,18 @@ protocol details and oversized IPv4 handling.
 The script serializes deployments with a lock and is idempotent. Re-running it
 downloads and upgrades the server while preserving `/etc/porta/porta.env`,
 `/var/lib/porta/clients.json`, and persistent leases.
+
+Deployment options are saved in `/etc/porta/deploy.conf`, so an upgrade needs
+no options at all: `sudo ./scripts/deploy.sh`. Any option given on a later run
+overrides its saved value, is saved in turn, and is reported as
+`deploy: changing NAME: OLD -> NEW` before services are stopped. Use the
+explicit off-switches to remove saved behavior: `--no-upstream`, `--acme`
+(forget a saved certificate path), `--client-to-client=false`,
+`--client-host-access=false`, `--trust-proxy-headers=false`, and
+`--forward-proxy=true|false`. The external interface is saved only when given
+explicitly; otherwise it is detected on every run. An invalid or
+hand-edited file with unknown keys or unsafe characters is rejected before
+anything is stopped.
 The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately.
@@ -202,6 +216,93 @@ Docker service is started and no iptables rules are added; Porta uses only its
 isolated nftables table. If Docker is installed later, restart Porta once after
 Docker starts, or rerun deployment, to add the live exceptions; subsequent
 boots retain the correct ordering.
+
+## Cascade relays (multi-hop)
+
+A gateway can forward its clients' traffic through another Porta gateway
+instead of exiting from its own host, like a multi-hop WireGuard chain.
+Chains can be any length; each relay only knows its next hop:
+
+```text
+clients -> relay A -> relay B -> exit C -> Internet
+```
+
+Deploy from the exit backwards:
+
+1. Deploy the exit gateway normally.
+2. On the exit, create a client account for the relay in the admin portal (or
+   use its initial `PORTA_TOKEN`). The relay enrolls as one device of that
+   account, named after the relay's hostname.
+3. Deploy the relay with the exit as its upstream. Provide the token through
+   the environment, a private file, or the interactive prompt; it is never a
+   command-line value:
+
+   ```sh
+   read -rsp "Exit client token: " PORTA_UPSTREAM_TOKEN && echo
+   export PORTA_UPSTREAM_TOKEN
+   sudo --preserve-env=GH_TOKEN,PORTA_UPSTREAM_TOKEN ./scripts/deploy.sh \
+     --domain relay.example.com \
+     --upstream https://exit.example.com
+   unset PORTA_UPSTREAM_TOKEN
+   ```
+
+   Use `--upstream-token-file /root/exit.token` instead of the environment if
+   preferred, and `--upstream-ca /path/ca.pem` when the next hop uses a
+   private CA. Upgrades reuse the saved token from `/etc/porta/porta.env`.
+4. Repeat for each earlier hop, pointing it at the next one.
+
+Clients connect to the first relay exactly as they would to any gateway. Every
+hop can keep the default `10.66.0.0/24` pool: the relay masquerades its clients
+to a fixed relay address (`--upstream-address`, default `169.254.66.1`) on
+`porta-up0` and translates only that address to and from its upstream lease,
+so the upstream lease never becomes a local address. Each hop decapsulates and
+re-encapsulates rather than nesting tunnels, so the inner MTU is the smallest
+hop MTU instead of shrinking at every hop; relays also clamp TCP MSS on the
+upstream path.
+
+Relays fail closed. Client traffic is policy-routed (routing table and rule
+priority `10066`) only to `porta-up0`, an unreachable fallback route covers
+the time the interface is absent, and the forward filter accepts client traffic
+only toward the upstream interface. While the next hop is unavailable, relayed
+traffic is dropped rather than leaving through the relay's own Internet
+connection, and the relay reconnects automatically with exponential backoff.
+The relay's own traffic, such as ACME renewal and its tunnel to the next hop,
+still uses the host's normal routes.
+
+Relay readiness adds two required components: `upstream_tunnel` reports the
+next-hop connection and its last error, and `upstream_route` asks the kernel
+how it would forward a client packet. A relay is therefore ready only once the
+next hop accepts its token and device. Deployment prints the readiness report
+if that does not happen; typical causes are a wrong token, an exhausted device
+limit on the next hop's account, or an unreachable next hop. Monitor
+`porta_upstream_connected` and `porta_upstream_packets_total` in metrics.
+
+Avoid loops: a chain that eventually points back to an earlier hop forwards
+packets until their TTL expires.
+
+## Client isolation
+
+VPN clients can never reach link-local destinations, including the cloud
+instance metadata service at `169.254.169.254` (and Alibaba Cloud's
+`100.100.100.200`), through the gateway. Metadata services trust requests from
+the VM itself, so without this rule any client account could read the gateway
+VM's instance credentials. The forward proxy applies the same restriction.
+
+Clients can also reach only two services on the gateway host itself: ICMP,
+such as ping, and DNS on port 53, for operators who advertise a resolver on
+the gateway with `--dns`. Other host services, such as SSH or databases
+listening on all addresses, are unreachable from the tunnel. Add
+`--client-host-access` to allow clients to reach every host service, for
+example to administer the gateway over the tunnel; metadata remains blocked.
+
+## Client-to-client traffic
+
+By default each client can reach only its exit; traffic between leases is
+dropped. Add `--client-to-client` to let all clients of the gateway reach each
+other's tunnel addresses, as in a hub-and-spoke WireGuard bounce server. This
+applies to every account on the gateway, so enable it only when all clients
+are trusted to see each other. It combines with `--upstream`: inter-client
+traffic stays on the hub while Internet traffic continues to the next hop.
 
 ## Token portal and client downloads
 
@@ -429,6 +530,28 @@ disconnects it, but a device with a still-valid shared token can enroll again.
 Use **Disconnect now** to end current sessions without changing credentials;
 clients with automatic reconnect enabled may reconnect immediately.
 
+### Account limits
+
+Each client account can have three optional limits, set in the client dialog
+of the admin UI or with `PUT /api/clients/{id}/limits`:
+
+- **Expiry:** access ends at the configured time. VPN, forward-proxy and portal
+  access are refused afterwards, and live sessions end within a few seconds.
+- **Monthly data quota:** uploaded plus downloaded tunnel and proxy traffic per
+  UTC calendar month. The first period starts when the quota is set, and each
+  new month starts a new period. An exhausted account is disconnected and
+  refused until the next month, until the quota is raised or removed, or until
+  an administrator uses **Reset quota usage**.
+- **Speed limit:** a per-direction throughput limit shared by all of the
+  account's devices and transport lanes. Excess packets are dropped, which
+  tunneled TCP treats like a slower link.
+
+Limits are enforced every five seconds, so an account can exceed its quota by
+roughly five seconds of its traffic. Expired and over-quota clients receive
+HTTP 403 with an `X-Porta-Reason` header, and native clients show the reason
+instead of a generic authentication error. Packets dropped by speed limits are
+counted in `porta_router_dropped_packets_total{reason="rate_limited"}`.
+
 ## Validation and operations
 
 For a default port-443 deployment:
@@ -468,7 +591,10 @@ per-source meters, rates, bounds, and drop verdicts. Missing or failed required
 checks return HTTP 503. Deployment passes the expected egress interface; manual
 runs can set `--egress-interface`. A routed deployment without NAT can use
 `--readiness-require-nat=false`. Reverse-proxy backend mode does not require the
-public-input guard because its listener must be loopback-only.
+public-input guard because its listener must be loopback-only. On a cascade
+relay, the forwarding/NAT checks expect the upstream interface, and the
+`upstream_tunnel` and `upstream_route` components are also required. When
+deployment's readiness wait fails, it prints this report.
 
 Checks share the `--readiness-timeout` budget (default three seconds). Optional
 `--readiness-egress-url` and `--readiness-dns-name` probes report outbound HTTP

@@ -1,26 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port>" >&2
+usage() {
+  echo "usage: sudo $0 <tun-interface> <gateway-cidr> <pool-cidr> <external-interface> <public-port> [--upstream-interface IF] [--client-to-client] [--client-host-access]" >&2
   echo "example: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443" >&2
+  echo "cascade relay: sudo $0 porta0 10.66.0.1/24 10.66.0.0/24 eth0 8443 --upstream-interface porta-up0" >&2
   exit 2
-fi
+}
+[[ $# -ge 5 ]] || usage
 
 tun_interface=$1
 gateway_cidr=$2
 pool_cidr=$3
 external_interface=$4
 public_port=$5
+shift 5
+upstream_interface=
+client_to_client=false
+client_host_access=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --upstream-interface)
+      [[ $# -ge 2 && -z $upstream_interface ]] || usage
+      upstream_interface=$2
+      shift 2
+      ;;
+    --client-to-client) client_to_client=true; shift ;;
+    --client-host-access) client_host_access=true; shift ;;
+    *) usage ;;
+  esac
+done
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
    $tun_interface != "$external_interface" &&
+   ( -z $upstream_interface ||
+     ( $upstream_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ &&
+       $upstream_interface != "$tun_interface" &&
+       $upstream_interface != "$external_interface" ) ) &&
    $gateway_cidr =~ ^[0-9.]+/[0-9]+$ &&
    $pool_cidr =~ ^[0-9.]+/[0-9]+$ &&
    $public_port =~ ^[0-9]{1,5}$ ]] || {
   echo "invalid interface, IPv4 CIDR, or public port" >&2
   exit 2
 }
+# Client traffic leaves through the physical interface, or through the
+# next-hop gateway's tunnel when this gateway is a cascade relay.
+forward_interface=${upstream_interface:-$external_interface}
+# Cascade policy routing; server-down.sh removes the same entries.
+relay_table=10066
+relay_priority=10066
 public_port=$((10#$public_port))
 (( public_port >= 1 && public_port <= 65535 )) || {
   echo "invalid public port" >&2
@@ -73,6 +101,9 @@ nft_tables=$(nft list tables) || {
 }
 ip link show dev "$tun_interface" >/dev/null
 ip link show dev "$external_interface" >/dev/null
+if [[ -n $upstream_interface ]]; then
+  ip link show dev "$upstream_interface" >/dev/null
+fi
 ip address replace "$gateway_cidr" dev "$tun_interface"
 ip link set dev "$tun_interface" up
 if [[ -e $ip_forward_state ]]; then
@@ -97,6 +128,17 @@ sysctl -w "net/ipv4/conf/$tun_interface/rp_filter=2"
 if [[ -e "/proc/sys/net/ipv6/conf/$tun_interface/disable_ipv6" ]]; then
   sysctl -w "net/ipv6/conf/$tun_interface/disable_ipv6=1"
 fi
+if [[ -n $upstream_interface ]]; then
+  # Relayed replies arrive on the upstream tunnel although the main table
+  # routes their Internet sources through the physical interface. The next
+  # hop's gateway may share this gateway's address when pools overlap, so its
+  # MTU feedback must not be discarded as a martian.
+  sysctl -w "net/ipv4/conf/$upstream_interface/rp_filter=2"
+  sysctl -w "net/ipv4/conf/$upstream_interface/accept_local=1"
+  if [[ -e "/proc/sys/net/ipv6/conf/$upstream_interface/disable_ipv6" ]]; then
+    sysctl -w "net/ipv6/conf/$upstream_interface/disable_ipv6=1"
+  fi
+fi
 
 {
   if grep -Fxq 'table ip porta' <<<"$nft_tables"; then
@@ -109,15 +151,68 @@ fi
 table ip porta {
   chain forward {
     type filter hook forward priority filter; policy accept;
-    iifname "$tun_interface" oifname "$external_interface" accept
-    iifname "$external_interface" oifname "$tun_interface" ct state established,related accept
+    iifname "$tun_interface" oifname "$forward_interface" accept
+    iifname "$forward_interface" oifname "$tun_interface" ct state established,related accept
+EOF
+  if $client_to_client; then
+    # Hub-and-spoke: connected clients may reach each other's leases.
+    printf '    iifname "%s" oifname "%s" ip saddr %s ip daddr %s accept\n' \
+      "$tun_interface" "$tun_interface" "$pool_cidr" "$pool_cidr"
+  fi
+  cat <<EOF
     iifname "$tun_interface" drop
     oifname "$tun_interface" drop
   }
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "$external_interface" ip saddr $pool_cidr masquerade
+    oifname "$forward_interface" ip saddr $pool_cidr masquerade
   }
+EOF
+  if [[ -n $upstream_interface ]]; then
+    cat <<EOF
+  chain relay_mss {
+    type filter hook forward priority mangle; policy accept;
+    iifname "$tun_interface" oifname "$upstream_interface" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+    iifname "$upstream_interface" oifname "$tun_interface" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+  }
+  chain relay_input {
+    type filter hook input priority filter; policy accept;
+    iifname "$upstream_interface" ct state established,related accept
+    iifname "$upstream_interface" drop
+  }
+EOF
+  fi
+  # Clients never reach link-local services such as cloud instance metadata,
+  # which would otherwise disclose the gateway VM's credentials. The forward
+  # proxy applies the same rule to CONNECT destinations.
+  cat <<EOF
+  chain client_forward_guard {
+    type filter hook forward priority -10; policy accept;
+    iifname "$tun_interface" ip daddr { 169.254.0.0/16, 100.100.100.200 } drop
+  }
+EOF
+  if ! $client_host_access; then
+    # Clients may ping the gateway and use a resolver on it; other host
+    # services stay unreachable from the tunnel.
+    cat <<EOF
+  chain client_input {
+    type filter hook input priority filter; policy accept;
+    iifname "$tun_interface" ct state established,related accept
+    iifname "$tun_interface" icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept
+    iifname "$tun_interface" meta l4proto { tcp, udp } th dport 53 accept
+    iifname "$tun_interface" drop
+  }
+EOF
+  fi
+  if $client_to_client; then
+    cat <<EOF
+  chain client_redirects {
+    type filter hook output priority filter; policy accept;
+    oifname "$tun_interface" icmp type redirect drop
+  }
+EOF
+  fi
+  cat <<EOF
 }
 table inet porta_guard {
   chain input {
@@ -155,23 +250,54 @@ if command -v iptables >/dev/null; then
   else
     {
       printf '%s\n' "${tracked_external_interfaces[@]}"
-      printf '%s\n' "$external_interface"
+      printf '%s\n' "$forward_interface"
     } | awk 'NF && !seen[$0]++' >"$docker_rules_state"
     for tracked_external_interface in "${tracked_external_interfaces[@]}"; do
-      [[ $tracked_external_interface == "$external_interface" ]] && continue
+      [[ $tracked_external_interface == "$forward_interface" ]] && continue
       remove_docker_rule -i "$tun_interface" -o "$tracked_external_interface" -m comment --comment porta -j ACCEPT ||
         { echo "could not remove previous Porta Docker rule" >&2; exit 1; }
       remove_docker_rule -i "$tracked_external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
         { echo "could not remove previous Porta Docker rule" >&2; exit 1; }
     done
-    ensure_docker_rule 1 -i "$tun_interface" -o "$external_interface" -m comment --comment porta -j ACCEPT ||
+    ensure_docker_rule 1 -i "$tun_interface" -o "$forward_interface" -m comment --comment porta -j ACCEPT ||
       { echo "could not install Porta Docker rule" >&2; exit 1; }
-    ensure_docker_rule 2 -i "$external_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
+    ensure_docker_rule 2 -i "$forward_interface" -o "$tun_interface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment porta -j ACCEPT ||
       { echo "could not install Porta Docker rule" >&2; exit 1; }
-    printf '%s\n' "$external_interface" >"$docker_rules_state"
+    printf '%s\n' "$forward_interface" >"$docker_rules_state"
   fi
 else
   rm -f "$docker_rules_state"
 fi
 
-echo "configured $tun_interface; Porta nftables forwarding and public-input guards are active"
+relay_rule_present() {
+  local rules line
+  rules=$(ip -4 rule show) || return 2
+  while IFS= read -r line; do
+    [[ $line == "$relay_priority:"*" iif $tun_interface lookup $relay_table"* ]] && return 0
+  done <<<"$rules"
+  return 1
+}
+for _ in 1 2 3 4 5 6 7 8; do
+  if relay_rule_present; then
+    ip -4 rule del priority "$relay_priority" iif "$tun_interface" lookup "$relay_table"
+  else
+    rule_status=$?
+    [[ $rule_status -eq 1 ]] || { echo "could not inspect policy routing rules" >&2; exit 1; }
+    break
+  fi
+done
+ip -4 route flush table "$relay_table" 2>/dev/null || true
+if [[ -n $upstream_interface ]]; then
+  # Send client traffic to the next hop. The unreachable fallback keeps it
+  # from reaching the main table's physical default route while the upstream
+  # interface is missing; client-to-client traffic stays on the main table,
+  # where the forward chain drops it.
+  ip link set dev "$upstream_interface" up
+  ip -4 route replace default dev "$upstream_interface" table "$relay_table"
+  ip -4 route replace unreachable default metric 4294967295 table "$relay_table"
+  ip -4 route replace throw "$pool_cidr" table "$relay_table"
+  ip -4 rule add priority "$relay_priority" iif "$tun_interface" lookup "$relay_table"
+  echo "configured $tun_interface; client traffic is relayed through $upstream_interface"
+else
+  echo "configured $tun_interface; Porta nftables forwarding and public-input guards are active"
+fi

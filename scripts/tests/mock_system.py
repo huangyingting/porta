@@ -149,6 +149,28 @@ elif name == "ip":
         print("2: porta0: <POINTOPOINT,UP> mtu 1400")
     elif args[:4] == ["-4", "route", "show", "default"]:
         print("default via 192.0.2.1 dev eth0")
+    elif args[:3] == ["-4", "rule", "show"]:
+        for rule in state.get("ip_rules", []):
+            print(rule)
+    elif args[:3] in (["-4", "rule", "add"], ["-4", "rule", "del"]):
+        options = dict(zip(args[3::2], args[4::2]))
+        rule = (f"{options['priority']}:\tfrom all iif {options['iif']} "
+                f"lookup {options['lookup']}")
+        rules = state.setdefault("ip_rules", [])
+        if args[2] == "add":
+            rules.append(rule)
+        elif rule in rules:
+            rules.remove(rule)
+        else:
+            code = 2
+    elif args[:3] == ["-4", "route", "replace"]:
+        table = args[args.index("table") + 1]
+        route = " ".join(args[3:args.index("table")])
+        routes = state.setdefault("ip_routes", {}).setdefault(table, [])
+        if route not in routes:
+            routes.append(route)
+    elif args[:3] == ["-4", "route", "flush"]:
+        state.setdefault("ip_routes", {}).pop(args[args.index("table") + 1], None)
 elif name == "nft":
     if args[0] == "list" and state.get("fail_nft_list"):
         code = 2
@@ -287,7 +309,7 @@ elif name == "ss":
 elif name == "make":
     binary = safe(Path.cwd() / "bin/porta-server")
     binary.parent.mkdir(exist_ok=True)
-    binary.write_text("#!/bin/sh\nprintf 'client-downloads\\nlanding-template-dir\\ntrust-proxy-headers\\n'\n")
+    binary.write_text("#!/bin/sh\nprintf 'client-downloads\\nlanding-template-dir\\ntrust-proxy-headers\\n  --upstream [<UPSTREAM>]\\n'\n")
     binary.chmod(0o755)
 elif name == "mv":
     source, destination = map(safe, args[-2:])

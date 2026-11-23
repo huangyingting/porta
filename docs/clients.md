@@ -83,6 +83,39 @@ unset PORTA_TOKEN
 Do not place the token assignment after `sudo`; `sudo` treats it as a process
 argument that other local users can read.
 
+Alternatively, keep the token in a file readable only by its owner and pass
+`--token-file`; the client refuses group- or world-accessible files. This also
+suits a systemd service:
+
+```bash
+sudo install -d -m 0700 /etc/porta
+read -rsp "Client token: " token && echo
+printf '%s\n' "$token" | sudo install -m 0600 /dev/stdin /etc/porta/client.token
+unset token
+sudo install -m 0755 porta-client-linux-amd64 /usr/local/bin/porta-client
+sudo tee /etc/systemd/system/porta-client.service >/dev/null <<'EOF'
+[Unit]
+Description=Porta VPN client
+Wants=network-online.target
+After=network-online.target systemd-resolved.service
+
+[Service]
+ExecStart=/usr/local/bin/porta-client --server https://vpn.example.com:8443 --token-file /etc/porta/client.token
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now porta-client
+```
+
+Stopping the service restores networking. After a crash, the restarted client
+reuses the recovery journal and keeps the fail-closed guard in place; run
+`--cleanup-network` only when intentionally giving up the tunnel.
+The Windows CLI accepts the same `--token-file` option.
+
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
 full-tunnel routes, and per-link DNS automatically. Its owned nftables OUTPUT
 guard blocks physical IPv4, IPv6, and DNS bypass while connected or reconnecting.

@@ -71,7 +71,8 @@ The operations listener defaults to `127.0.0.1:9090`:
 
 - `GET /healthz` reports process health.
 - `GET /readyz` reports required local forwarding components and optional
-  external probes; failed required components return HTTP 503.
+  external probes; failed required components return HTTP 503. Cascade relays
+  add the required `upstream_tunnel` and `upstream_route` components.
 - `GET /metrics` is available only when `PORTA_METRICS_TOKEN` is configured and
   requires that bearer token.
 - `/api/*` accepts `PORTA_ADMIN_TOKEN` as a bearer token for local automation.
@@ -142,6 +143,29 @@ QR/paste payloads, and Intent extras, falling back to `Build.MODEL`, then
 Names are normalized to a 1-64-character ASCII format and sent as mutable
 metadata. The immutable enrollment ID is derived from the client-generated
 public key, so duplicate names coexist and renaming does not consume a slot.
+
+## Account limits
+
+`PUT /api/clients/{clientID}/limits` replaces an account's limits. All three
+fields are required, and `null` removes a limit:
+
+```json
+{"expires_at": "2027-01-01T00:00:00Z", "monthly_quota_bytes": 107374182400, "rate_limit_kbps": 20000}
+```
+
+`expires_at` is RFC 3339. `monthly_quota_bytes` counts uploaded plus
+downloaded IP bytes per UTC calendar month and must be positive.
+`rate_limit_kbps` applies to each direction and must be at least 64. Client
+summaries in `GET /api/clients` include these fields when set, plus
+`quota_used_bytes` for the current period and `status`: `active`, `disabled`,
+`expired`, or `quota_exceeded`.
+
+`POST /api/clients/{clientID}/usage/reset` starts a new quota period
+immediately and restores a blocked account.
+
+Tunnel requests from expired or over-quota accounts receive HTTP 403 with
+`X-Porta-Reason: account-expired` or `X-Porta-Reason: quota-exceeded`. The
+reason is sent only after the token has been validated.
 
 ## Session administration
 

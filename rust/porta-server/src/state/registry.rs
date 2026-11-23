@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -55,6 +55,10 @@ pub enum RegistryError {
     InvalidDeviceProof,
     #[error("client registry durability sync failed: {0}")]
     Durability(String),
+    #[error("client account has expired")]
+    Expired,
+    #[error("client account has used its monthly data quota")]
+    QuotaExceeded,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,6 +72,51 @@ pub struct ClientRecord {
     pub created_at: OffsetDateTime,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<DeviceRecord>,
+    #[serde(default, flatten)]
+    pub limits: AccountLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_period: Option<UsagePeriod>,
+}
+
+/// Optional account restrictions; absent values mean unrestricted.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AccountLimits {
+    /// Access ends at this instant, including active sessions.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_rfc3339"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
+    /// Uploaded plus downloaded IP bytes allowed per UTC calendar month.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_quota_bytes: Option<u64>,
+    /// Per-direction throughput shared by all of the account's sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_kbps: Option<u32>,
+}
+
+impl AccountLimits {
+    pub fn expired_at(&self, now: OffsetDateTime) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
+    }
+}
+
+/// Quota accounting period: monthly usage is the account's lifetime traffic
+/// minus `baseline_bytes`, its lifetime traffic when the period began.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsagePeriod {
+    pub month: String,
+    pub baseline_bytes: u64,
+}
+
+/// Limits and accounting state the policy enforcer evaluates per account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountPolicy {
+    pub id: String,
+    pub limits: AccountLimits,
+    pub usage_period: Option<UsagePeriod>,
+    pub active_sessions: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,6 +157,13 @@ pub struct ClientSummary {
     #[serde(skip_serializing_if = "Option::is_none", with = "optional_rfc3339")]
     pub last_disconnected: Option<OffsetDateTime>,
     pub devices: Vec<DeviceSummary>,
+    #[serde(flatten)]
+    pub limits: AccountLimits,
+    /// Traffic counted against the monthly quota in the current period.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_used_bytes: Option<u64>,
+    /// `active`, `disabled`, `expired`, or `quota_exceeded`.
+    pub status: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -187,6 +243,7 @@ struct RegistryState {
     next_persist_sequence: u64,
     metadata_dirty: bool,
     metadata_version: u64,
+    quota_blocked: HashSet<String>,
 }
 
 struct PersistenceState {
@@ -299,6 +356,8 @@ impl ClientRegistry {
                     enabled: true,
                     created_at: OffsetDateTime::now_utc(),
                     devices: Vec::new(),
+                    limits: AccountLimits::default(),
+                    usage_period: None,
                 }]
             }
             Err(error) => return Err(error.into()),
@@ -352,7 +411,14 @@ impl ClientRegistry {
         let mut summaries = state
             .clients
             .iter()
-            .map(|client| summarize_client(client, &self.inner.sessions, snapshot))
+            .map(|client| {
+                summarize_client(
+                    client,
+                    &self.inner.sessions,
+                    snapshot,
+                    state.quota_blocked.contains(&client.id),
+                )
+            })
             .collect::<Vec<_>>();
         summaries.sort_by_cached_key(|client| client.name.to_ascii_lowercase());
         summaries
@@ -368,14 +434,16 @@ impl ClientRegistry {
     }
 
     pub fn portal_client_active(&self, client_id: &str, token_hash: &str) -> bool {
-        self.inner
-            .state
-            .lock()
+        let now = OffsetDateTime::now_utc();
+        let state = self.inner.state.lock();
+        state
             .clients
             .iter()
             .find(|client| client.id == client_id)
             .is_some_and(|client| {
                 client.enabled
+                    && !client.limits.expired_at(now)
+                    && !state.quota_blocked.contains(&client.id)
                     && client.token_hash.len() == token_hash.len()
                     && bool::from(client.token_hash.as_bytes().ct_eq(token_hash.as_bytes()))
             })
@@ -397,6 +465,8 @@ impl ClientRegistry {
             enabled: true,
             created_at: OffsetDateTime::now_utc(),
             devices: Vec::new(),
+            limits: AccountLimits::default(),
+            usage_period: None,
         };
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -411,7 +481,10 @@ impl ClientRegistry {
         state.clients.push(client.clone());
         rebuild_token_index(&mut state);
         drop(state);
-        Ok((summarize_client(&client, &self.inner.sessions, None), token))
+        Ok((
+            summarize_client(&client, &self.inner.sessions, None, false),
+            token,
+        ))
     }
 
     pub async fn update(
@@ -471,7 +544,131 @@ impl ClientRegistry {
             .iter()
             .find(|client| client.id == id)
             .ok_or(RegistryError::NotFound)?;
-        Ok(summarize_client(client, &self.inner.sessions, None))
+        Ok(summarize_client(
+            client,
+            &self.inner.sessions,
+            None,
+            state.quota_blocked.contains(id),
+        ))
+    }
+
+    /// Replaces an account's limits. Expiry takes effect immediately; quota
+    /// and throughput limits are applied by the account policy enforcer.
+    pub async fn set_limits(
+        &self,
+        id: &str,
+        limits: AccountLimits,
+    ) -> Result<ClientSummary, RegistryError> {
+        self.ensure_open()?;
+        validate_limits(&limits)?;
+        let _mutation = self.inner.mutations.lock().await;
+        self.ensure_open()?;
+        let candidate = {
+            let state = self.inner.state.lock();
+            let mut clients = state.clients.clone();
+            let client = clients
+                .iter_mut()
+                .find(|client| client.id == id)
+                .ok_or(RegistryError::NotFound)?;
+            if limits.monthly_quota_bytes.is_none() {
+                client.usage_period = None;
+            }
+            client.limits = limits;
+            clients
+        };
+        self.persist_clients(&candidate).await?;
+        let expired = {
+            let mut state = self.inner.state.lock();
+            let persisted = candidate
+                .iter()
+                .find(|client| client.id == id)
+                .expect("candidate contains the selected client")
+                .clone();
+            if persisted.limits.monthly_quota_bytes.is_none() {
+                state.quota_blocked.remove(id);
+            }
+            let client = find_client_mut(&mut state, id)?;
+            client.limits = persisted.limits;
+            client.usage_period = persisted.usage_period;
+            client.limits.expired_at(OffsetDateTime::now_utc())
+        };
+        if expired {
+            self.end_sessions(id).await;
+        }
+        let state = self.inner.state.lock();
+        let client = state
+            .clients
+            .iter()
+            .find(|client| client.id == id)
+            .ok_or(RegistryError::NotFound)?;
+        Ok(summarize_client(
+            client,
+            &self.inner.sessions,
+            None,
+            state.quota_blocked.contains(id),
+        ))
+    }
+
+    /// Starts a new quota period whose usage is measured from `baseline_bytes`.
+    pub async fn set_usage_period(
+        &self,
+        id: &str,
+        period: UsagePeriod,
+    ) -> Result<(), RegistryError> {
+        self.ensure_open()?;
+        let _mutation = self.inner.mutations.lock().await;
+        self.ensure_open()?;
+        let candidate = {
+            let state = self.inner.state.lock();
+            let mut clients = state.clients.clone();
+            clients
+                .iter_mut()
+                .find(|client| client.id == id)
+                .ok_or(RegistryError::NotFound)?
+                .usage_period = Some(period.clone());
+            clients
+        };
+        self.persist_clients(&candidate).await?;
+        let mut state = self.inner.state.lock();
+        find_client_mut(&mut state, id)?.usage_period = Some(period);
+        Ok(())
+    }
+
+    pub fn account_policies(&self) -> Vec<AccountPolicy> {
+        let state = self.inner.state.lock();
+        state
+            .clients
+            .iter()
+            .map(|client| AccountPolicy {
+                id: client.id.clone(),
+                limits: client.limits.clone(),
+                usage_period: client.usage_period.clone(),
+                active_sessions: self.inner.sessions.active_count(&client.id, None),
+            })
+            .collect()
+    }
+
+    /// Marks an account as over (or back under) its quota. Newly blocked
+    /// accounts lose their active sessions. Returns whether the state changed.
+    pub async fn set_quota_blocked(&self, id: &str, blocked: bool) -> bool {
+        let changed = {
+            let mut state = self.inner.state.lock();
+            if blocked {
+                state.quota_blocked.insert(id.to_owned())
+            } else {
+                state.quota_blocked.remove(id)
+            }
+        };
+        if changed && blocked {
+            self.end_sessions(id).await;
+        }
+        changed
+    }
+
+    /// Ends every VPN and proxy session of an account that must stop now.
+    pub async fn end_sessions(&self, id: &str) -> usize {
+        let _drain = self.begin_account_drain(id);
+        self.inner.sessions.cancel_account(id).await
     }
 
     pub async fn rotate_token(&self, id: &str) -> Result<String, RegistryError> {
@@ -1151,8 +1348,15 @@ fn client_index_for_token(state: &RegistryState, token: &str) -> Result<usize, R
     let index = index
         .filter(|_| matches)
         .ok_or(RegistryError::Unauthorized)?;
-    if !state.clients[index].enabled {
+    let client = &state.clients[index];
+    if !client.enabled {
         return Err(RegistryError::Disabled);
+    }
+    if client.limits.expired_at(OffsetDateTime::now_utc()) {
+        return Err(RegistryError::Expired);
+    }
+    if state.quota_blocked.contains(&client.id) {
+        return Err(RegistryError::QuotaExceeded);
     }
     Ok(index)
 }
@@ -1387,6 +1591,7 @@ fn summarize_client(
     client: &ClientRecord,
     sessions: &LiveSessions,
     snapshot: Option<&usage::Snapshot>,
+    quota_blocked: bool,
 ) -> ClientSummary {
     let mut devices = client.devices.clone();
     devices.sort_by_key(|device| std::cmp::Reverse(device.last_seen));
@@ -1440,7 +1645,45 @@ fn summarize_client(
                 }
             })
             .collect(),
+        quota_used_bytes: client.limits.monthly_quota_bytes.and_then(|_| {
+            let period = client.usage_period.as_ref()?;
+            snapshot.map(|_| {
+                (client_usage.bytes_uploaded + client_usage.bytes_downloaded)
+                    .saturating_sub(period.baseline_bytes)
+            })
+        }),
+        status: if !client.enabled {
+            "disabled"
+        } else if client.limits.expired_at(OffsetDateTime::now_utc()) {
+            "expired"
+        } else if quota_blocked {
+            "quota_exceeded"
+        } else {
+            "active"
+        },
+        limits: client.limits.clone(),
     }
+}
+
+/// Smallest accepted throughput limit; lower values cannot carry one
+/// full-size packet per second in each direction.
+pub const MIN_RATE_LIMIT_KBPS: u32 = 64;
+
+fn validate_limits(limits: &AccountLimits) -> Result<(), RegistryError> {
+    if limits.monthly_quota_bytes == Some(0) {
+        return Err(RegistryError::InvalidInput(
+            "monthly quota must be positive; disable the client to block all traffic".into(),
+        ));
+    }
+    if limits
+        .rate_limit_kbps
+        .is_some_and(|rate| rate < MIN_RATE_LIMIT_KBPS)
+    {
+        return Err(RegistryError::InvalidInput(format!(
+            "throughput limit must be at least {MIN_RATE_LIMIT_KBPS} kbit/s"
+        )));
+    }
+    Ok(())
 }
 
 fn registry_identity(account_id: &str, device_id: &str) -> ClientIdentity {
@@ -1524,9 +1767,18 @@ mod rfc3339 {
 }
 
 mod optional_rfc3339 {
-    use serde::Serializer;
+    use serde::{Deserialize, Deserializer, Serializer};
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| OffsetDateTime::parse(&value, &Rfc3339).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 
     pub fn serialize<S>(value: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1770,6 +2022,8 @@ mod tests {
                     enabled: true,
                     created_at: at,
                     devices: Vec::new(),
+                    limits: AccountLimits::default(),
+                    usage_period: None,
                 })
                 .collect(),
             ..RegistryState::default()
@@ -1790,6 +2044,8 @@ mod tests {
                 enabled: false,
                 created_at: at,
                 devices: Vec::new(),
+                limits: AccountLimits::default(),
+                usage_period: None,
             },
             ClientRecord {
                 id: "8899aabbccddeeff".into(),
@@ -1799,6 +2055,8 @@ mod tests {
                 enabled: true,
                 created_at: at,
                 devices: Vec::new(),
+                limits: AccountLimits::default(),
+                usage_period: None,
             },
         ];
         rebuild_token_index(&mut state);
@@ -1823,6 +2081,8 @@ mod tests {
                 enabled: true,
                 created_at: at,
                 devices: vec![test_device("phone", at), test_device("tablet", at)],
+                limits: AccountLimits::default(),
+                usage_period: None,
             }],
         };
         tokio::fs::write(&path, serde_json::to_vec(&file).unwrap())
@@ -1880,6 +2140,159 @@ mod tests {
             .await
             .unwrap();
         registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_limits_persist_and_expiry_rejects_and_ends_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let id = registry.list()[0].id.clone();
+        assert!(matches!(
+            registry
+                .set_limits(
+                    &id,
+                    AccountLimits {
+                        monthly_quota_bytes: Some(0),
+                        ..AccountLimits::default()
+                    }
+                )
+                .await,
+            Err(RegistryError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            registry
+                .set_limits(
+                    &id,
+                    AccountLimits {
+                        rate_limit_kbps: Some(MIN_RATE_LIMIT_KBPS - 1),
+                        ..AccountLimits::default()
+                    }
+                )
+                .await,
+            Err(RegistryError::InvalidInput(_))
+        ));
+
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let session = registry
+            .authenticate_device_session(
+                BOOTSTRAP_TOKEN,
+                &signed_proof(&key, "Laptop", BOOTSTRAP_TOKEN, 1),
+                "POST",
+                "/v1/tunnel",
+            )
+            .await
+            .unwrap();
+        let limits = AccountLimits {
+            expires_at: Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+            monthly_quota_bytes: Some(10 << 30),
+            rate_limit_kbps: Some(20_000),
+        };
+        // Like a transport, release the session once it is cancelled.
+        let ended = tokio::spawn(async move {
+            let session = session;
+            session.cancellation.cancelled().await;
+            drop(session);
+        });
+        let summary = registry.set_limits(&id, limits.clone()).await.unwrap();
+        assert_eq!(summary.status, "expired");
+        assert_eq!(summary.limits, limits);
+        // Setting a past expiry ends the account's live sessions.
+        tokio::time::timeout(Duration::from_secs(1), ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            registry
+                .authenticate_device_session(
+                    BOOTSTRAP_TOKEN,
+                    &signed_proof(&key, "Laptop", BOOTSTRAP_TOKEN, 2),
+                    "POST",
+                    "/v1/tunnel",
+                )
+                .await,
+            Err(RegistryError::Expired)
+        ));
+        assert!(matches!(
+            registry.authenticate_portal(BOOTSTRAP_TOKEN),
+            Err(RegistryError::Expired)
+        ));
+        assert!(matches!(
+            registry.authenticate_proxy_session(BOOTSTRAP_TOKEN).await,
+            Err(RegistryError::Expired)
+        ));
+        registry.close().await.unwrap();
+
+        let reopened = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        assert_eq!(reopened.list()[0].limits, limits);
+        let mut renewed = limits;
+        renewed.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
+        assert_eq!(
+            reopened.set_limits(&id, renewed).await.unwrap().status,
+            "active"
+        );
+        assert!(reopened.authenticate_portal(BOOTSTRAP_TOKEN).is_ok());
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_blocking_rejects_and_clearing_the_quota_restores_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let id = registry.list()[0].id.clone();
+        registry
+            .set_limits(
+                &id,
+                AccountLimits {
+                    monthly_quota_bytes: Some(1 << 20),
+                    ..AccountLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        let session = registry
+            .authenticate_proxy_session(BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let ended = tokio::spawn(async move {
+            let session = session;
+            session.cancellation.cancelled().await;
+            drop(session);
+        });
+        assert!(registry.set_quota_blocked(&id, true).await);
+        assert!(!registry.set_quota_blocked(&id, true).await);
+        tokio::time::timeout(Duration::from_secs(1), ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            registry.authenticate_proxy_session(BOOTSTRAP_TOKEN).await,
+            Err(RegistryError::QuotaExceeded)
+        ));
+        assert_eq!(registry.list()[0].status, "quota_exceeded");
+        registry
+            .set_limits(&id, AccountLimits::default())
+            .await
+            .unwrap();
+        assert!(registry
+            .authenticate_proxy_session(BOOTSTRAP_TOKEN)
+            .await
+            .is_ok());
+        assert_eq!(registry.account_policies()[0].usage_period, None);
+        registry.close().await.unwrap();
+    }
+
+    #[test]
+    fn registries_without_limits_still_load_and_omit_them_when_saved() {
+        let json = r#"{"id":"0011223344556677","name":"Old","token_hash":"00","max_devices":5,"enabled":true,"created_at":"2026-01-01T00:00:00Z"}"#;
+        let client: ClientRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(client.limits, AccountLimits::default());
+        assert_eq!(client.usage_period, None);
+        let encoded = serde_json::to_string(&client).unwrap();
+        assert!(!encoded.contains("expires_at"));
+        assert!(!encoded.contains("usage_period"));
     }
 
     #[tokio::test]

@@ -7,13 +7,15 @@ Deploy or upgrade a direct Porta HTTP/2 + HTTP/3 gateway managed by systemd.
 
 Usage:
   sudo ./scripts/deploy.sh --domain DOMAIN [--cert CERTIFICATE --key PRIVATE_KEY] [options]
+  sudo ./scripts/deploy.sh [options]     # upgrade, reusing the saved options
 
-Required:
+Required on the first deployment:
   --domain DOMAIN           TLS hostname used by clients
 
 Options:
   --cert PATH               Certificate managed by an external issuer
   --key PATH                Matching private key; required with --cert
+  --acme                    Forget a saved --cert/--key and use Let's Encrypt
   --acme-email EMAIL        Optional Let's Encrypt account contact
   --port PORT               Direct TCP and UDP port (default: 443)
   --admin-port PORT         Loopback admin UI and operations port (default: 9090)
@@ -24,9 +26,22 @@ Options:
   --dns ADDRESS             DNS server advertised to clients (default: 1.1.1.1)
   --mtu MTU                 Tunnel MTU ceiling (default: 1400)
   --auto-mtu[=BOOL]         Automatic HTTP/3 MTU selection (default: true)
-  --trust-proxy-headers     Trust client IP headers from a loopback reverse proxy
-  --disable-forward-proxy   Disable authenticated HTTPS CONNECT proxying
+  --trust-proxy-headers[=BOOL]
+                            Trust client IP headers from a loopback reverse proxy
+  --forward-proxy=BOOL      Authenticated HTTPS CONNECT proxying (default: true);
+                            --disable-forward-proxy is the same as =false
   --reset-leases            Archive leases incompatible with a changed pool
+  --upstream URL            Relay client traffic through another Porta gateway
+                            (cascade relay) instead of exiting from this host
+  --upstream-token-file F   File holding the next hop's client token; defaults
+                            to $PORTA_UPSTREAM_TOKEN, the saved token, or a prompt
+  --upstream-ca PATH        PEM CA for a next hop with a private certificate
+  --upstream-interface IF   Upstream TUN interface (default: porta-up0)
+  --no-upstream             Stop relaying and exit traffic from this host again
+  --client-to-client[=BOOL] Let connected clients reach each other's addresses
+  --client-host-access[=BOOL]
+                            Let clients reach all services on this host; by
+                            default they may only ping it and use DNS port 53
   --release VERSION         GitHub release to deploy (default: latest)
   --build-local             Build the server from the current checkout instead
   --help                    Show this help
@@ -34,9 +49,17 @@ Options:
 The script preserves existing /etc/porta credentials. On a new installation it
 creates random client, admin, and metrics tokens.
 
+Options are saved in /etc/porta/deploy.conf. Later runs start from the saved
+options, so an upgrade needs no options; any option given overrides its saved
+value and is saved in turn.
+
 When --cert and --key are omitted, Porta obtains and renews a Let's Encrypt
 certificate using HTTP-01. Public TCP port 80 must reach this server and must
 not already be owned by another process.
+
+Cascade relays chain gateways like multi-hop WireGuard: deploy the exit
+gateway normally, create a client token for the relay on it, then deploy the
+relay with --upstream https://EXIT-DOMAIN[:PORT]. Repeat for longer chains.
 EOF
 }
 
@@ -68,6 +91,46 @@ release=latest
 build_local=false
 reset_leases=false
 client_version=
+upstream=
+upstream_token_file=
+upstream_ca=
+upstream_interface=porta-up0
+client_to_client=false
+client_host_access=false
+
+# Options persisted across upgrades. Values are parsed, never sourced, and
+# validated below exactly like command-line input.
+deploy_config=/etc/porta/deploy.conf
+saved_option_names=(
+  domain certificate private_key acme_email port admin_port external_interface
+  tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
+  upstream_ca upstream_interface client_to_client client_host_access
+)
+declare -A saved_options=()
+if [[ -e $deploy_config || -L $deploy_config ]]; then
+  [[ -f $deploy_config && ! -L $deploy_config ]] ||
+    die "$deploy_config must be a regular file"
+  line_number=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line_number=$((line_number + 1))
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line =~ ^([a-z_]+)=([A-Za-z0-9_./:@+-]*)$ ]] ||
+      die "invalid line $line_number in $deploy_config"
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    [[ " ${saved_option_names[*]} " == *" $key "* ]] ||
+      die "unknown option '$key' on line $line_number of $deploy_config"
+    saved_options[$key]=$value
+    printf -v "$key" '%s' "$value"
+  done <"$deploy_config"
+fi
+
+parse_bool() {
+  case "$2" in
+    true|false) printf '%s' "$2" ;;
+    *) die "$1 must be true or false" ;;
+  esac
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,9 +148,21 @@ while [[ $# -gt 0 ]]; do
     --mtu) require_value "$@"; mtu=$2; shift 2 ;;
     --auto-mtu|--auto-mtu=true) auto_mtu=true; shift ;;
     --auto-mtu=false) auto_mtu=false; shift ;;
+    --acme) certificate=; private_key=; shift ;;
     --trust-proxy-headers) trust_proxy_headers=true; shift ;;
+    --trust-proxy-headers=*) trust_proxy_headers=$(parse_bool --trust-proxy-headers "${1#*=}"); shift ;;
     --disable-forward-proxy) forward_proxy=false; shift ;;
+    --forward-proxy=*) forward_proxy=$(parse_bool --forward-proxy "${1#*=}"); shift ;;
     --reset-leases) reset_leases=true; shift ;;
+    --upstream) require_value "$@"; upstream=$2; shift 2 ;;
+    --upstream-token-file) require_value "$@"; upstream_token_file=$2; shift 2 ;;
+    --upstream-ca) require_value "$@"; upstream_ca=$2; shift 2 ;;
+    --upstream-interface) require_value "$@"; upstream_interface=$2; shift 2 ;;
+    --no-upstream) upstream=; upstream_ca=; shift ;;
+    --client-to-client) client_to_client=true; shift ;;
+    --client-to-client=*) client_to_client=$(parse_bool --client-to-client "${1#*=}"); shift ;;
+    --client-host-access) client_host_access=true; shift ;;
+    --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
     --release) require_value "$@"; release=$2; shift 2 ;;
     --build-local) build_local=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -96,6 +171,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
+for option in auto_mtu trust_proxy_headers forward_proxy client_to_client client_host_access; do
+  [[ ${!option} == true || ${!option} == false ]] || die "invalid saved value for $option"
+done
+[[ -n $domain ]] || die "--domain is required on the first deployment"
+# Only an explicit interface is saved; otherwise it is detected on each run.
+configured_external_interface=$external_interface
 [[ ${#domain} -le 253 &&
    ! $domain =~ ^[0-9.]+$ &&
    $domain =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] ||
@@ -129,6 +210,25 @@ mtu=$((10#$mtu))
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
 [[ $release == latest || $release =~ ^v[0-9][A-Za-z0-9._-]*$ ]] ||
   die "--release must be latest or a tag beginning with v"
+if [[ -z $upstream ]]; then
+  [[ -z $upstream_token_file && -z $upstream_ca ]] ||
+    die "--upstream-token-file and --upstream-ca require --upstream"
+else
+  [[ $upstream =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] ||
+    die "--upstream must be an HTTPS origin such as https://exit.example.com:8443"
+  upstream=${upstream%/}
+  [[ ${upstream#https://} != "$domain" && ${upstream#https://} != "$domain:$port" ]] ||
+    die "--upstream must name another gateway, not this one"
+  [[ $upstream_interface =~ ^[A-Za-z0-9_.-]{1,15}$ && $upstream_interface != "$tun_interface" ]] ||
+    die "invalid --upstream-interface"
+  if [[ -n $upstream_token_file ]]; then
+    [[ -f $upstream_token_file && -r $upstream_token_file ]] ||
+      die "--upstream-token-file must name a readable file"
+  fi
+  if [[ -n $upstream_ca ]]; then
+    [[ $upstream_ca == /* && -f $upstream_ca ]] || die "--upstream-ca must name an existing absolute path"
+  fi
+fi
 
 for command in install systemctl ip nft openssl curl sed awk sysctl python3 ss grep sha256sum uname flock; do
   command -v "$command" >/dev/null || die "required command not found: $command"
@@ -155,11 +255,31 @@ if [[ $tls_mode == static ]]; then
   done
 fi
 
+upstream_token=
+if [[ -n $upstream ]]; then
+  upstream_token=${PORTA_UPSTREAM_TOKEN:-}
+  if [[ -n $upstream_token_file ]]; then
+    upstream_token=$(<"$upstream_token_file")
+  fi
+  if [[ -z $upstream_token && -f /etc/porta/porta.env ]]; then
+    upstream_token=$(sed -n 's/^PORTA_UPSTREAM_TOKEN=//p' /etc/porta/porta.env | tail -n 1)
+  fi
+  if [[ -z $upstream_token && -t 0 ]]; then
+    read -rsp "Client token issued by $upstream: " upstream_token
+    echo
+  fi
+  upstream_token=${upstream_token//[$'\r\n\t ']/}
+  [[ ${#upstream_token} -ge 16 && $upstream_token =~ ^[[:graph:]]+$ ]] ||
+    die "--upstream requires a client token issued by the next hop: set PORTA_UPSTREAM_TOKEN or use --upstream-token-file"
+fi
+
 if [[ -z $external_interface ]]; then
   external_interface=$(ip -4 route show default | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
 fi
 [[ $external_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "could not determine a valid external interface"
 [[ $external_interface != "$tun_interface" ]] || die "TUN and external interfaces must differ"
+[[ -z $upstream || $external_interface != "$upstream_interface" ]] ||
+  die "upstream and external interfaces must differ"
 ip link show dev "$external_interface" >/dev/null 2>&1 ||
   die "external interface does not exist: $external_interface"
 
@@ -377,6 +497,9 @@ grep -q -- 'landing-template-dir' <<<"$server_help" ||
 if $trust_proxy_headers && ! grep -q -- 'trust-proxy-headers' <<<"$server_help"; then
   die "selected server release does not support trusted reverse-proxy client addresses"
 fi
+if [[ -n $upstream ]] && ! grep -q -- '--upstream ' <<<"$server_help"; then
+  die "selected server release does not support cascade relays (--upstream)"
+fi
 
 lease_state=/var/lib/porta/leases.json
 if [[ -s $lease_state ]] && ! python3 - "$pool" "$lease_state" <<'PY'
@@ -531,6 +654,26 @@ trap rollback EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Report how this run differs from the saved configuration before any
+# service is stopped.
+declare -A effective_options=()
+for name in "${saved_option_names[@]}"; do
+  effective_options[$name]=${!name}
+done
+effective_options[external_interface]=$configured_external_interface
+if [[ -n $upstream_ca ]]; then
+  effective_options[upstream_ca]=/etc/porta/upstream-ca.pem
+fi
+if [[ ${#saved_options[@]} -gt 0 ]]; then
+  for name in "${saved_option_names[@]}"; do
+    previous=${saved_options[$name]-}
+    current=${effective_options[$name]}
+    if [[ $previous != "$current" ]]; then
+      echo "deploy: changing $name: ${previous:-(unset)} -> ${current:-(unset)}"
+    fi
+  done
+fi
+
 services_paused=true
 # Quiesce writers and run the old unit's cleanup with its original helpers.
 systemctl stop porta-cert-sync.timer porta-cert-sync.service >/dev/null 2>&1 || {
@@ -589,7 +732,30 @@ fi
 if ! grep -q '^PORTA_ADMIN_TOKEN=' "$environment_file"; then
   printf 'PORTA_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$environment_file"
 fi
+if [[ -n $upstream ]]; then
+  grep -v '^PORTA_UPSTREAM_TOKEN=' "$environment_file" >"$environment_file.new" || true
+  printf 'PORTA_UPSTREAM_TOKEN=%s\n' "$upstream_token" >>"$environment_file.new"
+  chmod 0600 "$environment_file.new"
+  mv "$environment_file.new" "$environment_file"
+  unset upstream_token
+  if [[ -n $upstream_ca ]]; then
+    if [[ $(realpath "$upstream_ca") != "$(realpath -m /etc/porta/upstream-ca.pem)" ]]; then
+      install -m 0644 "$upstream_ca" /etc/porta/upstream-ca.pem
+    fi
+    upstream_ca=/etc/porta/upstream-ca.pem
+  else
+    rm -f /etc/porta/upstream-ca.pem
+  fi
+fi
 chmod 0600 "$environment_file"
+{
+  echo "# Written by deploy.sh; later runs reuse these options. Edit with care."
+  for name in "${saved_option_names[@]}"; do
+    printf '%s=%s\n' "$name" "${effective_options[$name]}"
+  done
+} >"$deploy_config.new"
+chmod 0600 "$deploy_config.new"
+mv "$deploy_config.new" "$deploy_config"
 
 if [[ -n $downloads_stage ]]; then
   rm -rf /var/lib/porta/downloads
@@ -629,6 +795,21 @@ if $trust_proxy_headers; then
   trust_proxy_argument="--trust-proxy-headers"
 fi
 auto_mtu_argument="--auto-mtu=$auto_mtu"
+upstream_arguments=
+network_up_options=
+if [[ -n $upstream ]]; then
+  upstream_arguments="--upstream $upstream --upstream-interface $upstream_interface --upstream-identity /var/lib/porta/upstream-identity.json"
+  if [[ -n $upstream_ca ]]; then
+    upstream_arguments+=" --upstream-ca /etc/porta/upstream-ca.pem"
+  fi
+  network_up_options=" --upstream-interface $upstream_interface"
+fi
+if $client_to_client; then
+  network_up_options+=" --client-to-client"
+fi
+if $client_host_access; then
+  network_up_options+=" --client-host-access"
+fi
 
 if systemctl cat docker.service >/dev/null 2>&1; then
   unit_wants+=" docker.service"
@@ -644,8 +825,8 @@ $unit_wants
 Type=simple
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
-ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port; sleep 0.1; done; exit 1'
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns --mtu $mtu --json-logs
+ExecStartPost=/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 Restart=on-failure
 RestartSec=2
@@ -715,8 +896,17 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
-curl --silent --show-error --fail --noproxy '*' --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null ||
-  die "gateway started but did not become ready"
+if ! curl --silent --show-error --fail --noproxy '*' --connect-timeout 5 --max-time 10 "http://127.0.0.1:$admin_port/readyz" >/dev/null; then
+  readiness_report=$(curl --silent --noproxy '*' --connect-timeout 5 --max-time 10 \
+    "http://127.0.0.1:$admin_port/readyz" 2>/dev/null || true)
+  if [[ -n $readiness_report ]]; then
+    echo "deploy: readiness report: $readiness_report" >&2
+  fi
+  if [[ -n $upstream ]]; then
+    echo "deploy: a relay is ready only after $upstream accepts its token and device" >&2
+  fi
+  die "gateway started but did not become ready; see: sudo journalctl -u porta -n 50"
+fi
 landing_tls_arguments=()
 if [[ $tls_mode == static ]]; then
   landing_tls_arguments+=(--cacert /etc/porta/tls/server.crt)
@@ -763,6 +953,9 @@ Transports:      HTTP/2 over TCP $port and HTTP/3 MASQUE over UDP $port
 Forward proxy:   $([[ $forward_proxy == true ]] && echo "enabled (HTTPS CONNECT on port 443 only)" || echo "disabled")
 TLS mode:        $tls_mode
 Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "GitHub release $release")
+Exit traffic:    $([[ -n $upstream ]] && echo "relayed through $upstream via $upstream_interface" || echo "this host via $external_interface")
+Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
+Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Browser portal:  https://$domain:$port
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env

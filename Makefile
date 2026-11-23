@@ -11,7 +11,7 @@ WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef5
 
 .PHONY: all build build-rust-server build-rust-clients build-windows android android-debug \
 	check-version clean test test-automation test-rust test-rust-server test-rust-client \
-	test-rust-interop test-live-vpn test-windows-cross test-native-firewall test-server-web \
+	test-rust-interop test-live-vpn test-cascade test-windows-cross test-native-firewall test-server-web \
 	verify-wintun vet
 
 all: build
@@ -65,6 +65,13 @@ test-live-vpn:
 test-native-firewall:
 	./scripts/test-server-firewall.sh
 	./scripts/test-rust-client-network.sh
+
+test-cascade:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-server-rust --package porta-client-rust --locked
+	sudo -n ./scripts/test-cascade.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+	sudo -n env PORTA_CASCADE_TRANSPORT=h2 ./scripts/test-cascade.sh \
+		$(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
 
 vet:
 	$(CARGO) clippy --manifest-path $(RUST_MANIFEST) --workspace --all-targets --locked -- -D warnings

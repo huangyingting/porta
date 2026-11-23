@@ -143,6 +143,11 @@ impl Portal {
     }
 
     fn sign_in(&self, request: &RequestContext, now: u64) -> Response {
+        // Without this, another site could sign a visitor in with the
+        // attacker's token and show them the attacker's VPN profile.
+        if !same_origin_portal_request(request, self.trust_proxy_headers) {
+            return access_page_response(request, true, 403);
+        }
         let Some(form) = parse_form(&request.body, 4 << 10) else {
             return access_page_response(request, true, 401);
         };
@@ -242,6 +247,13 @@ impl Portal {
     }
 
     fn sign_out(&self, request: &RequestContext) -> Response {
+        if !same_origin_portal_request(request, self.trust_proxy_headers) {
+            return Response::text(
+                403,
+                "text/plain; charset=utf-8",
+                b"invalid request origin\n".to_vec(),
+            );
+        }
         if let Some(id) = request.cookie(PORTAL_COOKIE_NAME) {
             self.sessions.remove(id);
         }
@@ -2004,6 +2016,37 @@ mod tests {
             .header("Set-Cookie")
             .unwrap()
             .contains("Secure; HttpOnly; SameSite=Strict"));
+    }
+
+    #[tokio::test]
+    async fn cross_site_sign_in_and_sign_out_are_rejected() {
+        let token = "client-token-0123456789";
+        let registry: Arc<dyn ClientRegistry> = Arc::new(Registry::new(token));
+        let portal = Portal::new(registry, "admin-token-0123456789", "", false).unwrap();
+        let body = format!("token={token}").into_bytes();
+
+        let forged = RequestContext::new("POST", "/access")
+            .with_host("porta.example.com")
+            .with_header("Origin", "https://attacker.example")
+            .with_body(body.clone());
+        let response = portal.handle(&forged).await.unwrap();
+        assert_eq!(response.status, 403);
+        assert!(response.header("Set-Cookie").is_none());
+
+        let same_site = RequestContext::new("POST", "/access")
+            .with_host("porta.example.com")
+            .with_header("Origin", "https://porta.example.com")
+            .with_body(body);
+        let response = portal.handle(&same_site).await.unwrap();
+        assert_eq!(response.status, 303);
+        assert!(response.header("Set-Cookie").is_some());
+
+        let forged = RequestContext::new("POST", "/portal/logout")
+            .with_host("porta.example.com")
+            .with_header("Origin", "https://attacker.example");
+        let response = portal.handle(&forged).await.unwrap();
+        assert_eq!(response.status, 403);
+        assert!(response.header("Set-Cookie").is_none());
     }
 
     #[tokio::test]

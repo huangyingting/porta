@@ -40,6 +40,8 @@ pub struct AutomaticCertificateConfig {
     pub email: String,
     pub cache_directory: PathBuf,
     pub http_listen: String,
+    /// Public HTTPS port that plain-HTTP visitors are redirected to.
+    pub https_port: u16,
 }
 
 pub struct AutomaticCertificateManager {
@@ -148,10 +150,11 @@ impl AutomaticCertificateManager {
         let http_task = http_listener.map(|listener| {
             let cancellation = cancellation.clone();
             let resolver = resolver.clone();
-            let domain = domain.clone();
-            tokio::spawn(
-                async move { serve_http01(listener, resolver, domain, cancellation).await },
-            )
+            let site = Arc::new(Http01Site {
+                origin: https_origin(&domain, config.https_port),
+                domain: domain.clone(),
+            });
+            tokio::spawn(async move { serve_http01(listener, resolver, site, cancellation).await })
         });
 
         Ok(Self {
@@ -380,10 +383,25 @@ fn server_config(
     Ok(config)
 }
 
+/// The configured site: challenges are answered only for `domain`, and other
+/// requests redirect to `origin` rather than to a client-supplied Host.
+struct Http01Site {
+    domain: String,
+    origin: String,
+}
+
+fn https_origin(domain: &str, port: u16) -> String {
+    if port == 443 {
+        format!("https://{domain}")
+    } else {
+        format!("https://{domain}:{port}")
+    }
+}
+
 async fn serve_http01(
     listener: TcpListener,
     resolver: Arc<ResolvesServerCertAcme>,
-    domain: String,
+    site: Arc<Http01Site>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut connections = tokio::task::JoinSet::new();
@@ -406,12 +424,12 @@ async fn serve_http01(
                     continue;
                 };
                 let resolver = resolver.clone();
-                let domain = domain.clone();
+                let site = site.clone();
                 let cancellation = cancellation.child_token();
                 connections.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        serve_http01_connection(stream, resolver, domain, cancellation).await
+                        serve_http01_connection(stream, resolver, site, cancellation).await
                     {
                         tracing::debug!(%peer, %error, "ACME HTTP-01 connection closed with error");
                     }
@@ -439,13 +457,13 @@ async fn serve_http01(
 async fn serve_http01_connection(
     stream: TcpStream,
     resolver: Arc<ResolvesServerCertAcme>,
-    domain: String,
+    site: Arc<Http01Site>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let service = service_fn(move |request| {
         let resolver = resolver.clone();
-        let domain = domain.clone();
-        async move { Ok::<_, Infallible>(http01_response(request, resolver.as_ref(), &domain)) }
+        let site = site.clone();
+        async move { Ok::<_, Infallible>(http01_response(request, resolver.as_ref(), &site)) }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.keep_alive(false).max_buf_size(16 << 10);
@@ -469,11 +487,11 @@ async fn serve_http01_connection(
 fn http01_response(
     request: Request<Incoming>,
     resolver: &ResolvesServerCertAcme,
-    domain: &str,
+    site: &Http01Site,
 ) -> Response<Full<Bytes>> {
     const PREFIX: &str = "/.well-known/acme-challenge/";
     if let Some(token) = request.uri().path().strip_prefix(PREFIX) {
-        if !host_allowed(request.headers().get(header::HOST), domain) {
+        if !host_allowed(request.headers().get(header::HOST), &site.domain) {
             return text_response(StatusCode::FORBIDDEN, "acme host policy rejected request\n");
         }
         if token.is_empty() || token.contains('/') {
@@ -491,10 +509,7 @@ fn http01_response(
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return text_response(StatusCode::BAD_REQUEST, "Use HTTPS\n");
     }
-    let Some(host) = redirect_host(request.headers().get(header::HOST)) else {
-        return text_response(StatusCode::BAD_REQUEST, "missing Host header\n");
-    };
-    let location = format!("https://{host}{}", request.uri());
+    let location = redirect_location(&site.origin, request.uri());
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, location)
@@ -527,17 +542,12 @@ fn host_without_port(value: Option<&http::HeaderValue>) -> Option<&str> {
         .map_or(Some(value), |(host, _)| Some(host))
 }
 
-fn redirect_host(value: Option<&http::HeaderValue>) -> Option<String> {
-    let value = value?.to_str().ok()?;
-    if let Ok(address) = value.parse::<SocketAddr>() {
-        return Some(SocketAddr::new(address.ip(), 443).to_string());
-    }
-    if let Some((host, port)) = value.rsplit_once(':') {
-        if port.parse::<u16>().is_ok() {
-            return Some(format!("{host}:443"));
-        }
-    }
-    Some(value.to_string())
+fn redirect_location(origin: &str, uri: &http::Uri) -> String {
+    // Absolute-form request targets carry their own authority; keep only the
+    // path so the redirect always stays on the configured site.
+    let path = uri.path_and_query().map_or("/", |path| path.as_str());
+    let path = if path.starts_with('/') { path } else { "/" };
+    format!("{origin}{path}")
 }
 
 pub fn normalize_domain(domain: &str) -> String {
@@ -633,6 +643,28 @@ mod tests {
         let long_label = format!("{}.example.com", "a".repeat(64));
         assert!(normalize_and_validate_domain(&long_label).is_err());
         assert!(validate_cache_directory(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn redirects_stay_on_the_configured_origin_and_port() {
+        let origin = https_origin("vpn.example.com", 8443);
+        assert_eq!(origin, "https://vpn.example.com:8443");
+        assert_eq!(
+            https_origin("vpn.example.com", 443),
+            "https://vpn.example.com"
+        );
+        for (target, expected) in [
+            ("/portal?x=1", "https://vpn.example.com:8443/portal?x=1"),
+            (
+                "http://evil.example/steal",
+                "https://vpn.example.com:8443/steal",
+            ),
+            ("http://evil.example", "https://vpn.example.com:8443/"),
+            ("*", "https://vpn.example.com:8443/"),
+        ] {
+            let uri = target.parse::<http::Uri>().unwrap();
+            assert_eq!(redirect_location(&origin, &uri), expected, "{target}");
+        }
     }
 
     #[test]

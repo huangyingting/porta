@@ -187,6 +187,10 @@ successful retry rather than making its address available to another identity.
 Linux forwarding and NAT are deliberately outside the daemon. The supplied
 setup script makes these changes explicit and reversible. The daemon itself can
 run with only access to `/dev/net/tun` plus the configured TCP/UDP port.
+Client-to-client forwarding between leases is dropped unless the setup script
+runs with `--client-to-client`, which accepts `porta0`-to-`porta0` traffic
+within the pool and suppresses the ICMP redirects Linux would otherwise send
+for it.
 
 Packet-device reads transfer ownership of their buffers to the caller. The
 router and client receive queues pass those buffers onward without another
@@ -207,6 +211,53 @@ caches only fully validated public DNS answers for 30 seconds, and rejects the
 whole answer set if any address is private or reserved. Downstream response
 writes are coalesced up to 128 KiB or two milliseconds before a protocol flush;
 the final partial buffer is flushed when the copy direction completes.
+
+## Cascade relays
+
+With `--upstream`, a gateway is a relay: it joins the next-hop gateway as an
+ordinary native device, using the shared client tunnel implementation, its own
+persistent P-256 identity (`--upstream-identity`), and a client token from the
+next hop (`PORTA_UPSTREAM_TOKEN`). No protocol extension is involved, so any
+Porta gateway can serve as a next hop, and relays chain to any depth.
+
+```text
+client --MASQUE--> relay: porta0 -> policy route -> porta-up0 --MASQUE--> next hop
+```
+
+The relay owns a second TUN, `porta-up0`, addressed with a fixed relay address
+(`--upstream-address`, default `169.254.66.1/32`). The kernel still does the
+forwarding work:
+
+- an `iif porta0` rule (priority `10066`) selects table `10066`, whose default
+  route is `porta-up0`, whose `unreachable` fallback covers a missing
+  interface, and whose `throw` route for the pool keeps client-to-client
+  traffic in the main table;
+- the Porta forward chain accepts client traffic only toward `porta-up0`, and
+  masquerades it to the relay address; a mangle chain clamps TCP MSS to the
+  route MTU; unsolicited input from `porta-up0` is dropped.
+
+The daemon reads `porta-up0`, accepts only packets sourced from the relay
+address, translates that source to its current upstream lease, and sends the
+packets through the upstream tunnel. Received packets are translated back
+before being written to `porta-up0`, where conntrack restores each client
+address. Translation is stateless and one-to-one; it updates IPv4, TCP and UDP
+checksums incrementally and rewrites the packet quoted by ICMP errors so that
+conntrack can match PMTU and unreachable feedback. Because the upstream lease
+is never a local address, a relay and its next hop may use overlapping or
+identical pools. `accept_local=1` on `porta-up0` admits MTU feedback from a
+next-hop gateway whose address equals the relay's own gateway address.
+
+Hops decapsulate and re-encapsulate, so encapsulation overhead does not
+accumulate. The upstream interface MTU follows the upstream lease, including
+automatic HTTP/3 MTU selection. Larger downstream packets receive the normal
+kernel fragmentation or ICMP Fragmentation Needed treatment.
+
+The upstream connection reconnects with exponential backoff up to 30 seconds;
+authentication and protocol rejections retry every 30 seconds so that fixing
+the token or enrollment on the next hop recovers without a restart. While it
+is down, policy routing still selects `porta-up0` and the daemon drops what it
+reads, so traffic never falls back to the relay's physical route. The relay's
+own traffic, including its tunnel to the next hop, is not policy-routed.
 
 ## Transport behavior
 

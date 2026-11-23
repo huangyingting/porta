@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -68,8 +68,38 @@ pub struct Config {
     pub readiness_egress_url: String,
     #[arg(long, default_value = "")]
     pub readiness_dns_name: String,
+    /// HTTPS origin of the next-hop Porta gateway. Client traffic leaves
+    /// through that gateway instead of this host (cascade relay).
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub upstream: Option<String>,
+    #[arg(long, default_value = "porta-up0")]
+    pub upstream_interface: String,
+    /// Fixed address of the upstream interface. Relayed client traffic is
+    /// masqueraded to it, then translated to the next hop's lease.
+    #[arg(long, default_value = "169.254.66.1")]
+    pub upstream_address: Ipv4Addr,
+    #[arg(long, value_enum, default_value_t = UpstreamTransport::Auto)]
+    pub upstream_transport: UpstreamTransport,
+    /// Private device key used to enroll with the next hop. Defaults to
+    /// upstream-identity.json beside the client registry.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_parser = parse_path)]
+    pub upstream_identity: Option<PathBuf>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_parser = parse_path)]
+    pub upstream_ca: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    pub upstream_thumbprint: String,
     #[arg(skip)]
     pub admin_token: String,
+    #[arg(skip)]
+    pub upstream_token: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum UpstreamTransport {
+    #[default]
+    Auto,
+    H3,
+    H2,
 }
 
 impl fmt::Debug for Config {
@@ -106,7 +136,15 @@ impl fmt::Debug for Config {
             .field("readiness_require_nat", &self.readiness_require_nat)
             .field("readiness_egress_url", &self.readiness_egress_url)
             .field("readiness_dns_name", &self.readiness_dns_name)
+            .field("upstream", &self.upstream)
+            .field("upstream_interface", &self.upstream_interface)
+            .field("upstream_address", &self.upstream_address)
+            .field("upstream_transport", &self.upstream_transport)
+            .field("upstream_identity", &self.upstream_identity)
+            .field("upstream_ca", &self.upstream_ca)
+            .field("upstream_thumbprint", &self.upstream_thumbprint)
             .field("admin_token", &redacted(&self.admin_token))
+            .field("upstream_token", &redacted(&self.upstream_token))
             .finish()
     }
 }
@@ -152,6 +190,16 @@ impl Config {
             }
         }
         self.admin_token = std::env::var("PORTA_ADMIN_TOKEN").unwrap_or_default();
+        self.upstream_token = std::env::var("PORTA_UPSTREAM_TOKEN").unwrap_or_default();
+        Self::normalize_optional_path(&mut self.upstream_identity);
+        Self::normalize_optional_path(&mut self.upstream_ca);
+        if self
+            .upstream
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            self.upstream = None;
+        }
         if self.usage_state.is_none() {
             self.usage_state = Some(
                 self.client_registry
@@ -262,6 +310,58 @@ impl Config {
         if !self.readiness_dns_name.is_empty() && self.dns.is_empty() {
             bail!("--dns must be an IP address when --readiness-dns-name is configured");
         }
+        self.validate_upstream()?;
+        Ok(())
+    }
+
+    fn validate_upstream(&mut self) -> Result<()> {
+        let Some(upstream) = self.upstream.as_deref() else {
+            return Ok(());
+        };
+        self.upstream = Some(normalize_https_origin(upstream).context(
+            "--upstream must be the HTTPS origin of the next-hop gateway, for example https://exit.example.com",
+        )?);
+        if self.upstream_token.is_empty() {
+            bail!("PORTA_UPSTREAM_TOKEN is required with --upstream");
+        }
+        if !valid_interface_name(&self.upstream_interface) {
+            bail!("--upstream-interface must be a valid interface name");
+        }
+        if self.upstream_interface == self.interface
+            || (!self.egress_interface.is_empty()
+                && self.upstream_interface == self.egress_interface)
+        {
+            bail!("--upstream-interface must differ from --interface and --egress-interface");
+        }
+        let address = self.upstream_address;
+        if address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+            || address.is_broadcast()
+            || self.pool.contains(&address)
+        {
+            bail!("--upstream-address must be a unicast address outside --pool");
+        }
+        if let Some(path) = &self.upstream_ca {
+            if !path.is_absolute() {
+                bail!("--upstream-ca must be an absolute path");
+            }
+        }
+        let identity = match self.upstream_identity.take() {
+            Some(path) => path,
+            None => self
+                .client_registry
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                .join("upstream-identity.json"),
+        };
+        self.upstream_identity = Some(if identity.is_absolute() {
+            identity
+        } else {
+            std::env::current_dir()
+                .context("resolve --upstream-identity")?
+                .join(identity)
+        });
         Ok(())
     }
 
@@ -342,6 +442,33 @@ fn validate_loopback_address(value: &str, option: &str) -> Result<()> {
 
 fn normalize_domain(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_https_origin(value: &str) -> Result<String> {
+    let uri = value.trim().parse::<http::Uri>()?;
+    let authority = uri
+        .authority()
+        .filter(|authority| !authority.as_str().contains('@') && !authority.host().is_empty())
+        .context("missing host")?;
+    if uri.scheme_str() != Some("https")
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+        || authority.port_u16() == Some(0)
+    {
+        bail!("not an HTTPS origin");
+    }
+    Ok(format!(
+        "https://{}",
+        authority.as_str().to_ascii_lowercase()
+    ))
+}
+
+fn valid_interface_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() < 16
+        && value
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-' | b'.'))
 }
 
 fn valid_dns_name(value: &str) -> bool {
@@ -476,8 +603,121 @@ mod tests {
         config.token = "token-secret-value".to_string();
         config.metrics_token = "metrics-secret-value".to_string();
         config.admin_token = "admin-secret-value".to_string();
+        config.upstream_token = "upstream-secret-value".to_string();
         let output = format!("{config:?}");
         assert!(!output.contains("secret-value"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    fn relay_config(arguments: &[&str], token: &str) -> Result<Config> {
+        let mut config = Config::try_parse_from(
+            [
+                "porta-server",
+                "--behind-proxy",
+                "--listen=127.0.0.1:8443",
+                "--admin-listen=",
+                "--client-registry=/var/lib/porta/clients.json",
+            ]
+            .into_iter()
+            .chain(arguments.iter().copied()),
+        )?;
+        config.upstream_token = token.to_owned();
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn upstream_is_optional_and_normalized_to_an_origin() {
+        let config = relay_config(&[], "").unwrap();
+        assert_eq!(config.upstream, None);
+        assert_eq!(config.upstream_identity, None);
+
+        let config = relay_config(
+            &["--upstream", "https://Exit.Example.com:8443/"],
+            "upstream-account-token",
+        )
+        .unwrap();
+        assert_eq!(
+            config.upstream.as_deref(),
+            Some("https://exit.example.com:8443")
+        );
+        assert_eq!(config.upstream_interface, "porta-up0");
+        assert_eq!(config.upstream_transport, UpstreamTransport::Auto);
+        assert_eq!(
+            config.upstream_identity,
+            Some(PathBuf::from("/var/lib/porta/upstream-identity.json"))
+        );
+    }
+
+    #[test]
+    fn upstream_requires_a_token_https_origin_and_distinct_interface() {
+        for (arguments, token, message) in [
+            (
+                vec!["--upstream", "https://exit.example.com"],
+                "",
+                "PORTA_UPSTREAM_TOKEN",
+            ),
+            (
+                vec!["--upstream", "http://exit.example.com"],
+                "token",
+                "HTTPS origin",
+            ),
+            (
+                vec!["--upstream", "https://exit.example.com/path"],
+                "token",
+                "HTTPS origin",
+            ),
+            (
+                vec!["--upstream", "https://user@exit.example.com"],
+                "token",
+                "HTTPS origin",
+            ),
+            (
+                vec![
+                    "--upstream",
+                    "https://exit.example.com",
+                    "--upstream-interface",
+                    "porta0",
+                ],
+                "token",
+                "must differ",
+            ),
+            (
+                vec![
+                    "--upstream",
+                    "https://exit.example.com",
+                    "--upstream-interface",
+                    "bad/name",
+                ],
+                "token",
+                "valid interface name",
+            ),
+            (
+                vec![
+                    "--upstream",
+                    "https://exit.example.com",
+                    "--upstream-ca",
+                    "ca.pem",
+                ],
+                "token",
+                "absolute path",
+            ),
+            (
+                vec![
+                    "--upstream",
+                    "https://exit.example.com",
+                    "--upstream-address",
+                    "10.66.0.9",
+                ],
+                "token",
+                "outside --pool",
+            ),
+        ] {
+            let error = relay_config(&arguments, token).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{arguments:?}: {error:#}"
+            );
+        }
     }
 }

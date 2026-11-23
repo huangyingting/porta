@@ -107,6 +107,31 @@ fi
 if [[ -n $nft_cleanup ]] && ! printf '%s' "$nft_cleanup" | nft -f -; then
   status=1
 fi
+# Remove cascade relay policy routing installed by server-up.sh, if any.
+relay_table=10066
+relay_priority=10066
+relay_rule_present() {
+  local rules line
+  rules=$(ip -4 rule show) || return 2
+  while IFS= read -r line; do
+    [[ $line == "$relay_priority:"*" iif $tun_interface lookup $relay_table"* ]] && return 0
+  done <<<"$rules"
+  return 1
+}
+relay_rules_removed=false
+for _ in 1 2 3 4 5 6 7 8; do
+  if relay_rule_present; then
+    ip -4 rule del priority "$relay_priority" iif "$tun_interface" lookup "$relay_table" || break
+  else
+    [[ $? -eq 1 ]] && relay_rules_removed=true
+    break
+  fi
+done
+if ! $relay_rules_removed; then
+  echo "could not remove Porta relay routing rules" >&2
+  status=1
+fi
+ip -4 route flush table "$relay_table" 2>/dev/null || true
 if links=$(ip -o link show); then
   while read -r index name rest; do
     name=${name%:}

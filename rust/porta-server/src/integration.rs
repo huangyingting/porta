@@ -1,3 +1,4 @@
+use crate::data::ratelimit::{AccountRateLimiter, Direction as RateDirection, RateLimiters};
 use crate::data::router::{Router, RouterError, Session as RouterSession};
 use crate::ops::abuse::{AbuseGuard, Surface};
 use crate::ops::metrics::Metrics as OperationalMetrics;
@@ -8,18 +9,19 @@ use crate::proxy::service::{
 };
 use crate::state::pool::{Lease as PoolLease, Pool, PoolError};
 use crate::state::registry::{
-    ClientRegistry as StateRegistry, RegistryError as StateRegistryError,
+    AccountLimits, ClientRegistry as StateRegistry, RegistryError as StateRegistryError,
+    UsagePeriod,
 };
 use crate::state::sessions::SessionGuard;
 use crate::state::usage;
 use crate::transport::session::{
     Authenticated, AuthenticationError, AuthenticationRequest, Authenticator, Cleanup,
-    ClientIdentity as TransportIdentity, Lease, LeaseAllocator, LeaseError, LeaseMode,
-    LeaseRequest, Metrics, PacketRouter, PacketSource, QueueDrop, RouteError, RouteKind,
+    ClientIdentity as TransportIdentity, DenialReason, Lease, LeaseAllocator, LeaseError,
+    LeaseMode, LeaseRequest, Metrics, PacketRouter, PacketSource, QueueDrop, RouteError, RouteKind,
     RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata, UsageSession,
 };
 use crate::web::admin::{
-    ClientIdentity as WebIdentity, ClientRegistry as WebRegistry,
+    ClientIdentity as WebIdentity, ClientLimits as WebClientLimits, ClientRegistry as WebRegistry,
     ClientSummary as WebClientSummary, DeviceSummary as WebDeviceSummary,
     RegistryError as WebRegistryError,
 };
@@ -83,18 +85,22 @@ impl Authenticator for NativeAuthenticator {
                 tracing::error!(%error, "native authentication task failed");
                 AuthenticationError::Unauthorized
             })?
-            .map_err(|error| {
-                if !matches!(
-                    error,
-                    StateRegistryError::Unauthorized
-                        | StateRegistryError::Disabled
-                        | StateRegistryError::DeviceLimit
-                        | StateRegistryError::Draining
-                        | StateRegistryError::InvalidDeviceProof
-                ) {
-                    tracing::error!(%error, "native authentication failed");
+            .map_err(|error| match error {
+                StateRegistryError::Expired => {
+                    AuthenticationError::Forbidden(DenialReason::AccountExpired)
                 }
-                AuthenticationError::Unauthorized
+                StateRegistryError::QuotaExceeded => {
+                    AuthenticationError::Forbidden(DenialReason::QuotaExceeded)
+                }
+                StateRegistryError::Unauthorized
+                | StateRegistryError::Disabled
+                | StateRegistryError::DeviceLimit
+                | StateRegistryError::Draining
+                | StateRegistryError::InvalidDeviceProof => AuthenticationError::Unauthorized,
+                error => {
+                    tracing::error!(%error, "native authentication failed");
+                    AuthenticationError::Unauthorized
+                }
             })?;
             reservation.refund();
             Ok(Authenticated {
@@ -266,6 +272,123 @@ impl WebRegistryAdapter {
     pub fn new(registry: Arc<StateRegistry>, usage: Arc<usage::Store>) -> Arc<Self> {
         Arc::new(Self { registry, usage })
     }
+
+    fn summary(&self, id: &str) -> Result<WebClientSummary, WebRegistryError> {
+        let snapshot = self.usage.snapshot();
+        self.registry
+            .list_with_usage(&snapshot)
+            .into_iter()
+            .find(|client| client.id == id)
+            .map(web_client_summary)
+            .ok_or(WebRegistryError::NotFound)
+    }
+}
+
+/// Applies account expiry, monthly data quotas, and throughput limits.
+///
+/// Authentication rejects expired and over-quota accounts immediately; this
+/// task additionally ends sessions that cross a limit while connected and
+/// keeps the data-path rate limiters in sync with the registry.
+pub struct AccountPolicyEnforcer {
+    registry: Arc<StateRegistry>,
+    usage: Arc<usage::Store>,
+    limiters: Arc<RateLimiters>,
+}
+
+/// How often limits are evaluated; quota overshoot is bounded by the
+/// account's traffic during one interval.
+pub const POLICY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl AccountPolicyEnforcer {
+    pub fn new(
+        registry: Arc<StateRegistry>,
+        usage: Arc<usage::Store>,
+        limiters: Arc<RateLimiters>,
+    ) -> Self {
+        Self {
+            registry,
+            usage,
+            limiters,
+        }
+    }
+
+    pub async fn run(&self, cancellation: CancellationToken) {
+        let mut interval = tokio::time::interval(POLICY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = interval.tick() => self.enforce(time::OffsetDateTime::now_utc()).await,
+            }
+        }
+    }
+
+    pub async fn enforce(&self, now: time::OffsetDateTime) {
+        let policies = self.registry.account_policies();
+        self.limiters.configure(
+            policies
+                .iter()
+                .map(|policy| (policy.id.clone(), policy.limits.rate_limit_kbps)),
+        );
+        let snapshot = self.usage.snapshot();
+        let month = usage_month(now);
+        for policy in policies {
+            if policy.limits.expired_at(now) {
+                if policy.active_sessions > 0 {
+                    let ended = self.registry.end_sessions(&policy.id).await;
+                    tracing::info!(account_id = %policy.id, ended, "account expired; sessions ended");
+                }
+                continue;
+            }
+            let Some(quota) = policy.limits.monthly_quota_bytes else {
+                self.registry.set_quota_blocked(&policy.id, false).await;
+                continue;
+            };
+            let total = account_usage_bytes(&snapshot, &policy.id);
+            let period = match policy.usage_period {
+                Some(period) if period.month == month => period,
+                _ => {
+                    // A new month, or a newly configured quota, counts from now.
+                    let period = UsagePeriod {
+                        month: month.clone(),
+                        baseline_bytes: total,
+                    };
+                    if let Err(error) = self
+                        .registry
+                        .set_usage_period(&policy.id, period.clone())
+                        .await
+                    {
+                        tracing::warn!(%error, account_id = %policy.id, "start quota period failed");
+                        continue;
+                    }
+                    period
+                }
+            };
+            let used = total.saturating_sub(period.baseline_bytes);
+            let blocked = used >= quota;
+            if self.registry.set_quota_blocked(&policy.id, blocked).await {
+                if blocked {
+                    tracing::info!(account_id = %policy.id, used, quota, "monthly data quota exhausted; sessions ended");
+                } else {
+                    tracing::info!(account_id = %policy.id, used, quota, "account is within its monthly data quota again");
+                }
+            }
+        }
+    }
+}
+
+/// Lifetime uploaded plus downloaded IP bytes of an account.
+pub fn account_usage_bytes(snapshot: &usage::Snapshot, account_id: &str) -> u64 {
+    snapshot
+        .clients
+        .get(account_id)
+        .map_or(0, |client| client.bytes_uploaded + client.bytes_downloaded)
+}
+
+/// Quota periods are UTC calendar months.
+pub fn usage_month(now: time::OffsetDateTime) -> String {
+    let now = now.to_offset(time::UtcOffset::UTC);
+    format!("{:04}-{:02}", now.year(), u8::from(now.month()))
 }
 
 impl WebRegistry for WebRegistryAdapter {
@@ -380,10 +503,31 @@ impl WebRegistry for WebRegistryAdapter {
         let device_id = device_id.to_owned();
         Box::pin(async move {
             join_web_mutation(tokio::spawn(async move {
+                let device_bytes = {
+                    let snapshot = usage.snapshot();
+                    let device = usage::device(&snapshot, &client_id, &device_id);
+                    device.bytes_uploaded + device.bytes_downloaded
+                };
                 let retirement = registry
                     .retire_device(&client_id, &device_id)
                     .await
                     .map_err(web_registry_error)?;
+                // Deleting the device's counters lowers the account's lifetime
+                // total; lower the quota baseline too so period usage is kept.
+                let period = registry
+                    .account_policies()
+                    .into_iter()
+                    .find(|policy| policy.id == client_id)
+                    .and_then(|policy| policy.usage_period);
+                if let Some(period) = period {
+                    let adjusted = UsagePeriod {
+                        baseline_bytes: period.baseline_bytes.saturating_sub(device_bytes),
+                        ..period
+                    };
+                    if let Err(error) = registry.set_usage_period(&client_id, adjusted).await {
+                        tracing::warn!(%error, client_id, "adjust quota baseline failed");
+                    }
+                }
                 let result = usage
                     .delete_device(&client_id, &device_id)
                     .map_err(|error| {
@@ -415,6 +559,58 @@ impl WebRegistry for WebRegistryAdapter {
     fn portal_client_active(&self, client_id: &str, token_hash: &str) -> bool {
         self.registry.portal_client_active(client_id, token_hash)
     }
+
+    fn set_client_limits<'a>(
+        &'a self,
+        id: &'a str,
+        limits: WebClientLimits,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        Box::pin(async move {
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_limits(
+                        &owned_id,
+                        AccountLimits {
+                            expires_at: limits.expires_at,
+                            monthly_quota_bytes: limits.monthly_quota_bytes,
+                            rate_limit_kbps: limits.rate_limit_kbps,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
+    fn reset_client_usage<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let usage = self.usage.clone();
+        let owned_id = id.to_owned();
+        Box::pin(async move {
+            join_web_mutation(tokio::spawn(async move {
+                let period = UsagePeriod {
+                    month: usage_month(time::OffsetDateTime::now_utc()),
+                    baseline_bytes: account_usage_bytes(&usage.snapshot(), &owned_id),
+                };
+                registry
+                    .set_usage_period(&owned_id, period)
+                    .await
+                    .map_err(web_registry_error)?;
+                registry.set_quota_blocked(&owned_id, false).await;
+                Ok(())
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
 }
 
 async fn join_web_mutation<T>(
@@ -432,7 +628,9 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
         StateRegistryError::Unauthorized | StateRegistryError::InvalidDeviceProof => {
             WebRegistryError::Unauthorized
         }
-        StateRegistryError::Disabled => WebRegistryError::Disabled,
+        StateRegistryError::Disabled
+        | StateRegistryError::Expired
+        | StateRegistryError::QuotaExceeded => WebRegistryError::Disabled,
         StateRegistryError::InvalidInput(message) => WebRegistryError::Invalid(message),
         error => {
             tracing::error!(%error, "client registry operation failed");
@@ -457,6 +655,11 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
         packets_downloaded: summary.packets_downloaded,
         last_connected: summary.last_connected.map(format_time),
         last_disconnected: summary.last_disconnected.map(format_time),
+        expires_at: summary.limits.expires_at.map(format_time),
+        monthly_quota_bytes: summary.limits.monthly_quota_bytes,
+        rate_limit_kbps: summary.limits.rate_limit_kbps,
+        quota_used_bytes: summary.quota_used_bytes,
+        status: summary.status.to_owned(),
         devices: summary
             .devices
             .into_iter()
@@ -587,25 +790,82 @@ impl Drop for PendingLease {
 pub struct RouterAdapter {
     router: Arc<Router>,
     leases: Arc<PoolAdapter>,
+    limiters: Arc<RateLimiters>,
+    /// Uplink limiter by lease; leases are unique per live device session.
+    uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
 }
 
 impl RouterAdapter {
     pub fn new(router: Arc<Router>, leases: Arc<PoolAdapter>) -> Arc<Self> {
-        Arc::new(Self { router, leases })
+        Self::with_rate_limits(router, leases, RateLimiters::new())
+    }
+
+    pub fn with_rate_limits(
+        router: Arc<Router>,
+        leases: Arc<PoolAdapter>,
+        limiters: Arc<RateLimiters>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            router,
+            leases,
+            limiters,
+            uplink: Arc::default(),
+        })
+    }
+
+    fn uplink_allowed(&self, lease: Ipv4Addr, bytes: usize) -> bool {
+        if !self.limiters.any_limited() {
+            return true;
+        }
+        let allowed = self
+            .uplink
+            .read()
+            .get(&lease)
+            .is_none_or(|limiter| limiter.allow(RateDirection::Uplink, bytes));
+        if !allowed {
+            self.limiters.record_drop();
+        }
+        allowed
     }
 }
 
 struct RouteHandle {
     session: RouterSession,
+    address: Ipv4Addr,
+    limiter: Arc<AccountRateLimiter>,
+    limiters: Arc<RateLimiters>,
+    uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
+}
+
+impl RouteHandle {
+    fn admit(&self, packet: &Bytes) -> bool {
+        if self.limiter.allow(RateDirection::Downlink, packet.len()) {
+            return true;
+        }
+        self.limiters.record_drop();
+        false
+    }
 }
 
 impl PacketSource for RouteHandle {
     fn next_packet(&self) -> BoxFuture<'_, Option<Bytes>> {
-        Box::pin(self.session.recv())
+        Box::pin(async move {
+            loop {
+                let packet = self.session.recv().await?;
+                if self.admit(&packet) {
+                    return Some(packet);
+                }
+            }
+        })
     }
 
     fn try_packet(&self) -> Option<Bytes> {
-        self.session.try_recv()
+        loop {
+            let packet = self.session.try_recv()?;
+            if self.admit(&packet) {
+                return Some(packet);
+            }
+        }
     }
 
     fn queued_bytes(&self) -> usize {
@@ -616,6 +876,13 @@ impl PacketSource for RouteHandle {
 impl Cleanup for RouteHandle {
     fn close(&self) {
         self.session.close();
+        let mut uplink = self.uplink.write();
+        if uplink
+            .get(&self.address)
+            .is_some_and(|limiter| Arc::ptr_eq(limiter, &self.limiter))
+        {
+            uplink.remove(&self.address);
+        }
     }
 }
 
@@ -627,6 +894,9 @@ impl PacketRouter for RouterAdapter {
         let router = self.router.clone();
         let pool = self.leases.pool.clone();
         let lease = self.leases.lease(request.lease.opaque_id);
+        let limiter = self.limiters.limiter(&request.account_id);
+        let limiters = self.limiters.clone();
+        let uplink = self.uplink.clone();
         Box::pin(async move {
             let lease = lease.ok_or(RouteError::Conflict)?;
             let mut registered = None;
@@ -660,7 +930,15 @@ impl PacketRouter for RouterAdapter {
                 .expect("current lease registration executes")
                 .map_err(map_route_error)?;
             let cancellation = session.cancellation();
-            let handle = Arc::new(RouteHandle { session });
+            let address = request.lease.address;
+            uplink.write().insert(address, limiter.clone());
+            let handle = Arc::new(RouteHandle {
+                session,
+                address,
+                limiter,
+                limiters,
+                uplink,
+            });
             Ok(RouteSession {
                 downlink: handle.clone(),
                 cancellation,
@@ -677,7 +955,11 @@ impl PacketRouter for RouterAdapter {
         packet: Bytes,
     ) -> BoxFuture<'static, Result<(), RouteError>> {
         let router = self.router.clone();
+        let allowed = self.uplink_allowed(lease, packet.len());
         Box::pin(async move {
+            if !allowed {
+                return Ok(());
+            }
             router
                 .inject(&cancellation, lease, &packet)
                 .await
@@ -910,6 +1192,7 @@ mod tests {
                 lease: first.clone(),
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
+                account_id: "account".into(),
             })
             .await;
         assert!(matches!(stale, Err(RouteError::Conflict)));
@@ -919,6 +1202,7 @@ mod tests {
                 lease: current.clone(),
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
+                account_id: "account".into(),
             })
             .await
             .unwrap();
@@ -936,6 +1220,210 @@ mod tests {
         route.cleanup.close();
         leases.release(&first);
         leases.release(&current);
+    }
+
+    const TOKEN: &str = "bootstrap-token-0123456789";
+
+    async fn policy_fixture() -> (
+        tempfile::TempDir,
+        Arc<StateRegistry>,
+        Arc<usage::Store>,
+        Arc<RateLimiters>,
+        String,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            StateRegistry::open(directory.path().join("clients.json"), TOKEN)
+                .await
+                .unwrap(),
+        );
+        let id = registry.list()[0].id.clone();
+        (
+            directory,
+            registry,
+            Arc::new(usage::Store::in_memory()),
+            RateLimiters::new(),
+            id,
+        )
+    }
+
+    #[tokio::test]
+    async fn enforcer_blocks_exhausted_quotas_and_resets_each_month() {
+        let (_directory, registry, usage, limiters, id) = policy_fixture().await;
+        let enforcer =
+            AccountPolicyEnforcer::new(registry.clone(), usage.clone(), limiters.clone());
+        registry
+            .set_limits(
+                &id,
+                AccountLimits {
+                    monthly_quota_bytes: Some(1_000),
+                    rate_limit_kbps: Some(1_000),
+                    ..AccountLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        let november = time::macros::datetime!(2026-11-20 12:00 UTC);
+        enforcer.enforce(november).await;
+        assert!(limiters.any_limited());
+        assert_eq!(
+            registry.account_policies()[0].usage_period,
+            Some(UsagePeriod {
+                month: "2026-11".into(),
+                baseline_bytes: 0
+            })
+        );
+
+        let session = usage.begin("s", &id, "device", "h3", "10.66.0.2", "");
+        session.add_uploaded(600, 1);
+        enforcer.enforce(november).await;
+        assert!(registry.authenticate_proxy_session(TOKEN).await.is_ok());
+        session.add_downloaded(600, 1);
+        enforcer.enforce(november).await;
+        assert!(matches!(
+            registry.authenticate_proxy_session(TOKEN).await,
+            Err(StateRegistryError::QuotaExceeded)
+        ));
+        let summary = &registry.list_with_usage(&usage.snapshot())[0];
+        assert_eq!(summary.status, "quota_exceeded");
+        assert_eq!(summary.quota_used_bytes, Some(1_200));
+
+        // The next month starts a new period from the current total.
+        enforcer
+            .enforce(time::macros::datetime!(2026-12-01 00:00:05 UTC))
+            .await;
+        assert!(registry.authenticate_proxy_session(TOKEN).await.is_ok());
+        assert_eq!(
+            registry.account_policies()[0].usage_period,
+            Some(UsagePeriod {
+                month: "2026-12".into(),
+                baseline_bytes: 1_200
+            })
+        );
+
+        registry
+            .set_limits(&id, AccountLimits::default())
+            .await
+            .unwrap();
+        enforcer.enforce(november).await;
+        assert!(!limiters.any_limited());
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn admin_api_sets_limits_and_resets_quota_usage() {
+        use crate::web::admin::AdminService;
+        use crate::web::session::RequestContext;
+
+        let (_directory, registry, usage, _limiters, id) = policy_fixture().await;
+        let admin = AdminService::new(
+            WebRegistryAdapter::new(registry.clone(), usage.clone()),
+            b"admin-token-0123456789abcdef".to_vec(),
+        );
+        let put = |body: &str| {
+            RequestContext::new("PUT", format!("/api/clients/{id}/limits"))
+                .with_header("Authorization", "Bearer admin-token-0123456789abcdef")
+                .with_body(body.as_bytes().to_vec())
+        };
+        let response = admin
+            .handle(
+                &put(r#"{"expires_at":"2030-01-01T00:00:00Z","monthly_quota_bytes":5000000000,"rate_limit_kbps":10000}"#),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["client"]["expires_at"], "2030-01-01T00:00:00Z");
+        assert_eq!(body["client"]["monthly_quota_bytes"], 5_000_000_000_u64);
+        assert_eq!(body["client"]["rate_limit_kbps"], 10_000);
+        assert_eq!(body["client"]["status"], "active");
+
+        for invalid in [
+            r#"{"monthly_quota_bytes":1}"#,
+            r#"{"expires_at":"tomorrow","monthly_quota_bytes":null,"rate_limit_kbps":null}"#,
+            r#"{"expires_at":null,"monthly_quota_bytes":null,"rate_limit_kbps":8}"#,
+        ] {
+            let response = admin.handle(&put(invalid), false).await.unwrap();
+            assert_eq!(response.status, 400, "{invalid}");
+        }
+
+        let session = usage.begin("s", &id, "device", "h3", "10.66.0.2", "");
+        session.add_uploaded(4_000, 2);
+        registry
+            .set_usage_period(
+                &id,
+                UsagePeriod {
+                    month: usage_month(time::OffsetDateTime::now_utc()),
+                    baseline_bytes: 0,
+                },
+            )
+            .await
+            .unwrap();
+        registry.set_quota_blocked(&id, true).await;
+        let reset = RequestContext::new("POST", format!("/api/clients/{id}/usage/reset"))
+            .with_header("Authorization", "Bearer admin-token-0123456789abcdef");
+        let response = admin.handle(&reset, false).await.unwrap();
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["client"]["quota_used_bytes"], 0);
+        assert_eq!(body["client"]["status"], "active");
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn uplink_is_policed_per_account() {
+        let pool = Arc::new(Pool::new("10.66.0.0/30").unwrap());
+        let leases = PoolAdapter::new(pool);
+        let lease = leases
+            .acquire(LeaseRequest {
+                lease_id: "client".into(),
+                group_id: None,
+                mode: LeaseMode::Exclusive,
+            })
+            .await
+            .unwrap();
+        let device = Arc::new(MemoryDevice::default());
+        let limiters = RateLimiters::new();
+        limiters.configure([("account".to_owned(), Some(64))]);
+        let router = RouterAdapter::with_rate_limits(
+            Arc::new(Router::new(device.clone(), None)),
+            leases.clone(),
+            limiters,
+        );
+        let route = router
+            .register(RouteRequest {
+                lease: lease.clone(),
+                kind: RouteKind::ConnectIp,
+                parent: CancellationToken::new(),
+                account_id: "account".into(),
+            })
+            .await
+            .unwrap();
+        let mut packet = vec![0_u8; 1400];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&1400_u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&lease.address.octets());
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        let packet = Bytes::from(packet);
+        for _ in 0..200 {
+            router
+                .inject_from_client(route.cancellation.clone(), lease.address, packet.clone())
+                .await
+                .unwrap();
+        }
+        // A 64 kbit/s account passes its 64 KiB burst, then drops the excess.
+        let written = device.writes.lock().len();
+        assert!((40..60).contains(&written), "{written} packets passed");
+        route.cleanup.close();
+        assert!(router.uplink.read().is_empty());
     }
 
     fn ipv4_packet(source: Ipv4Addr) -> Bytes {

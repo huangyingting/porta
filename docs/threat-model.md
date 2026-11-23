@@ -130,6 +130,21 @@ not conceal transport fingerprints from network inspection.
   `rp_filter=2`. Incoming
   client packet sources must still match their authenticated lease. Physical
   interfaces and global reverse-path filtering are not weakened.
+- A cascade relay is not an anonymity network. Every hop terminates TLS and
+  sees the inner IPv4 packets it forwards, and each relay authenticates to its
+  next hop as one device with a stored token and software key. The exit sees
+  all relayed clients as that one device. Relay hops limit which public address
+  the Internet observes and where traffic exits, not which operators can
+  observe it. The upstream interface accepts only replies to relayed flows;
+  the next hop cannot use it to reach the relay's host or networks.
+- Gateways drop client traffic to link-local addresses, including cloud
+  instance metadata, and to gateway host services other than ICMP and DNS
+  unless `--client-host-access` is set. Other private networks routed from the
+  gateway, such as its cloud VPC, remain reachable by design for remote access;
+  restrict them with additional operator firewall rules when not intended.
+- `--client-to-client` lets every client of a gateway, across all accounts,
+  reach every other client's tunnel address. Leave it off unless all clients
+  are mutually trusted; client hosts must then protect their own services.
 - Native clients mitigate fallback head-of-line blocking with independent
   HTTP/2 connections, a prioritized control lane, bounded queues, and
   flow-pinned data lanes. Loss can still stall every flow assigned to the

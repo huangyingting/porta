@@ -478,6 +478,9 @@ const DENIED_V4: &[(u32, u8)] = &[
 ];
 
 const DENIED_V6: &[(u128, u8)] = &[
+    // Deprecated IPv4-compatible addresses can reach IPv4 hosts through
+    // automatic tunnels without passing the IPv4 checks above.
+    (0, 96),
     (0x0064_ff9b_0000_0000_0000_0000_0000_0000, 96),
     (0x0064_ff9b_0001_0000_0000_0000_0000_0000, 48),
     (0x0100_0000_0000_0000_0000_0000_0000_0000, 64),
@@ -687,6 +690,8 @@ mod tests {
             "203.0.113.1",
             "224.0.0.1",
             "::1",
+            "::7f00:1",
+            "::a00:1",
             "64:ff9b::1",
             "64:ff9b:1::1",
             "100::1",

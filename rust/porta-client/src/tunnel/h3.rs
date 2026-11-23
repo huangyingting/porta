@@ -447,7 +447,8 @@ fn validate_response(response: &http::Response<()>) -> Result<(), ClientError> {
             header(response.headers(), frame::HEADER_MIN_VERSION),
             header(response.headers(), frame::HEADER_MAX_VERSION),
         );
-        let detail = format!("gateway returned HTTP {status}");
+        let detail =
+            super::rejection_detail(status, header(response.headers(), super::REASON_HEADER));
         return match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED

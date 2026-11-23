@@ -51,6 +51,29 @@ pub struct ClientSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_disconnected: Option<String>,
     pub devices: Vec<DeviceSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_quota_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_kbps: Option<u32>,
+    /// Traffic counted against the monthly quota in the current period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_used_bytes: Option<u64>,
+    /// `active`, `disabled`, `expired`, or `quota_exceeded`.
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Account limits accepted by `PUT /api/clients/{id}/limits`. Every field
+/// is required so that `null` explicitly removes a limit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLimits {
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<time::OffsetDateTime>,
+    pub monthly_quota_bytes: Option<u64>,
+    pub rate_limit_kbps: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +122,28 @@ pub trait ClientRegistry: Send + Sync {
     ) -> BoxFuture<'a, Result<(), RegistryError>>;
     fn authenticate_portal(&self, token: &str) -> Result<ClientIdentity, RegistryError>;
     fn portal_client_active(&self, client_id: &str, token_hash: &str) -> bool;
+    fn set_client_limits<'a>(
+        &'a self,
+        _id: &'a str,
+        _limits: ClientLimits,
+    ) -> BoxFuture<'a, Result<ClientSummary, RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Invalid(
+                "account limits are unsupported".into(),
+            ))
+        })
+    }
+    /// Starts a new quota period now, clearing the account's quota usage.
+    fn reset_client_usage<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> BoxFuture<'a, Result<ClientSummary, RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Invalid(
+                "account limits are unsupported".into(),
+            ))
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -219,6 +264,22 @@ impl AdminService {
                     .update_client(&client_id, name, input.max_devices, enabled)
                     .await
                 {
+                    Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
+                    Err(error) => registry_error(error),
+                }
+            }
+            ("PUT", [_, "limits"]) => {
+                let limits: ClientLimits = match decode_json(request) {
+                    Ok(limits) => limits,
+                    Err(response) => return response,
+                };
+                match self.registry.set_client_limits(&client_id, limits).await {
+                    Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
+                    Err(error) => registry_error(error),
+                }
+            }
+            ("POST", [_, "usage", "reset"]) => {
+                match self.registry.reset_client_usage(&client_id).await {
                     Ok(client) => json_response(200, &serde_json::json!({ "client": client })),
                     Err(error) => registry_error(error),
                 }

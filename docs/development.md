@@ -21,6 +21,7 @@ make test-rust-client
 make test-rust-interop
 make test-windows-cross
 make test-native-firewall
+make test-cascade
 make vet
 make build
 make build-windows
@@ -31,6 +32,13 @@ make android
 `make build` builds the production Rust server, Linux client, and key generator
 under `bin/`. Rust is the only supported implementation for shipped server and
 client components.
+
+`make test-cascade` needs passwordless `sudo`. It builds the debug server and
+client, then runs `scripts/test-cascade.sh` over HTTP/3 and HTTP/2: real
+gateways in network namespaces form a client -> relay -> relay -> exit chain
+with identical pools. It checks the exit address seen by a web server, a
+full-size DF ping, a bulk transfer, client-to-client reachability, fail-closed
+behavior while the exit is down, and automatic recovery after it returns.
 
 `make test-automation` uses Python 3's standard library to exercise
 deployment, certificate sync, firewall cleanup and packaging with isolated

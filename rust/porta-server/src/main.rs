@@ -1,19 +1,22 @@
 use anyhow::Result;
 use porta_server_rust::app::OperationsHandler;
 use porta_server_rust::config::{version_requested, Config};
+use porta_server_rust::data::ratelimit::RateLimiters;
 use porta_server_rust::data::router::Router;
 use porta_server_rust::data::tun::NativeTun;
 use porta_server_rust::http_handler::{AdminHttpHandler, PublicHttpHandler};
 use porta_server_rust::integration::{
-    AbuseLimiter, NativeAuthenticator, PoolAdapter, ProxyUsageAdapter, RegistryProxyAuthorizer,
-    RouterAdapter, UsageAdapter, WebRegistryAdapter,
+    AbuseLimiter, AccountPolicyEnforcer, NativeAuthenticator, PoolAdapter, ProxyUsageAdapter,
+    RegistryProxyAuthorizer, RouterAdapter, UsageAdapter, WebRegistryAdapter,
 };
 use porta_server_rust::ops::abuse::AbuseGuard;
 use porta_server_rust::ops::acme::{AutomaticCertificateConfig, AutomaticCertificateManager};
 use porta_server_rust::ops::admission::{ConnectionAdmission, RetryController};
 use porta_server_rust::ops::metrics::Metrics;
 use porta_server_rust::ops::shutdown::Drain;
-use porta_server_rust::ops::system_readiness::{system_readiness, SystemReadinessConfig};
+use porta_server_rust::ops::system_readiness::{
+    system_readiness, SystemReadinessConfig, UpstreamReadiness,
+};
 use porta_server_rust::ops::tls::StaticCertificateResolver;
 use porta_server_rust::proxy::dial::PublicConnector;
 use porta_server_rust::proxy::service::{ForwardProxy, DEFAULT_MAX_CONNECTIONS};
@@ -77,6 +80,9 @@ async fn run() -> Result<()> {
             .as_ref()
             .expect("validated configuration has a usage-state path"),
     )?);
+    // The upstream TUN must exist before the client TUN appears: the network
+    // helper starts once the client TUN exists and routes through both.
+    let upstream = upstream::open(&mut config, &metrics)?;
     let device = Arc::new(NativeTun::open(&config.interface, usize::from(config.mtu))?);
     let router = Arc::new(Router::new(device, Some(metrics.clone())));
     let bootstrap_token = Zeroizing::new(std::mem::take(&mut config.token));
@@ -85,10 +91,11 @@ async fn run() -> Result<()> {
     drop(bootstrap_token);
     let abuse = Arc::new(AbuseGuard::default_with_metrics(metrics.clone()));
     let leases = PoolAdapter::new(pool.clone());
+    let rate_limits = RateLimiters::with_metrics(metrics.clone());
     let services = Arc::new(Services {
         authenticator: NativeAuthenticator::new(registry.clone(), abuse.clone()),
         leases: leases.clone(),
-        router: RouterAdapter::new(router.clone(), leases),
+        router: RouterAdapter::with_rate_limits(router.clone(), leases, rate_limits.clone()),
         usage: UsageAdapter::new(usage.clone()),
         metrics: metrics.clone(),
     });
@@ -122,6 +129,7 @@ async fn run() -> Result<()> {
         dns_name: (!config.readiness_dns_name.is_empty())
             .then(|| config.readiness_dns_name.clone()),
         dns_address: config.dns_address()?.map(IpAddr::V4),
+        upstream: upstream.as_ref().map(|upstream| upstream.readiness()),
     })?;
     let metrics_token = Zeroizing::new(std::mem::take(&mut config.metrics_token));
     let operations: Arc<dyn Handler> = Arc::new(OperationsHandler::new(
@@ -220,6 +228,17 @@ async fn run() -> Result<()> {
                 .map_err(anyhow::Error::from)
         }
     });
+    let policy_shutdown = tokio_util::sync::CancellationToken::new();
+    let policy_task = tokio::spawn({
+        let enforcer = AccountPolicyEnforcer::new(registry.clone(), usage.clone(), rate_limits);
+        let cancellation = policy_shutdown.clone();
+        async move { enforcer.run(cancellation).await }
+    });
+    let upstream_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut upstream_task = upstream.map(|upstream| {
+        let cancellation = upstream_shutdown.clone();
+        tokio::spawn(async move { upstream.run(cancellation).await })
+    });
     let admission = Arc::new(ConnectionAdmission::new(metrics.clone()));
     let retry = Arc::new(RetryController::new(admission.as_ref(), metrics));
     let mut acme_manager = None;
@@ -246,6 +265,7 @@ async fn run() -> Result<()> {
                 email: config.acme_email.clone(),
                 cache_directory: config.acme_cache.clone(),
                 http_listen: config.acme_http_listen.clone(),
+                https_port: public_address.port(),
             },
             drain.cancellation(),
         )
@@ -310,6 +330,7 @@ async fn run() -> Result<()> {
     let mut http3_completed = false;
     let mut router_completed = false;
     let mut usage_completed = false;
+    let mut upstream_completed = false;
     let mut run_error = tokio::select! {
         signal = shutdown_signal() => {
             signal.err()
@@ -342,6 +363,15 @@ async fn run() -> Result<()> {
         },
         result = &mut usage_task => {
             usage_completed = true;
+            task_error(result)
+        },
+        result = async {
+            match upstream_task.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending::<Result<Result<()>, tokio::task::JoinError>>().await,
+            }
+        } => {
+            upstream_completed = true;
             task_error(result)
         },
     };
@@ -386,6 +416,21 @@ async fn run() -> Result<()> {
             run_error = Some(error.into());
         }
     }
+    policy_shutdown.cancel();
+    if let Err(error) = policy_task.await {
+        if run_error.is_none() {
+            run_error = Some(error.into());
+        }
+    }
+    upstream_shutdown.cancel();
+    if let Some(task) = upstream_task {
+        if !upstream_completed {
+            let error = task_error(task.await);
+            if run_error.is_none() {
+                run_error = error;
+            }
+        }
+    }
     router_shutdown.cancel();
     if !router_completed {
         let error = task_error(router_task.await);
@@ -425,6 +470,86 @@ fn task_error(
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(error),
         Err(error) => Some(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod upstream {
+    use super::*;
+    use porta_client::tunnel::Transport;
+    use porta_server_rust::config::UpstreamTransport;
+    use porta_server_rust::upstream::{Upstream, UpstreamConfig};
+    use tokio_util::sync::CancellationToken;
+
+    pub struct Relay(Arc<Upstream>);
+
+    pub fn open(config: &mut Config, metrics: &Arc<Metrics>) -> Result<Option<Relay>> {
+        let Some(url) = config.upstream.clone() else {
+            return Ok(None);
+        };
+        let upstream = Upstream::open(
+            UpstreamConfig {
+                url,
+                token: Zeroizing::new(std::mem::take(&mut config.upstream_token)),
+                transport: match config.upstream_transport {
+                    UpstreamTransport::Auto => Transport::Auto,
+                    UpstreamTransport::H3 => Transport::Http3,
+                    UpstreamTransport::H2 => Transport::Http2,
+                },
+                interface: config.upstream_interface.clone(),
+                local_address: config.upstream_address,
+                identity_path: config
+                    .upstream_identity
+                    .clone()
+                    .expect("validated upstream configuration has an identity path"),
+                ca_path: config.upstream_ca.clone(),
+                thumbprint: (!config.upstream_thumbprint.is_empty())
+                    .then(|| config.upstream_thumbprint.clone()),
+            },
+            metrics.clone(),
+        )?;
+        if let Some(path) = &config.upstream_ca {
+            tracing::info!(ca = %path.display(), "next-hop gateway uses a private CA");
+        }
+        Ok(Some(Relay(Arc::new(upstream))))
+    }
+
+    impl Relay {
+        pub fn readiness(&self) -> UpstreamReadiness {
+            let status = self.0.status();
+            UpstreamReadiness {
+                interface: self.0.interface().to_owned(),
+                status: Arc::new(move || status.check()),
+            }
+        }
+
+        pub async fn run(self, cancellation: CancellationToken) -> Result<()> {
+            self.0.run(cancellation).await
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod upstream {
+    use super::*;
+
+    pub struct Relay;
+
+    pub fn open(config: &mut Config, _metrics: &Arc<Metrics>) -> Result<Option<Relay>> {
+        if config.upstream.is_some() {
+            anyhow::bail!("--upstream cascade relaying requires Linux");
+        }
+        Ok(None)
+    }
+
+    impl Relay {
+        pub fn readiness(&self) -> UpstreamReadiness {
+            unreachable!("non-Linux builds never create an upstream relay")
+        }
+
+        pub async fn run(self, _cancellation: tokio_util::sync::CancellationToken) -> Result<()> {
+            Ok(())
+        }
     }
 }
 

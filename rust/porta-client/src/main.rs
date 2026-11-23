@@ -48,6 +48,11 @@ mod linux {
         transport: TransportArgument,
         #[arg(long, default_value = "porta0", help = "TUN interface name")]
         interface: String,
+        #[arg(
+            long,
+            help = "Read the client token from an owner-only file instead of PORTA_TOKEN"
+        )]
+        token_file: Option<PathBuf>,
         #[arg(long, help = "Optional absolute private device identity path")]
         identity: Option<PathBuf>,
         #[arg(long, help = "Optional PEM CA certificate")]
@@ -123,7 +128,8 @@ mod linux {
         let result = if arguments.cleanup_network {
             client::cleanup_network(arguments.network_state, &cancellation).await
         } else {
-            let token = std::env::var("PORTA_TOKEN").unwrap_or_default();
+            let token =
+                super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;
             client::run(
                 client::Config {
                     server_url: arguments.server,
@@ -260,6 +266,11 @@ mod windows {
         transport: TransportArgument,
         #[arg(long, default_value = "Porta", help = "Wintun interface name")]
         interface: String,
+        #[arg(
+            long,
+            help = "Read the client token from a private file instead of PORTA_TOKEN"
+        )]
+        token_file: Option<PathBuf>,
         #[arg(long, help = "Optional PEM CA certificate")]
         ca: Option<PathBuf>,
         #[arg(long, help = "Optional SHA-256 gateway certificate thumbprint")]
@@ -321,7 +332,8 @@ mod windows {
         }
 
         let server = parse_origin(&arguments.server)?;
-        let token = std::env::var("PORTA_TOKEN").unwrap_or_default();
+        let token =
+            super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;
         if token.is_empty() {
             return Err(client::RunError::Invalid(
                 "gateway token is required".to_owned(),
@@ -437,6 +449,78 @@ mod windows {
                 Arguments::try_parse_from(["porta-client", "--token", "secret"]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
+    }
+}
+
+/// Returns the client token from `--token-file`, or else `PORTA_TOKEN`.
+/// Tokens are never accepted as command-line values, which other local users
+/// could read.
+#[cfg(any(
+    all(target_os = "linux", not(target_os = "android")),
+    target_os = "windows"
+))]
+fn token(path: Option<&std::path::Path>) -> Result<String, String> {
+    let Some(path) = path else {
+        return Ok(std::env::var("PORTA_TOKEN").unwrap_or_default());
+    };
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("read token file {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "token file {} is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "token file {} must be accessible only by its owner (chmod 600)",
+                path.display()
+            ));
+        }
+        // Another user's file could silently attach this host to their account.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "token file {} must be owned by the user running the client",
+                path.display()
+            ));
+        }
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("read token file {}: {error}", path.display()))?;
+    let token = contents.trim();
+    if token.is_empty() || token.contains(char::is_whitespace) {
+        return Err(format!(
+            "token file {} must contain exactly one token",
+            path.display()
+        ));
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod token_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn token_file_must_be_private_and_contain_one_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        std::fs::write(&path, "  client-token-0123456789\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::token(Some(&path)).unwrap_err().contains("chmod 600"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            super::token(Some(&path)).unwrap(),
+            "client-token-0123456789"
+        );
+        std::fs::write(&path, "two tokens\n").unwrap();
+        assert!(super::token(Some(&path))
+            .unwrap_err()
+            .contains("exactly one token"));
+        assert!(super::token(Some(&directory.path().join("missing"))).is_err());
     }
 }
 

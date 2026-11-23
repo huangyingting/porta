@@ -31,13 +31,41 @@ pub struct Metrics {
     closed_session_drops: AtomicU64,
     invalid_tun_drops: AtomicU64,
     no_session_drops: AtomicU64,
+    rate_limited_drops: AtomicU64,
     mtu_fragmented: AtomicU64,
     mtu_icmp_sent: AtomicU64,
     mtu_icmp_suppressed: AtomicU64,
     mtu_icmp_rate_limited: AtomicU64,
+    upstream_connected: AtomicI64,
+    upstream_connections_total: AtomicU64,
+    upstream_packets_sent: AtomicU64,
+    upstream_packets_received: AtomicU64,
+    upstream_packets_dropped: AtomicU64,
 }
 
 impl Metrics {
+    pub fn upstream_state(&self, connected: bool) {
+        if connected {
+            self.upstream_connections_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.upstream_connected
+            .store(i64::from(connected), Ordering::Relaxed);
+    }
+
+    pub fn upstream_sent(&self) {
+        self.upstream_packets_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn upstream_received(&self) {
+        self.upstream_packets_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn upstream_dropped(&self) {
+        self.upstream_packets_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
     pub fn public_connection_opened(&self, transport: &str) {
         if let Some(index) = public_transport_index(transport) {
             self.public_connections[index].fetch_add(1, Ordering::Relaxed);
@@ -121,6 +149,7 @@ impl Metrics {
             "session_closed" => &self.closed_session_drops,
             "invalid_tun_packet" => &self.invalid_tun_drops,
             "no_session" => &self.no_session_drops,
+            "rate_limited" => &self.rate_limited_drops,
             _ => return,
         };
         target.fetch_add(1, Ordering::Relaxed);
@@ -311,6 +340,7 @@ impl Metrics {
                 ("session_closed", &self.closed_session_drops),
                 ("invalid_tun_packet", &self.invalid_tun_drops),
                 ("no_session", &self.no_session_drops),
+                ("rate_limited", &self.rate_limited_drops),
             ]
             .into_iter()
             .map(|(reason, value)| (format!("reason={reason:?}"), value.load(Ordering::Relaxed))),
@@ -366,6 +396,38 @@ impl Metrics {
             .into_iter()
             .map(|(action, value)| (format!("action={action:?}"), value.load(Ordering::Relaxed))),
         );
+        metric(
+            &mut output,
+            "porta_upstream_connected",
+            "gauge",
+            "Whether the cascade relay tunnel to the next-hop gateway is established.",
+            self.upstream_connected.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "porta_upstream_connections_total",
+            "counter",
+            "Cascade relay tunnels established to the next-hop gateway.",
+            self.upstream_connections_total.load(Ordering::Relaxed),
+        );
+        family(
+            &mut output,
+            "porta_upstream_packets_total",
+            "counter",
+            "Packets relayed through the next-hop gateway by direction or drop.",
+            [
+                ("sent", &self.upstream_packets_sent),
+                ("received", &self.upstream_packets_received),
+                ("dropped", &self.upstream_packets_dropped),
+            ]
+            .into_iter()
+            .map(|(direction, value)| {
+                (
+                    format!("direction={direction:?}"),
+                    value.load(Ordering::Relaxed),
+                )
+            }),
+        );
         output.push('\n');
         output
     }
@@ -419,5 +481,25 @@ mod tests {
         assert!(output.contains("not confirmed delivered"));
         assert!(output.contains("porta_datagram_mtu_reductions_total 1"));
         assert!(output.contains("porta_datagram_oversize_total 1"));
+    }
+
+    #[test]
+    fn renders_upstream_relay_state() {
+        let metrics = Metrics::default();
+        assert!(metrics
+            .render_prometheus()
+            .contains("porta_upstream_connected 0"));
+        metrics.upstream_state(true);
+        metrics.upstream_sent();
+        metrics.upstream_dropped();
+        let output = metrics.render_prometheus();
+        assert!(output.contains("porta_upstream_connected 1"));
+        assert!(output.contains("porta_upstream_connections_total 1"));
+        assert!(output.contains("porta_upstream_packets_total{direction=\"sent\"} 1"));
+        assert!(output.contains("porta_upstream_packets_total{direction=\"dropped\"} 1"));
+        metrics.upstream_state(false);
+        assert!(metrics
+            .render_prometheus()
+            .contains("porta_upstream_connected 0"));
     }
 }

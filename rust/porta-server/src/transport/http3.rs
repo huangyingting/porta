@@ -18,10 +18,10 @@ use tracing::Instrument;
 
 use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryController};
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, AuthenticationRequest, DeviceProof,
-    Lease, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind,
-    Services, Session, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH,
-    MASQUE_PATH, PROTOCOL_VERSION,
+    bearer_token, fragment_ipv4, icmp_fragmentation_needed, AuthenticationRequest, DenialReason,
+    DeviceProof, Lease, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError,
+    RouteKind, Services, Session, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION,
+    MASQUE_AUTH_PATH, MASQUE_PATH, PROTOCOL_VERSION, REASON_HEADER,
 };
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
@@ -1417,6 +1417,37 @@ where
     Ok(())
 }
 
+async fn send_forbidden<S, B>(
+    stream: &mut h3::server::RequestStream<S, B>,
+    reason: DenialReason,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<B>,
+    B: Buf + From<Bytes>,
+{
+    let mut response = http::Response::new(());
+    *response.status_mut() = http::StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        REASON_HEADER,
+        http::HeaderValue::from_static(reason.as_str()),
+    );
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    set_security_headers(response.headers_mut());
+    stream.send_response(response).await?;
+    stream
+        .send_data(Bytes::from(format!("{reason}\n")).into())
+        .await?;
+    stream.finish().await?;
+    Ok(())
+}
+
 async fn send_unauthorized<S, B>(stream: &mut h3::server::RequestStream<S, B>) -> Result<()>
 where
     S: h3::quic::BidiStream<B>,
@@ -1487,6 +1518,7 @@ where
 {
     match error {
         OpenSessionError::Unauthorized => send_unauthorized(stream).await,
+        OpenSessionError::Forbidden(reason) => send_forbidden(stream, reason).await,
         OpenSessionError::RateLimited {
             retry_after_seconds,
         } => {

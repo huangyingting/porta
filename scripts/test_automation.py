@@ -256,6 +256,89 @@ class AutomationTests(unittest.TestCase):
                         "eth0", "8443", "--auto-mtu=false", success=False)
         self.assertFalse((self.root / "commands.jsonl").exists())
 
+    def test_relay_forwards_clients_only_through_the_upstream_tunnel(self):
+        self.update_state(docker=True)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                        "eth0", "8443", "--upstream-interface", "porta-up0")
+        transaction = self.state()["nft_transaction"]
+        self.assertIn('iifname "porta0" oifname "porta-up0" accept', transaction)
+        self.assertIn('iifname "porta-up0" oifname "porta0" ct state established,related accept',
+                      transaction)
+        self.assertIn('oifname "porta-up0" ip saddr 10.66.0.0/24 masquerade', transaction)
+        self.assertNotIn('oifname "eth0"', transaction)
+        self.assertIn("tcp option maxseg size set rt mtu", transaction)
+        self.assertIn('iifname "porta-up0" drop', transaction)
+        # The public input guard still protects the physical interface.
+        self.assertIn('iifname "eth0" meta nfproto ipv4 tcp dport 8443', transaction)
+        state = self.state()
+        self.assertEqual(state["ip_rules"], ["10066:\tfrom all iif porta0 lookup 10066"])
+        self.assertEqual(state["ip_routes"]["10066"], [
+            "default dev porta-up0",
+            "unreachable default metric 4294967295",
+            "throw 10.66.0.0/24",
+        ])
+        self.assertEqual(state["sysctl"]["net.ipv4.conf.porta-up0.rp_filter"], "2")
+        self.assertTrue(all("porta-up0" in " ".join(rule) for rule in state["iptables_rules"]))
+        self.assertEqual((self.root / "runtime/docker-rules-porta0").read_text(), "porta-up0\n")
+
+    def test_relay_routing_is_idempotent_and_removed_on_down_or_exit_mode(self):
+        relay = ("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
+        self.run_script(*relay, "--upstream-interface", "porta-up0")
+        self.run_script(*relay, "--upstream-interface", "porta-up0")
+        self.assertEqual(len(self.state()["ip_rules"]), 1)
+        self.run_script("server-down.sh", "porta0", "eth0")
+        self.assertEqual(self.state()["ip_rules"], [])
+        self.assertNotIn("10066", self.state()["ip_routes"])
+
+        self.run_script(*relay, "--upstream-interface", "porta-up0")
+        self.run_script(*relay)
+        self.assertEqual(self.state()["ip_rules"], [])
+        self.assertNotIn("10066", self.state()["ip_routes"])
+        self.assertIn('oifname "eth0" ip saddr 10.66.0.0/24 masquerade',
+                      self.state()["nft_transaction"])
+
+    def test_relay_rejects_reused_interfaces_before_mutation(self):
+        for options in (["--upstream-interface", "porta0"], ["--upstream-interface", "eth0"],
+                        ["--upstream-interface", "bad/name"], ["--upstream-interface"],
+                        ["porta-up0"], ["--unknown"]):
+            with self.subTest(options=options):
+                self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                "eth0", "8443", *options, success=False)
+        self.assertFalse((self.root / "commands.jsonl").exists())
+
+    def test_clients_cannot_reach_metadata_or_host_services_by_default(self):
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
+        transaction = self.state()["nft_transaction"]
+        self.assertIn('iifname "porta0" ip daddr { 169.254.0.0/16, 100.100.100.200 } drop',
+                      transaction)
+        guard = transaction.split("chain client_input {", 1)[1].split("\n  }", 1)[0]
+        self.assertIn('iifname "porta0" ct state established,related accept', guard)
+        self.assertIn("th dport 53 accept", guard)
+        self.assertTrue(guard.rstrip().endswith('iifname "porta0" drop'))
+
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                        "--client-host-access")
+        transaction = self.state()["nft_transaction"]
+        self.assertNotIn("chain client_input", transaction)
+        # Instance metadata stays blocked even when host access is allowed.
+        self.assertIn("169.254.0.0/16", transaction)
+
+    def test_client_to_client_forwarding_is_opt_in(self):
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
+        self.assertNotIn('oifname "porta0" ip saddr', self.state()["nft_transaction"])
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                        "--client-to-client")
+        transaction = self.state()["nft_transaction"]
+        forward = transaction.split("chain forward {", 1)[1].split("}", 1)[0].splitlines()
+        rules = [line.strip() for line in forward if line.strip() and "type filter" not in line]
+        # Readiness requires the egress and return rules to stay first.
+        self.assertEqual(rules[:3], [
+            'iifname "porta0" oifname "eth0" accept',
+            'iifname "eth0" oifname "porta0" ct state established,related accept',
+            'iifname "porta0" oifname "porta0" ip saddr 10.66.0.0/24 ip daddr 10.66.0.0/24 accept',
+        ])
+        self.assertIn('oifname "porta0" icmp type redirect drop', transaction)
+
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
         setting = proc / "net/ipv6/conf/porta.0/disable_ipv6"
@@ -710,6 +793,100 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--mtu 1280", unit)
         self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
 
+    def test_deploy_relay_routes_through_upstream_and_keeps_its_token(self):
+        deploy = self.prepare_deploy(timer=False)
+        token = "relay-account-token-0123456789"
+        self.env["PORTA_UPSTREAM_TOKEN"] = token
+        result = self.run_deploy(deploy, "--build-local",
+                                 "--upstream", "https://exit.example:8443/")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--upstream https://exit.example:8443 --upstream-interface porta-up0 "
+                      f"--upstream-identity {self.root}/system/var/lib/porta/upstream-identity.json",
+                      unit)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 "
+                      "--upstream-interface porta-up0;", unit)
+        self.assertNotIn(token, unit)
+        self.assertNotIn(token, result.stdout + result.stderr)
+        environment = self.root / "system/etc/porta/porta.env"
+        self.assertIn(f"PORTA_UPSTREAM_TOKEN={token}\n", environment.read_text())
+        self.assertIn("PORTA_TOKEN=old-client\n", environment.read_text())
+        self.assertEqual(environment.stat().st_mode & 0o777, 0o600)
+        self.assertIn("relayed through https://exit.example:8443", result.stdout)
+
+        # Upgrades reuse the saved next-hop token.
+        del self.env["PORTA_UPSTREAM_TOKEN"]
+        self.run_deploy(deploy, "--build-local", "--upstream", "https://exit.example:8443")
+        self.assertEqual(environment.read_text().count("PORTA_UPSTREAM_TOKEN="), 1)
+        self.assertIn(f"PORTA_UPSTREAM_TOKEN={token}\n", environment.read_text())
+
+    def test_deploy_client_to_client_is_passed_to_network_setup(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local", "--client-to-client")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --client-to-client;",
+                      unit)
+        self.assertIn("allowed within 10.66.0.0/24", result.stdout)
+
+    def test_deploy_relay_without_token_fails_before_stopping_service(self):
+        deploy = self.prepare_deploy(timer=False)
+        before = self.snapshot()
+        result = self.run_deploy(deploy, "--build-local", "--upstream",
+                                 "https://exit.example", success=False)
+        self.assertIn("PORTA_UPSTREAM_TOKEN", result.stderr)
+        self.assertTrue(self.state()["active"]["porta.service"])
+        self.assertEqual(self.snapshot(), before)
+        for options in (("--upstream", "http://exit.example"),
+                        ("--upstream", "https://vpn.example"),
+                        ("--upstream-ca", "/etc/ssl/ca.pem")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+        self.assertTrue(self.state()["active"]["porta.service"])
+
+    def test_deploy_upgrade_without_options_reuses_saved_configuration(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.env["PORTA_UPSTREAM_TOKEN"] = "relay-account-token-0123456789"
+        self.run_deploy(deploy, "--build-local", "--port", "8443", "--dns", "9.9.9.9",
+                        "--upstream", "https://exit.example", "--client-to-client")
+        del self.env["PORTA_UPSTREAM_TOKEN"]
+        unit_path = self.root / "system/etc/systemd/system/porta.service"
+        first = unit_path.read_text()
+        config = self.root / "system/etc/porta/deploy.conf"
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+        self.assertIn("upstream=https://exit.example\n", config.read_text())
+        self.assertIn("external_interface=eth0\n", config.read_text())
+
+        result = subprocess.run(["bash", str(deploy), "--build-local"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("deploy: changing", result.stdout)
+        self.assertEqual(unit_path.read_text(), first)
+
+        # Explicit options override and are saved; off-switches clear values.
+        result = self.run_deploy(deploy, "--build-local", "--no-upstream",
+                                 "--client-to-client=false", "--dns", "1.0.0.1")
+        self.assertIn("deploy: changing upstream: https://exit.example -> (unset)", result.stdout)
+        self.assertIn("deploy: changing dns: 9.9.9.9 -> 1.0.0.1", result.stdout)
+        unit = unit_path.read_text()
+        self.assertNotIn("--upstream", unit)
+        self.assertNotIn("--client-to-client", unit)
+        self.assertIn("--listen :8443", unit)
+        self.assertIn("upstream=\n", config.read_text())
+
+    def test_deploy_rejects_invalid_saved_configuration_before_stopping_service(self):
+        deploy = self.prepare_deploy(timer=False)
+        config = self.root / "system/etc/porta/deploy.conf"
+        for contents, message in (("dns=1.1.1.1; reboot\n", "invalid line 1"),
+                                  ("unknown_option=1\n", "unknown option 'unknown_option'"),
+                                  ("client_to_client=yes\n", "invalid saved value"),
+                                  ("port=$(id)\n", "invalid line 1")):
+            with self.subTest(contents=contents):
+                config.write_text(contents)
+                before = self.snapshot()
+                result = self.run_deploy(deploy, "--build-local", success=False)
+                self.assertIn(message, result.stderr)
+                self.assertTrue(self.state()["active"]["porta.service"])
+                self.assertEqual(self.snapshot(), before)
+
     def test_deploy_fixed_mtu_disables_discovery_but_preserves_feedback_setup(self):
         deploy = self.prepare_deploy(timer=False)
         self.run_deploy(deploy, "--build-local", "--auto-mtu=false", "--mtu", "1100")
@@ -721,6 +898,7 @@ class AutomationTests(unittest.TestCase):
 
     def test_bundled_service_uses_automatic_mtu_defaults(self):
         unit = (ROOT / "deploy/porta.service").read_text()
+        self.assertNotIn("--upstream", unit)
         start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
         setup = next(line for line in unit.splitlines() if line.startswith("ExecStartPost="))
         self.assertIn("--auto-mtu=true", start)

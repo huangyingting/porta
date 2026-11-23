@@ -21,10 +21,11 @@ use crate::transport::http3::{
 };
 use crate::transport::session::{
     bearer_token, fragment_ipv4, icmp_fragmentation_needed, parse_lane_config,
-    AuthenticationRequest, DeviceProof, LaneConfig, LeaseError, MtuError, OpenSessionError,
-    OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES, CONTENT_TYPE,
-    HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION, HEADER_MAX_VERSION, HEADER_MIN_VERSION,
-    HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH, PACKET_BATCH, PROTOCOL_VERSION, TUNNEL_PATH,
+    AuthenticationRequest, DenialReason, DeviceProof, LaneConfig, LeaseError, MtuError,
+    OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES,
+    CONTENT_TYPE, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION, HEADER_MAX_VERSION,
+    HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH, PACKET_BATCH,
+    PROTOCOL_VERSION, REASON_HEADER, TUNNEL_PATH,
 };
 use crate::wire::ip::parse_ipv4;
 use crate::wire::masque::{
@@ -341,6 +342,18 @@ fn porta_authenticate_header() -> http::HeaderValue {
 fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
     match error {
         OpenSessionError::Unauthorized => unauthorized_response(),
+        OpenSessionError::Forbidden(reason) => {
+            let body = match reason {
+                DenialReason::AccountExpired => "account-expired\n",
+                DenialReason::QuotaExceeded => "quota-exceeded\n",
+            };
+            let mut response = plain_response(StatusCode::FORBIDDEN, body);
+            response.headers_mut().insert(
+                REASON_HEADER,
+                http::HeaderValue::from_static(reason.as_str()),
+            );
+            response
+        }
         OpenSessionError::RateLimited {
             retry_after_seconds,
         } => {

@@ -308,6 +308,24 @@ async fn send_outbound<T>(
     }
 }
 
+/// Response header explaining why a gateway refused valid credentials.
+pub const REASON_HEADER: &str = "x-porta-reason";
+
+/// Describes a rejected tunnel request, preferring the gateway's stated
+/// reason so users learn why access ended rather than only an HTTP status.
+fn rejection_detail(status: http::StatusCode, reason: Option<&str>) -> String {
+    match reason {
+        Some("account-expired") => {
+            "the gateway account has expired; ask the administrator to renew it".to_owned()
+        }
+        Some("quota-exceeded") => {
+            "the gateway account has used its monthly data quota; access resumes next month or when the administrator raises it"
+                .to_owned()
+        }
+        _ => format!("gateway returned HTTP {status}"),
+    }
+}
+
 fn valid_unicast(address: Ipv4Addr) -> bool {
     !address.is_unspecified()
         && !address.is_loopback()
@@ -393,6 +411,21 @@ mod tests {
             guard.disarm();
         }
         assert!(!retained.is_cancelled());
+    }
+
+    #[test]
+    fn rejection_detail_explains_account_denials() {
+        let forbidden = http::StatusCode::FORBIDDEN;
+        assert!(rejection_detail(forbidden, Some("account-expired")).contains("expired"));
+        assert!(rejection_detail(forbidden, Some("quota-exceeded")).contains("quota"));
+        assert_eq!(
+            rejection_detail(forbidden, Some("<script>")),
+            "gateway returned HTTP 403 Forbidden"
+        );
+        assert_eq!(
+            rejection_detail(http::StatusCode::UNAUTHORIZED, None),
+            "gateway returned HTTP 401 Unauthorized"
+        );
     }
 
     #[tokio::test]

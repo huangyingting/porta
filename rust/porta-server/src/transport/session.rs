@@ -121,9 +121,37 @@ pub struct Authenticated {
 pub enum AuthenticationError {
     #[error("authentication failed")]
     Unauthorized,
+    /// Valid credentials whose account may not connect now; the reason is
+    /// reported to the client.
+    #[error("account access denied: {0}")]
+    Forbidden(DenialReason),
     #[error("too many authentication attempts")]
     RateLimited { retry_after_seconds: u64 },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenialReason {
+    AccountExpired,
+    QuotaExceeded,
+}
+
+impl DenialReason {
+    /// Value of the `X-Porta-Reason` response header.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountExpired => "account-expired",
+            Self::QuotaExceeded => "quota-exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for DenialReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+pub const REASON_HEADER: &str = "x-porta-reason";
 
 pub trait Authenticator: Send + Sync {
     fn authenticate(
@@ -188,6 +216,8 @@ pub struct RouteRequest {
     pub lease: Lease,
     pub kind: RouteKind,
     pub parent: CancellationToken,
+    /// Account whose throughput limit applies to the route.
+    pub account_id: String,
 }
 
 pub trait PacketSource: Send + Sync {
@@ -359,6 +389,8 @@ pub struct OpenSessionRequest {
 pub enum OpenSessionError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("account access denied: {0}")]
+    Forbidden(DenialReason),
     #[error("too many authentication attempts")]
     RateLimited { retry_after_seconds: u64 },
     #[error(transparent)]
@@ -385,6 +417,9 @@ impl Services {
             Err(AuthenticationError::Unauthorized) => {
                 self.metrics.authentication_failed();
                 return Err(OpenSessionError::Unauthorized);
+            }
+            Err(AuthenticationError::Forbidden(reason)) => {
+                return Err(OpenSessionError::Forbidden(reason));
             }
             Err(AuthenticationError::RateLimited {
                 retry_after_seconds,
@@ -417,6 +452,7 @@ impl Services {
                 lease: lease.clone(),
                 kind: request.route,
                 parent: authenticated.cancellation.token(),
+                account_id: authenticated.identity.account_id.clone(),
             })
             .await
         {

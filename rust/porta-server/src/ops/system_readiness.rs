@@ -27,6 +27,24 @@ pub struct SystemReadinessConfig {
     pub egress_url: Option<String>,
     pub dns_name: Option<String>,
     pub dns_address: Option<IpAddr>,
+    pub upstream: Option<UpstreamReadiness>,
+}
+
+/// Cascade relay state: client traffic is forwarded through `interface`
+/// instead of the physical egress interface.
+#[derive(Clone)]
+pub struct UpstreamReadiness {
+    pub interface: String,
+    pub status: Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for UpstreamReadiness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamReadiness")
+            .field("interface", &self.interface)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
@@ -179,6 +197,19 @@ pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
             }),
     ));
     checks.push(mtu_feedback_probe(config.interface.clone()));
+    if let Some(upstream) = config.upstream.clone() {
+        checks.push(required_probe("upstream_tunnel", move |_| {
+            let result = (upstream.status)().map_err(|error| anyhow!(error));
+            async move { result }
+        }));
+        checks.push(required_probe("upstream_route", {
+            let config = config.clone();
+            move |cancellation| {
+                let config = config.clone();
+                async move { check_upstream_route(&config, cancellation).await }
+            }
+        }));
+    }
 
     Ok(Readiness::new(checks, config.timeout))
 }
@@ -202,6 +233,11 @@ fn validate_config(config: &SystemReadinessConfig) -> Result<()> {
     }
     if config.require_input_guard && config.public_port == 0 {
         bail!("public listener port is invalid for input-guard readiness");
+    }
+    if config.upstream.as_ref().is_some_and(|upstream| {
+        upstream.interface.is_empty() || upstream.interface == config.interface
+    }) {
+        bail!("upstream readiness interface must differ from the client TUN");
     }
     if let Some(url) = config.egress_url.as_deref() {
         let parsed = reqwest::Url::parse(url)
@@ -361,6 +397,68 @@ async fn readiness_egress(
         bail!("egress interface {} is down", route.device);
     }
     Ok(route.device.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteDecision {
+    #[serde(default, rename = "dev")]
+    device: String,
+}
+
+/// Asks the kernel how it would forward a client packet: it must leave
+/// through the upstream interface, never the physical egress.
+async fn check_upstream_route(
+    config: &SystemReadinessConfig,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let upstream = config
+        .upstream
+        .as_ref()
+        .context("upstream readiness is not configured")?;
+    let client = Ipv4Addr::from(u32::from(config.gateway).wrapping_add(1));
+    let client = client.to_string();
+    let data = run_command(
+        "ip",
+        &[
+            "-j",
+            "-4",
+            "route",
+            "get",
+            "1.1.1.1",
+            "from",
+            &client,
+            "iif",
+            &config.interface,
+        ],
+        cancellation.clone(),
+    )
+    .await
+    .context("client traffic has no route through the next hop")?;
+    let decisions: Vec<RouteDecision> =
+        serde_json::from_slice(&data).context("decode route decision")?;
+    let device = decisions
+        .first()
+        .map(|decision| decision.device.as_str())
+        .unwrap_or_default();
+    if device != upstream.interface {
+        bail!(
+            "client traffic is routed through {device:?}, want {}",
+            upstream.interface
+        );
+    }
+    let mut effective_rpf = 0u8;
+    for name in ["all", upstream.interface.as_str()] {
+        let path = format!("/proc/sys/net/ipv4/conf/{name}/rp_filter");
+        let value = read_file(&path, cancellation.clone()).await?;
+        effective_rpf = effective_rpf.max(value.trim().parse::<u8>().unwrap_or(1));
+    }
+    if effective_rpf == 1 {
+        bail!(
+            "strict reverse-path filtering drops relayed replies; set net/ipv4/conf/{}/rp_filter=2",
+            upstream.interface
+        );
+    }
+    Ok(())
 }
 
 async fn check_mtu_feedback(interface: &str, cancellation: CancellationToken) -> Result<()> {
@@ -641,7 +739,10 @@ async fn check_porta_rules(
     nat: bool,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let egress = readiness_egress(config, cancellation.clone()).await?;
+    let egress = match &config.upstream {
+        Some(upstream) => upstream.interface.clone(),
+        None => readiness_egress(config, cancellation.clone()).await?,
+    };
     let data = run_command("nft", &["-j", "list", "table", "ip", "porta"], cancellation).await?;
     let table: NftDocument =
         serde_json::from_slice(&data).context("decode Porta nftables rules")?;
@@ -1103,6 +1204,7 @@ mod tests {
             egress_url: None,
             dns_name: None,
             dns_address: None,
+            upstream: None,
         };
         assert!(validate_config(&base).is_ok());
         assert!(system_readiness(base.clone()).is_ok());
@@ -1113,9 +1215,43 @@ mod tests {
         invalid = base.clone();
         invalid.egress_url = Some("https://user@example.com/".to_string());
         assert!(validate_config(&invalid).is_err());
-        invalid = base;
+        invalid = base.clone();
         invalid.dns_name = Some("health.example".to_string());
         assert!(validate_config(&invalid).is_err());
+        invalid = base;
+        invalid.upstream = Some(UpstreamReadiness {
+            interface: "porta0".to_string(),
+            status: Arc::new(|| Ok(())),
+        });
+        assert!(validate_config(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_readiness_requires_the_next_hop_tunnel() {
+        let config = SystemReadinessConfig {
+            interface: "porta0".to_string(),
+            gateway: "10.66.0.1".parse().unwrap(),
+            pool: "10.66.0.0/24".parse().unwrap(),
+            mtu: 1400,
+            egress_interface: None,
+            require_nat: true,
+            require_input_guard: false,
+            public_port: 0,
+            timeout: Duration::from_secs(1),
+            egress_url: None,
+            dns_name: None,
+            dns_address: None,
+            upstream: Some(UpstreamReadiness {
+                interface: "porta-up0".to_string(),
+                status: Arc::new(|| Err("next-hop tunnel is down: 401".to_string())),
+            }),
+        };
+        let report = system_readiness(config).unwrap().check().await;
+        assert_eq!(report.status, "not_ready");
+        let tunnel = &report.components["upstream_tunnel"];
+        assert!(tunnel.required);
+        assert!(tunnel.error.as_deref().unwrap().contains("401"));
+        assert!(report.components["upstream_route"].required);
     }
 
     #[test]

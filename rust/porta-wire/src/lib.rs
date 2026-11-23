@@ -5,3 +5,4 @@ pub mod frame;
 pub mod ip;
 pub mod masque;
 pub mod mtu;
+pub mod nat;

@@ -58,6 +58,8 @@ jobs:
       - run: make test
       - name: Test native firewall and client networking
         run: make test-native-firewall
+      - name: Test cascade relay chain end to end
+        run: make test-cascade
       - run: make build
       - run: make test-rust-interop
 
