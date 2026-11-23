@@ -78,6 +78,8 @@ jobs:
         run: make test-graceful-restart
       - name: Test the Linux desktop service end to end
         run: make test-client-daemon
+      - name: Test the Apple apps' C interface end to end
+        run: make test-apple-ffi
       - name: Test the unprivileged systemd service end to end
         run: make test-service-user
       - run: make build
@@ -119,6 +121,25 @@ jobs:
           fi
       - name: Test standard CONNECT-IP clients end to end
         run: make test-standard-masque
+
+  apple:
+    # Builds the tunnel for macOS and iOS, then compiles and tests PortaKit.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+      - run: make test-apple
 
   windows:
     runs-on: windows-latest
@@ -251,7 +272,7 @@ jobs:
   required:
     name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}
     if: ${{ always() }}
-    needs: [rust, windows, android]
+    needs: [rust, masque-interop, windows, android]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -264,12 +285,13 @@ jobs:
           RUST_RESULT: ${{ needs.rust.result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
           ANDROID_RESULT: ${{ needs.android.result }}
+          INTEROP_RESULT: ${{ needs.masque-interop.result }}
         run: |
           if [[ "$EVENT_NAME" == pull_request && ( "$HEAD_BRANCH" != rust || "$HEAD_REPOSITORY" != "$REPOSITORY" ) ]]; then
             echo "main only accepts promotion PRs from this repository's rust branch" >&2
             exit 1
           fi
-          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT"; do
+          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT"; do
             if [[ "$result" != success ]]; then
               echo "A required Rust build/test job failed, was cancelled, or was skipped: $result" >&2
               exit 1

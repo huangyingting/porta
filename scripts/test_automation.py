@@ -1531,15 +1531,16 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("secrets.", workflow)
         self.assertIn("name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}\n"
                       "    if: ${{ always() }}", workflow)
-        self.assertIn("needs: [rust, windows, android]", workflow)
+        self.assertIn("needs: [rust, masque-interop, windows, android]", workflow)
         script = self.workflow_script("ci.yml", "Require Rust promotion and every build")
         good = {
             "EVENT_NAME": "pull_request", "HEAD_BRANCH": "rust",
             "HEAD_REPOSITORY": "huangyingting/porta", "REPOSITORY": "huangyingting/porta",
             "RUST_RESULT": "success", "WINDOWS_RESULT": "success", "ANDROID_RESULT": "success",
+            "INTEROP_RESULT": "success",
         }
         cases = [(good, True), (good | {"EVENT_NAME": "push", "HEAD_BRANCH": ""}, True)]
-        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT"):
+        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT", "INTEROP_RESULT"):
             for outcome in ("failure", "cancelled", "skipped"):
                 cases.append((good | {job: outcome}, False))
         cases.extend([

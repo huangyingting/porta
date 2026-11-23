@@ -32,6 +32,7 @@ make test-ipv6
 make test-graceful-restart
 make test-client-daemon
 make test-standard-masque
+make test-apple-ffi
 make test-service-user
 make vet
 make build
@@ -111,6 +112,14 @@ CONNECT-IP client; it is test tooling and the only Go in the repository) and
 runs `scripts/test-standard-masque.sh`: the probe is refused until the
 account allows standard clients, then receives an address and routes with or
 without asking and pings the gateway and an Internet host through the tunnel.
+
+`make test-apple-ffi` links `rust/porta-apple/tests/probe.c` against
+`libporta.a` and runs `scripts/test-apple-ffi.sh`: through the C interface
+the macOS and iOS apps use, the probe connects with a device proof, reads the
+session's settings, pings through the tunnel and cancels; a wrong token is
+reported as denied. On macOS with Xcode, `make build-apple` builds
+`apple/build/Porta.xcframework` and `make test-apple` runs PortaKit's Swift
+tests and an iOS build.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that
@@ -399,7 +408,8 @@ workflows. `golang` is a separate implementation branch; do not merge its Go
 build/release workflows into `main`.
 
 **CI** builds and tests branch pushes, PRs targeting `main`, and manual runs.
-Linux/Rust, native Windows, and Android must all pass. The stable
+Linux/Rust, the standard CONNECT-IP interop job, native Windows, and
+Android must all pass; the macOS job builds and tests PortaKit. The stable
 **Rust PR required** check rejects failed, cancelled or skipped jobs and rejects
 promotion PRs whose source is not this repository's `rust` branch. Branch/main
 and manual runs use **Rust CI required**, so they cannot substitute for the

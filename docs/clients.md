@@ -539,6 +539,15 @@ timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but
 logs can contain server/network addresses and the device name, so
 share them privately.
 
+## macOS and iOS
+
+There is no macOS or iOS app release yet. [apple/](../apple/README.md) holds
+PortaKit, the Swift package the apps will build on: the Rust tunnel behind a
+C interface, a Secure Enclave device identity with the same `d-...` IDs and
+approval flow as the other clients, `porta://profile` setup links, and a
+packet tunnel provider that applies the gateway's addresses, routes, IPv6
+and DNS and reconnects across backup gateways.
+
 ## Forward proxy clients
 
 The HTTPS forward proxy ignores the Basic-auth username and authenticates only

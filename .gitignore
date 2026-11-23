@@ -21,3 +21,5 @@ __pycache__/
 *.p12
 signing.properties
 android-signing.properties
+/apple/build/
+/apple/.build/

@@ -3412,6 +3412,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "porta-apple"
+version = "0.1.41"
+dependencies = [
+ "base64 0.22.1",
+ "p256",
+ "porta-client-rust",
+ "porta-wire",
+ "rand 0.9.5",
+ "serde_json",
+ "time",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "porta-client-rust"
 version = "0.1.41"
 dependencies = [

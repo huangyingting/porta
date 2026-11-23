@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "porta-android",
+    "porta-apple",
     "porta-client",
     "porta-keygen",
     "porta-linux",

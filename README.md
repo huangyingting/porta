@@ -1,8 +1,9 @@
 # Porta
 
-Porta is an IPv4 VPN and authenticated HTTPS forward proxy built on MASQUE
+Porta is a dual-stack VPN and authenticated HTTPS forward proxy built on MASQUE
 `CONNECT-IP`. One gateway serves HTTP/2 over TCP and HTTP/3 over QUIC/UDP on
-the same port, with clients for Linux, Windows, and Android.
+the same port, with clients for Linux, Windows, and Android, and the
+[PortaKit](apple/README.md) foundation for macOS and iOS apps.
 
 ## Deploy
 
