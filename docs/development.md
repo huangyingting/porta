@@ -417,8 +417,8 @@ workflows. `golang` is a separate implementation branch; do not merge its Go
 build/release workflows into `main`.
 
 **CI** builds and tests branch pushes, PRs targeting `main`, and manual runs.
-Linux/Rust, the standard CONNECT-IP interop job, native Windows, and
-Android must all pass; the macOS job builds and tests PortaKit. The stable
+Linux/Rust, the standard CONNECT-IP interop job, the macOS job that builds
+and tests PortaKit, native Windows, and Android must all pass. The stable
 **Rust PR required** check rejects failed, cancelled or skipped jobs and rejects
 promotion PRs whose source is not this repository's `rust` branch. Branch/main
 and manual runs use **Rust CI required**, so they cannot substitute for the

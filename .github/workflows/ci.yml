@@ -274,7 +274,7 @@ jobs:
   required:
     name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}
     if: ${{ always() }}
-    needs: [rust, masque-interop, windows, android]
+    needs: [rust, masque-interop, apple, windows, android]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -288,12 +288,13 @@ jobs:
           WINDOWS_RESULT: ${{ needs.windows.result }}
           ANDROID_RESULT: ${{ needs.android.result }}
           INTEROP_RESULT: ${{ needs.masque-interop.result }}
+          APPLE_RESULT: ${{ needs.apple.result }}
         run: |
           if [[ "$EVENT_NAME" == pull_request && ( "$HEAD_BRANCH" != rust || "$HEAD_REPOSITORY" != "$REPOSITORY" ) ]]; then
             echo "main only accepts promotion PRs from this repository's rust branch" >&2
             exit 1
           fi
-          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT"; do
+          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT" "$APPLE_RESULT"; do
             if [[ "$result" != success ]]; then
               echo "A required Rust build/test job failed, was cancelled, or was skipped: $result" >&2
               exit 1
