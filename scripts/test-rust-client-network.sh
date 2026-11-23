@@ -16,6 +16,10 @@ cargo="${CARGO:-$HOME/.cargo/bin/cargo}"
   --example linux-network-cycle \
   --locked
 binary="$repository_root/rust/target/debug/examples/linux-network-cycle"
+# Automatic Linux networking requires systemd-resolved's stub; report what
+# this host provides when that precondition fails.
+echo "resolver: /etc/resolv.conf -> $(readlink -f /etc/resolv.conf 2>/dev/null || echo missing);" \
+  "$(grep -m3 '^nameserver' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
 
 sudo -n unshare --net -- bash -euo pipefail -c '
 binary=$1
