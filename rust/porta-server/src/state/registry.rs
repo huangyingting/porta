@@ -27,6 +27,9 @@ pub const REGISTRY_VERSION: u32 = 2;
 pub const MAX_DEVICE_NONCES: usize = 2048;
 pub const FORWARD_PROXY_DEVICE_ID: &str = "forward-proxy";
 const FORWARD_PROXY_DEVICE_NAME: &str = "Forward proxy";
+/// The logical device of an account's standard CONNECT-IP clients.
+pub const STANDARD_DEVICE_ID: &str = "standard-masque";
+const STANDARD_DEVICE_NAME: &str = "Standard MASQUE clients";
 const LAST_SEEN_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_METADATA_DEBOUNCE: Duration = Duration::from_secs(1);
 
@@ -34,6 +37,8 @@ const DEFAULT_METADATA_DEBOUNCE: Duration = Duration::from_secs(1);
 pub enum RegistryError {
     #[error("client token is invalid")]
     Unauthorized,
+    #[error("standard CONNECT-IP clients are not allowed for this account")]
+    StandardClientsDisabled,
     #[error("client is disabled")]
     Disabled,
     #[error("client device limit reached")]
@@ -98,6 +103,10 @@ pub struct ClientRecord {
     pub enrollment_open_until: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "AccessPolicy::is_default")]
     pub access: AccessPolicy,
+    /// Standard CONNECT-IP clients may connect with the token alone, without
+    /// a Porta device key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standard_clients: bool,
 }
 
 /// Network access rules for an account's tunnels. The default reaches every
@@ -336,6 +345,8 @@ pub struct ClientSummary {
     /// `active`, `disabled`, `expired`, or `quota_exceeded`.
     pub status: &'static str,
     pub access: AccessPolicy,
+    /// Standard CONNECT-IP clients may connect with the token alone.
+    pub standard_clients: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -547,6 +558,7 @@ impl ClientRegistry {
                     enrollment: EnrollmentPolicy::Open,
                     enrollment_open_until: None,
                     access: AccessPolicy::default(),
+                    standard_clients: false,
                 }]
             }
             Err(error) => return Err(error.into()),
@@ -787,6 +799,7 @@ impl ClientRegistry {
             enrollment: EnrollmentPolicy::Open,
             enrollment_open_until: None,
             access: AccessPolicy::default(),
+            standard_clients: false,
         };
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -953,6 +966,28 @@ impl ClientRegistry {
         .await
     }
 
+    /// Lets standard CONNECT-IP clients connect with the account's token
+    /// alone, or stops them and ends their sessions.
+    pub async fn set_standard_clients(
+        &self,
+        id: &str,
+        allowed: bool,
+    ) -> Result<ClientSummary, RegistryError> {
+        let summary = self
+            .mutate_client(id, |client| {
+                client.standard_clients = allowed;
+                Ok(())
+            })
+            .await?;
+        if !allowed {
+            self.inner
+                .sessions
+                .cancel_device(id, STANDARD_DEVICE_ID)
+                .await;
+        }
+        Ok(summary)
+    }
+
     /// Lets a pending or denied device connect, within the device limit.
     pub async fn approve_device(
         &self,
@@ -988,7 +1023,7 @@ impl ClientRegistry {
                 let device = client
                     .devices
                     .iter_mut()
-                    .find(|device| device.id == device_id && device.id != FORWARD_PROXY_DEVICE_ID)
+                    .find(|device| device.id == device_id && !is_logical_device(&device.id))
                     .ok_or(RegistryError::NotFound)?;
                 device.status = DeviceStatus::Denied;
                 Ok(())
@@ -1106,7 +1141,7 @@ impl ClientRegistry {
                     .ok_or(RegistryError::NotFound)?
                     .devices
                     .iter_mut()
-                    .find(|device| device.id == device_id && device.id != FORWARD_PROXY_DEVICE_ID)
+                    .find(|device| device.id == device_id && !is_logical_device(&device.id))
                     .ok_or(RegistryError::NotFound)?;
                 device.subnets.clone_from(&subnets);
                 Ok(())
@@ -1604,6 +1639,46 @@ impl ClientRegistry {
         &self,
         token: &str,
     ) -> Result<AuthenticatedSession, RegistryError> {
+        self.authenticate_logical_device(
+            token,
+            FORWARD_PROXY_DEVICE_ID,
+            FORWARD_PROXY_DEVICE_NAME,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Authenticates a standard CONNECT-IP client by its token alone, for
+    /// accounts that allow it. Such clients have no device key, so all of an
+    /// account's standard clients share one logical device and its lease.
+    pub async fn authenticate_standard_session(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSession, RegistryError> {
+        self.authenticate_logical_device(
+            token,
+            STANDARD_DEVICE_ID,
+            STANDARD_DEVICE_NAME,
+            |client| {
+                if client.standard_clients {
+                    Ok(())
+                } else {
+                    Err(RegistryError::StandardClientsDisabled)
+                }
+            },
+        )
+        .await
+    }
+
+    /// A session for a device the gateway records on the account's behalf,
+    /// created on first use within the device limit.
+    async fn authenticate_logical_device(
+        &self,
+        token: &str,
+        device_id: &str,
+        device_name: &str,
+        permitted: impl Fn(&ClientRecord) -> Result<(), RegistryError>,
+    ) -> Result<AuthenticatedSession, RegistryError> {
         self.ensure_open()?;
         let attempt = self.begin_authentication();
         let attempt_epoch = attempt.epoch;
@@ -1613,15 +1688,16 @@ impl ClientRegistry {
             let mut state = self.inner.state.lock();
             self.ensure_open()?;
             let client_index = client_index_for_token(&state, token)?;
+            permitted(&state.clients[client_index])?;
             let account_id = state.clients[client_index].id.clone();
-            let key = DeviceKey::new(&account_id, FORWARD_PROXY_DEVICE_ID);
+            let key = DeviceKey::new(&account_id, device_id);
             if authentication_blocked(&state, &account_id, &key, attempt_epoch) {
                 return Err(RegistryError::Draining);
             }
             if let Some(device) = state.clients[client_index]
                 .devices
                 .iter_mut()
-                .find(|device| device.id == FORWARD_PROXY_DEVICE_ID)
+                .find(|device| device.id == device_id)
             {
                 if elapsed_at_least(device.last_seen, now, LAST_SEEN_INTERVAL) {
                     device.last_seen = now;
@@ -1629,11 +1705,8 @@ impl ClientRegistry {
                     state.metadata_version = state.metadata_version.wrapping_add(1);
                     start_metadata_worker = true;
                 }
-                let identity = registry_identity(&account_id, FORWARD_PROXY_DEVICE_ID);
-                let registration = self
-                    .inner
-                    .sessions
-                    .register(&account_id, FORWARD_PROXY_DEVICE_ID);
+                let identity = registry_identity(&account_id, device_id);
+                let registration = self.inner.sessions.register(&account_id, device_id);
                 let (cancellation, guard) = registration.into_parts();
                 drop(state);
                 if start_metadata_worker {
@@ -1641,7 +1714,7 @@ impl ClientRegistry {
                 }
                 return Ok(AuthenticatedSession {
                     identity,
-                    device_id: FORWARD_PROXY_DEVICE_ID.into(),
+                    device_id: device_id.into(),
                     cancellation,
                     guard,
                 });
@@ -1653,26 +1726,24 @@ impl ClientRegistry {
         let (account_id, candidate) = {
             let state = self.inner.state.lock();
             let client_index = client_index_for_token(&state, token)?;
+            permitted(&state.clients[client_index])?;
             let account_id = state.clients[client_index].id.clone();
-            let key = DeviceKey::new(&account_id, FORWARD_PROXY_DEVICE_ID);
+            let key = DeviceKey::new(&account_id, device_id);
             if authentication_blocked(&state, &account_id, &key, attempt_epoch) {
                 return Err(RegistryError::Draining);
             }
             if let Some(device) = state.clients[client_index]
                 .devices
                 .iter()
-                .find(|device| device.id == FORWARD_PROXY_DEVICE_ID)
+                .find(|device| device.id == device_id)
             {
-                let identity = registry_identity(&account_id, FORWARD_PROXY_DEVICE_ID);
-                let registration = self
-                    .inner
-                    .sessions
-                    .register(&account_id, FORWARD_PROXY_DEVICE_ID);
+                let identity = registry_identity(&account_id, device_id);
+                let registration = self.inner.sessions.register(&account_id, device_id);
                 let (cancellation, guard) = registration.into_parts();
                 let _ = device;
                 return Ok(AuthenticatedSession {
                     identity,
-                    device_id: FORWARD_PROXY_DEVICE_ID.into(),
+                    device_id: device_id.into(),
                     cancellation,
                     guard,
                 });
@@ -1684,8 +1755,8 @@ impl ClientRegistry {
             }
             let mut clients = state.clients.clone();
             clients[client_index].devices.push(DeviceRecord {
-                id: FORWARD_PROXY_DEVICE_ID.into(),
-                name: FORWARD_PROXY_DEVICE_NAME.into(),
+                id: device_id.into(),
+                name: device_name.into(),
                 public_key: String::new(),
                 first_seen: now,
                 last_seen: now,
@@ -1702,11 +1773,7 @@ impl ClientRegistry {
                 .iter_mut()
                 .find(|client| client.id == account_id)
                 .ok_or(RegistryError::Unauthorized)?;
-            if !client
-                .devices
-                .iter()
-                .any(|device| device.id == FORWARD_PROXY_DEVICE_ID)
-            {
+            if !client.devices.iter().any(|device| device.id == device_id) {
                 client.devices.push(
                     candidate
                         .iter()
@@ -1716,15 +1783,12 @@ impl ClientRegistry {
                         .ok_or(RegistryError::Unauthorized)?,
                 );
             }
-            let identity = registry_identity(&account_id, FORWARD_PROXY_DEVICE_ID);
-            let registration = self
-                .inner
-                .sessions
-                .register(&account_id, FORWARD_PROXY_DEVICE_ID);
+            let identity = registry_identity(&account_id, device_id);
+            let registration = self.inner.sessions.register(&account_id, device_id);
             let (cancellation, guard) = registration.into_parts();
             Ok(AuthenticatedSession {
                 identity,
-                device_id: FORWARD_PROXY_DEVICE_ID.into(),
+                device_id: device_id.into(),
                 cancellation,
                 guard,
             })
@@ -2107,7 +2171,12 @@ fn validate_stored_client(client: &ClientRecord) -> Result<(), RegistryError> {
     }
     let mut seen = std::collections::HashSet::with_capacity(client.devices.len());
     for device in &client.devices {
-        if !(device.id == FORWARD_PROXY_DEVICE_ID || device_auth::is_valid_device_id(&device.id))
+        let logical = match device.id.as_str() {
+            FORWARD_PROXY_DEVICE_ID => Some(FORWARD_PROXY_DEVICE_NAME),
+            STANDARD_DEVICE_ID => Some(STANDARD_DEVICE_NAME),
+            _ => None,
+        };
+        if !(logical.is_some() || device_auth::is_valid_device_id(&device.id))
             || !seen.insert(&device.id)
         {
             return Err(RegistryError::InvalidInput(format!(
@@ -2115,11 +2184,12 @@ fn validate_stored_client(client: &ClientRecord) -> Result<(), RegistryError> {
                 device.id
             )));
         }
-        if device.id == FORWARD_PROXY_DEVICE_ID {
-            if !device.public_key.is_empty() || device.name != FORWARD_PROXY_DEVICE_NAME {
-                return Err(RegistryError::InvalidInput(
-                    "invalid forward proxy device".into(),
-                ));
+        if let Some(name) = logical {
+            if !device.public_key.is_empty() || device.name != name {
+                return Err(RegistryError::InvalidInput(format!(
+                    "invalid logical device {:?}",
+                    device.id
+                )));
             }
             continue;
         }
@@ -2260,6 +2330,7 @@ fn summarize_client(
         },
         limits: client.limits.clone(),
         access: client.access.clone(),
+        standard_clients: client.standard_clients,
     }
 }
 
@@ -2458,6 +2529,11 @@ fn validate_limits(limits: &AccountLimits) -> Result<(), RegistryError> {
         )));
     }
     Ok(())
+}
+
+/// Devices the gateway records on an account's behalf, without a key.
+fn is_logical_device(device_id: &str) -> bool {
+    matches!(device_id, FORWARD_PROXY_DEVICE_ID | STANDARD_DEVICE_ID)
 }
 
 fn registry_identity(account_id: &str, device_id: &str) -> ClientIdentity {
@@ -2663,6 +2739,7 @@ mod tests {
                         method: http::Method::POST,
                         path: "/v1/tunnel".into(),
                         peer: "127.0.0.1:1234".parse().unwrap(),
+                        standard: false,
                     })
                     .await
                     .unwrap();
@@ -2803,6 +2880,7 @@ mod tests {
                     enrollment: EnrollmentPolicy::Open,
                     enrollment_open_until: None,
                     access: AccessPolicy::default(),
+                    standard_clients: false,
                 })
                 .collect(),
             ..RegistryState::default()
@@ -2828,6 +2906,7 @@ mod tests {
                 enrollment: EnrollmentPolicy::Open,
                 enrollment_open_until: None,
                 access: AccessPolicy::default(),
+                standard_clients: false,
             },
             ClientRecord {
                 id: "8899aabbccddeeff".into(),
@@ -2842,6 +2921,7 @@ mod tests {
                 enrollment: EnrollmentPolicy::Open,
                 enrollment_open_until: None,
                 access: AccessPolicy::default(),
+                standard_clients: false,
             },
         ];
         rebuild_token_index(&mut state);
@@ -2871,6 +2951,7 @@ mod tests {
                 enrollment: EnrollmentPolicy::Open,
                 enrollment_open_until: None,
                 access: AccessPolicy::default(),
+                standard_clients: false,
             }],
         };
         tokio::fs::write(&path, serde_json::to_vec(&file).unwrap())
@@ -3198,6 +3279,7 @@ mod tests {
             enrollment: EnrollmentPolicy::Open,
             enrollment_open_until: None,
             access: AccessPolicy::default(),
+            standard_clients: false,
         };
         let mut phone = test_device("Phone", at);
         phone.id = "d-phone".into();
@@ -3224,6 +3306,62 @@ mod tests {
             "{first}"
         );
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn standard_clients_need_the_account_setting_and_share_one_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let id = registry.list()[0].id.clone();
+        assert!(matches!(
+            registry
+                .authenticate_standard_session(BOOTSTRAP_TOKEN)
+                .await,
+            Err(RegistryError::StandardClientsDisabled)
+        ));
+        assert!(matches!(
+            registry
+                .authenticate_standard_session("wrong-token-0123456789")
+                .await,
+            Err(RegistryError::Unauthorized)
+        ));
+        let summary = registry.set_standard_clients(&id, true).await.unwrap();
+        assert!(summary.standard_clients);
+        let first = registry
+            .authenticate_standard_session(BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        let second = registry
+            .authenticate_standard_session(BOOTSTRAP_TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(first.device_id, STANDARD_DEVICE_ID);
+        assert_eq!(first.identity.lease_id, second.identity.lease_id);
+        let devices = &registry.list()[0].devices;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, STANDARD_DEVICE_NAME);
+        drop(second);
+
+        // Turning the setting off ends standard sessions and is persisted.
+        let ended = tokio::spawn(async move {
+            let session = first;
+            session.cancellation.cancelled().await;
+        });
+        registry.set_standard_clients(&id, false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), ended)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.close().await.unwrap();
+        let reopened = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        assert!(!reopened.list()[0].standard_clients);
+        assert!(matches!(
+            reopened
+                .authenticate_standard_session(BOOTSTRAP_TOKEN)
+                .await,
+            Err(RegistryError::StandardClientsDisabled)
+        ));
     }
 
     #[tokio::test]

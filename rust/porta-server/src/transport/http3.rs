@@ -18,11 +18,11 @@ use tracing::Instrument;
 
 use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryController};
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, set_account_headers,
-    AuthenticationRequest, DenialReason, DeviceProof, Lease, LeaseError, MtuError,
-    OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session,
-    HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH,
-    PROTOCOL_VERSION, REASON_HEADER,
+    bearer_token, fragment_ipv4, icmp_fragmentation_needed, is_masque_path, is_standard_request,
+    set_account_headers, AuthenticationRequest, DenialReason, DeviceProof, Lease, LeaseError,
+    MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session,
+    HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, PROTOCOL_VERSION,
+    REASON_HEADER,
 };
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
@@ -224,7 +224,7 @@ async fn serve_connection(
                     }
                 };
                 if request.method() == http::Method::CONNECT
-                    && request.uri().path().eq_ignore_ascii_case(MASQUE_PATH)
+                    && is_masque_path(request.uri().path())
                 {
                     if tunnel_active.swap(true, Ordering::AcqRel) {
                         requests.spawn(async move {
@@ -428,7 +428,7 @@ where
     RecvHandler: h3_datagram::quic_traits::RecvDatagram + Send + 'static,
     RecvHandler::Buffer: Send + 'static,
 {
-    if !request.uri().path().eq_ignore_ascii_case(MASQUE_PATH) {
+    if !is_masque_path(request.uri().path()) {
         send_error(
             &mut stream,
             http::StatusCode::NOT_FOUND,
@@ -467,11 +467,13 @@ where
         .await?;
         return Ok(());
     }
-    if request
-        .headers()
-        .get(HEADER_VERSION)
-        .and_then(|value| value.to_str().ok())
-        != Some(PROTOCOL_VERSION)
+    let standard = is_standard_request(request.headers());
+    if !standard
+        && request
+            .headers()
+            .get(HEADER_VERSION)
+            .and_then(|value| value.to_str().ok())
+            != Some(PROTOCOL_VERSION)
     {
         send_error(
             &mut stream,
@@ -531,10 +533,15 @@ where
         .open(OpenSessionRequest {
             authentication: AuthenticationRequest {
                 bearer_token: token,
-                proof: DeviceProof::from_headers(request.headers()),
+                proof: if standard {
+                    DeviceProof::standard()
+                } else {
+                    DeviceProof::from_headers(request.headers())
+                },
                 method: request.method().clone(),
                 path: MASQUE_AUTH_PATH.to_owned(),
                 peer,
+                standard,
             },
             group_id: None,
             route: RouteKind::ConnectIp,
@@ -661,6 +668,16 @@ where
     let mut downlink_ready = false;
     let mut assignment_ack: Option<oneshot::Receiver<()>> = None;
     let (writer, commands) = ReliableQueue::new();
+    // Standard clients may wait for the proxy to assign addresses unasked.
+    if session.proof.is_standard() {
+        let (tx, rx) = oneshot::channel();
+        assignment_ack = Some(rx);
+        writer.control(
+            unsolicited_assignment(&session.lease, &session.routing)?,
+            Some(tx),
+        )?;
+        assigned = true;
+    }
     let writer_cancellation = CancellationToken::new();
     let connection = diagnostics.connection.clone();
 
@@ -1362,7 +1379,7 @@ impl Http3Diagnostics {
 
 fn is_connect_ip(request: &http::Request<()>) -> bool {
     request.method() == http::Method::CONNECT
-        && request.uri().path().eq_ignore_ascii_case(MASQUE_PATH)
+        && is_masque_path(request.uri().path())
         && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP)
 }
 
@@ -1631,6 +1648,30 @@ fn set_version_headers(headers: &mut http::HeaderMap) {
         HEADER_MAX_VERSION,
         http::HeaderValue::from_static(PROTOCOL_VERSION),
     );
+}
+
+/// ADDRESS_ASSIGN with all of the client's addresses under request ID zero,
+/// followed by the route advertisement.
+pub(crate) fn unsolicited_assignment(
+    lease: &Lease,
+    routing: &crate::transport::session::TunnelRouting,
+) -> Result<Bytes> {
+    let mut addresses = vec![Address {
+        request_id: 0,
+        prefix: IpNet::V4(Ipv4Net::new(lease.address, 32).expect("IPv4 /32 is valid")),
+    }];
+    if let Some(ipv6) = lease.ipv6 {
+        addresses.push(Address {
+            request_id: 0,
+            prefix: IpNet::V6(Ipv6Net::new(ipv6.address, 128).expect("IPv6 /128 is valid")),
+        });
+    }
+    let assignment = encode_address_assign(&addresses)?;
+    let routes = encode_route_advertisement(&routing.advertisement())?;
+    let mut control = BytesMut::with_capacity(assignment.len() + routes.len() + 16);
+    append_capsule(&mut control, CAPSULE_ADDRESS_ASSIGN, &assignment)?;
+    append_capsule(&mut control, CAPSULE_ROUTE_ADVERTISEMENT, &routes)?;
+    Ok(control.freeze())
 }
 
 pub(crate) fn address_response(
@@ -2052,6 +2093,7 @@ impl MtuResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::session::MASQUE_PATH;
     use crate::transport::session::{
         Authenticated, AuthenticationError, Authenticator, ClientIdentity, LeaseAllocator,
         LeaseRequest, NoopCleanup, NoopMetrics, NoopUsage, PacketQueue, PacketRouter, QueueConfig,
@@ -2127,6 +2169,7 @@ mod tests {
                     method: http::Method::CONNECT,
                     path: MASQUE_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,
@@ -3561,6 +3604,7 @@ mod tests {
                     method: http::Method::CONNECT,
                     path: MASQUE_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,

@@ -2,7 +2,7 @@ use crate::proxy::service::{ForwardProxy, ProxyAction, ProxyRequest, ProxyRespon
 use crate::server::{
     plain_response, BoxError, ConnectionMetadata, Handler, RequestLifetime, ResponseBody,
 };
-use crate::transport::session::{MASQUE_PATH, TUNNEL_PATH};
+use crate::transport::session::{is_masque_path, TUNNEL_PATH};
 use crate::web::admin::AdminService;
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
@@ -59,9 +59,7 @@ impl PublicHttpHandler {
         peer: SocketAddr,
     ) -> Result<Response<ResponseBody>> {
         let client_ip = client_address(peer.ip(), request.headers(), self.trust_proxy_headers);
-        if request.method() == http::Method::CONNECT
-            && request.uri().path().eq_ignore_ascii_case(MASQUE_PATH)
-        {
+        if request.method() == http::Method::CONNECT && is_masque_path(request.uri().path()) {
             request
                 .extensions_mut()
                 .insert(EffectiveClientAddress(client_ip));

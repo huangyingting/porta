@@ -194,6 +194,10 @@ not conceal transport fingerprints from network inspection.
   traffic. Its exact endpoint TCP/UDP exceptions are not process-specific.
   Windows endpoint exceptions are application scoped and forwarding is blocked.
   Neither implementation overrides unrelated firewall blocks.
+- Standard CONNECT-IP clients, allowed per account and off by default,
+  authenticate with the token alone. For those accounts a stolen token is
+  sufficient to connect (as for the forward proxy); device enrollment,
+  approval and per-device revocation do not apply to them.
 - IPv6 payload is tunneled only with an IPv6 lease and otherwise blocked in
   full tunnels; split tunnels leave untunneled IPv6 on the device's network.
   On the gateway IPv6 leaves only through the physical interface, never a

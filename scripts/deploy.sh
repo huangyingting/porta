@@ -292,14 +292,14 @@ mtu=$((10#$mtu))
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
 if $generate_ipv6 && [[ -z $ipv6_pool ]]; then
   # A random unique local prefix (RFC 4193), kept across upgrades.
-  ipv6_pool=$(python3 -c 'import secrets; g = secrets.token_bytes(5); print("fd%02x:%02x%02x:%02x%02x::/64" % tuple(g))')
+  ipv6_pool=$(python3 -c 'import ipaddress, secrets; print(ipaddress.IPv6Network((b"\xfd" + secrets.token_bytes(5) + bytes(10), 64)))')
 fi
 ipv6_arguments=
 ipv6_gateway_cidr=
 if [[ -n $ipv6_pool ]]; then
   [[ -z $upstream ]] || die "IPv6 is not supported on a cascade relay (--upstream) yet"
   (( mtu >= 1280 )) || die "IPv6 needs --mtu of at least 1280"
-  ipv6_gateway_cidr=$(python3 - "$ipv6_pool" "$pool" <<'PY'
+  ipv6_layout=$(python3 - "$ipv6_pool" "$pool" <<'PY'
 import ipaddress
 import sys
 
@@ -312,9 +312,10 @@ if prefix.prefixlen > 128 - (32 - pool.prefixlen) or prefix.prefixlen < 8:
     raise SystemExit("the IPv6 pool is too small to mirror the IPv4 pool")
 if prefix.is_multicast or prefix.is_link_local or prefix.is_loopback:
     raise SystemExit("the IPv6 pool must be unicast")
-print(f"{prefix.network_address + 1}/{prefix.prefixlen}")
+print(f"{prefix.network_address + 1}/{prefix.prefixlen} {prefix}")
 PY
 ) || die "invalid --ipv6-pool $ipv6_pool"
+  read -r ipv6_gateway_cidr ipv6_pool <<<"$ipv6_layout"
   ipv6_arguments=" --ipv6-pool $ipv6_pool"
 elif $ipv6_routed; then
   die "--ipv6-routed requires --ipv6 or --ipv6-pool"

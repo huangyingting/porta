@@ -31,6 +31,7 @@ make test-gateway-failover
 make test-ipv6
 make test-graceful-restart
 make test-client-daemon
+make test-standard-masque
 make test-service-user
 make vet
 make build
@@ -103,6 +104,13 @@ reporting a rejected token, and checking that only root and the control
 group may use the socket. `make build-linux-desktop` builds the window
 itself (`porta-linux --features gui`); workspace builds leave it out so
 they need no GTK files.
+
+`make test-standard-masque` builds the interop probe in
+`experiments/masque-interop` (Go, using the independent quic-go/connect-ip-go
+CONNECT-IP client; it is test tooling and the only Go in the repository) and
+runs `scripts/test-standard-masque.sh`: the probe is refused until the
+account allows standard clients, then receives an address and routes with or
+without asking and pings the gateway and an Internet host through the tunnel.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

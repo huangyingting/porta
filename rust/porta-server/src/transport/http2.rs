@@ -18,13 +18,14 @@ use crate::http_handler::EffectiveClientAddress;
 use crate::server::{plain_response, BoxError, Handler, RequestLifetime, ResponseBody};
 use crate::transport::http3::{
     address_response, append_ip_capsule, decode_ip_bytes, inject_packet, take_capsule,
+    unsolicited_assignment,
 };
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, parse_lane_config, set_account_headers,
-    AuthenticationRequest, DenialReason, DeviceProof, LaneConfig, LeaseError, MtuError,
-    OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES,
-    CONTENT_TYPE, HEADER_ADDRESS6, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION,
-    HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH,
+    bearer_token, fragment_ipv4, icmp_fragmentation_needed, is_masque_path, is_standard_request,
+    parse_lane_config, set_account_headers, AuthenticationRequest, DenialReason, DeviceProof,
+    LaneConfig, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind,
+    Services, Session, BATCH_BYTES, CONTENT_TYPE, HEADER_ADDRESS6, HEADER_LANE, HEADER_LANES,
+    HEADER_LANE_SESSION, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH,
     PACKET_BATCH, PROTOCOL_VERSION, REASON_HEADER, TUNNEL_PATH,
 };
 use crate::wire::ip::parse_ip;
@@ -79,7 +80,7 @@ impl Http2Handler {
         request: Request<Incoming>,
         peer: SocketAddr,
     ) -> Result<Response<ResponseBody>> {
-        if request.uri().path().eq_ignore_ascii_case(MASQUE_PATH) {
+        if is_masque_path(request.uri().path()) {
             return self.handle_masque(request, peer).await;
         }
         if request.uri().path() != TUNNEL_PATH {
@@ -143,6 +144,7 @@ impl Http2Handler {
                 .extensions()
                 .get::<EffectiveClientAddress>()
                 .map_or(peer, |address| SocketAddr::new(address.0, peer.port())),
+            standard: false,
         };
         let session = match self
             .services
@@ -224,7 +226,8 @@ impl Http2Handler {
                 "Capsule-Protocol is required\n",
             ));
         }
-        if !protocol_version_supported(request.headers()) {
+        let standard = is_standard_request(request.headers());
+        if !standard && !protocol_version_supported(request.headers()) {
             return Ok(version_error_response());
         }
         let token = match bearer_token(request.headers()) {
@@ -236,13 +239,18 @@ impl Http2Handler {
         };
         let authentication = AuthenticationRequest {
             bearer_token: token,
-            proof: DeviceProof::from_headers(request.headers()),
+            proof: if standard {
+                DeviceProof::standard()
+            } else {
+                DeviceProof::from_headers(request.headers())
+            },
             method: request.method().clone(),
             path: MASQUE_AUTH_PATH.to_owned(),
             peer: request
                 .extensions()
                 .get::<EffectiveClientAddress>()
                 .map_or(peer, |address| SocketAddr::new(address.0, peer.port())),
+            standard,
         };
         let session = match self
             .services
@@ -351,6 +359,7 @@ fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
                 DenialReason::DevicePending => "device-pending\n",
                 DenialReason::EnrollmentClosed => "enrollment-closed\n",
                 DenialReason::DeviceDenied => "device-denied\n",
+                DenialReason::StandardClientsDisabled => "standard-clients-disabled\n",
             };
             let mut response = plain_response(StatusCode::FORBIDDEN, body);
             response.headers_mut().insert(
@@ -486,6 +495,13 @@ where
     let mut assigned = false;
     let mut downlink_ready = false;
     let mut icmp_after = Instant::now();
+    // Standard clients may wait for the proxy to assign addresses unasked.
+    if session.proof.is_standard() {
+        let control = unsolicited_assignment(&session.lease, &session.routing)?;
+        write_masque_output(&mut writer, &control, &session).await?;
+        assigned = true;
+        downlink_ready = true;
+    }
     loop {
         tokio::select! {
             biased;
@@ -783,6 +799,7 @@ impl Drop for ChannelBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::session::MASQUE_PATH;
     use crate::transport::session::{
         Authenticated, AuthenticationError, Authenticator, ClientIdentity, Lease, LeaseAllocator,
         LeaseRequest, NoopCleanup, NoopMetrics, NoopUsage, PacketQueue, PacketRouter, PacketSource,
@@ -961,6 +978,7 @@ mod tests {
                     method: http::Method::POST,
                     path: TUNNEL_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
                 },
                 group_id: Some("session-12345678".into()),
                 route: RouteKind::Http2Lane {
@@ -1034,6 +1052,7 @@ mod tests {
                     method: http::Method::CONNECT,
                     path: MASQUE_AUTH_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,

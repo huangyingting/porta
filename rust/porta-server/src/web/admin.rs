@@ -83,6 +83,9 @@ pub struct ClientSummary {
     pub pending_devices: usize,
     #[serde(default)]
     pub access: ClientAccess,
+    /// Standard CONNECT-IP clients may connect with the token alone.
+    #[serde(default)]
+    pub standard_clients: bool,
 }
 
 /// Network access rules of an account, as returned in summaries and
@@ -120,6 +123,10 @@ pub struct ClientEnrollment {
     /// Lets new devices enroll directly for this many minutes.
     #[serde(default)]
     pub open_for_minutes: Option<u32>,
+    /// Allows or stops standard CONNECT-IP clients, which have no Porta
+    /// device key; unset keeps the current setting.
+    #[serde(default)]
+    pub standard_clients: Option<bool>,
 }
 
 /// Account limits accepted by `PUT /api/clients/{id}/limits`. Every field

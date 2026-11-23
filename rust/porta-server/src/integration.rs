@@ -123,14 +123,20 @@ impl Authenticator for NativeAuthenticator {
             // disappears while the registry's detached persistence task is running.
             let status_registry = registry.clone();
             let session = tokio::spawn(async move {
-                registry
-                    .authenticate_device_session(
-                        &request.bearer_token,
-                        &proof,
-                        request.method.as_str(),
-                        &request.path,
-                    )
-                    .await
+                if request.standard {
+                    registry
+                        .authenticate_standard_session(&request.bearer_token)
+                        .await
+                } else {
+                    registry
+                        .authenticate_device_session(
+                            &request.bearer_token,
+                            &proof,
+                            request.method.as_str(),
+                            &request.path,
+                        )
+                        .await
+                }
             })
             .await
             .map_err(|error| {
@@ -152,6 +158,9 @@ impl Authenticator for NativeAuthenticator {
                 }
                 StateRegistryError::DeviceDenied => {
                     AuthenticationError::Forbidden(DenialReason::DeviceDenied)
+                }
+                StateRegistryError::StandardClientsDisabled => {
+                    AuthenticationError::Forbidden(DenialReason::StandardClientsDisabled)
                 }
                 // A client with several gateways moves on to the primary.
                 StateRegistryError::EnrollOnPrimary => AuthenticationError::Unavailable(
@@ -743,12 +752,19 @@ impl WebRegistry for WebRegistryAdapter {
             let window = enrollment
                 .open_for_minutes
                 .map(|minutes| std::time::Duration::from_secs(u64::from(minutes) * 60));
+            let standard_clients = enrollment.standard_clients;
             join_web_mutation(tokio::spawn(async move {
                 registry
                     .set_enrollment(&owned_id, policy, window)
                     .await
-                    .map(|_| ())
-                    .map_err(web_registry_error)
+                    .map_err(web_registry_error)?;
+                if let Some(allowed) = standard_clients {
+                    registry
+                        .set_standard_clients(&owned_id, allowed)
+                        .await
+                        .map_err(web_registry_error)?;
+                }
+                Ok(())
             }))
             .await?;
             self.summary(id)
@@ -957,6 +973,7 @@ fn web_client_summary(
             group: summary.access.group,
             exit: summary.access.exit,
         },
+        standard_clients: summary.standard_clients,
         devices: summary
             .devices
             .into_iter()

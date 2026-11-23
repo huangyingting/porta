@@ -16,6 +16,13 @@ pub use porta_wire::mtu::MtuError;
 pub const TUNNEL_PATH: &str = "/v1/tunnel";
 pub const MASQUE_PATH: &str = "/.well-known/masque/ip/%2A/%2A/";
 pub const MASQUE_AUTH_PATH: &str = "/.well-known/masque/ip/*/*/";
+
+/// Whether `path` is the unrestricted CONNECT-IP target in its canonical
+/// form: `*` percent-encoded, as RFC 6570 expansion of the RFC 9484
+/// template produces.
+pub fn is_masque_path(path: &str) -> bool {
+    path.eq_ignore_ascii_case(MASQUE_PATH)
+}
 pub const PROTOCOL_VERSION: &str = "2";
 pub const HEADER_VERSION: &str = "X-Porta-Version";
 pub const HEADER_MIN_VERSION: &str = "X-Porta-Min-Version";
@@ -41,6 +48,19 @@ pub struct DeviceProof {
 }
 
 impl DeviceProof {
+    /// The logical device of a standard CONNECT-IP client.
+    pub fn standard() -> Self {
+        Self {
+            device_id: crate::state::registry::STANDARD_DEVICE_ID.to_owned(),
+            name: "Standard MASQUE client".to_owned(),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_standard(&self) -> bool {
+        self.device_id == crate::state::registry::STANDARD_DEVICE_ID
+    }
+
     pub fn from_headers(headers: &http::HeaderMap) -> Self {
         let value = |name: &'static str| {
             headers
@@ -70,6 +90,9 @@ pub struct ClientIdentity {
 pub struct AuthenticationRequest {
     pub bearer_token: String,
     pub proof: DeviceProof,
+    /// A standard CONNECT-IP client without a Porta device proof, admitted by
+    /// token for accounts that allow it.
+    pub standard: bool,
     pub method: http::Method,
     pub path: String,
     pub peer: std::net::SocketAddr,
@@ -220,6 +243,7 @@ pub enum DenialReason {
     DevicePending,
     EnrollmentClosed,
     DeviceDenied,
+    StandardClientsDisabled,
 }
 
 impl DenialReason {
@@ -231,6 +255,7 @@ impl DenialReason {
             Self::DevicePending => "device-pending",
             Self::EnrollmentClosed => "enrollment-closed",
             Self::DeviceDenied => "device-denied",
+            Self::StandardClientsDisabled => "standard-clients-disabled",
         }
     }
 }
@@ -858,6 +883,12 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Whether a CONNECT-IP request comes from a standard client, which sends
+/// neither a Porta protocol version nor a device proof.
+pub fn is_standard_request(headers: &http::HeaderMap) -> bool {
+    !headers.contains_key(HEADER_VERSION) && !headers.contains_key("x-porta-client-id")
 }
 
 pub fn bearer_token(headers: &http::HeaderMap) -> Result<String, AuthenticationError> {

@@ -848,6 +848,13 @@ these refusals in their own language. The forward proxy has no device identity
 and is not subject to enrollment policy; disable it with
 `--disable-forward-proxy` if token-only proxy access is unwanted.
 
+**Allow standard MASQUE clients** in the same dialog lets third-party RFC 9484
+CONNECT-IP clients, which know nothing of Porta's device keys, connect with
+the account's token alone. It is off by default. They share one device slot
+and one address, and since the token is their only credential, use it only
+for accounts dedicated to such clients. See
+[Standard CONNECT-IP clients](endpoints.md#standard-connect-ip-clients).
+
 ### Account limits
 
 Each client account can have three optional limits, set in the client dialog

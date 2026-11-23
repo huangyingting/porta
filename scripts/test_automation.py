@@ -1133,7 +1133,7 @@ class AutomationTests(unittest.TestCase):
                                  "--routes", "10.20.0.0/16,2001:db8::/32")
         unit_path = self.root / "system/etc/systemd/system/porta.service"
         unit = unit_path.read_text()
-        match = re.search(r"--ipv6-pool (fd[0-9a-f]{2}:[0-9a-f]{4}:[0-9a-f]{4}::/64) ", unit)
+        match = re.search(r"--ipv6-pool (fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}::/64) ", unit)
         self.assertIsNotNone(match, unit)
         prefix = match.group(1)
         gateway = prefix.replace("::/64", "::1/64")
@@ -1663,8 +1663,14 @@ class AutomationTests(unittest.TestCase):
         self.assertRegex(wrapper, r"(?m)^distributionSha256Sum=[0-9a-f]{64}$")
 
     def test_client_builds_use_rust_without_go_tooling(self):
+        # The only Go is the independent CONNECT-IP interop probe: its own
+        # module, Makefile target and CI job, never part of a client build.
+        def without_interop_probe(text):
+            text = re.sub(r"(?ms)^build-masque-probe:.*?(?=^\S)", "", text)
+            return re.sub(r"(?ms)^  masque-interop:.*?(?=^  \S|\Z)", "", text)
+
         build_sources = "\n".join(
-            (ROOT / path).read_text()
+            without_interop_probe((ROOT / path).read_text())
             for path in ("Makefile", ".github/workflows/ci.yml",
                          ".github/workflows/release.yml", ".github/workflows/live.yml")
         )
@@ -1675,6 +1681,7 @@ class AutomationTests(unittest.TestCase):
             path.relative_to(ROOT)
             for directory in ("cmd", "internal", "mobile", "scripts", "experiments")
             for path in (ROOT / directory).rglob("*.go")
+            if path.parent != ROOT / "experiments/masque-interop"
         )
         self.assertEqual(go_sources, [])
         for obsolete in (

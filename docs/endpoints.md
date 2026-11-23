@@ -198,6 +198,33 @@ and `.../deny` review a device. Client summaries include `enrollment`,
 devices. Refused native tunnels receive HTTP 403 with `X-Porta-Reason`
 `device-pending`, `enrollment-closed`, or `device-denied`.
 
+The same body's optional `"standard_clients": true | false` allows or stops
+[standard CONNECT-IP clients](#standard-connect-ip-clients) for the account;
+summaries report it as `standard_clients`. Stopping them ends their sessions.
+
+## Standard CONNECT-IP clients
+
+Porta's own clients add a device proof and `X-Porta-Version` to every tunnel
+request. A request to the MASQUE endpoint that carries neither is a standard
+RFC 9484 request: it is authenticated by the bearer token alone and admitted
+only for accounts with `standard_clients` enabled, otherwise refused with
+HTTP 403 and `X-Porta-Reason: standard-clients-disabled`. The target may be
+`/.well-known/masque/ip/%2A/%2A/`, as RFC 6570 expansion of the RFC 9484
+template produces, over HTTP/3 or HTTP/2 Extended CONNECT. The gateway assigns the client's
+addresses and advertises its routes right after the response, with request ID
+zero, and also answers ADDRESS_REQUEST capsules. Standard clients receive the
+account's access policy, limits and DNS server header like native ones, but
+no MTU discovery.
+
+All of an account's standard clients share one logical device,
+`standard-masque` (**Standard MASQUE clients** in the device list), which
+takes one device slot and one lease: a second standard connection replaces
+the first. Without a device key they get none of the device guarantees:
+enrollment approval, per-device revocation, and proof against replay of a
+stolen token do not apply, so the token is their only credential.
+`scripts/test-standard-masque.sh` checks the mode against the independent
+quic-go/connect-ip-go client in `experiments/masque-interop`.
+
 ## Access policy and subnet routes
 
 `PUT /api/clients/{clientID}/access` replaces an account's access policy:

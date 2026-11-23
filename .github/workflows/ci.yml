@@ -89,6 +89,37 @@ jobs:
           cargo clippy --manifest-path rust/Cargo.toml --package porta-linux --features gui --all-targets --locked -- -D warnings
       - run: make test-rust-interop
 
+  masque-interop:
+    # An independent RFC 9484 client (quic-go/connect-ip-go) against the
+    # gateway's standard CONNECT-IP mode. Test tooling only.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: experiments/masque-interop/go.mod
+          cache-dependency-path: experiments/masque-interop/go.sum
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          cache-bin: "false"
+          cache-targets: "true"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+      - name: Install native integration dependencies
+        run: |
+          if ! command -v nft >/dev/null || ! command -v ip >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y nftables iproute2
+          fi
+      - name: Test standard CONNECT-IP clients end to end
+        run: make test-standard-masque
+
   windows:
     runs-on: windows-latest
     steps:
