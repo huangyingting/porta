@@ -1014,7 +1014,14 @@ fn matches_initial_syn(expression: &Map<String, Value>) -> bool {
         .as_object()
         .and_then(|value| value.get("payload"))
         .and_then(Value::as_object);
-    let flags = bitwise[1].as_array();
+    // nftables writes the flag mask either as a list or as an explicit
+    // `{"|": [...]}` expression depending on its version.
+    let flags = bitwise[1].as_array().or_else(|| {
+        bitwise[1]
+            .as_object()
+            .and_then(|mask| mask.get("|"))
+            .and_then(Value::as_array)
+    });
     payload
         .and_then(|payload| payload.get("protocol"))
         .and_then(Value::as_str)
@@ -1440,6 +1447,22 @@ mod tests {
         let valid = rule(expressions.clone());
         assert!(uses_named_set(&valid));
         assert!(matches_input_guard_rule(&valid, "eth0", 8443, &expected));
+        // Some nftables versions write the flag mask as an explicit OR.
+        let mut explicit_mask = expressions.as_array().unwrap().clone();
+        explicit_mask[3]["match"]["left"]["&"][1] = json!({"|": ["fin", "syn", "rst", "ack"]});
+        assert!(matches_input_guard_rule(
+            &rule(Value::Array(explicit_mask.clone())),
+            "eth0",
+            8443,
+            &expected
+        ));
+        explicit_mask[3]["match"]["left"]["&"][1] = json!({"|": ["fin", "syn"]});
+        assert!(!matches_input_guard_rule(
+            &rule(Value::Array(explicit_mask)),
+            "eth0",
+            8443,
+            &expected
+        ));
 
         let set = |size, flags: &[&str]| NftSet {
             name: "tcp4".into(),
