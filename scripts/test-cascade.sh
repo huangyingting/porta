@@ -205,6 +205,8 @@ wait_ready() {
     sleep 1
   done
   in_ns "$gateway" curl -sS --max-time 5 http://127.0.0.1:9090/readyz >&2 || true
+  echo "nftables state of gateway $gateway:" >&2
+  in_ns "$gateway" nft -j list table inet porta_guard >&2 || true
   echo "gateway $gateway did not become ready" >&2
   return 1
 }
