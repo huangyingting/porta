@@ -948,6 +948,7 @@ mod tests {
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
             routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -1020,6 +1021,7 @@ mod tests {
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
             routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -1106,6 +1108,7 @@ mod tests {
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
             routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let handler = Arc::new(
             Http2Handler::new(
@@ -1252,6 +1255,7 @@ mod tests {
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
             routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let handler = Arc::new(
             Http2Handler::new(

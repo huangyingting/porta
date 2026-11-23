@@ -25,9 +25,7 @@ use porta_server_rust::ops::system_readiness::{
 use porta_server_rust::ops::tls::StaticCertificateResolver;
 use porta_server_rust::proxy::dial::PublicConnector;
 use porta_server_rust::proxy::service::{ForwardProxy, DEFAULT_MAX_CONNECTIONS};
-use porta_server_rust::server::{
-    bind_tcp_listener, bind_udp_socket, serve_tcp, Handler, ServeOptions,
-};
+use porta_server_rust::server::{listen_tcp, listen_udp, serve_tcp, Handler, ServeOptions};
 use porta_server_rust::state::admins::AdminStore;
 use porta_server_rust::state::pool::Pool;
 use porta_server_rust::state::registry::ClientRegistry;
@@ -58,13 +56,36 @@ async fn main() {
         println!("{}", porta_server_rust::VERSION.trim());
         return;
     }
-    if let Err(error) = run().await {
-        eprintln!("porta-server: {error:#}");
-        std::process::exit(1);
+    #[cfg(unix)]
+    let program = porta_server_rust::ops::handoff::Program::current();
+    match run().await {
+        Ok(Stop::Exit) => {}
+        #[cfg(unix)]
+        Ok(Stop::Restart) => {
+            let error = match program {
+                Ok(program) => program.exec(),
+                Err(error) => error,
+            };
+            eprintln!("porta-server: restart in place failed: {error}");
+            std::process::exit(1);
+        }
+        #[cfg(not(unix))]
+        Ok(Stop::Restart) => {}
+        Err(error) => {
+            eprintln!("porta-server: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> Result<()> {
+/// How the server stopped.
+enum Stop {
+    Exit,
+    /// `SIGHUP`: re-execute in place, keeping sockets and interfaces.
+    Restart,
+}
+
+async fn run() -> Result<Stop> {
     let mut config = Config::parse_and_validate()?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if config.json_logs {
@@ -81,6 +102,8 @@ async fn run() -> Result<()> {
         admin_listen = ?config.admin_listen,
         "Rust server core initialized"
     );
+    #[cfg(unix)]
+    porta_server_rust::ops::handoff::adopt_from_environment();
     let metrics = Arc::new(Metrics::default());
     let pool = Arc::new(match &config.lease_state {
         Some(path) => Pool::from_prefix_persistent(config.pool, path)?,
@@ -230,7 +253,9 @@ async fn run() -> Result<()> {
     } else {
         None
     };
+    let tunnel_shutdown = tokio_util::sync::CancellationToken::new();
     let services = Arc::new(Services {
+        shutdown: tunnel_shutdown.clone(),
         authenticator: NativeAuthenticator::with_usage(
             registry.clone(),
             abuse.clone(),
@@ -482,7 +507,7 @@ async fn run() -> Result<()> {
         (Some(acceptor), Some(quinn))
     };
 
-    let public_listener = bind_tcp_listener(public_address)?;
+    let public_listener = listen_tcp(public_address)?;
     let mut public = tokio::spawn(serve_tcp(
         public_listener,
         tls,
@@ -496,7 +521,7 @@ async fn run() -> Result<()> {
         },
     ));
     let mut http3_task = if let Some(server_config) = quinn_tls {
-        let socket = bind_udp_socket(public_address)?;
+        let socket = listen_udp(public_address)?;
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(server_config),
@@ -514,7 +539,7 @@ async fn run() -> Result<()> {
         None
     };
     let mut admin = if let Some(address) = config.admin_address()? {
-        let listener = bind_tcp_listener(address)?;
+        let listener = listen_tcp(address)?;
         Some(tokio::spawn(serve_tcp(
             listener,
             None,
@@ -537,9 +562,20 @@ async fn run() -> Result<()> {
     let mut router_completed = false;
     let mut usage_completed = false;
     let mut upstream_completed = false;
+    #[cfg(unix)]
+    porta_server_rust::ops::handoff::release_unclaimed();
+    let mut stop = Stop::Exit;
     let mut run_error = tokio::select! {
-        signal = shutdown_signal() => {
-            signal.err()
+        signal = shutdown_signal() => match signal {
+            Ok(next) => {
+                stop = next;
+                if matches!(stop, Stop::Restart) {
+                    porta_server_rust::ops::shutdown::mark_restarting();
+                    tracing::info!("restarting in place; clients reconnect to the new process");
+                }
+                None
+            }
+            Err(error) => Some(error),
         },
         result = &mut public => {
             public_completed = true;
@@ -582,6 +618,7 @@ async fn run() -> Result<()> {
         },
     };
     drain.stop();
+    tunnel_shutdown.cancel();
     connections.close();
     if !drain.wait(Duration::from_secs(10)).await {
         tracing::warn!(
@@ -686,7 +723,7 @@ async fn run() -> Result<()> {
     }
     match run_error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(stop),
     }
 }
 
@@ -868,19 +905,23 @@ mod upstream {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<()> {
+async fn shutdown_signal() -> Result<Stop> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut terminate = signal(SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        _ = terminate.recv() => {},
-    }
-    Ok(())
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            Stop::Exit
+        }
+        _ = terminate.recv() => Stop::Exit,
+        _ = hangup.recv() => Stop::Restart,
+    })
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() -> Result<()> {
+async fn shutdown_signal() -> Result<Stop> {
     tokio::signal::ctrl_c().await?;
-    Ok(())
+    Ok(Stop::Exit)
 }

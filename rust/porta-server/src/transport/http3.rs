@@ -119,7 +119,12 @@ pub async fn serve_quinn(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                endpoint.close(0_u32.into(), b"server shutting down");
+                let reason: &[u8] = if crate::ops::shutdown::restarting() {
+                    b"gateway restarting"
+                } else {
+                    b"server shutting down"
+                };
+                endpoint.close(0_u32.into(), reason);
                 connections.close();
                 endpoint.wait_idle().await;
                 connections.wait().await;
@@ -2112,6 +2117,7 @@ mod tests {
             usage: Arc::new(NoopUsage),
             metrics: metrics.clone(),
             routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -3545,6 +3551,7 @@ mod tests {
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
             routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {

@@ -233,6 +233,33 @@ The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately.
 
+### Restarts without downtime
+
+`sudo systemctl reload porta` restarts the gateway in place. The process
+finishes its tunnels, telling HTTP/3 clients that the gateway is restarting,
+saves its state, and re-executes `/usr/local/bin/porta-server` under the same
+PID with the listening sockets and TUN interfaces still open. Nothing is torn
+down: the interface keeps its addresses, routes and firewall rules, connection
+attempts during the handover wait in the kernel instead of failing, and
+clients reconnect within about a second (their first retry is after 250 ms)
+to the same leases, over the same transport. Use it after replacing the
+binary, or send `SIGHUP` to the daemon directly.
+
+A rerun of `deploy.sh` that changes neither options nor the network helpers
+uses this path automatically and reports `deploy: restarting the running
+gateway in place`; other upgrades stop and start the service as before.
+In-memory state starts over: rate-limit and abuse counters, the device-proof
+nonce cache, and metrics counters. A new binary that fails to start makes
+systemd restart the service normally.
+
+### High availability
+
+A single gateway is a single host. For redundancy, run two or more gateways
+with [federation](#several-gateways-for-one-account-federation) and list them
+all in client profiles: clients measure them, use the nearest, and move to
+another one within seconds when a gateway stops, keeping leak protection on.
+Leases are per gateway, so a device has a different address on each.
+
 The generated unit carries an inert ordering rule for `docker.service`. If
 Docker is installed, deployment also adds it as a weak startup dependency so
 Porta starts only after Docker has initialized its firewall chains. Porta then

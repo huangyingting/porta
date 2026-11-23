@@ -126,6 +126,11 @@ elif name == "systemctl":
                 active = state["active"]
                 enabled = state["enabled"]
                 active[unit] = False
+    elif operation == "reload":
+        for unit in units:
+            if not active.get(unit):
+                code = 1
+            state.setdefault("reloaded", []).append(unit)
     elif operation != "daemon-reload":
         raise RuntimeError(f"unexpected systemctl call: {args}")
 elif name == "sysctl":

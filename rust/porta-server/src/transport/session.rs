@@ -488,6 +488,9 @@ pub struct Services {
     pub metrics: Arc<dyn Metrics>,
     /// Destinations clients route through the tunnel by default.
     pub routing: TunnelRouting,
+    /// Ends every tunnel when the gateway stops, so that shutdown and
+    /// in-place restarts need not wait for clients to disconnect.
+    pub shutdown: CancellationToken,
 }
 
 /// Which destinations a client sends through the tunnel, and which DNS
@@ -717,6 +720,14 @@ impl Services {
             session_id: session_id.clone(),
         })));
         let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
+        let shutdown = self.shutdown.clone();
+        let ended = route.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => ended.cancel(),
+                _ = ended.cancelled() => {}
+            }
+        });
         self.metrics.connected();
         tracing::info!(
             tunnel_id,

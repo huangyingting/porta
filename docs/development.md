@@ -29,6 +29,7 @@ make test-dns-resolver
 make test-admin-identity
 make test-gateway-failover
 make test-ipv6
+make test-graceful-restart
 make test-service-user
 make vet
 make build
@@ -86,6 +87,12 @@ NAT66 address and never through their own IPv6 network, download a large
 file over IPv6, and reach each other's IPv6 addresses; an IPv4-only gateway's
 full tunnel blocks IPv6 instead of leaking it; and a dual-stack split tunnel
 routes only its IPv6 prefixes.
+
+`make test-graceful-restart` runs `scripts/test-graceful-restart.sh` over both
+transports: it replaces the gateway binary, sends `SIGHUP`, and checks that
+the same process re-executes the new binary, keeps its TUN interface,
+addresses and firewall rules, and that the client resumes within five
+seconds with the same lease and transport, twice in a row.
 
 `make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
 gateway advertises one private prefix and a DNS domain; the test checks that

@@ -1193,11 +1193,17 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("deploy: changing", result.stdout)
         self.assertEqual(unit_path.read_text(), first)
+        # Nothing but the binary changed: the gateway restarts in place.
+        self.assertIn("ExecReload=/bin/kill -HUP $MAINPID\n", first)
+        self.assertIn("restarting the running gateway in place", result.stdout)
+        self.assertEqual(self.state()["reloaded"], ["porta.service"])
 
         # Explicit options override and are saved; off-switches clear values.
         result = self.run_deploy(deploy, "--build-local", "--no-upstream",
                                  "--client-to-client=false", "--dns", "1.0.0.1")
         self.assertIn("deploy: changing upstream: https://exit.example -> (unset)", result.stdout)
+        self.assertNotIn("in place", result.stdout)
+        self.assertEqual(self.state()["reloaded"], ["porta.service"])
         self.assertIn("deploy: changing dns: 9.9.9.9 -> 1.0.0.1", result.stdout)
         unit = unit_path.read_text()
         self.assertNotIn("--upstream", unit)

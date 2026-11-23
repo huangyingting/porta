@@ -895,15 +895,30 @@ fi
 if [[ -n $dns_blocklist ]]; then
   effective_options[dns_blocklist]=/etc/porta/dns-blocklist.txt
 fi
+options_changed=true
 if [[ ${#saved_options[@]} -gt 0 ]]; then
+  options_changed=false
   for name in "${saved_option_names[@]}"; do
     previous=${saved_options[$name]-}
     current=${effective_options[$name]}
     if [[ $previous != "$current" ]]; then
       echo "deploy: changing $name: ${previous:-(unset)} -> ${current:-(unset)}"
+      options_changed=true
     fi
   done
 fi
+# An upgrade that changes neither options nor network helpers restarts the
+# running gateway in place (systemctl reload): it keeps its sockets and
+# interfaces, and clients resume within about a second.
+in_place=false
+if $had_active_service && ! $options_changed && ! $reset_leases &&
+   grep -q '^ExecReload=' /etc/systemd/system/porta.service 2>/dev/null; then
+  in_place=true
+  for helper in server-up.sh server-down.sh; do
+    cmp -s "scripts/$helper" "/usr/local/libexec/porta/$helper" || in_place=false
+  done
+fi
+previous_unit=$(cat /etc/systemd/system/porta.service 2>/dev/null || true)
 
 services_paused=true
 # Quiesce writers and run the old unit's cleanup with its original helpers.
@@ -912,7 +927,7 @@ systemctl stop porta-cert-sync.timer porta-cert-sync.service >/dev/null 2>&1 || 
     die "could not stop certificate synchronization"
   fi
 }
-if $had_active_service; then
+if $had_active_service && ! $in_place; then
   systemctl stop porta.service
 fi
 backup_file /usr/local/bin/porta-server porta-server
@@ -1124,6 +1139,8 @@ $tls_preflight
 ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments$federation_arguments$ipv6_arguments --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
+# Restarts in place for upgrades, keeping sockets, interfaces and leases.
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15
@@ -1179,7 +1196,12 @@ if [[ $tls_mode == static ]]; then
   systemctl enable porta-cert-sync.timer >/dev/null
   systemctl start porta-cert-sync.service
 fi
-systemctl restart porta.service
+if $in_place && [[ $(cat /etc/systemd/system/porta.service) == "$previous_unit" ]]; then
+  echo "deploy: restarting the running gateway in place"
+  systemctl reload porta.service
+else
+  systemctl restart porta.service
+fi
 if [[ $tls_mode == static ]]; then
   systemctl start porta-cert-sync.timer
 fi

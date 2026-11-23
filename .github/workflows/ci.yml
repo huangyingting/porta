@@ -74,6 +74,8 @@ jobs:
         run: make test-gateway-failover
       - name: Test dual-stack IPv6 tunnels and leak protection end to end
         run: make test-ipv6
+      - name: Test in-place gateway restarts end to end
+        run: make test-graceful-restart
       - name: Test the unprivileged systemd service end to end
         run: make test-service-user
       - run: make build

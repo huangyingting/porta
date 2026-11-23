@@ -379,9 +379,12 @@ isolated transport patches:
 2. **Split routing:** authenticate server-defined route policy, advertise only
    authorized prefixes, configure platform-specific route exclusions, and
    define DNS behavior for included and excluded destinations.
-3. **High availability:** use a shared identity and lease control plane,
-   coordinate duplicate-session ownership, and provide a packet-routing layer
-   that can deliver return traffic to the instance holding each live tunnel.
-   Sharing the JSON lease file between independent servers is not sufficient.
+3. **Clustered high availability:** gateways restart in place without
+   dropping their sockets or interfaces, and federated gateways with
+   multi-gateway profiles give active/standby redundancy. Keeping a device's
+   address across hosts needs a shared lease control plane, coordinated
+   session ownership, and a packet-routing layer that delivers return traffic
+   to the instance holding each live tunnel. Sharing the JSON lease file
+   between independent servers is not sufficient.
 QUIC connection migration, policy management, and a control-plane API remain
 future work.

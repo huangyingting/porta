@@ -193,6 +193,7 @@ start_gateway() {
     --property "ReadWritePaths=$runtime" \
     --property "ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do ip link show dev porta0 >/dev/null 2>&1 && exec $files/libexec/server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 east $port$helper_options; sleep 0.1; done; exit 1'" \
     --property "ExecStopPost=!$files/libexec/server-down.sh porta0 east" \
+    --property "ExecReload=/bin/kill -HUP \$MAINPID" \
     "${sandbox[@]}" \
     "$files/bin/porta-server" "${arguments[@]}"
   for _ in $(seq 1 60); do
@@ -258,6 +259,36 @@ grep -qs "connected address=" "$files/client.log" || { echo "client did not conn
 seen=$(in_ns client curl -fsS --max-time 10 "http://$web_address:8080/")
 [[ $seen == "$exit_address" ]] || { echo "web server saw $seen, want exit $exit_address" >&2; exit 1; }
 echo "client traffic is relayed through both sandboxed gateways"
+
+# Both gateways restart in place under systemd: same PID and capabilities,
+# and the relay keeps its upstream TUN.
+upstream_index=$(in_ns 1 cat /sys/class/net/porta-up0/ifindex)
+for gateway in 2 1; do
+  unit=$(unit_name "$gateway")
+  before=$(systemctl show --property MainPID --value "$unit")
+  systemctl reload "$unit"
+  for _ in $(seq 1 60); do
+    in_ns "$gateway" curl -fsS --max-time 2 http://127.0.0.1:9090/readyz >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  after=$(systemctl show --property MainPID --value "$unit")
+  [[ $after == "$before" ]] || { echo "gateway $gateway changed PID $before -> $after on reload" >&2; exit 1; }
+  [[ $(sed -n 's/^CapEff:\t//p' "/proc/$after/status") == 0000000000001000 ]] || {
+    echo "gateway $gateway lost or gained capabilities on reload" >&2
+    exit 1
+  }
+done
+[[ $(in_ns 1 cat /sys/class/net/porta-up0/ifindex) == "$upstream_index" ]] || {
+  echo "the relay recreated its upstream TUN on reload" >&2
+  exit 1
+}
+for _ in $(seq 1 40); do
+  seen=$(in_ns client curl -fsS --max-time 2 "http://$web_address:8080/" 2>/dev/null || true)
+  [[ $seen == "$exit_address" ]] && break
+  sleep 0.5
+done
+[[ $seen == "$exit_address" ]] || { echo "traffic did not resume after reloading both gateways" >&2; exit 1; }
+echo "both gateways restarted in place under systemd and the relay kept its tunnel"
 
 kill -INT "$client_pid"
 wait "$client_pid" 2>/dev/null || true

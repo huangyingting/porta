@@ -984,9 +984,11 @@ fn usable_endpoint(address: IpAddr) -> bool {
     }
 }
 
+/// Waits 250 ms before the first retry, so a session a restarting gateway
+/// ended resumes at once, then doubles up to `maximum`.
 pub fn reconnect_delay(failures: u32, maximum: Duration) -> Duration {
     let maximum = maximum.max(Duration::from_secs(1));
-    Duration::from_secs(1_u64 << failures.min(5)).min(maximum)
+    Duration::from_millis(250_u64 << failures.min(7)).min(maximum)
 }
 
 #[cfg(test)]
@@ -1004,7 +1006,11 @@ mod tests {
         ] {
             assert!(parse_origin(invalid).is_err(), "{invalid}");
         }
-        assert_eq!(reconnect_delay(0, Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(
+            reconnect_delay(0, Duration::ZERO),
+            Duration::from_millis(250)
+        );
+        assert_eq!(reconnect_delay(3, Duration::ZERO), Duration::from_secs(1));
         assert_eq!(
             reconnect_delay(100, Duration::from_secs(5)),
             Duration::from_secs(5)
