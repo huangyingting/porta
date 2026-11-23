@@ -18,10 +18,11 @@ use tracing::Instrument;
 
 use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryController};
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, AuthenticationRequest, DenialReason,
-    DeviceProof, Lease, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError,
-    RouteKind, Services, Session, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION,
-    MASQUE_AUTH_PATH, MASQUE_PATH, PROTOCOL_VERSION, REASON_HEADER,
+    bearer_token, fragment_ipv4, icmp_fragmentation_needed, set_account_headers,
+    AuthenticationRequest, DenialReason, DeviceProof, Lease, LeaseError, MtuError,
+    OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session,
+    HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH,
+    PROTOCOL_VERSION, REASON_HEADER,
 };
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
@@ -599,7 +600,8 @@ where
     RecvHandler: h3_datagram::quic_traits::RecvDatagram + Send + 'static,
     RecvHandler::Buffer: Send + 'static,
 {
-    let response = success_response(config, mtu.as_ref(), &session.lease);
+    let mut response = success_response(config, mtu.as_ref(), &session.lease);
+    set_account_headers(response.headers_mut(), &session.account);
     let response_sent = tokio::select! {
         biased;
         _ = session.cancellation.cancelled() => false,
@@ -3322,6 +3324,7 @@ mod tests {
             Box::pin(async {
                 let token = CancellationToken::new();
                 Ok(Authenticated {
+                    account: Default::default(),
                     identity: ClientIdentity {
                         account_id: "account".into(),
                         lease_id: "lease".into(),

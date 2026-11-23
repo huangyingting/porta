@@ -115,6 +115,52 @@ pub struct Authenticated {
     pub identity: ClientIdentity,
     pub cancellation: Arc<dyn Cancellation>,
     pub cleanup: Arc<dyn Cleanup>,
+    pub account: AccountStatus,
+}
+
+/// Account limits reported to the client when a tunnel is established.
+/// Usage is a snapshot; enforcement does not depend on the client.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccountStatus {
+    /// Unix time in seconds.
+    pub expires_at: Option<i64>,
+    pub quota_bytes: Option<u64>,
+    pub quota_used_bytes: Option<u64>,
+    pub rate_limit_kbps: Option<u32>,
+}
+
+pub const HEADER_ACCOUNT_EXPIRES: &str = "x-porta-account-expires";
+pub const HEADER_QUOTA_BYTES: &str = "x-porta-quota-bytes";
+pub const HEADER_QUOTA_USED_BYTES: &str = "x-porta-quota-used-bytes";
+pub const HEADER_RATE_LIMIT_KBPS: &str = "x-porta-rate-limit-kbps";
+
+pub fn set_account_headers(headers: &mut http::HeaderMap, account: &AccountStatus) {
+    let values = [
+        (
+            HEADER_ACCOUNT_EXPIRES,
+            account.expires_at.map(|value| value.to_string()),
+        ),
+        (
+            HEADER_QUOTA_BYTES,
+            account.quota_bytes.map(|value| value.to_string()),
+        ),
+        (
+            HEADER_QUOTA_USED_BYTES,
+            account
+                .quota_bytes
+                .and(account.quota_used_bytes)
+                .map(|value| value.to_string()),
+        ),
+        (
+            HEADER_RATE_LIMIT_KBPS,
+            account.rate_limit_kbps.map(|value| value.to_string()),
+        ),
+    ];
+    for (name, value) in values {
+        if let Some(value) = value.and_then(|value| http::HeaderValue::from_str(&value).ok()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -502,6 +548,7 @@ impl Services {
             route_cleanup: route.cleanup,
             usage: usage.clone(),
             counted_usage: usage,
+            account: authenticated.account,
             closed: AtomicBool::new(false),
         })
     }
@@ -525,6 +572,7 @@ pub struct Session {
     route_cleanup: Arc<dyn Cleanup>,
     pub usage: Arc<dyn UsageSession>,
     counted_usage: Arc<CountedUsage>,
+    pub account: AccountStatus,
     closed: AtomicBool,
 }
 

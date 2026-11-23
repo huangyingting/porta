@@ -62,6 +62,23 @@ outside this identity guarantee. Device limits count enrolled keys, not
 provably distinct physical hardware. Forward proxy is the token-only exception
 described below.
 
+## Account limits in clients
+
+When an administrator sets an expiry date, a monthly data quota or a speed
+limit, every native client shows it while connected: the Linux CLI appends
+`expires=`, `quota=used/total` and `rate-limit=` to its connected line, the
+Windows desktop shows a line under the connection status, and Android adds it
+to the connection details. The line is highlighted when access ends within a
+week or 90% of the quota is used. Quota usage is a snapshot from the moment
+the tunnel was established.
+
+When an account expires or exhausts its quota, the gateway ends the tunnel and
+refuses reconnection. Clients show the reason in English or Simplified Chinese
+instead of a generic error, and the client portal's downloads page shows the
+same limits under **Your access**. Fail-closed protection behaves as for any
+other permanent rejection: disconnect, or run `--cleanup-network` on Linux, to
+use the network without the tunnel.
+
 ## Linux CLI
 
 Automatic Linux networking requires root, `iproute2`, `nftables`, and a running

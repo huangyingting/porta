@@ -170,6 +170,8 @@ struct Group {
     session: String,
     lanes: [Arc<Lane>; LANE_COUNT],
     lease: Mutex<Option<Lease>>,
+    /// Account status from the most recently established lane.
+    account: Arc<Mutex<super::AccountStatus>>,
     flows: Mutex<FlowTable>,
     established: AtomicBool,
     failure: Arc<FailureSignal>,
@@ -185,6 +187,7 @@ struct LaneConnection {
     driver: AbortOnDropHandle<Result<(), ::h2::Error>>,
     remote_address: SocketAddr,
     lease: Lease,
+    account: super::AccountStatus,
 }
 
 pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
@@ -220,6 +223,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         session,
         lanes,
         lease: Mutex::new(None),
+        account: Arc::default(),
         flows: Mutex::new(FlowTable::default()),
         established: AtomicBool::new(false),
         failure: failure.clone(),
@@ -249,6 +253,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         .expect("HTTP/2 lane address lock poisoned")
         .expect("control lane has a remote address");
 
+    let account = group.account.clone();
     tasks.spawn(dispatch_outbound(group.clone(), outbound_rx));
     tasks.spawn(merge_downstream(group.clone(), receivers));
     tasks.spawn(monitor_capacity(group));
@@ -256,6 +261,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
     setup_guard.disarm();
     Ok(Connection {
         lease,
+        account,
         remote_address,
         transport: Transport::Http2,
         delivery_mode: DeliveryMode::Framed,
@@ -356,7 +362,7 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         let connection = match connection {
             Ok(connection) => connection,
             Err(error) => {
-                if matches!(error, ClientError::Permanent(_)) {
+                if error.is_permanent() {
                     group.fail(error);
                     return;
                 }
@@ -368,6 +374,7 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
             }
         };
         let lease = connection.lease;
+        *group.account.lock().expect("HTTP/2 account lock poisoned") = connection.account;
         if let Err(error) = group.accept_lease(lease) {
             close_lane(connection).await;
             group.fail(error);
@@ -381,7 +388,7 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         if group.cancellation.is_cancelled() {
             return;
         }
-        if matches!(error, ClientError::Permanent(_)) {
+        if error.is_permanent() {
             group.fail(error);
             return;
         }
@@ -443,10 +450,11 @@ async fn establish_lane(group: &Group, index: usize) -> Result<LaneConnection, C
         let response = response.await.map_err(classify_h2_startup)?;
         validate_response(&response, &group.session, index)?;
         let lease = lease_from_headers(response.headers())?;
-        Ok((sender, response.into_body(), lease))
+        let account = super::parse_account_status(response.headers());
+        Ok((sender, response.into_body(), lease, account))
     }
     .await;
-    let (sender, receiver, lease) = match established {
+    let (sender, receiver, lease, account) = match established {
         Ok(established) => established,
         Err(error) => {
             driver.abort();
@@ -461,6 +469,7 @@ async fn establish_lane(group: &Group, index: usize) -> Result<LaneConnection, C
         driver,
         remote_address,
         lease,
+        account,
     })
 }
 
@@ -587,8 +596,12 @@ fn validate_response(
             header(response.headers(), frame::HEADER_MIN_VERSION),
             header(response.headers(), frame::HEADER_MAX_VERSION),
         );
-        let detail =
-            super::rejection_detail(status, header(response.headers(), super::REASON_HEADER));
+        if let Some(denial) =
+            super::account_denial(status, header(response.headers(), super::REASON_HEADER))
+        {
+            return Err(denial);
+        }
+        let detail = format!("gateway returned HTTP {status}");
         return match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
@@ -1180,6 +1193,7 @@ mod tests {
                 session: "test".to_owned(),
                 lanes,
                 lease: Mutex::new(None),
+                account: Arc::default(),
                 flows: Mutex::new(FlowTable::default()),
                 established: AtomicBool::new(true),
                 failure: Arc::new(FailureSignal::default()),

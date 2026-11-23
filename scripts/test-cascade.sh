@@ -188,6 +188,14 @@ stop_gateway() {
     "$repository_root/scripts/server-down.sh" porta0 east >>"$work/gateway-$gateway.log" 2>&1
 }
 
+# Calls a gateway's loopback admin API (default: the entry gateway).
+admin_api() {
+  local gateway=1
+  if [[ ${1:-} =~ ^[0-9]+$ ]]; then gateway=$1; shift; fi
+  in_ns "$gateway" curl -fsS --max-time 10 -H "Authorization: Bearer admin-token-0123456789abcdef" \
+    -H "Content-Type: application/json" "$@"
+}
+
 wait_ready() {
   local gateway=$1
   for _ in $(seq 1 60); do
@@ -288,6 +296,12 @@ for gateway in $(seq 1 $((gateways - 1))); do
   done
 done
 echo "every relay carried the traffic through its upstream tunnel"
+admin_api http://127.0.0.1:9090/api/gateway | python3 -c '
+import json, sys
+upstream = json.load(sys.stdin)["upstream"]
+assert upstream["connected"] and upstream["address"], upstream
+' || { echo "entry gateway does not report its connected next hop" >&2; exit 1; }
+echo "the admin API reports each relay's next-hop status"
 
 stop_gateway "$gateways"
 if in_ns client curl -fsS --max-time 5 "http://$web_address:8080/" >/dev/null 2>&1; then
@@ -299,6 +313,19 @@ route=$(in_ns "$((gateways - 1))" ip -4 route get "$web_address" from 10.66.0.2 
   echo "relay would bypass its next hop: $route" >&2
   exit 1
 }
+next_hop_down=false
+for _ in $(seq 1 30); do
+  if admin_api "$((gateways - 1))" http://127.0.0.1:9090/api/gateway | python3 -c '
+import json, sys
+upstream = json.load(sys.stdin)["upstream"]
+sys.exit(0 if not upstream["connected"] and upstream.get("error") else 1)
+'; then
+    next_hop_down=true
+    break
+  fi
+  sleep 1
+done
+$next_hop_down || { echo "relay does not report its unavailable next hop" >&2; exit 1; }
 echo "relayed traffic fails closed while the exit gateway is down"
 
 start_gateway "$gateways"
@@ -312,15 +339,22 @@ done
 echo "relays reconnected automatically after the exit gateway restarted"
 
 # Account limits on the entry gateway, through its loopback admin API.
-admin_api() {
-  in_ns 1 curl -fsS --max-time 10 -H "Authorization: Bearer admin-token-0123456789abcdef" \
-    -H "Content-Type: application/json" "$@"
-}
 account_id=$(admin_api http://127.0.0.1:9090/api/clients |
   python3 -c 'import json, sys; print(json.load(sys.stdin)["clients"][0]["id"])')
 admin_api -X PUT --data '{"expires_at":null,"monthly_quota_bytes":null,"rate_limit_kbps":8000}' \
   "http://127.0.0.1:9090/api/clients/$account_id/limits" >/dev/null
 sleep 6 # one enforcement interval applies the rate limit to live sessions
+# Reconnecting delivers the new limits to the client with its tunnel.
+admin_api -X POST "http://127.0.0.1:9090/api/clients/$account_id/disconnect" >/dev/null
+for _ in $(seq 1 30); do
+  grep -q "rate-limit=8000kbit/s" "$work/client.log" && break
+  sleep 1
+done
+grep -q "rate-limit=8000kbit/s" "$work/client.log" || {
+  echo "client did not receive its account limits on reconnect" >&2
+  exit 1
+}
+echo "reconnecting clients receive their account limits"
 bulk=$(in_ns client curl -fsS --max-time 90 -o /dev/null -w '%{size_download} %{speed_download}' \
   "http://$web_address:8080/bulk")
 [[ ${bulk%% *} == 16777216 ]] || { echo "rate-limited transfer was incomplete: $bulk" >&2; exit 1; }

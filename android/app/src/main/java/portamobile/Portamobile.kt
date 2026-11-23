@@ -95,6 +95,10 @@ class Session internal constructor(handle: Long) : AutoCloseable {
     fun transport(): String =
         Portamobile.callNative { Portamobile.sessionTransport(requireHandle()) }
 
+    /** Account limits encoded as `expires|quota|used|rate`; empty fields are unset. */
+    fun accountStatus(): String =
+        Portamobile.callNative { Portamobile.sessionAccount(requireHandle()) }
+
     override fun close() {
         val activeHandle = handle.getAndSet(0)
         if (activeHandle != 0L) Portamobile.closeSession(activeHandle)
@@ -176,6 +180,7 @@ object Portamobile {
     internal fun sessionPrefixLength(handle: Long): Int = nativeSessionPrefixLength(handle)
     internal fun sessionMTU(handle: Long): Int = nativeSessionMTU(handle)
     internal fun sessionDNS(handle: Long): String = nativeSessionDNS(handle)
+    internal fun sessionAccount(handle: Long): String = nativeSessionAccount(handle)
     internal fun sessionAutomaticMTU(handle: Long): Boolean = nativeSessionAutomaticMTU(handle)
     internal fun sessionMaximumMTU(handle: Long): Int = nativeSessionMaximumMTU(handle)
     internal fun sessionPacketDeliveryMode(handle: Long): String =
@@ -214,6 +219,7 @@ object Portamobile {
     @JvmStatic private external fun nativeSessionPrefixLength(handle: Long): Int
     @JvmStatic private external fun nativeSessionMTU(handle: Long): Int
     @JvmStatic private external fun nativeSessionDNS(handle: Long): String
+    @JvmStatic private external fun nativeSessionAccount(handle: Long): String
     @JvmStatic private external fun nativeSessionAutomaticMTU(handle: Long): Boolean
     @JvmStatic private external fun nativeSessionMaximumMTU(handle: Long): Int
     @JvmStatic private external fun nativeSessionPacketDeliveryMode(handle: Long): String

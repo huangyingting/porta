@@ -41,6 +41,8 @@ pub struct ConnectionInfo {
     pub delivery_mode: DeliveryMode,
     pub remote_address: SocketAddr,
     pub lease: Lease,
+    /// Account limits the gateway reported when the tunnel was established.
+    pub account: crate::tunnel::AccountStatus,
     pub connected_at: Instant,
 }
 
@@ -56,6 +58,8 @@ pub enum Event {
     Progress {
         uploaded_bytes: u64,
         downloaded_bytes: u64,
+        /// Latest gateway-reported limits, which can change while connected.
+        account: crate::tunnel::AccountStatus,
     },
     Reconnecting {
         reason: String,
@@ -99,6 +103,23 @@ pub enum RunError {
     },
     #[error("tunnel stopped")]
     Cancelled,
+}
+
+impl RunError {
+    /// The account limit that ended the tunnel, if the gateway reported one.
+    pub fn account_denial(&self) -> Option<crate::tunnel::AccountDenial> {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = source {
+            if let Some(denial) = error
+                .downcast_ref::<ClientError>()
+                .and_then(ClientError::denial)
+            {
+                return Some(denial);
+            }
+            source = error.source();
+        }
+        None
+    }
 }
 
 pub async fn run(
@@ -299,6 +320,7 @@ pub async fn run(
             delivery_mode: connection.delivery_mode,
             remote_address: connection.remote_address,
             lease: connection.lease,
+            account: connection.account(),
             connected_at: Instant::now(),
         }));
 
@@ -422,6 +444,7 @@ async fn run_session(
             _ = progress.tick() => observer.event(Event::Progress {
                 uploaded_bytes,
                 downloaded_bytes,
+                account: connection.account(),
             }),
         }
     }

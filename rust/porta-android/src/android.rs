@@ -34,7 +34,15 @@ enum BridgeError {
 
 impl From<ClientError> for BridgeError {
     fn from(error: ClientError) -> Self {
-        Self::Message(error.to_string())
+        // A stable code prefix lets the app localize account denials.
+        match error.denial() {
+            Some(denial) => Self::Message(format!(
+                "account-denied:{}: {}",
+                denial.code(),
+                denial.message()
+            )),
+            None => Self::Message(error.to_string()),
+        }
     }
 }
 
@@ -570,6 +578,33 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeSessionDNS(
         Ok(JString::from_str(env, dns)?.into_raw())
     })
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Account limits as `expires|quota|used|rate`, with empty unset fields.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAccount(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        let session = get_session(id)?;
+        Ok(JString::from_str(env, encode_account(&session.connection.account()))?.into_raw())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+fn encode_account(account: &porta_client::tunnel::AccountStatus) -> String {
+    fn field(value: Option<impl ToString>) -> String {
+        value.map(|value| value.to_string()).unwrap_or_default()
+    }
+    format!(
+        "{}|{}|{}|{}",
+        field(account.expires_at),
+        field(account.quota_bytes),
+        field(account.quota_used_bytes),
+        field(account.rate_limit_kbps)
+    )
 }
 
 #[unsafe(no_mangle)]

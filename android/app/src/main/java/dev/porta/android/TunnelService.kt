@@ -408,6 +408,7 @@ class TunnelService : VpnService() {
                 setupDurationMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - attemptStartedAt),
                 appVersion = Portamobile.version(),
                 protocolVersion = PacketFraming.VERSION,
+                account = parseAccountLimits(activeSession.accountStatus()),
             )
             if (!publishConnectionDetails(attemptToken, details.toConnectionDetails())) {
                 throw InterruptedException("Native tunnel was replaced")

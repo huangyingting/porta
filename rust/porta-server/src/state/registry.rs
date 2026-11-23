@@ -634,6 +634,20 @@ impl ClientRegistry {
         Ok(())
     }
 
+    pub fn account_policy(&self, id: &str) -> Option<AccountPolicy> {
+        let state = self.inner.state.lock();
+        state
+            .clients
+            .iter()
+            .find(|client| client.id == id)
+            .map(|client| AccountPolicy {
+                id: client.id.clone(),
+                limits: client.limits.clone(),
+                usage_period: client.usage_period.clone(),
+                active_sessions: self.inner.sessions.active_count(&client.id, None),
+            })
+    }
+
     pub fn account_policies(&self) -> Vec<AccountPolicy> {
         let state = self.inner.state.lock();
         state

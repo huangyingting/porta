@@ -154,9 +154,33 @@ struct ClientInput {
     enabled: Option<bool>,
 }
 
+/// Gateway-wide state for `GET /api/gateway`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct GatewayStatus {
+    pub version: String,
+    /// Present when this gateway is a cascade relay.
+    pub upstream: Option<UpstreamStatus>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct UpstreamStatus {
+    pub url: String,
+    pub interface: String,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub type GatewayStatusProvider = Arc<dyn Fn() -> GatewayStatus + Send + Sync>;
+
 pub struct AdminService {
     registry: Arc<dyn ClientRegistry>,
     admin_token: Zeroizing<Vec<u8>>,
+    gateway: Option<GatewayStatusProvider>,
 }
 
 impl AdminService {
@@ -164,7 +188,13 @@ impl AdminService {
         Self {
             registry,
             admin_token: Zeroizing::new(admin_token.into()),
+            gateway: None,
         }
+    }
+
+    pub fn with_gateway_status(mut self, provider: GatewayStatusProvider) -> Self {
+        self.gateway = Some(provider);
+        self
     }
 
     pub fn registry(&self) -> &Arc<dyn ClientRegistry> {
@@ -200,6 +230,16 @@ impl AdminService {
             return Some(response);
         }
         let response = match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/api/gateway") => {
+                let status = self.gateway.as_ref().map_or_else(
+                    || GatewayStatus {
+                        version: crate::VERSION.trim().to_owned(),
+                        upstream: None,
+                    },
+                    |provider| provider(),
+                );
+                json_response(200, &status)
+            }
             ("GET", "/api/clients") => match self.registry.list_clients() {
                 Ok(clients) => json_response(200, &serde_json::json!({ "clients": clients })),
                 Err(error) => registry_error(error),

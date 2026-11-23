@@ -19,6 +19,7 @@ internal data class ConnectionTelemetry(
     val setupDurationMillis: Long = 0,
     val appVersion: String = "",
     val protocolVersion: String = "",
+    val account: AccountLimits = AccountLimits(),
 )
 
 internal fun ConnectionTelemetry.toConnectionDetails(): ConnectionDetails =
@@ -34,6 +35,7 @@ internal fun ConnectionTelemetry.toConnectionDetails(): ConnectionDetails =
         setupDurationMillis = setupDurationMillis,
         appVersion = appVersion,
         protocolVersion = protocolVersion,
+        account = account,
     )
 
 internal fun formatAttemptEvent(transport: String, networkType: String?): String =

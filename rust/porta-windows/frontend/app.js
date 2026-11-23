@@ -72,6 +72,13 @@ const messages = {
     chooseProfile: "Choose a profile to connect.",
     addProfileDetail: "Add a profile to connect.",
     profileReady: "{name} · {server}",
+    accountExpiredDenied: "This account has expired. Ask your administrator to renew it.",
+    quotaExceededDenied: "This account has used its monthly data allowance. Access resumes next month or when your administrator raises it.",
+    accountExpires: "Access until {date}",
+    accountExpiresSoon: "Access ends {date}",
+    quotaUsage: "{used} of {total} used this month",
+    quotaAllowance: "{total} monthly allowance",
+    speedLimit: "Speed limited to {rate} Mbit/s",
     establishingTunnel: "Establishing a secure tunnel…",
     configuringTunnel: "Applying private routes, DNS, and tunnel MTU…",
     connectedH3: "HTTP/3 MASQUE · fast and resilient · MTU {mtu}",
@@ -158,6 +165,13 @@ const messages = {
     chooseProfile: "选择一个配置以建立连接。",
     addProfileDetail: "添加配置后即可连接。",
     profileReady: "{name} · {server}",
+    accountExpiredDenied: "此账户已过期，请联系管理员续期。",
+    quotaExceededDenied: "此账户已用完本月流量额度。下月恢复，或请管理员提高额度。",
+    accountExpires: "可使用至 {date}",
+    accountExpiresSoon: "将于 {date} 到期",
+    quotaUsage: "本月已用 {used} / {total}",
+    quotaAllowance: "每月额度 {total}",
+    speedLimit: "限速 {rate} Mbit/s",
     establishingTunnel: "正在建立安全隧道…",
     configuringTunnel: "正在应用私有路由、DNS 和隧道 MTU…",
     connectedH3: "HTTP/3 MASQUE · 快速且稳定 · MTU {mtu}",
@@ -392,6 +406,7 @@ function applySnapshot(snapshot, recordTraffic) {
   const status = t(statusKeys[snapshot.status] || "") || snapshot.status;
   setText("status-text", status);
   setText("status-detail", localizedDetail(snapshot));
+  renderAccount(snapshot);
   const tone = snapshot.tone === "connected"
     ? "connected"
     : snapshot.tone === "warning"
@@ -415,6 +430,45 @@ function applySnapshot(snapshot, recordTraffic) {
   renderActivityIfNeeded();
   updateRecoveryAction();
   updateDuration();
+}
+
+// Account limits the gateway reported for the current connection.
+function accountSummary(snapshot) {
+  if (!snapshot.connected) return { text: "", warning: false };
+  const parts = [];
+  let warning = false;
+  if (snapshot.accountExpiresAt) {
+    const expires = new Date(snapshot.accountExpiresAt * 1000);
+    const soon = expires.getTime() - Date.now() < 7 * 86400000;
+    warning ||= soon;
+    const date = new Intl.DateTimeFormat(state.language, { dateStyle: "medium" }).format(expires);
+    parts.push(t(soon ? "accountExpiresSoon" : "accountExpires", { date }));
+  }
+  if (snapshot.quotaBytes) {
+    if (snapshot.quotaUsedBytes == null) {
+      parts.push(t("quotaAllowance", { total: formatBytes(snapshot.quotaBytes) }));
+    } else {
+      warning ||= snapshot.quotaUsedBytes >= snapshot.quotaBytes * 0.9;
+      parts.push(t("quotaUsage", {
+        used: formatBytes(snapshot.quotaUsedBytes),
+        total: formatBytes(snapshot.quotaBytes),
+      }));
+    }
+  }
+  if (snapshot.rateLimitKbps) {
+    const rate = new Intl.NumberFormat(state.language, { maximumFractionDigits: 3 })
+      .format(snapshot.rateLimitKbps / 1000);
+    parts.push(t("speedLimit", { rate }));
+  }
+  return { text: parts.join(" · "), warning };
+}
+
+function renderAccount(snapshot) {
+  const { text, warning } = accountSummary(snapshot);
+  const element = $("account-detail");
+  setText("account-detail", text);
+  element.classList.toggle("hidden", !text);
+  element.classList.toggle("warning", warning);
 }
 
 function localizedDetail(snapshot) {
@@ -445,6 +499,8 @@ function localizedDetail(snapshot) {
     case "Recovering network":
       return t("recoveryActive");
     default:
+      if (snapshot.accountDenial === "account-expired") return t("accountExpiredDenied");
+      if (snapshot.accountDenial === "quota-exceeded") return t("quotaExceededDenied");
       if (snapshot.detail === "Normal network access has been restored.") return t("networkRestored");
       if (snapshot.detail === "Network recovery remains pending.") return t("recoveryPending");
       return snapshot.detail;

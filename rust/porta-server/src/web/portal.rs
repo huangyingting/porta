@@ -108,6 +108,15 @@ impl Portal {
         self.abuse = abuse;
     }
 
+    /// Reports gateway state, such as the cascade relay, on the admin page.
+    pub fn set_gateway_status(&mut self, provider: super::admin::GatewayStatusProvider) {
+        let admin = std::mem::replace(
+            &mut self.admin,
+            AdminService::new(Arc::clone(&self.registry), Vec::new()),
+        );
+        self.admin = admin.with_gateway_status(provider);
+    }
+
     pub async fn handle(&self, request: &RequestContext) -> Option<Response> {
         let now = unix_time_now();
         match request.path.as_str() {
@@ -397,6 +406,20 @@ impl Portal {
             certificate: self
                 .issue_download_ticket("release-signing-cert.der", now + DOWNLOAD_TICKET_TTL_SECS),
         };
+        let account = if session.role == PortalRole::Client {
+            self.registry
+                .list_clients()
+                .ok()
+                .and_then(|clients| {
+                    clients
+                        .into_iter()
+                        .find(|client| client.id == session.client_id)
+                })
+                .map(|client| account_status_html(&client, now))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let body = downloads_page_html(
             &name,
             &portal_request_host(request, self.trust_proxy_headers),
@@ -404,6 +427,7 @@ impl Portal {
             &rows,
             &release_tickets,
             profile.as_ref(),
+            &account,
         );
         let mut response = Response::html(200, body.into_bytes());
         response.set_header("Cache-Control", "no-store");
@@ -877,6 +901,22 @@ pub fn format_download_size(size: u64) -> String {
     }
 }
 
+/// Formats data quotas, which commonly span gigabytes or terabytes.
+fn format_quota_size(size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn access_page_response(request: &RequestContext, invalid: bool, status: u16) -> Response {
     let message = if invalid {
         "<p class=\"error\" role=\"alert\">Access could not be verified.</p>"
@@ -996,6 +1036,53 @@ fn render_asset_template(template: &str, replacements: &[(&str, &str)]) -> Strin
     rendered
 }
 
+/// Describes the signed-in client's account limits, or nothing when the
+/// account is unrestricted.
+fn account_status_html(client: &super::admin::ClientSummary, now: u64) -> String {
+    let mut lines = Vec::new();
+    if let Some(expires) = client.expires_at.as_deref().and_then(|value| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+    }) {
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            expires.year(),
+            u8::from(expires.month()),
+            expires.day()
+        );
+        let soon = expires.unix_timestamp() - now as i64 <= 7 * 86_400;
+        lines.push((format!("Access until {date} (UTC)"), soon));
+    }
+    if let Some(quota) = client.monthly_quota_bytes {
+        let used = client.quota_used_bytes.unwrap_or(0);
+        lines.push((
+            format!(
+                "{} of {} used this month",
+                format_quota_size(used),
+                format_quota_size(quota)
+            ),
+            used >= quota / 10 * 9,
+        ));
+    }
+    if let Some(rate) = client.rate_limit_kbps {
+        let rate = rate as f64 / 1000.0;
+        lines.push((format!("Speed limited to {rate} Mbit/s"), false));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let lines = lines
+        .into_iter()
+        .map(|(text, warning)| {
+            format!(
+                "<span{}>{}</span>",
+                if warning { " class=\"warning\"" } else { "" },
+                html_escape(&text)
+            )
+        })
+        .collect::<String>();
+    format!("<div class=\"account-status\"><small>Your access</small>{lines}</div>")
+}
+
 fn downloads_page_html(
     client_name: &str,
     host: &str,
@@ -1003,6 +1090,7 @@ fn downloads_page_html(
     rows: &str,
     release_tickets: &ReleaseDownloadTickets,
     profile: Option<&DownloadProfile>,
+    account: &str,
 ) -> String {
     let version = html_escape(version);
     let client_name = html_escape(client_name);
@@ -1022,6 +1110,7 @@ fn downloads_page_html(
             ("%%PORTA_CHECKSUMS_TICKET%%", &checksums),
             ("%%PORTA_SIGNATURE_TICKET%%", &signature),
             ("%%PORTA_CERTIFICATE_TICKET%%", &certificate),
+            ("%%PORTA_ACCOUNT_STATUS%%", account),
         ],
     )
 }
@@ -1797,7 +1886,7 @@ mod tests {
             signature: "signature-ticket".into(),
             certificate: "certificate-ticket".into(),
         };
-        let page = downloads_page_html("Phone", "porta.test", "v1.2.3", "", &tickets, None);
+        let page = downloads_page_html("Phone", "porta.test", "v1.2.3", "", &tickets, None, "");
         for fragment in [
             "@font-face{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\") format(\"woff2-variations\");font-weight:200 900;font-display:swap}",
             ":root{font-family:\"Mona Sans\",sans-serif;color:#171923;background:#f5f6fa;--violet:#6558ed;--line:#e2e4ea}",
@@ -1867,7 +1956,7 @@ mod tests {
             qr_code: "javascript:alert(1)".into(),
         };
         let rows = "<article class=\"download-row\">trusted row</article>";
-        let page = downloads_page_html(name, host, version, rows, &tickets, Some(&profile));
+        let page = downloads_page_html(name, host, version, rows, &tickets, Some(&profile), "");
         for value in [
             name,
             host,
@@ -2016,6 +2105,45 @@ mod tests {
             .header("Set-Cookie")
             .unwrap()
             .contains("Secure; HttpOnly; SameSite=Strict"));
+    }
+
+    #[test]
+    fn client_portal_shows_account_limits_only_when_configured() {
+        let now = 1_900_000_000;
+        assert_eq!(
+            account_status_html(&crate::web::admin::ClientSummary::default(), now),
+            ""
+        );
+        let client = crate::web::admin::ClientSummary {
+            expires_at: Some("2030-03-15T23:59:59Z".into()),
+            monthly_quota_bytes: Some(2 << 30),
+            quota_used_bytes: Some(1_950_000_000),
+            rate_limit_kbps: Some(5_000),
+            ..Default::default()
+        };
+        let html = account_status_html(&client, now);
+        assert!(html.contains("Your access"));
+        assert!(html.contains("Access until 2030-03-15 (UTC)"));
+        assert!(html.contains("1.8 GB of 2.0 GB used this month"), "{html}");
+        assert_eq!(format_quota_size(5 << 40), "5.0 TB");
+        assert_eq!(format_quota_size(512), "512 B");
+        assert!(html.contains("<span class=\"warning\">"));
+        assert!(html.contains("Speed limited to 5 Mbit/s"));
+        let page = downloads_page_html(
+            "Phone",
+            "porta.test",
+            "v1",
+            "",
+            &ReleaseDownloadTickets {
+                checksums: String::new(),
+                signature: String::new(),
+                certificate: String::new(),
+            },
+            None,
+            &html,
+        );
+        assert!(page.contains("Your access"));
+        assert!(!page.contains("%%PORTA_ACCOUNT_STATUS%%"));
     }
 
     #[tokio::test]

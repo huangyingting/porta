@@ -14,7 +14,9 @@ use url::Url;
 
 use crate::identity::{self, IdentityError};
 use crate::tls::{self, TlsConfigError};
-use crate::tunnel::{self, ClientConfig, ClientError, Connection, DeliveryMode, Lease, Transport};
+use crate::tunnel::{
+    self, AccountStatus, ClientConfig, ClientError, Connection, DeliveryMode, Lease, Transport,
+};
 
 use super::network::{NetworkError, NetworkManager};
 use super::tun::Tun;
@@ -55,6 +57,8 @@ pub struct Event {
     pub state: State,
     pub message: String,
     pub lease: Option<Lease>,
+    /// Account limits the gateway reported when the tunnel was established.
+    pub account: AccountStatus,
     pub transport: Transport,
     pub delivery_mode: DeliveryMode,
     pub connected_at: Option<SystemTime>,
@@ -100,23 +104,26 @@ struct Counters {
     packets_downloaded: AtomicU64,
 }
 
+/// Connection fields reported with an event.
+#[derive(Clone, Copy)]
+struct EventDetails {
+    lease: Option<Lease>,
+    account: AccountStatus,
+    transport: Transport,
+    delivery_mode: DeliveryMode,
+    connected_at: Option<SystemTime>,
+}
+
 impl Counters {
-    fn event(
-        &self,
-        state: State,
-        message: impl Into<String>,
-        lease: Option<Lease>,
-        transport: Transport,
-        delivery_mode: DeliveryMode,
-        connected_at: Option<SystemTime>,
-    ) -> Event {
+    fn event(&self, state: State, message: impl Into<String>, details: EventDetails) -> Event {
         Event {
             state,
             message: message.into(),
-            lease,
-            transport,
-            delivery_mode,
-            connected_at,
+            lease: details.lease,
+            account: details.account,
+            transport: details.transport,
+            delivery_mode: details.delivery_mode,
+            connected_at: details.connected_at,
             bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: self.bytes_downloaded.load(Ordering::Relaxed),
             packets_uploaded: self.packets_uploaded.load(Ordering::Relaxed),
@@ -191,6 +198,7 @@ struct Runtime {
     device_error_tx: mpsc::Sender<io::Error>,
     device_error_rx: mpsc::Receiver<io::Error>,
     lease: Option<Lease>,
+    account: AccountStatus,
     transport: Transport,
     delivery_mode: DeliveryMode,
     connected_at: Option<SystemTime>,
@@ -211,6 +219,7 @@ impl Runtime {
             device_error_tx,
             device_error_rx,
             lease: None,
+            account: AccountStatus::default(),
             transport,
             delivery_mode: DeliveryMode::Unknown,
             connected_at: None,
@@ -255,10 +264,13 @@ impl Runtime {
         self.counters.event(
             state,
             message,
-            self.lease,
-            self.transport,
-            self.delivery_mode,
-            self.connected_at,
+            EventDetails {
+                lease: self.lease,
+                account: self.account,
+                transport: self.transport,
+                delivery_mode: self.delivery_mode,
+                connected_at: self.connected_at,
+            },
         )
     }
 }
@@ -295,6 +307,7 @@ pub async fn run(
         state: State::Connecting,
         message: format!("Device: {} ({})", identity.name, identity.id),
         lease: None,
+        account: AccountStatus::default(),
         transport: config.transport,
         delivery_mode: DeliveryMode::Unknown,
         connected_at: None,
@@ -307,6 +320,7 @@ pub async fn run(
         state: State::Connecting,
         message: "Connecting".to_owned(),
         lease: None,
+        account: AccountStatus::default(),
         transport: config.transport,
         delivery_mode: DeliveryMode::Unknown,
         connected_at: None,
@@ -517,10 +531,13 @@ async fn run_loop(
             observer(runtime.counters.event(
                 State::Configuring,
                 "Configuring network",
-                Some(connection.lease),
-                connection.transport,
-                connection.delivery_mode,
-                runtime.connected_at,
+                EventDetails {
+                    lease: Some(connection.lease),
+                    account: connection.account(),
+                    transport: connection.transport,
+                    delivery_mode: connection.delivery_mode,
+                    connected_at: runtime.connected_at,
+                },
             ));
             if let Err(error) = network
                 .up(
@@ -539,6 +556,7 @@ async fn run_loop(
             }
         }
         runtime.lease = Some(connection.lease);
+        runtime.account = connection.account();
         runtime.ensure_reader(cancellation);
         runtime.connected_at.get_or_insert_with(SystemTime::now);
         observer(runtime.event(State::Connected, "Connected"));
@@ -664,7 +682,10 @@ async fn run_connection(
                     None => RunError::Tunnel(ClientError::Closed),
                 };
             }
-            _ = progress.tick() => observer(runtime.event(State::Connected, "Connected")),
+            _ = progress.tick() => {
+                runtime.account = connection.account();
+                observer(runtime.event(State::Connected, "Connected"));
+            }
         }
     };
     pumps.cancel();

@@ -29,7 +29,10 @@ use porta_server_rust::state::usage::Store as UsageStore;
 use porta_server_rust::transport::http2::{Http2Config, Http2Handler};
 use porta_server_rust::transport::http3::{serve_quinn, Http3Config, Http3Server};
 use porta_server_rust::transport::session::Services;
-use porta_server_rust::web::admin::{AdminService, ClientRegistry as WebClientRegistry};
+use porta_server_rust::web::admin::{
+    AdminService, ClientRegistry as WebClientRegistry, GatewayStatus, GatewayStatusProvider,
+    UpstreamStatus,
+};
 use porta_server_rust::web::landing::{load_landing_template_set, LandingSite};
 use porta_server_rust::web::portal::Portal;
 use std::net::IpAddr;
@@ -83,6 +86,7 @@ async fn run() -> Result<()> {
     // The upstream TUN must exist before the client TUN appears: the network
     // helper starts once the client TUN exists and routes through both.
     let upstream = upstream::open(&mut config, &metrics)?;
+    let gateway_status = upstream::gateway_status(upstream.as_ref());
     let device = Arc::new(NativeTun::open(&config.interface, usize::from(config.mtu))?);
     let router = Arc::new(Router::new(device, Some(metrics.clone())));
     let bootstrap_token = Zeroizing::new(std::mem::take(&mut config.token));
@@ -93,7 +97,11 @@ async fn run() -> Result<()> {
     let leases = PoolAdapter::new(pool.clone());
     let rate_limits = RateLimiters::with_metrics(metrics.clone());
     let services = Arc::new(Services {
-        authenticator: NativeAuthenticator::new(registry.clone(), abuse.clone()),
+        authenticator: NativeAuthenticator::with_usage(
+            registry.clone(),
+            abuse.clone(),
+            usage.clone(),
+        ),
         leases: leases.clone(),
         router: RouterAdapter::with_rate_limits(router.clone(), leases, rate_limits.clone()),
         usage: UsageAdapter::new(usage.clone()),
@@ -156,6 +164,7 @@ async fn run() -> Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
     portal.set_abuse_guard(Some(abuse.clone()));
+    portal.set_gateway_status(gateway_status.clone());
     let portal = Arc::new(portal);
     let landing = Arc::new(match &config.landing_template_dir {
         Some(directory) => LandingSite::with_templates(
@@ -198,10 +207,10 @@ async fn run() -> Result<()> {
         drain.cancellation(),
     ));
     let admin_handler: Arc<dyn Handler> = Arc::new(AdminHttpHandler::new(
-        Arc::new(AdminService::new(
-            web_registry,
-            admin_token.as_bytes().to_vec(),
-        )),
+        Arc::new(
+            AdminService::new(web_registry, admin_token.as_bytes().to_vec())
+                .with_gateway_status(gateway_status),
+        ),
         operations,
     ));
     drop(admin_token);
@@ -514,6 +523,30 @@ mod upstream {
         Ok(Some(Relay(Arc::new(upstream))))
     }
 
+    pub fn gateway_status(relay: Option<&Relay>) -> GatewayStatusProvider {
+        let upstream = relay.map(|relay| {
+            (
+                relay.0.status(),
+                relay.0.url().to_owned(),
+                relay.0.interface().to_owned(),
+            )
+        });
+        Arc::new(move || GatewayStatus {
+            version: porta_server_rust::VERSION.trim().to_owned(),
+            upstream: upstream.as_ref().map(|(status, url, interface)| {
+                let snapshot = status.snapshot();
+                UpstreamStatus {
+                    url: url.clone(),
+                    interface: interface.clone(),
+                    connected: snapshot.connected,
+                    address: snapshot.address,
+                    transport: snapshot.transport.map(str::to_owned),
+                    error: snapshot.error,
+                }
+            }),
+        })
+    }
+
     impl Relay {
         pub fn readiness(&self) -> UpstreamReadiness {
             let status = self.0.status();
@@ -534,6 +567,13 @@ mod upstream {
     use super::*;
 
     pub struct Relay;
+
+    pub fn gateway_status(_relay: Option<&Relay>) -> GatewayStatusProvider {
+        Arc::new(|| GatewayStatus {
+            version: porta_server_rust::VERSION.trim().to_owned(),
+            upstream: None,
+        })
+    }
 
     pub fn open(config: &mut Config, _metrics: &Arc<Metrics>) -> Result<Option<Relay>> {
         if config.upstream.is_some() {

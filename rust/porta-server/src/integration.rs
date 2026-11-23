@@ -15,8 +15,8 @@ use crate::state::registry::{
 use crate::state::sessions::SessionGuard;
 use crate::state::usage;
 use crate::transport::session::{
-    Authenticated, AuthenticationError, AuthenticationRequest, Authenticator, Cleanup,
-    ClientIdentity as TransportIdentity, DenialReason, Lease, LeaseAllocator, LeaseError,
+    AccountStatus, Authenticated, AuthenticationError, AuthenticationRequest, Authenticator,
+    Cleanup, ClientIdentity as TransportIdentity, DenialReason, Lease, LeaseAllocator, LeaseError,
     LeaseMode, LeaseRequest, Metrics, PacketRouter, PacketSource, QueueDrop, RouteError, RouteKind,
     RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata, UsageSession,
 };
@@ -39,11 +39,57 @@ use zeroize::Zeroizing;
 pub struct NativeAuthenticator {
     registry: Arc<StateRegistry>,
     abuse: Arc<AbuseGuard>,
+    usage: Option<Arc<usage::Store>>,
 }
 
 impl NativeAuthenticator {
     pub fn new(registry: Arc<StateRegistry>, abuse: Arc<AbuseGuard>) -> Arc<Self> {
-        Arc::new(Self { registry, abuse })
+        Arc::new(Self {
+            registry,
+            abuse,
+            usage: None,
+        })
+    }
+
+    /// Also reports quota usage from `usage` to connecting clients.
+    pub fn with_usage(
+        registry: Arc<StateRegistry>,
+        abuse: Arc<AbuseGuard>,
+        usage: Arc<usage::Store>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            abuse,
+            usage: Some(usage),
+        })
+    }
+}
+
+/// Snapshot of an account's limits for the client's information.
+pub fn account_status(
+    registry: &StateRegistry,
+    usage: Option<&usage::Store>,
+    account_id: &str,
+) -> AccountStatus {
+    let Some(policy) = registry.account_policy(account_id) else {
+        return AccountStatus::default();
+    };
+    let quota_used_bytes = policy
+        .limits
+        .monthly_quota_bytes
+        .and(policy.usage_period.as_ref())
+        .zip(usage)
+        .map(|(period, usage)| {
+            account_usage_bytes(&usage.snapshot(), account_id).saturating_sub(period.baseline_bytes)
+        });
+    AccountStatus {
+        expires_at: policy
+            .limits
+            .expires_at
+            .map(|expires_at| expires_at.unix_timestamp()),
+        quota_bytes: policy.limits.monthly_quota_bytes,
+        quota_used_bytes,
+        rate_limit_kbps: policy.limits.rate_limit_kbps,
     }
 }
 
@@ -54,6 +100,7 @@ impl Authenticator for NativeAuthenticator {
     ) -> BoxFuture<'static, Result<Authenticated, AuthenticationError>> {
         let registry = self.registry.clone();
         let abuse = self.abuse.clone();
+        let usage = self.usage.clone();
         Box::pin(async move {
             let Some(reservation) = abuse.reserve(Surface::Native, request.peer.ip()) else {
                 return Err(AuthenticationError::RateLimited {
@@ -70,6 +117,7 @@ impl Authenticator for NativeAuthenticator {
             };
             // Enrollment must publish its in-memory state even if the HTTP request
             // disappears while the registry's detached persistence task is running.
+            let status_registry = registry.clone();
             let session = tokio::spawn(async move {
                 registry
                     .authenticate_device_session(
@@ -103,7 +151,13 @@ impl Authenticator for NativeAuthenticator {
                 }
             })?;
             reservation.refund();
+            let account = account_status(
+                &status_registry,
+                usage.as_deref(),
+                &session.identity.account_id,
+            );
             Ok(Authenticated {
+                account,
                 identity: TransportIdentity {
                     account_id: session.identity.account_id,
                     lease_id: session.identity.lease_id,
@@ -1307,6 +1361,61 @@ mod tests {
             .unwrap();
         enforcer.enforce(november).await;
         assert!(!limiters.any_limited());
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn connecting_clients_receive_their_account_status() {
+        let (_directory, registry, usage, _limiters, id) = policy_fixture().await;
+        assert_eq!(
+            account_status(&registry, Some(&usage), &id),
+            AccountStatus::default()
+        );
+        let expires = time::macros::datetime!(2031-03-15 23:59:59 UTC);
+        registry
+            .set_limits(
+                &id,
+                AccountLimits {
+                    expires_at: Some(expires),
+                    monthly_quota_bytes: Some(10_000),
+                    rate_limit_kbps: Some(5_000),
+                },
+            )
+            .await
+            .unwrap();
+        // Usage is unknown until the enforcer starts the quota period.
+        assert_eq!(
+            account_status(&registry, Some(&usage), &id).quota_used_bytes,
+            None
+        );
+        let session = usage.begin("s", &id, "device", "h3", "10.66.0.2", "");
+        session.add_uploaded(1_500, 1);
+        registry
+            .set_usage_period(
+                &id,
+                UsagePeriod {
+                    month: "2031-03".into(),
+                    baseline_bytes: 500,
+                },
+            )
+            .await
+            .unwrap();
+        let status = account_status(&registry, Some(&usage), &id);
+        assert_eq!(status.expires_at, Some(expires.unix_timestamp()));
+        assert_eq!(status.quota_bytes, Some(10_000));
+        assert_eq!(status.quota_used_bytes, Some(1_000));
+        assert_eq!(status.rate_limit_kbps, Some(5_000));
+
+        let mut headers = http::HeaderMap::new();
+        crate::transport::session::set_account_headers(&mut headers, &status);
+        assert_eq!(
+            headers["x-porta-account-expires"],
+            expires.unix_timestamp().to_string()
+        );
+        assert_eq!(headers["x-porta-quota-used-bytes"], "1000");
+        let mut headers = http::HeaderMap::new();
+        crate::transport::session::set_account_headers(&mut headers, &AccountStatus::default());
+        assert!(headers.is_empty());
         session.close();
     }
 

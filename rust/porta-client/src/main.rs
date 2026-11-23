@@ -159,7 +159,7 @@ mod linux {
         if event.state == State::Connected {
             let lease = event.lease.expect("connected event includes a lease");
             eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={} uploaded={} downloaded={}",
+                "porta-client: connected address={} dns={} mtu={} transport={} uploaded={} downloaded={}{}",
                 lease.address,
                 lease
                     .dns
@@ -167,7 +167,8 @@ mod linux {
                 lease.mtu,
                 transport_name(event.transport),
                 event.bytes_uploaded,
-                event.bytes_downloaded
+                event.bytes_downloaded,
+                super::account_summary(&event.account)
             );
         } else {
             eprintln!("porta-client: {}", event.message);
@@ -413,17 +414,19 @@ mod windows {
             } => eprintln!("porta-client: connecting attempt={attempt} endpoint={remote_address}"),
             Event::ConfiguringNetwork => eprintln!("porta-client: configuring network"),
             Event::Connected(info) => eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={:?}",
+                "porta-client: connected address={} dns={} mtu={} transport={:?}{}",
                 info.lease.address,
                 info.lease
                     .dns
                     .map_or_else(|| "-".to_owned(), |address| address.to_string()),
                 info.lease.mtu,
-                info.transport
+                info.transport,
+                super::account_summary(&info.account)
             ),
             Event::Progress {
                 uploaded_bytes,
                 downloaded_bytes,
+                ..
             } => eprintln!("porta-client: uploaded={uploaded_bytes} downloaded={downloaded_bytes}"),
             Event::Reconnecting { reason, delay } => eprintln!(
                 "porta-client: reconnecting in {}: {reason}",
@@ -449,6 +452,55 @@ mod windows {
                 Arguments::try_parse_from(["porta-client", "--token", "secret"]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
+    }
+}
+
+/// Formats gateway-reported account limits for status lines, or nothing for
+/// unrestricted accounts.
+#[cfg(any(
+    all(target_os = "linux", not(target_os = "android")),
+    target_os = "windows"
+))]
+fn account_summary(account: &porta_client::tunnel::AccountStatus) -> String {
+    let mut summary = String::new();
+    if let Some(expires) = account
+        .expires_at
+        .and_then(|seconds| u64::try_from(seconds).ok())
+    {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires);
+        summary.push_str(&format!(
+            " expires={}",
+            humantime::format_rfc3339_seconds(at)
+        ));
+    }
+    if let Some(quota) = account.quota_bytes {
+        let used = account
+            .quota_used_bytes
+            .map_or_else(|| "?".to_owned(), format_bytes);
+        summary.push_str(&format!(" quota={used}/{}", format_bytes(quota)));
+    }
+    if let Some(rate) = account.rate_limit_kbps {
+        summary.push_str(&format!(" rate-limit={}kbit/s", rate));
+    }
+    summary
+}
+
+#[cfg(any(
+    all(target_os = "linux", not(target_os = "android")),
+    target_os = "windows"
+))]
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
     }
 }
 
@@ -498,6 +550,26 @@ fn token(path: Option<&std::path::Path>) -> Result<String, String> {
         ));
     }
     Ok(token.to_owned())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod account_tests {
+    use porta_client::tunnel::AccountStatus;
+
+    #[test]
+    fn account_summary_lists_only_configured_limits() {
+        assert_eq!(super::account_summary(&AccountStatus::default()), "");
+        let summary = super::account_summary(&AccountStatus {
+            expires_at: Some(1_931_385_599),
+            quota_bytes: Some(2 << 30),
+            quota_used_bytes: Some(512 << 20),
+            rate_limit_kbps: Some(5_000),
+        });
+        assert_eq!(
+            summary,
+            " expires=2031-03-15T23:59:59Z quota=512.0MiB/2.0GiB rate-limit=5000kbit/s"
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

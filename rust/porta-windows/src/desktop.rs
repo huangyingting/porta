@@ -72,6 +72,14 @@ struct DesktopSnapshot {
     bytes_downloaded: u64,
     upload_rate: u64,
     download_rate: u64,
+    /// Unix seconds; zero when the account does not expire.
+    account_expires_at: i64,
+    quota_bytes: u64,
+    quota_used_bytes: Option<u64>,
+    rate_limit_kbps: u32,
+    /// `account-expired` or `quota-exceeded` when an account limit ended
+    /// the last connection attempt.
+    account_denial: String,
     activity: Vec<String>,
 }
 
@@ -106,6 +114,8 @@ struct DesktopState {
     bytes_downloaded: u64,
     upload_rate: u64,
     download_rate: u64,
+    account: porta_client::tunnel::AccountStatus,
+    account_denial: String,
     last_sample_at: Option<Instant>,
     last_uploaded: u64,
     last_downloaded: u64,
@@ -202,6 +212,8 @@ impl Controller {
                 bytes_downloaded: 0,
                 upload_rate: 0,
                 download_rate: 0,
+                account: Default::default(),
+                account_denial: String::new(),
                 last_sample_at: None,
                 last_uploaded: 0,
                 last_downloaded: 0,
@@ -355,6 +367,7 @@ impl Controller {
             state.active_id = profile.id.clone();
             state.cancellation = Some(cancellation.clone());
             state.running = true;
+            state.account_denial.clear();
             state.connected = false;
             state.disconnecting = false;
             state.status = "Connecting".to_owned();
@@ -420,11 +433,12 @@ impl Controller {
         cancellation: CancellationToken,
     ) {
         let result = async {
-            let server = parse_origin(&profile.server_url)?;
+            let server = parse_origin(&profile.server_url).map_err(|error| (error, None))?;
             let ca_path = (!profile.ca_path.is_empty()).then(|| Path::new(&profile.ca_path));
             let thumbprint =
                 (!profile.thumbprint.is_empty()).then_some(profile.thumbprint.as_str());
-            let tls = tls::config(ca_path, thumbprint, false).map_err(|error| error.to_string())?;
+            let tls = tls::config(ca_path, thumbprint, false)
+                .map_err(|error| (error.to_string(), None))?;
             let observer_controller = Arc::clone(&self);
             let observer_app = app.clone();
             match client::run(
@@ -449,7 +463,12 @@ impl Controller {
             .await
             {
                 Ok(()) | Err(client::RunError::Cancelled) => Ok(()),
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err((
+                    error.to_string(),
+                    error
+                        .account_denial()
+                        .map(|denial| denial.code().to_owned()),
+                )),
             }
         }
         .await;
@@ -470,10 +489,11 @@ impl Controller {
             state.recovery = recovery;
             reset_connection(&mut state);
             should_exit = state.quitting && result.is_ok() && !recovery;
-            if let Err(error) = result {
+            if let Err((error, denial)) = result {
                 state.quitting = false;
                 state.status = "Connection error".to_owned();
                 state.detail = error.clone();
+                state.account_denial = denial.unwrap_or_default();
                 state.tone = "danger".to_owned();
                 line = add_activity(&mut state, &format!("Connection error: {error}"));
             } else {
@@ -498,6 +518,7 @@ impl Controller {
     fn handle_connection_event(&self, app: &AppHandle, event: Event) {
         let activity;
         let mut traffic = None;
+        let mut account_changed = false;
         {
             let mut state = match self.lock_state() {
                 Ok(state) => state,
@@ -545,6 +566,8 @@ impl Controller {
                     state.address = info.lease.address.to_string();
                     state.transport = transport_name(info.transport).to_owned();
                     state.mtu = info.lease.mtu;
+                    state.account = info.account;
+                    state.account_denial.clear();
                     state.connected_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
                     add_activity(
                         &mut state,
@@ -558,7 +581,10 @@ impl Controller {
                 Event::Progress {
                     uploaded_bytes,
                     downloaded_bytes,
+                    account,
                 } => {
+                    account_changed = state.account != account;
+                    state.account = account;
                     update_rates(&mut state, uploaded_bytes, downloaded_bytes);
                     traffic = Some(traffic_from(&state));
                     None
@@ -586,7 +612,9 @@ impl Controller {
         }
         if let Some(traffic) = traffic {
             let _ = app.emit("porta:traffic", traffic);
-            return;
+            if !account_changed {
+                return;
+            }
         }
         if let Some(line) = activity {
             self.write_activity(Some(line));
@@ -1126,6 +1154,11 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
         bytes_downloaded: state.bytes_downloaded,
         upload_rate: state.upload_rate,
         download_rate: state.download_rate,
+        account_expires_at: state.account.expires_at.unwrap_or_default(),
+        quota_bytes: state.account.quota_bytes.unwrap_or_default(),
+        quota_used_bytes: state.account.quota_used_bytes,
+        rate_limit_kbps: state.account.rate_limit_kbps.unwrap_or_default(),
+        account_denial: state.account_denial.clone(),
         activity: state.activity.clone(),
     }
 }
@@ -1243,6 +1276,7 @@ fn reset_connection(state: &mut DesktopState) {
     state.bytes_downloaded = 0;
     state.upload_rate = 0;
     state.download_rate = 0;
+    state.account = Default::default();
     state.last_sample_at = None;
     state.last_uploaded = 0;
     state.last_downloaded = 0;

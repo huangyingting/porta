@@ -55,6 +55,14 @@
     <string name="disconnect_active_profile">Disconnect the active profile before connecting another one.</string>
     <string name="connected">Connected</string>
     <string name="connection_blocked">Connection blocked</string>
+    <string name="connection_rejected">Connection rejected</string>
+    <string name="account_expired_denied">This account has expired. Ask your administrator to renew it.</string>
+    <string name="quota_exceeded_denied">This account has used its monthly data allowance. Access resumes next month or when your administrator raises it.</string>
+    <string name="account_expires">Access until %1$s</string>
+    <string name="account_expires_soon">Access ends %1$s</string>
+    <string name="quota_usage">%1$s of %2$s used this month</string>
+    <string name="quota_allowance">%1$s monthly allowance</string>
+    <string name="speed_limit">Speed limited to %1$s Mbit/s</string>
     <string name="disconnected">Disconnected</string>
     <string name="connecting">Connecting</string>
     <string name="waiting_for_network">Waiting for network</string>

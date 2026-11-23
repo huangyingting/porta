@@ -14,6 +14,7 @@ internal data class ConnectionDetails(
     val setupDurationMillis: Long = 0,
     val appVersion: String = "",
     val protocolVersion: String = "",
+    val account: AccountLimits = AccountLimits(),
 )
 
 internal data class ConnectionAttemptToken internal constructor(

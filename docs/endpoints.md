@@ -167,6 +167,18 @@ Tunnel requests from expired or over-quota accounts receive HTTP 403 with
 `X-Porta-Reason: account-expired` or `X-Porta-Reason: quota-exceeded`. The
 reason is sent only after the token has been validated.
 
+Successful tunnel responses for limited accounts carry informational headers
+that native clients display: `X-Porta-Account-Expires` (Unix seconds),
+`X-Porta-Quota-Bytes`, `X-Porta-Quota-Used-Bytes` (a snapshot at connection
+time) and `X-Porta-Rate-Limit-Kbps`. Enforcement never depends on them.
+
+## Gateway status
+
+`GET /api/gateway` returns the server version and, on a cascade relay, the
+next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","interface":"porta-up0","connected":true,"address":"10.66.0.2","transport":"h3"}}`.
+While disconnected, `connected` is `false` and `error` holds the last failure.
+The admin page shows this as a banner.
+
 ## Session administration
 
 Authorized administrators can end current sessions without changing tokens:

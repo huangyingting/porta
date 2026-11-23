@@ -386,11 +386,13 @@ class MainActivity : Activity() {
         if (!::status.isInitialized) return
         val connected = value.startsWith("Connected")
         val blocked = value.startsWith("Connection blocked")
+        val rejected = value.startsWith("Connection rejected")
         val waiting = value.startsWith("Waiting")
         val active = isActiveStatus(value)
         status.text = when {
             connected -> getString(R.string.connected)
             blocked -> getString(R.string.connection_blocked)
+            rejected -> getString(R.string.connection_rejected)
             waiting -> getString(R.string.waiting_for_network)
             active -> getString(R.string.connecting)
             else -> getString(R.string.disconnected)
@@ -398,7 +400,8 @@ class MainActivity : Activity() {
         statusDetail.text = when {
             value.contains("HTTP/3") -> getString(R.string.transport_http3)
             value.contains("HTTP/2") -> getString(R.string.transport_http2)
-            blocked -> value.substringAfter(": ", getString(R.string.connection_blocked))
+            blocked || rejected -> accountDenialText(value)
+                ?: value.substringAfter(": ", getString(R.string.connection_blocked))
             value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
                 getString(R.string.reconnecting_secure_tunnel)
             waiting -> getString(R.string.waiting_for_network)
@@ -413,6 +416,7 @@ class MainActivity : Activity() {
                         details.mtu,
                     ),
                 )
+                accountSummary(details.account)?.let { statusDetail.append("\n" + it) }
             }
         }
         statusDot.background = circle(
@@ -933,9 +937,49 @@ class MainActivity : Activity() {
         return null
     }
 
+    private fun accountDenialText(value: String): String? = when (accountDenialIn(value)) {
+        AccountDenial.EXPIRED -> getString(R.string.account_expired_denied)
+        AccountDenial.QUOTA_EXCEEDED -> getString(R.string.quota_exceeded_denied)
+        null -> null
+    }
+
+    /** One line describing the account limits reported for this connection. */
+    private fun accountSummary(account: AccountLimits): String? {
+        if (!account.isLimited) return null
+        val parts = mutableListOf<String>()
+        account.expiresAtSeconds?.let { seconds ->
+            val date = java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM)
+                .format(Date(seconds * 1_000L))
+            parts += getString(
+                if (account.expiresSoon(System.currentTimeMillis())) R.string.account_expires_soon
+                else R.string.account_expires,
+                date,
+            )
+        }
+        account.quotaBytes?.let { quota ->
+            val total = android.text.format.Formatter.formatShortFileSize(this, quota)
+            parts += account.quotaUsedBytes?.let { used ->
+                getString(
+                    R.string.quota_usage,
+                    android.text.format.Formatter.formatShortFileSize(this, used),
+                    total,
+                )
+            } ?: getString(R.string.quota_allowance, total)
+        }
+        account.rateLimitKbps?.let { rate ->
+            parts += getString(
+                R.string.speed_limit,
+                java.text.NumberFormat.getNumberInstance().apply { maximumFractionDigits = 3 }
+                    .format(rate / 1_000.0),
+            )
+        }
+        return parts.joinToString(" · ")
+    }
+
     private fun profileStatus(value: String): String = when {
         value.startsWith("Connected") -> getString(R.string.profile_connected)
         value.startsWith("Connection blocked") -> getString(R.string.connection_blocked)
+        value.startsWith("Connection rejected") -> getString(R.string.connection_rejected)
         value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
             getString(R.string.profile_reconnecting)
         value.startsWith("Waiting") -> getString(R.string.waiting_for_network)

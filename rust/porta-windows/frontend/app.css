@@ -928,3 +928,14 @@ input::placeholder {
     transition-duration: 0.01ms !important;
   }
 }
+
+.account-detail {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.account-detail.warning {
+  color: #f0b45a;
+  font-weight: 600;
+}

@@ -73,6 +73,23 @@ impl UpstreamStatus {
         self.inner.lock().connected.map(|(lease, _)| lease)
     }
 
+    /// Current next-hop state for operators.
+    pub fn snapshot(&self) -> UpstreamSnapshot {
+        let inner = self.inner.lock();
+        UpstreamSnapshot {
+            connected: inner.connected.is_some(),
+            address: inner
+                .connected
+                .map(|(lease, _)| lease.address.addr().to_string()),
+            transport: inner.connected.map(|(_, transport)| match transport {
+                Transport::Http3 => "h3",
+                Transport::Http2 => "h2",
+                Transport::Auto => "auto",
+            }),
+            error: inner.error.clone(),
+        }
+    }
+
     fn connected(&self, lease: Lease, transport: Transport) {
         let mut inner = self.inner.lock();
         inner.connected = Some((lease, transport));
@@ -84,6 +101,14 @@ impl UpstreamStatus {
         inner.connected = None;
         inner.error = Some(error.into());
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UpstreamSnapshot {
+    pub connected: bool,
+    pub address: Option<String>,
+    pub transport: Option<&'static str>,
+    pub error: Option<String>,
 }
 
 pub struct Upstream {
@@ -138,6 +163,10 @@ impl Upstream {
 
     pub fn interface(&self) -> &str {
         self.device.name()
+    }
+
+    pub fn url(&self) -> &str {
+        &self.config.url
     }
 
     /// Maintains the next-hop tunnel until cancelled, reconnecting with

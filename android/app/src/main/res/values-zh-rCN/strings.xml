@@ -55,6 +55,14 @@
     <string name="disconnect_active_profile">连接其他配置前请先断开当前配置。</string>
     <string name="connected">已连接</string>
     <string name="connection_blocked">连接已阻止</string>
+    <string name="connection_rejected">连接被拒绝</string>
+    <string name="account_expired_denied">此账户已过期，请联系管理员续期。</string>
+    <string name="quota_exceeded_denied">此账户已用完本月流量额度。下月恢复，或请管理员提高额度。</string>
+    <string name="account_expires">可使用至 %1$s</string>
+    <string name="account_expires_soon">将于 %1$s 到期</string>
+    <string name="quota_usage">本月已用 %1$s / %2$s</string>
+    <string name="quota_allowance">每月额度 %1$s</string>
+    <string name="speed_limit">限速 %1$s Mbit/s</string>
     <string name="disconnected">已断开</string>
     <string name="connecting">正在连接</string>
     <string name="waiting_for_network">正在等待网络</string>

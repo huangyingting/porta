@@ -20,7 +20,7 @@ use crate::transport::http3::{
     address_response, append_ip_capsule, decode_ip_bytes, inject_packet, take_capsule,
 };
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, parse_lane_config,
+    bearer_token, fragment_ipv4, icmp_fragmentation_needed, parse_lane_config, set_account_headers,
     AuthenticationRequest, DenialReason, DeviceProof, LaneConfig, LeaseError, MtuError,
     OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES,
     CONTENT_TYPE, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION, HEADER_MAX_VERSION,
@@ -260,13 +260,14 @@ impl Http2Handler {
 
         let upgrade = hyper::upgrade::on(&mut request);
         let lifetime = request.extensions_mut().remove::<RequestLifetime>();
-        let response = masque_success_response(
+        let mut response = masque_success_response(
             self.config.mtu,
             self.config.dns,
             Full::new(Bytes::new())
                 .map_err(|never| -> BoxError { match never {} })
                 .boxed(),
         );
+        set_account_headers(response.headers_mut(), &session.account);
         let mtu = self.config.mtu;
         tokio::spawn(async move {
             let _lifetime = lifetime;
@@ -417,6 +418,7 @@ fn success_response(
     headers.insert(HEADER_LANE_SESSION, lanes.session_id.parse().unwrap());
     headers.insert(HEADER_LANE, lanes.index.to_string().parse().unwrap());
     headers.insert(HEADER_LANES, lanes.count.to_string().parse().unwrap());
+    set_account_headers(headers, &session.account);
     if let Some(dns) = dns {
         headers.insert("X-Porta-DNS", dns.to_string().parse().unwrap());
     }
@@ -805,6 +807,7 @@ mod tests {
                 assert_eq!(request.proof.device_id, "d-test");
                 let token = CancellationToken::new();
                 Ok(Authenticated {
+                    account: Default::default(),
                     identity: ClientIdentity {
                         account_id: "account".into(),
                         lease_id: "lease".into(),
@@ -828,6 +831,7 @@ mod tests {
             let cancellation = self.cancellation.clone();
             Box::pin(async move {
                 Ok(Authenticated {
+                    account: Default::default(),
                     identity: ClientIdentity {
                         account_id: "account".into(),
                         lease_id: "lease".into(),

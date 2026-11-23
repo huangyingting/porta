@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-pub use error::ClientError;
+pub use error::{AccountDenial, ClientError};
 
 pub const TUNNEL_PATH: &str = "/v1/tunnel";
 pub const MASQUE_PATH: &str = "/.well-known/masque/ip/%2A/%2A/";
@@ -77,8 +77,47 @@ pub struct ClientConfig {
     pub cancellation: CancellationToken,
 }
 
+/// Account limits reported by the gateway when the tunnel was established.
+/// Usage is a snapshot taken at connection time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccountStatus {
+    /// Unix time in seconds at which the account expires.
+    pub expires_at: Option<i64>,
+    pub quota_bytes: Option<u64>,
+    pub quota_used_bytes: Option<u64>,
+    pub rate_limit_kbps: Option<u32>,
+}
+
+impl AccountStatus {
+    pub fn is_limited(&self) -> bool {
+        self.expires_at.is_some() || self.quota_bytes.is_some() || self.rate_limit_kbps.is_some()
+    }
+}
+
+pub const HEADER_ACCOUNT_EXPIRES: &str = "x-porta-account-expires";
+pub const HEADER_QUOTA_BYTES: &str = "x-porta-quota-bytes";
+pub const HEADER_QUOTA_USED_BYTES: &str = "x-porta-quota-used-bytes";
+pub const HEADER_RATE_LIMIT_KBPS: &str = "x-porta-rate-limit-kbps";
+
+/// Reads optional account headers; malformed values are ignored because
+/// they are informational and never affect tunnel behavior.
+pub fn parse_account_status(headers: &http::HeaderMap) -> AccountStatus {
+    fn value<T: std::str::FromStr>(headers: &http::HeaderMap, name: &str) -> Option<T> {
+        headers.get(name)?.to_str().ok()?.trim().parse().ok()
+    }
+    AccountStatus {
+        expires_at: value(headers, HEADER_ACCOUNT_EXPIRES),
+        quota_bytes: value(headers, HEADER_QUOTA_BYTES),
+        quota_used_bytes: value(headers, HEADER_QUOTA_USED_BYTES),
+        rate_limit_kbps: value(headers, HEADER_RATE_LIMIT_KBPS),
+    }
+}
+
 pub struct Connection {
     pub lease: Lease,
+    /// Latest gateway-reported limits; HTTP/2 lanes that reconnect within a
+    /// connection update it. Read with [`Connection::account`].
+    account: Arc<StdMutex<AccountStatus>>,
     pub remote_address: SocketAddr,
     pub transport: Transport,
     pub delivery_mode: DeliveryMode,
@@ -196,6 +235,11 @@ enum Inbound {
 }
 
 impl Connection {
+    /// Account limits most recently reported by the gateway.
+    pub fn account(&self) -> AccountStatus {
+        *self.account.lock().expect("tunnel account lock poisoned")
+    }
+
     pub async fn send(&self, packet: &[u8]) -> Result<(), ClientError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ClientError::Closed);
@@ -311,19 +355,13 @@ async fn send_outbound<T>(
 /// Response header explaining why a gateway refused valid credentials.
 pub const REASON_HEADER: &str = "x-porta-reason";
 
-/// Describes a rejected tunnel request, preferring the gateway's stated
-/// reason so users learn why access ended rather than only an HTTP status.
-fn rejection_detail(status: http::StatusCode, reason: Option<&str>) -> String {
-    match reason {
-        Some("account-expired") => {
-            "the gateway account has expired; ask the administrator to renew it".to_owned()
-        }
-        Some("quota-exceeded") => {
-            "the gateway account has used its monthly data quota; access resumes next month or when the administrator raises it"
-                .to_owned()
-        }
-        _ => format!("gateway returned HTTP {status}"),
-    }
+/// Returns the account denial a refused tunnel request reports, so users
+/// learn why access ended rather than only an HTTP status.
+fn account_denial(status: http::StatusCode, reason: Option<&str>) -> Option<ClientError> {
+    (status == http::StatusCode::FORBIDDEN)
+        .then(|| reason.and_then(AccountDenial::from_reason))
+        .flatten()
+        .map(ClientError::Denied)
 }
 
 fn valid_unicast(address: Ipv4Addr) -> bool {
@@ -349,6 +387,7 @@ mod tests {
             let (outbound, _) = mpsc::channel(1);
             let (_, inbound) = mpsc::channel(1);
             let connection = Arc::new(Connection {
+                account: Default::default(),
                 lease: Lease {
                     address: "10.66.0.2/32".parse().unwrap(),
                     gateway: None,
@@ -414,18 +453,37 @@ mod tests {
     }
 
     #[test]
-    fn rejection_detail_explains_account_denials() {
+    fn account_denials_are_structured_permanent_errors() {
         let forbidden = http::StatusCode::FORBIDDEN;
-        assert!(rejection_detail(forbidden, Some("account-expired")).contains("expired"));
-        assert!(rejection_detail(forbidden, Some("quota-exceeded")).contains("quota"));
+        let expired = account_denial(forbidden, Some("account-expired")).unwrap();
+        assert_eq!(expired.denial(), Some(AccountDenial::Expired));
+        assert!(expired.is_permanent() && !expired.is_retryable());
+        assert!(expired.to_string().contains("expired"));
         assert_eq!(
-            rejection_detail(forbidden, Some("<script>")),
-            "gateway returned HTTP 403 Forbidden"
+            account_denial(forbidden, Some("quota-exceeded"))
+                .unwrap()
+                .denial(),
+            Some(AccountDenial::QuotaExceeded)
         );
-        assert_eq!(
-            rejection_detail(http::StatusCode::UNAUTHORIZED, None),
-            "gateway returned HTTP 401 Unauthorized"
-        );
+        assert!(account_denial(forbidden, Some("<script>")).is_none());
+        assert!(account_denial(http::StatusCode::UNAUTHORIZED, Some("account-expired")).is_none());
+    }
+
+    #[test]
+    fn account_status_headers_are_optional_and_tolerant() {
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(parse_account_status(&headers), AccountStatus::default());
+        assert!(!AccountStatus::default().is_limited());
+        headers.insert(HEADER_ACCOUNT_EXPIRES, "1900000000".parse().unwrap());
+        headers.insert(HEADER_QUOTA_BYTES, "2147483648".parse().unwrap());
+        headers.insert(HEADER_QUOTA_USED_BYTES, "not-a-number".parse().unwrap());
+        headers.insert(HEADER_RATE_LIMIT_KBPS, "5000".parse().unwrap());
+        let status = parse_account_status(&headers);
+        assert_eq!(status.expires_at, Some(1_900_000_000));
+        assert_eq!(status.quota_bytes, Some(2_147_483_648));
+        assert_eq!(status.quota_used_bytes, None);
+        assert_eq!(status.rate_limit_kbps, Some(5000));
+        assert!(status.is_limited());
     }
 
     #[tokio::test]
