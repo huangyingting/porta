@@ -278,6 +278,7 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         delivery_mode: DeliveryMode::Framed,
         mtu_automatic: false,
         mtu_ceiling: None,
+        peers: None,
         inner: Arc::new(ConnectionInner {
             outbound: outbound_tx,
             inbound: tokio::sync::Mutex::new(inbound_rx),

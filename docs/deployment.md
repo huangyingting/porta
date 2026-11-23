@@ -451,6 +451,38 @@ group, or when the daemon runs with `--client-to-client`
 hub-and-spoke WireGuard bounce server. Enable that only when all clients are
 trusted to see each other.
 
+### Direct paths between devices
+
+With `--peer-to-peer` (`deploy.sh --peer-to-peer`), devices that may reach
+each other under these rules connect directly instead of through the
+gateway, like a Tailscale or NetBird mesh. The gateway only introduces
+them: it tells each HTTP/3 client the public UDP address it sees for each
+of its peers and the certificate fingerprint each peer chose for this
+tunnel. The clients then open QUIC connections to each other from the
+socket that carries their tunnel, authenticate each other by those
+fingerprints, and carry IP packets between their tunnel addresses as QUIC
+datagrams. A device's list changes as peers connect and leave, and when an
+account is disabled or a device revoked its sessions end and its peers drop
+their paths to it.
+
+Direct paths work through NATs that keep a socket's public address for
+every destination, as most home and office routers do. Behind symmetric
+NATs or carrier-grade NATs that do not, a firewall that blocks UDP, or with
+two devices behind one NAT that does not hairpin, the devices keep using
+the gateway, as they do for anything a path cannot carry: packets larger
+than the path allows, traffic to a subnet behind a device, and the moments
+before a path is up or after it breaks (a silent path is given up after 8
+seconds). Only split-tunnel clients use direct paths, because a full tunnel
+sends everything through the gateway by definition, and HTTP/2 clients have
+no UDP socket to share. The admin page's routing banner shows whether the
+gateway offers direct paths.
+
+Traffic on a direct path does not pass the gateway, so it does not count
+toward usage, quotas or rate limits, and the gateway does not see it.
+Access policy still decides which devices are introduced, in both
+directions, and each client accepts only packets from the peer's own tunnel
+addresses to its own.
+
 Each account also has an access policy, set in the admin page's **Network
 access** section or with `PUT /api/clients/{id}/access`:
 

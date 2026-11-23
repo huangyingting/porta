@@ -374,6 +374,8 @@ pub struct GatewayStatus {
     pub ipv6_pool: Option<String>,
     /// Every client reaches every other client (`--client-to-client`).
     pub client_to_client: bool,
+    /// Devices connect directly where they can (`--peer-to-peer`).
+    pub peer_to_peer: bool,
     /// The built-in resolver serves device names (`--dns-resolver`).
     pub dns_resolver: bool,
     /// Exit names an account's access policy may select.

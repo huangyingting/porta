@@ -393,6 +393,24 @@ pub trait PacketRouter: Send + Sync {
         cancellation: CancellationToken,
         packet: Bytes,
     ) -> BoxFuture<'static, Result<(), RouteError>>;
+
+    /// Whether the gateway coordinates direct paths between devices.
+    fn offers_peers(&self) -> bool {
+        false
+    }
+
+    /// Publishes the session at `lease` for direct paths: `endpoint` is its
+    /// public UDP address and `fingerprint` identifies the certificate it
+    /// presents to other devices. The receiver yields the devices it may
+    /// connect to, updated as they come and go, until the session ends.
+    fn announce_peer(
+        &self,
+        _lease: Ipv4Addr,
+        _endpoint: std::net::SocketAddr,
+        _fingerprint: crate::wire::peer::Fingerprint,
+    ) -> Option<tokio::sync::watch::Receiver<Vec<crate::wire::peer::Peer>>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

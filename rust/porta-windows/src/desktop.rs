@@ -86,6 +86,8 @@ struct DesktopSnapshot {
     /// Tunneled prefixes of a split tunnel; empty while a full tunnel is up.
     split_routes: Vec<String>,
     split_dns_domains: Vec<String>,
+    /// Devices reached directly, as `address via endpoint`.
+    direct_peers: Vec<String>,
     activity: Vec<String>,
 }
 
@@ -123,6 +125,7 @@ struct DesktopState {
     account: porta_client::tunnel::AccountStatus,
     account_denial: String,
     routing: porta_client::tunnel::Routing,
+    direct_peers: Vec<porta_client::tunnel::DirectPeer>,
     last_sample_at: Option<Instant>,
     last_uploaded: u64,
     last_downloaded: u64,
@@ -222,6 +225,7 @@ impl Controller {
                 account: Default::default(),
                 account_denial: String::new(),
                 routing: Default::default(),
+                direct_peers: Vec::new(),
                 last_sample_at: None,
                 last_uploaded: 0,
                 last_downloaded: 0,
@@ -619,7 +623,13 @@ impl Controller {
                     traffic = Some(traffic_from(&state));
                     None
                 }
+                Event::DirectPeers(peers) => {
+                    let line = porta_client::tunnel::direct_summary(&peers);
+                    state.direct_peers = peers;
+                    add_activity(&mut state, &line)
+                }
                 Event::Reconnecting { reason, delay } => {
+                    state.direct_peers.clear();
                     state.status = "Reconnecting".to_owned();
                     state.detail = "The network changed; restoring the secure tunnel...".to_owned();
                     state.tone = "warning".to_owned();
@@ -1197,6 +1207,7 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
             .map(ToString::to_string)
             .collect(),
         split_dns_domains: state.routing.dns_domains.clone(),
+        direct_peers: state.direct_peers.iter().map(ToString::to_string).collect(),
         activity: state.activity.clone(),
     }
 }
@@ -1316,6 +1327,7 @@ fn reset_connection(state: &mut DesktopState) {
     state.download_rate = 0;
     state.account = Default::default();
     state.routing = Default::default();
+    state.direct_peers.clear();
     state.last_sample_at = None;
     state.last_uploaded = 0;
     state.last_downloaded = 0;

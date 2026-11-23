@@ -24,6 +24,7 @@ use porta_wire::mtu::{
     fragment_ipv4, icmp_fragmentation_needed, ip_datagram_capacity, DatagramMtu, FeedbackPolicy,
     IcmpContext, MtuError,
 };
+use porta_wire::peer::{self, CAPSULE_PEERS, CAPSULE_PEER_OFFER, PEERS_HEADER};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use tokio::sync::{mpsc, oneshot};
@@ -265,6 +266,9 @@ async fn connect_address(
             let mut lease = response_lease(response.headers())?;
             let account = super::parse_account_status(response.headers());
             let routing = super::parse_routing(response.headers())?;
+            // Direct paths leave the tunnel, so a full tunnel never has one.
+            let offers_peers = header(response.headers(), PEERS_HEADER) == Some("?1")
+                && !routing.is_full_tunnel();
             let (automatic, ceiling) = configure_mtu(
                 config,
                 response.headers(),
@@ -308,7 +312,7 @@ async fn connect_address(
             writer_lease_tx.send(lease).map_err(|_| {
                 failure.current().unwrap_or(ClientError::Closed)
             })?;
-            Ok((lease, account, routing, automatic, ceiling, datagrams))
+            Ok((lease, account, routing, automatic, ceiling, datagrams, offers_peers))
         }) => {
             result.unwrap_or_else(|_| {
                 Err(if transport_ready {
@@ -319,7 +323,7 @@ async fn connect_address(
             })
         }
     };
-    let (lease, account, routing, automatic, ceiling, datagrams) = match established {
+    let (lease, account, routing, automatic, ceiling, datagrams, offers_peers) = match established {
         Ok(established) => established,
         Err(error) => {
             cancellation.cancel();
@@ -332,10 +336,37 @@ async fn connect_address(
         }
     };
 
+    // Without direct paths the tunnel works as before, so failing to set
+    // them up is not an error.
+    let peers = if offers_peers {
+        match super::peer::Peers::start(
+            endpoint.clone(),
+            lease,
+            routing.clone(),
+            inbound_tx.clone(),
+            &tasks,
+            cancellation.clone(),
+        ) {
+            Ok((peers, fingerprint)) => send_capsule(
+                &outbound_tx,
+                &failure,
+                CAPSULE_PEER_OFFER,
+                Bytes::from(peer::encode_offer(&fingerprint)),
+            )
+            .await
+            .ok()
+            .map(|()| peers),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let close_cancellation = cancellation.clone();
     tasks.spawn(async move {
         close_cancellation.cancelled().await;
         quic.close(0_u32.into(), b"client closed");
+        endpoint.close(0_u32.into(), b"client closed");
         endpoint.wait_idle().await;
     });
 
@@ -353,6 +384,7 @@ async fn connect_address(
         },
         mtu_automatic: automatic,
         mtu_ceiling: ceiling,
+        peers,
         inner: Arc::new(ConnectionInner {
             outbound: outbound_tx,
             inbound: tokio::sync::Mutex::new(inbound_rx),
@@ -1359,6 +1391,10 @@ async fn handle_capsule(
         CAPSULE_ROUTE_ADVERTISEMENT => {
             masque::decode_route_advertisement(&value).map_err(ClientError::permanent)?;
         }
+        CAPSULE_PEERS => {
+            let peers = peer::decode_peers(&value).map_err(ClientError::permanent)?;
+            deliver_inbound(inbound, cancellation, Inbound::Peers(peers)).await?;
+        }
         CAPSULE_DATAGRAM => match masque::decode_ip_packet(&value) {
             Ok(packet) => {
                 deliver_inbound(
@@ -1572,6 +1608,7 @@ mod tests {
                 },
                 mtu_automatic: true,
                 mtu_ceiling: Some(1400),
+                peers: None,
                 inner: Arc::new(ConnectionInner {
                     outbound,
                     inbound: tokio::sync::Mutex::new(received),
@@ -2461,6 +2498,7 @@ mod tests {
             delivery_mode: DeliveryMode::Datagram,
             mtu_automatic: true,
             mtu_ceiling: Some(1400),
+            peers: None,
             inner: Arc::new(ConnectionInner {
                 outbound,
                 inbound: tokio::sync::Mutex::new(receiver),

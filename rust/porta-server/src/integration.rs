@@ -30,11 +30,12 @@ use crate::web::admin::{
     RegistryError as WebRegistryError,
 };
 use crate::wire::device_auth;
+use crate::wire::peer::{Fingerprint, Peer, MAX_PEERS};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -1129,6 +1130,7 @@ pub struct RouterAdapter {
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
     /// Account and network policy of each live session, by lease.
     contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
+    peers: Arc<PeerDirectory>,
     switching: SwitchConfig,
 }
 
@@ -1137,6 +1139,8 @@ pub struct RouterAdapter {
 pub struct SwitchConfig {
     /// Every client may reach every other client, as if in one group.
     pub client_to_client: bool,
+    /// Devices learn each other's public addresses to connect directly.
+    pub peer_to_peer: bool,
     /// Destinations that access policies never block, such as the gateway
     /// addresses and its DNS server.
     pub always_reachable: Vec<IpAddr>,
@@ -1158,6 +1162,99 @@ struct RouteContext {
     network: NetworkPolicy,
     /// The session's IPv6 address, when it has one.
     ipv6: Option<std::net::Ipv6Addr>,
+}
+
+/// Whether two sessions' devices may exchange traffic.
+fn may_peer(client_to_client: bool, first: &RouteContext, second: &RouteContext) -> bool {
+    client_to_client
+        || first.account_id == second.account_id
+        || (first.network.group.is_some() && first.network.group == second.network.group)
+}
+
+/// Sessions published for direct paths, and the peer list each receives.
+#[derive(Default)]
+struct PeerDirectory {
+    client_to_client: bool,
+    announced: Mutex<HashMap<Ipv4Addr, Announced>>,
+}
+
+struct Announced {
+    context: Arc<RouteContext>,
+    endpoint: SocketAddr,
+    fingerprint: Fingerprint,
+    updates: tokio::sync::watch::Sender<Vec<Peer>>,
+}
+
+impl PeerDirectory {
+    fn announce(
+        &self,
+        lease: Ipv4Addr,
+        context: Arc<RouteContext>,
+        endpoint: SocketAddr,
+        fingerprint: Fingerprint,
+    ) -> tokio::sync::watch::Receiver<Vec<Peer>> {
+        let (updates, receiver) = tokio::sync::watch::channel(Vec::new());
+        let mut announced = self.announced.lock();
+        announced.insert(
+            lease,
+            Announced {
+                context,
+                endpoint: SocketAddr::new(endpoint.ip().to_canonical(), endpoint.port()),
+                fingerprint,
+                updates,
+            },
+        );
+        self.publish(&announced);
+        receiver
+    }
+
+    /// Removes the session at `lease` if `context` is still its session.
+    fn withdraw(&self, lease: Ipv4Addr, context: &Arc<RouteContext>) {
+        let mut announced = self.announced.lock();
+        if announced
+            .get(&lease)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.context, context))
+        {
+            announced.remove(&lease);
+            self.publish(&announced);
+        }
+    }
+
+    /// Sends each session the devices it and they may both reach: the same
+    /// rules as traffic switched through the gateway, in both directions.
+    fn publish(&self, announced: &HashMap<Ipv4Addr, Announced>) {
+        for (address, entry) in announced {
+            let own = &entry.context;
+            let mut peers = announced
+                .iter()
+                .filter(|(other, peer)| {
+                    *other != address
+                        && may_peer(self.client_to_client, own, &peer.context)
+                        && own.network.permits(IpAddr::V4(**other))
+                        && peer.context.network.permits(IpAddr::V4(*address))
+                })
+                .map(|(other, peer)| Peer {
+                    address: *other,
+                    address6: own.ipv6.zip(peer.context.ipv6).and_then(|(mine, theirs)| {
+                        (own.network.permits(IpAddr::V6(theirs))
+                            && peer.context.network.permits(IpAddr::V6(mine)))
+                        .then_some(theirs)
+                    }),
+                    endpoint: peer.endpoint,
+                    fingerprint: peer.fingerprint,
+                })
+                .collect::<Vec<_>>();
+            peers.sort_by_key(|peer| peer.address);
+            peers.truncate(MAX_PEERS);
+            entry.updates.send_if_modified(|current| {
+                let changed = *current != peers;
+                if changed {
+                    *current = peers;
+                }
+                changed
+            });
+        }
+    }
 }
 
 /// What happens to a packet a client sent.
@@ -1196,15 +1293,16 @@ impl RouterAdapter {
             limiters,
             uplink: Arc::default(),
             contexts: Arc::default(),
+            peers: Arc::new(PeerDirectory {
+                client_to_client: switching.client_to_client,
+                ..PeerDirectory::default()
+            }),
             switching,
         })
     }
 
-    /// Whether two sessions' devices may exchange traffic.
     fn peers(&self, sender: &RouteContext, receiver: &RouteContext) -> bool {
-        self.switching.client_to_client
-            || sender.account_id == receiver.account_id
-            || (sender.network.group.is_some() && sender.network.group == receiver.network.group)
+        may_peer(self.switching.client_to_client, sender, receiver)
     }
 
     /// Whether `querier` may learn about the device at `address`.
@@ -1301,6 +1399,7 @@ struct RouteHandle {
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
     context: Arc<RouteContext>,
     contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
+    peers: Arc<PeerDirectory>,
     /// The exit rule this session installed, released when it closes.
     exit: Option<(Arc<ExitRules>, u64)>,
 }
@@ -1359,6 +1458,7 @@ impl Cleanup for RouteHandle {
             contexts.remove(&self.address);
         }
         drop(contexts);
+        self.peers.withdraw(self.address, &self.context);
         if let Some((exits, generation)) = &self.exit {
             exits.release(self.address, *generation);
         }
@@ -1377,6 +1477,7 @@ impl PacketRouter for RouterAdapter {
         let limiters = self.limiters.clone();
         let uplink = self.uplink.clone();
         let contexts = self.contexts.clone();
+        let peers = self.peers.clone();
         let exits = self.switching.exits.clone();
         Box::pin(async move {
             let lease = lease.ok_or(RouteError::Conflict)?;
@@ -1446,6 +1547,7 @@ impl PacketRouter for RouterAdapter {
                 uplink,
                 context,
                 contexts,
+                peers,
                 exit,
             });
             Ok(RouteSession {
@@ -1504,6 +1606,26 @@ impl PacketRouter for RouterAdapter {
                 .await
                 .map_err(map_route_error)
         })
+    }
+
+    fn offers_peers(&self) -> bool {
+        self.switching.peer_to_peer
+    }
+
+    fn announce_peer(
+        &self,
+        lease: Ipv4Addr,
+        endpoint: SocketAddr,
+        fingerprint: Fingerprint,
+    ) -> Option<tokio::sync::watch::Receiver<Vec<Peer>>> {
+        if !self.switching.peer_to_peer {
+            return None;
+        }
+        // Holding the session table keeps a closing session from being
+        // published after its withdrawal.
+        let contexts = self.contexts.read();
+        let context = contexts.get(&lease)?.clone();
+        Some(self.peers.announce(lease, context, endpoint, fingerprint))
     }
 }
 
@@ -1878,6 +2000,81 @@ mod tests {
         })
     }
 
+    #[test]
+    fn peer_lists_follow_switching_rules_both_ways_and_withdrawals() {
+        let directory = PeerDirectory::default();
+        let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
+        let c: Ipv4Addr = "10.66.0.4".parse().unwrap();
+        let d: Ipv4Addr = "10.66.0.5".parse().unwrap();
+        let alpha = context("alpha", NetworkPolicy::default());
+        let mut dual = context("alpha", NetworkPolicy::default());
+        Arc::get_mut(&mut dual).unwrap().ipv6 = Some("fd66::3".parse().unwrap());
+        // One account, but its policy keeps it away from a.
+        let fenced = context(
+            "alpha",
+            NetworkPolicy {
+                deny: vec!["10.66.0.2/32".parse().unwrap()],
+                ..NetworkPolicy::default()
+            },
+        );
+        let endpoint = |port| SocketAddr::new("198.51.100.7".parse().unwrap(), port);
+        let mut first = directory.announce(a, alpha.clone(), endpoint(1000), [1; 32]);
+        assert!(first.borrow_and_update().is_empty());
+        let mut second = directory.announce(b, dual.clone(), endpoint(2000), [2; 32]);
+        directory.announce(c, fenced.clone(), endpoint(3000), [3; 32]);
+        let other = directory.announce(
+            d,
+            context("beta", NetworkPolicy::default()),
+            "[::ffff:203.0.113.9]:4000".parse().unwrap(),
+            [4; 32],
+        );
+        assert!(first.has_changed().unwrap());
+        let peers = first.borrow_and_update().clone();
+        assert_eq!(
+            peers,
+            vec![Peer {
+                address: b,
+                // a has no IPv6, so b's is not offered.
+                address6: None,
+                endpoint: endpoint(2000),
+                fingerprint: [2; 32],
+            }]
+        );
+        assert_eq!(
+            second
+                .borrow_and_update()
+                .iter()
+                .map(|peer| peer.address)
+                .collect::<Vec<_>>(),
+            vec![a, c]
+        );
+        assert!(other.borrow().is_empty());
+
+        // A stale session's withdrawal does not remove its successor.
+        directory.withdraw(b, &alpha);
+        assert!(!first.has_changed().unwrap());
+        directory.withdraw(b, &dual);
+        assert!(first.borrow_and_update().is_empty());
+        drop(second);
+
+        let switching = PeerDirectory {
+            client_to_client: true,
+            ..PeerDirectory::default()
+        };
+        let first = switching.announce(a, alpha, endpoint(1000), [1; 32]);
+        switching.announce(
+            d,
+            context("beta", NetworkPolicy::default()),
+            "[::ffff:203.0.113.9]:4000".parse().unwrap(),
+            [4; 32],
+        );
+        assert_eq!(
+            first.borrow()[0].endpoint,
+            "203.0.113.9:4000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn switching_enforces_sources_peers_and_access_policy() {
         let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
@@ -1896,6 +2093,7 @@ mod tests {
                 RateLimiters::new(),
                 SwitchConfig {
                     client_to_client,
+                    peer_to_peer: false,
                     always_reachable: vec![IpAddr::V4(gateway)],
                     exits: None,
                     names: None,

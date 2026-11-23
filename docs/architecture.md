@@ -197,6 +197,24 @@ the exit are checked against the sender's lists; packets sourced from a
 subnet may only reach other clients. The kernel forward chain therefore drops
 all `porta0`-to-`porta0` traffic.
 
+With `--peer-to-peer`, the gateway also introduces peers so that they can
+skip it (`porta_wire::peer`). It sets `x-porta-peers: ?1` on HTTP/3
+CONNECT-IP responses. A split-tunnel client then generates a self-signed
+certificate for the tunnel and sends its SHA-256 fingerprint in a
+`PEER_OFFER` capsule (`0xff7010`). The gateway records it with the UDP
+address it sees for the QUIC connection and answers with a `PEERS` capsule
+(`0xff7011`): every published device the two may both reach under the
+switching rules above, with its tunnel addresses, public address and
+fingerprint, resent whenever the list changes. Clients share the tunnel's
+UDP socket with their peer connections, so NATs map both to the address the
+gateway saw. Of each pair the lower tunnel address dials, over QUIC with
+ALPN `porta-peer/1` and mutual certificate pinning; the other side sends
+throwaway connection attempts of its own to open its NAT, accepts only from
+the address the gateway listed, and confirms the handshake by opening a
+stream, because a TLS client finishes before the server has checked its
+certificate. IP packets travel as QUIC datagrams; anything that does not
+fit or has no live path goes through the gateway.
+
 Packet-device reads transfer ownership of their buffers to the caller. The
 router and client receive queues pass those buffers onward without another
 payload copy. Reusable decoder buffers are used only where TUN writes finish

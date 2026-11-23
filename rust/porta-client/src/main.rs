@@ -201,6 +201,10 @@ mod linux {
 
     fn print_event(event: Event) {
         if event.state == State::Connected {
+            // Changes while connected, such as direct paths.
+            if event.message != "Connected" {
+                eprintln!("porta-client: {}", event.message);
+            }
             let lease = event.lease.expect("connected event includes a lease");
             eprintln!(
                 "porta-client: connected address={}{} dns={} mtu={} transport={} uploaded={} downloaded={}{}",
@@ -505,6 +509,9 @@ mod windows {
                 "porta-client: reconnecting in {}: {reason}",
                 humantime::format_duration(delay)
             ),
+            Event::DirectPeers(peers) => {
+                eprintln!("porta-client: {}", porta_client::tunnel::direct_summary(&peers))
+            }
             Event::Stopping => eprintln!("porta-client: stopping"),
         }
     }

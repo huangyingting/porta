@@ -31,6 +31,7 @@ make test-gateway-failover
 make test-ipv6
 make test-graceful-restart
 make test-client-daemon
+make test-peer-to-peer
 make test-standard-masque
 make test-apple-ffi
 make test-service-user
@@ -105,6 +106,14 @@ reporting a rejected token, and checking that only root and the control
 group may use the socket. `make build-linux-desktop` builds the window
 itself (`porta-linux --features gui`); workspace builds leave it out so
 they need no GTK files.
+
+`make test-peer-to-peer` runs `scripts/test-peer-to-peer.sh`: two clients
+behind separate masquerading NATs, which drop unsolicited packets like home
+routers, learn each other's public addresses from a `--peer-to-peer`
+gateway and punch through both NATs. The test checks that their traffic
+takes the direct path, returns to the gateway when the path is blocked and
+goes direct again when it heals, and that a device disconnecting ends its
+peers' paths to it.
 
 `make test-standard-masque` builds the interop probe in
 `experiments/masque-interop` (Go, using the independent quic-go/connect-ip-go

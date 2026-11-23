@@ -93,6 +93,7 @@ pub fn unavailable_snapshot(error: &str) -> Value {
         "accountDenial": "",
         "splitRoutes": [],
         "splitDnsDomains": [],
+        "directPeers": [],
         "activity": [],
     })
 }

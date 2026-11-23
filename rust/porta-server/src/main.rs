@@ -151,6 +151,7 @@ async fn run() -> Result<Stop> {
             .collect::<Vec<_>>();
         let dns_domains = config.dns_domains.clone();
         let client_to_client = config.client_to_client;
+        let peer_to_peer = config.peer_to_peer;
         let dns_resolver = config.dns_resolver;
         let exits = config.exit_names();
         let ipv6_pool = config.ipv6_pool.map(|prefix| prefix.to_string());
@@ -159,6 +160,7 @@ async fn run() -> Result<Stop> {
             ipv6_pool: ipv6_pool.clone(),
             dns_domains: dns_domains.clone(),
             client_to_client,
+            peer_to_peer,
             dns_resolver,
             exits: exits.clone(),
             federation: match &federation {
@@ -241,6 +243,7 @@ async fn run() -> Result<Stop> {
         rate_limits.clone(),
         SwitchConfig {
             client_to_client: config.client_to_client,
+            peer_to_peer: config.peer_to_peer,
             always_reachable: [
                 Some(IpAddr::V4(pool.gateway())),
                 config.dns_address()?.map(IpAddr::V4),

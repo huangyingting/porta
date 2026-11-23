@@ -118,6 +118,12 @@ pub struct Config {
     /// access group reach each other.
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub client_to_client: bool,
+    /// Let devices that may reach each other connect directly over UDP,
+    /// with this gateway exchanging their addresses; traffic falls back
+    /// through the gateway when no direct path works. HTTP/3 clients on
+    /// split tunnels only.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    pub peer_to_peer: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub auto_mtu: bool,
     #[arg(long, default_value = "")]

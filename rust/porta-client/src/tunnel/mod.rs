@@ -2,6 +2,7 @@ mod error;
 mod h2;
 mod h2_queue;
 mod h3;
+mod peer;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub use error::{AccountDenial, ClientError};
+pub use peer::{direct_summary, DirectPeer};
 
 pub const TUNNEL_PATH: &str = "/v1/tunnel";
 pub const MASQUE_PATH: &str = "/.well-known/masque/ip/%2A/%2A/";
@@ -285,6 +287,8 @@ pub struct Connection {
     pub delivery_mode: DeliveryMode,
     pub mtu_automatic: bool,
     pub mtu_ceiling: Option<u16>,
+    /// Direct paths to other devices, when the gateway coordinates them.
+    peers: Option<Arc<peer::Peers>>,
     inner: Arc<ConnectionInner>,
 }
 
@@ -400,6 +404,7 @@ enum Inbound {
     MtuProbe(porta_wire::masque::MtuProbe),
     MtuSelected(Bytes),
     Address(Assignment),
+    Peers(Vec<porta_wire::peer::Peer>),
     Failure(ClientError),
 }
 
@@ -407,6 +412,12 @@ impl Connection {
     /// Account limits most recently reported by the gateway.
     pub fn account(&self) -> AccountStatus {
         *self.account.lock().expect("tunnel account lock poisoned")
+    }
+
+    /// The devices this tunnel reaches directly, as they change; `None`
+    /// when the gateway does not coordinate direct paths.
+    pub fn direct_peers(&self) -> Option<tokio::sync::watch::Receiver<Vec<DirectPeer>>> {
+        self.peers.as_ref().map(|peers| peers.status())
     }
 
     pub async fn send(&self, packet: &[u8]) -> Result<(), ClientError> {
@@ -431,6 +442,11 @@ impl Connection {
                 info.source, self.lease.address
             )));
         }
+        if let Some(peers) = &self.peers {
+            if self.lease.owns(info.source) && peers.send(info.destination, packet) {
+                return Ok(());
+            }
+        }
         send_outbound(&self.inner.outbound, &self.inner.failure, |result| {
             Outbound::Packet {
                 packet: Bytes::copy_from_slice(packet),
@@ -453,6 +469,11 @@ impl Connection {
                     };
                     if self.lease.owns(info.destination) || self.routing.serves(info.destination) {
                         return Ok(packet);
+                    }
+                }
+                Inbound::Peers(listed) => {
+                    if let Some(peers) = &self.peers {
+                        peers.update(listed);
                     }
                 }
                 Inbound::Failure(error) => return Err(error),
@@ -578,6 +599,7 @@ mod tests {
                 delivery_mode: DeliveryMode::Capsule,
                 mtu_automatic: false,
                 mtu_ceiling: None,
+                peers: None,
                 inner: Arc::new(ConnectionInner {
                     outbound,
                     inbound: Mutex::new(inbound),

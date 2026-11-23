@@ -67,6 +67,8 @@ pub enum Event {
         /// Latest gateway-reported limits, which can change while connected.
         account: crate::tunnel::AccountStatus,
     },
+    /// The devices the tunnel reaches directly changed.
+    DirectPeers(Vec<crate::tunnel::DirectPeer>),
     Reconnecting {
         reason: String,
         delay: Duration,
@@ -416,10 +418,17 @@ async fn run_session(
     let mut progress = tokio::time::interval(Duration::from_secs(1));
     progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     progress.tick().await;
+    let mut direct = connection.direct_peers();
 
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return SessionEnd::Cancelled,
+            changed = async { direct.as_mut().expect("guarded").changed().await }, if direct.is_some() => {
+                match direct.as_mut().filter(|_| changed.is_ok()) {
+                    Some(peers) => observer.event(Event::DirectPeers(peers.borrow_and_update().clone())),
+                    None => direct = None,
+                }
+            }
             Some(error) = device_errors.recv() => {
                 return SessionEnd::Terminal(Box::new(error));
             }

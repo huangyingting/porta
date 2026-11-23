@@ -1052,6 +1052,18 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--dns 1.1.1.1 --client-to-client --mtu", start)
         self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
         self.assertIn("allowed within 10.66.0.0/24", result.stdout)
+        self.assertIn("Direct paths:    off", result.stdout)
+
+        # Saved like other options, so a plain redeploy keeps direct paths.
+        self.run_deploy(deploy, "--build-local", "--peer-to-peer")
+        result = self.run_deploy(deploy, "--build-local")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn("--dns 1.1.1.1 --client-to-client --peer-to-peer --mtu", start)
+        self.assertIn("Direct paths:    offered", result.stdout)
+        self.run_deploy(deploy, "--build-local", "--peer-to-peer=false")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertNotIn("--peer-to-peer", unit)
 
     def test_deploy_runs_the_daemon_as_an_unprivileged_user(self):
         deploy = self.prepare_deploy(timer=False)

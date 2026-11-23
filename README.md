@@ -111,7 +111,8 @@ Repeat with `--upstream https://relay.example.com` for a longer chain. Every
 hop can keep the default pool, clients need no changes, and relays fail
 closed: if the next hop is down, relayed traffic is dropped instead of leaving
 through the relay's own connection. Add `--client-to-client` to let clients of
-one gateway reach each other (hub and spoke). See
+one gateway reach each other (hub and spoke), and `--peer-to-peer` to let
+devices connect directly through NATs where they can (mesh). See
 [cascade relays](docs/deployment.md#cascade-relays-multi-hop).
 Forward-proxy CONNECT uses HTTP/1.1 or HTTP/2; HTTP/3 is reserved for the
 native MASQUE CONNECT-IP tunnel.

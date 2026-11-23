@@ -78,6 +78,8 @@ jobs:
         run: make test-graceful-restart
       - name: Test the Linux desktop service end to end
         run: make test-client-daemon
+      - name: Test direct paths between devices through NATs end to end
+        run: make test-peer-to-peer
       - name: Test the Apple apps' C interface end to end
         run: make test-apple-ffi
       - name: Test the unprivileged systemd service end to end

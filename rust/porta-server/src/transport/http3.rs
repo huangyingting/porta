@@ -38,6 +38,7 @@ use crate::wire::masque::{
     CAPSULE_MTU_SELECTED, CAPSULE_ROUTE_ADVERTISEMENT, MAX_CAPSULE_SIZE, MAX_DISCOVERED_MTU,
     MTU_DISCOVERY_HEADER, SAFE_MTU,
 };
+use crate::wire::peer::{self, Peer, CAPSULE_PEERS, CAPSULE_PEER_OFFER, PEERS_HEADER};
 
 const CAPSULE_PROTOCOL: &str = "Capsule-Protocol";
 const MAX_WEB_BODY: usize = 16 << 10;
@@ -617,6 +618,12 @@ where
     let mut response = success_response(config, mtu.as_ref(), &session.lease);
     set_account_headers(response.headers_mut(), &session.account);
     session.routing.set_headers(response.headers_mut());
+    let offers_peers = !session.proof.is_standard() && session.services().router.offers_peers();
+    if offers_peers {
+        response
+            .headers_mut()
+            .insert(PEERS_HEADER, http::HeaderValue::from_static("?1"));
+    }
     let response_sent = tokio::select! {
         biased;
         _ = session.cancellation.cancelled() => false,
@@ -680,6 +687,7 @@ where
     }
     let writer_cancellation = CancellationToken::new();
     let connection = diagnostics.connection.clone();
+    let mut peer_updates: Option<tokio::sync::watch::Receiver<Vec<Peer>>> = None;
 
     let mut result: Result<&'static str> = {
         // Poll writes independently: receive handlers only try_enqueue, even while
@@ -761,6 +769,25 @@ where
                         CAPSULE_ADDRESS_ASSIGN => {
                             decode_address_assign(&value)?;
                         }
+                        CAPSULE_PEER_OFFER if offers_peers && assigned && peer_updates.is_none() => {
+                            let Ok(fingerprint) = peer::decode_offer(&value) else {
+                                continue;
+                            };
+                            peer_updates = session.services().router.announce_peer(
+                                session.lease.address,
+                                connection.remote_address(),
+                                fingerprint,
+                            );
+                            if let Some(updates) = peer_updates.as_mut() {
+                                tracing::info!(
+                                    address = %session.lease.address,
+                                    endpoint = %connection.remote_address(),
+                                    "device published for direct paths"
+                                );
+                                let peers = updates.borrow_and_update().clone();
+                                writer.control(peers_capsule(&peers)?, None)?;
+                            }
+                        }
                         CAPSULE_ROUTE_ADVERTISEMENT => {
                             decode_route_advertisement(&value)?;
                         }
@@ -803,6 +830,14 @@ where
                     }
                     Err(_) => session.services().metrics.dropped_from_client(),
                 }
+            }
+            changed = async { peer_updates.as_mut().expect("guarded").changed().await }, if peer_updates.is_some() => {
+                if changed.is_err() {
+                    peer_updates = None;
+                    continue;
+                }
+                let peers = peer_updates.as_mut().expect("guarded").borrow_and_update().clone();
+                writer.control(peers_capsule(&peers)?, None)?;
             }
             packet = session.downlink.next_packet(), if downlink_ready => {
                 let Some(packet) = packet else {
@@ -1671,6 +1706,13 @@ pub(crate) fn unsolicited_assignment(
     let mut control = BytesMut::with_capacity(assignment.len() + routes.len() + 16);
     append_capsule(&mut control, CAPSULE_ADDRESS_ASSIGN, &assignment)?;
     append_capsule(&mut control, CAPSULE_ROUTE_ADVERTISEMENT, &routes)?;
+    Ok(control.freeze())
+}
+
+fn peers_capsule(peers: &[Peer]) -> Result<Bytes> {
+    let value = peer::encode_peers(peers)?;
+    let mut control = BytesMut::with_capacity(value.len() + 16);
+    append_capsule(&mut control, CAPSULE_PEERS, &value)?;
     Ok(control.freeze())
 }
 

@@ -160,6 +160,12 @@ not conceal transport fingerprints from network inspection.
   every client of a gateway, across all accounts, a peer. Leave it off unless
   all clients are mutually trusted; client hosts must protect their own
   services from their peers.
+- With `--peer-to-peer`, peers learn each other's public IP addresses and
+  traffic between them bypasses the gateway: it is not logged, counted
+  toward usage or quotas, or rate limited there. Peers authenticate each
+  other only through fingerprints the gateway vouches for, so a compromised
+  gateway can impersonate peers either way. Each client drops direct
+  packets that are not from the peer's tunnel addresses to its own.
 - `PORTA_FEDERATION_TOKEN` lets its holder download every account's token
   hash, devices and policies from a primary; token hashes are SHA-256 of
   random tokens and cannot be reversed, but treat the federation token like

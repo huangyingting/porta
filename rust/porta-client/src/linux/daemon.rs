@@ -150,6 +150,7 @@ pub struct Snapshot {
     account_denial: String,
     split_routes: Vec<String>,
     split_dns_domains: Vec<String>,
+    direct_peers: Vec<String>,
     activity: Vec<String>,
 }
 
@@ -177,6 +178,7 @@ struct Status {
     account: AccountStatus,
     account_denial: String,
     routing: Routing,
+    direct_peers: Vec<crate::tunnel::DirectPeer>,
     activity: Vec<String>,
 }
 
@@ -355,6 +357,11 @@ impl Daemon {
                 .chain(status.routing.routes6.iter().map(ToString::to_string))
                 .collect(),
             split_dns_domains: status.routing.dns_domains.clone(),
+            direct_peers: status
+                .direct_peers
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             activity: status.activity.clone(),
         }
     }
@@ -642,6 +649,13 @@ impl Daemon {
                 status.transport = transport.to_owned();
                 status.account = event.account;
                 status.routing = event.routing;
+                if status.direct_peers != event.direct_peers {
+                    add_activity(
+                        &mut status.activity,
+                        &crate::tunnel::direct_summary(&event.direct_peers),
+                    );
+                    status.direct_peers = event.direct_peers;
+                }
                 status.connected_at = event.connected_at.map(rfc3339).unwrap_or_default();
                 update_rates(&mut status, event.bytes_uploaded, event.bytes_downloaded);
             }
@@ -733,6 +747,7 @@ fn reset_connection(status: &mut Status) {
     status.last_sample = None;
     status.account = AccountStatus::default();
     status.routing = Routing::default();
+    status.direct_peers.clear();
 }
 
 fn update_rates(status: &mut Status, uploaded: u64, downloaded: u64) {

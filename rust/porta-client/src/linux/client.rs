@@ -70,6 +70,8 @@ pub struct Event {
     pub connected_at: Option<SystemTime>,
     /// Routes and DNS domains of the current tunnel.
     pub routing: crate::tunnel::Routing,
+    /// Devices the tunnel currently reaches directly.
+    pub direct_peers: Vec<crate::tunnel::DirectPeer>,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub packets_uploaded: u64,
@@ -121,6 +123,7 @@ struct EventDetails {
     delivery_mode: DeliveryMode,
     connected_at: Option<SystemTime>,
     routing: crate::tunnel::Routing,
+    direct_peers: Vec<crate::tunnel::DirectPeer>,
 }
 
 impl Counters {
@@ -134,6 +137,7 @@ impl Counters {
             delivery_mode: details.delivery_mode,
             connected_at: details.connected_at,
             routing: details.routing,
+            direct_peers: details.direct_peers,
             bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: self.bytes_downloaded.load(Ordering::Relaxed),
             packets_uploaded: self.packets_uploaded.load(Ordering::Relaxed),
@@ -213,6 +217,7 @@ struct Runtime {
     delivery_mode: DeliveryMode,
     connected_at: Option<SystemTime>,
     routing: crate::tunnel::Routing,
+    direct_peers: Vec<crate::tunnel::DirectPeer>,
     counters: Arc<Counters>,
 }
 
@@ -235,6 +240,7 @@ impl Runtime {
             delivery_mode: DeliveryMode::Unknown,
             connected_at: None,
             routing: crate::tunnel::Routing::default(),
+            direct_peers: Vec::new(),
             counters: Arc::new(Counters::default()),
         }
     }
@@ -283,6 +289,7 @@ impl Runtime {
                 delivery_mode: self.delivery_mode,
                 connected_at: self.connected_at,
                 routing: self.routing.clone(),
+                direct_peers: self.direct_peers.clone(),
             },
         )
     }
@@ -348,6 +355,7 @@ pub async fn run(
         packets_uploaded: 0,
         packets_downloaded: 0,
         routing: crate::tunnel::Routing::default(),
+        direct_peers: Vec::new(),
     });
     observer(Event {
         state: State::Connecting,
@@ -362,6 +370,7 @@ pub async fn run(
         packets_uploaded: 0,
         packets_downloaded: 0,
         routing: crate::tunnel::Routing::default(),
+        direct_peers: Vec::new(),
     });
 
     let network = if config.manual_network {
@@ -631,6 +640,7 @@ async fn run_loop(
                     delivery_mode: connection.delivery_mode,
                     connected_at: runtime.connected_at,
                     routing: connection.routing.clone(),
+                    direct_peers: Vec::new(),
                 },
             ));
             if let Err(error) = network
@@ -653,6 +663,7 @@ async fn run_loop(
         runtime.lease = Some(connection.lease);
         runtime.routing = connection.routing.clone();
         runtime.account = connection.account();
+        runtime.direct_peers.clear();
         runtime.ensure_reader(cancellation);
         runtime.connected_at.get_or_insert_with(SystemTime::now);
         observer(runtime.event(State::Connected, "Connected"));
@@ -766,9 +777,21 @@ async fn run_connection(
         Duration::from_secs(1),
     );
     progress.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut direct = connection.direct_peers();
     let result = loop {
         tokio::select! {
             _ = cancellation.cancelled() => break RunError::Cancelled,
+            changed = async { direct.as_mut().expect("guarded").changed().await }, if direct.is_some() => {
+                let Some(peers) = direct.as_mut().filter(|_| changed.is_ok()) else {
+                    direct = None;
+                    continue;
+                };
+                runtime.direct_peers = peers.borrow_and_update().clone();
+                observer(runtime.event(
+                    State::Connected,
+                    crate::tunnel::direct_summary(&runtime.direct_peers),
+                ));
+            }
             error = runtime.device_error_rx.recv() => {
                 break RunError::Device(error.unwrap_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof)));
             }

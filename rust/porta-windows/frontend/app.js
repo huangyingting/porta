@@ -84,6 +84,7 @@ const messages = {
     fullTunnel: "All traffic goes through the gateway",
     splitTunnel: "Split tunnel · {count} networks via the gateway",
     splitTunnelDns: "Split tunnel · {count} networks via the gateway · DNS for {domains}",
+    directPeers: "{count} devices reached directly",
     accountExpiresSoon: "Access ends {date}",
     quotaUsage: "{used} of {total} used this month",
     quotaAllowance: "{total} monthly allowance",
@@ -186,6 +187,7 @@ const messages = {
     fullTunnel: "所有流量均经由网关",
     splitTunnel: "分流模式 · {count} 个网络经由网关",
     splitTunnelDns: "分流模式 · {count} 个网络经由网关 · {domains} 使用隧道 DNS",
+    directPeers: "{count} 台设备直连",
     accountExpiresSoon: "将于 {date} 到期",
     quotaUsage: "本月已用 {used} / {total}",
     quotaAllowance: "每月额度 {total}",
@@ -500,9 +502,11 @@ function renderRouting(snapshot) {
     if (!routes.length) text = t("fullTunnel");
     else if (domains.length) text = t("splitTunnelDns", { count: routes.length, domains: domains.join(", ") });
     else text = t("splitTunnel", { count: routes.length });
+    const direct = snapshot.directPeers || [];
+    if (direct.length) text += " · " + t("directPeers", { count: direct.length });
   }
   setText("routing-detail", text);
-  element.title = routes.join("\n");
+  element.title = routes.concat(snapshot.directPeers || []).join("\n");
   element.classList.toggle("hidden", !text);
 }
 

@@ -452,7 +452,21 @@ class TunnelService : VpnService() {
             formatConnectedEvents(details).forEach(::logEvent)
             updateConnectionStatus("Connected over $transport", runGeneration)
             sender.start()
+            var directPeers = ""
+            var directCheckedAt = System.nanoTime()
             while (isRunActive(runGeneration) && attemptActive.get()) {
+                val now = System.nanoTime()
+                if (now - directCheckedAt >= DIRECT_PEERS_CHECK_NANOS) {
+                    directCheckedAt = now
+                    val current = activeSession.directPeers()
+                    if (current != directPeers) {
+                        directPeers = current
+                        logEvent(
+                            if (current.isEmpty()) "Direct paths: none; peers are reached through the gateway"
+                            else "Direct paths: ${current.replace(",", ", ")}"
+                        )
+                    }
+                }
                 val packet = try {
                     activeSession.receive()
                 } catch (error: Exception) {
@@ -1074,6 +1088,7 @@ class TunnelService : VpnService() {
         private const val STABLE_CONNECTION_MILLIS = 30_000L
         private const val VPN_READER_STOP_TIMEOUT_MILLIS = 2_000L
         private const val NATIVE_SENDER_STOP_TIMEOUT_MILLIS = 2_000L
+        private val DIRECT_PEERS_CHECK_NANOS = TimeUnit.SECONDS.toNanos(2)
         private const val STATS_INTERVAL_MILLIS = 1_000L
         private const val STATS_STOP_TIMEOUT_MILLIS = 2_000L
         private const val NANOS_PER_SECOND = 1_000_000_000L

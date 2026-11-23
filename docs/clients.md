@@ -135,6 +135,17 @@ The client enables IPv4 forwarding, masquerades tunnel traffic toward the
 assigned subnets, and restores forwarding when it disconnects. It logs the
 subnets on connection. See [Subnet routing](deployment.md#subnet-routing-site-to-site).
 
+## Direct paths
+
+When the gateway runs with `--peer-to-peer`, HTTP/3 clients on split
+tunnels connect directly to the other devices they may reach, through NATs
+where possible, and fall back to the gateway otherwise. Nothing needs to be
+configured on the device. The Linux CLI and Windows CLI log
+`direct paths: 10.66.0.3 via 203.0.113.7:51820` when paths come and go,
+the Linux and Windows desktop apps show the number of directly reached
+devices next to the routing summary, and Android lists them in **Log**. See
+[Direct paths between devices](deployment.md#direct-paths-between-devices).
+
 ## Linux CLI
 
 Automatic Linux networking requires root, `iproute2`, `nftables`, and a running

@@ -261,7 +261,7 @@ next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","int
 While disconnected, `connected` is `false` and `error` holds the last failure.
 A split-tunnel gateway adds `routes` and `dns_domains`, a dual-stack gateway
 adds `ipv6_pool`, `client_to_client`
-reports `--client-to-client`, `exits` lists the exit names access policies
+reports `--client-to-client`, `peer_to_peer` reports `--peer-to-peer`, `exits` lists the exit names access policies
 may select, and `upstreams` lists every next hop, with `name` set for named
 exits. `federation` reports `role` (`primary` or `replica`) and, on a
 replica, the `primary`, whether it is `connected`, the `last_sync` time,
