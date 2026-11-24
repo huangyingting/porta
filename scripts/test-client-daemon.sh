@@ -3,12 +3,14 @@
 # using network namespaces and real binaries.
 #
 #   client (daemon) --west/east-- gateway --egress-- web (192.0.2.80)
+#      `--lan0-- printer (192.168.77.10), on the client's local network
 #
 # The test drives the daemon's control socket the way the desktop app does:
 # it saves a profile, connects, checks that traffic uses the tunnel and that
 # the snapshot reports it, disconnects, and checks that networking is
-# restored. A wrong token surfaces as a connection error, and only root and
-# members of the control group may open the socket.
+# restored. The full tunnel blocks the local printer until the profile allows
+# the local network. A wrong token surfaces as a connection error, and only
+# root and members of the control group may open the socket.
 #
 # Usage: sudo scripts/test-client-daemon.sh [path-to-porta-server] [path-to-porta-client]
 set -euo pipefail
@@ -56,7 +58,7 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  for node in client gateway web; do
+  for node in client gateway web printer; do
     ip netns delete "$(ns "$node")" 2>/dev/null || true
     rm -rf "/etc/netns/$(ns "$node")"
   done
@@ -73,10 +75,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for node in client gateway web; do
+for node in client gateway web printer; do
   ip netns add "$(ns "$node")"
   in_ns "$node" ip link set lo up
 done
+ip link add lan0 netns "$(ns client)" type veth peer name lan netns "$(ns printer)"
+in_ns client ip address add 192.168.77.1/24 dev lan0
+in_ns printer ip address add 192.168.77.10/24 dev lan
+in_ns client ip link set dev lan0 up
+in_ns printer ip link set dev lan up
 ip link add west netns "$(ns client)" type veth peer name east netns "$(ns gateway)"
 ip link add egress netns "$(ns gateway)" type veth peer name ingress netns "$(ns web)"
 in_ns client ip address add 172.31.0.1/30 dev west
@@ -108,6 +115,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 ip netns exec "$(ns web)" python3 "$work/web.py" >"$work/web.log" 2>&1 &
+pids+=($!)
+ip netns exec "$(ns printer)" python3 "$work/web.py" >"$work/printer.log" 2>&1 &
 pids+=($!)
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Porta daemon test CA" \
@@ -200,6 +209,7 @@ wait_for() {
   return 1
 }
 seen() { in_ns client curl -fsS --max-time 2 "http://$web:8080/" 2>/dev/null || true; }
+printer() { in_ns client curl -fsS --max-time 2 "http://192.168.77.10:8080/" 2>/dev/null || true; }
 
 # Only root and the control group may use the socket.
 if setpriv --reuid=nobody --regid="$other_group" --clear-groups python3 "$work/control.py" "$socket" '{"command":"snapshot"}' >/dev/null 2>&1; then
@@ -223,6 +233,7 @@ if control "{\"command\":\"delete_profile\",\"id\":\"$id\"}" 2>/dev/null; then
   echo "the active profile was deleted" >&2
   exit 1
 fi
+[[ -z $(printer) ]] || { echo "the full tunnel let local traffic out" >&2; exit 1; }
 echo "the daemon connects a saved profile and reports the tunnel"
 
 control '{"command":"disconnect"}' >/dev/null
@@ -233,6 +244,21 @@ if in_ns client ip link show dev porta-ci0 >/dev/null 2>&1; then
   exit 1
 fi
 echo "disconnecting restores the network"
+
+# Allowing the local network keeps the printer reachable beside the tunnel.
+control "{\"command\":\"save_profile\",\"input\":{\"id\":\"$id\",\"name\":\"Office\",\"serverUrl\":\"https://172.31.0.2:$port\",\"transport\":\"auto\",\"allowLan\":true}}" >/dev/null
+[[ $(control '{"command":"snapshot"}' | field '["profiles"][0]["allowLan"]') == True ]]
+control "{\"command\":\"connect\",\"id\":\"$id\"}" >/dev/null
+wait_for 's["connected"] and s["status"] == "Connected"' "a connection with local network access"
+[[ $(printer) == 192.168.77.1 ]] || { echo "the local printer is unreachable with local network access" >&2; exit 1; }
+[[ $(seen) == 172.31.9.1 ]] || { echo "Internet traffic left the tunnel with local network access" >&2; exit 1; }
+if in_ns client nft list ruleset | grep -q "192.168.77.0/24.*accept"; then :; else
+  echo "the leak protection lacks the local network rule" >&2
+  exit 1
+fi
+control '{"command":"disconnect"}' >/dev/null
+wait_for 'not s["running"] and s["status"] == "Disconnected"' "a disconnection"
+echo "a profile that allows the local network reaches it beside a full tunnel"
 
 wrong=$(control "{\"command\":\"save_profile\",\"input\":{\"name\":\"Wrong\",\"serverUrl\":\"https://172.31.0.2:$port\",\"token\":\"wrong-token-0123456789abcdef\"}}")
 wrong_id=$(python3 -c 'import json, sys; print(next(p["id"] for p in json.load(sys.stdin)["profiles"] if p["name"] == "Wrong"))' <<<"$wrong")

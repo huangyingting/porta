@@ -100,6 +100,12 @@ mod linux {
         #[arg(
             long,
             action = ArgAction::SetTrue,
+            help = "In a full tunnel, keep printers and other devices on the local network reachable"
+        )]
+        allow_lan: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
         cleanup_network: bool,
@@ -188,6 +194,7 @@ mod linux {
                     manual_network: arguments.manual_network,
                     network_state: arguments.network_state,
                     subnet_router: arguments.subnet_router,
+                    allow_lan: arguments.allow_lan,
                 },
                 &cancellation,
                 print_event,
@@ -360,6 +367,12 @@ mod windows {
         #[arg(
             long,
             action = ArgAction::SetTrue,
+            help = "In a full tunnel, keep printers and other devices on the local network reachable"
+        )]
+        allow_lan: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
         cleanup_network: bool,
@@ -421,6 +434,7 @@ mod windows {
                 reconnect: arguments.reconnect,
                 connect_timeout: Duration::from_secs(15),
                 reconnect_max_delay: arguments.reconnect_max_delay,
+                allow_lan: arguments.allow_lan,
             },
             cancellation,
             Arc::new(print_event),

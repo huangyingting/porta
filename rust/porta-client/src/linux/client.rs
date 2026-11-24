@@ -46,6 +46,9 @@ pub struct Config {
     /// Forward and masquerade tunnel traffic to the subnets the gateway
     /// routes to this device.
     pub subnet_router: bool,
+    /// In a full tunnel, keep the directly connected private networks
+    /// reachable outside the tunnel.
+    pub allow_lan: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,6 +381,7 @@ pub async fn run(
     } else {
         let mut network = NetworkManager::open(config.network_state.clone())?;
         network.set_subnet_router(config.subnet_router);
+        network.set_allow_lan(config.allow_lan);
         Some(network)
     };
     let mut runtime = Runtime::new(network, config.transport);

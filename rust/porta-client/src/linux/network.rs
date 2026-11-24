@@ -117,6 +117,10 @@ struct NetworkState {
     /// forwarded and masqueraded to.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     subnet_routes: Vec<String>,
+    /// Full tunnel with local network access: the directly connected
+    /// private networks the firewall lets through outside the tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_networks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -176,6 +180,7 @@ pub struct NetworkManager {
     state: NetworkState,
     commands: Arc<dyn CommandRunner>,
     subnet_router: bool,
+    allow_lan: bool,
 }
 
 impl NetworkManager {
@@ -204,6 +209,7 @@ impl NetworkManager {
         };
         Ok(Self {
             subnet_router: false,
+            allow_lan: false,
             state_path,
             _lock: lock,
             state,
@@ -245,6 +251,56 @@ impl NetworkManager {
     /// routes to this device.
     pub fn set_subnet_router(&mut self, enabled: bool) {
         self.subnet_router = enabled;
+    }
+
+    /// In a full tunnel, keeps directly connected private networks, such as
+    /// printers and media players on the LAN, reachable outside the tunnel.
+    pub fn set_allow_lan(&mut self, enabled: bool) {
+        self.allow_lan = enabled;
+    }
+
+    /// Directly connected private networks other than the tunnel's, which
+    /// must not contain the tunnel's addresses or DNS server.
+    async fn local_networks(
+        &self,
+        interface: &str,
+        lease: &Lease,
+    ) -> Result<Vec<String>, NetworkError> {
+        let tunnel_addresses = [
+            Some(IpAddr::V4(lease.address.addr())),
+            lease.dns.map(IpAddr::V4),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(lease.ipv6().map(|address| IpAddr::V6(address.addr())))
+        .collect::<Vec<_>>();
+        let mut networks = Vec::new();
+        for family in [4, 6] {
+            for route in self.routes(family, Some(("scope", "link"))).await? {
+                let Ok(network) = route.destination.parse::<ipnet::IpNet>() else {
+                    continue;
+                };
+                let private = match network {
+                    ipnet::IpNet::V4(network) => {
+                        network.addr().is_private() || network.addr().is_link_local()
+                    }
+                    // Unique local addresses (fc00::/7).
+                    ipnet::IpNet::V6(network) => network.addr().segments()[0] & 0xfe00 == 0xfc00,
+                };
+                if route.device != interface
+                    && private
+                    && network.prefix_len() >= if family == 4 { 8 } else { 48 }
+                    && !tunnel_addresses
+                        .iter()
+                        .any(|address| network.contains(address))
+                {
+                    networks.push(network.trunc().to_string());
+                }
+            }
+        }
+        networks.sort();
+        networks.dedup();
+        Ok(networks)
     }
 
     pub async fn up(
@@ -465,12 +521,19 @@ impl NetworkManager {
         if !subnet_routes.is_empty() {
             self.ensure_forwarding(&link, &alias).await?;
         }
+        let local_networks = if self.allow_lan && split_prefixes.is_empty() {
+            self.local_networks(interface, &lease).await?
+        } else {
+            Vec::new()
+        };
         let previous_split = std::mem::replace(&mut self.state.split_prefixes, split_prefixes);
         let previous_subnets = std::mem::replace(&mut self.state.subnet_routes, subnet_routes);
+        let previous_local = std::mem::replace(&mut self.state.local_networks, local_networks);
         if let Err(error) = self.persist() {
             self.state.endpoints = previous;
             self.state.split_prefixes = previous_split;
             self.state.subnet_routes = previous_subnets;
+            self.state.local_networks = previous_local;
             return Err(error);
         }
         self.protect().await?;
@@ -729,6 +792,25 @@ impl NetworkManager {
         }
         add("udp dport { 53, 853 } drop");
         add("tcp dport { 53, 853 } drop");
+        // Local network access: connected private networks, and the
+        // multicast and broadcast that discovery (mDNS, SSDP) uses. DNS
+        // stays in the tunnel because the rules above come first.
+        if !self.state.local_networks.is_empty() {
+            let (ipv6, ipv4): (Vec<_>, Vec<_>) = self
+                .state
+                .local_networks
+                .iter()
+                .map(String::as_str)
+                .partition(|network| network.contains(':'));
+            if !ipv4.is_empty() {
+                add(&format!("ip daddr {{ {} }} accept", ipv4.join(", ")));
+            }
+            if !ipv6.is_empty() {
+                add(&format!("ip6 daddr {{ {} }} accept", ipv6.join(", ")));
+            }
+            add("ip daddr { 224.0.0.0/4, 255.255.255.255 } accept");
+            add("ip6 daddr { fe80::/10, ff00::/8 } accept");
+        }
         let mut ipv6 = false;
         for endpoint in &self.state.endpoints {
             let family = if endpoint.address()?.is_ipv4() {

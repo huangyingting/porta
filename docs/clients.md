@@ -95,6 +95,28 @@ reachable outside the tunnel. While protection is active the order is not
 re-measured and DNS is unavailable, so failover uses the endpoints resolved
 when the client started.
 
+## Local network access
+
+A full tunnel sends everything through the gateway, so printers, file
+shares, casting and other devices on the network you are attached to become
+unreachable. Enable **Allow local network** on a profile (the Linux and
+Windows apps' profile editor, the Android profile dialog, or `--allow-lan`
+for the Linux and Windows CLIs). The option then lets through, outside the
+tunnel:
+- the private networks the device is directly attached to (RFC 1918,
+  link-local and IPv6 unique-local), except any that contain the tunnel's
+  own addresses or DNS server;
+- the multicast and broadcast that discovery protocols such as mDNS and
+  SSDP use.
+
+Everything else, including DNS, still uses the tunnel and stays fail-closed.
+Linux and Windows let only that local traffic past leak protection, and keep
+DNS (ports 53 and 853) to local hosts blocked. Android routes
+around those networks, and on macOS and iOS the app sets the system's
+`excludeLocalNetworks` option. Split tunnels never route the local network
+through the tunnel, so the option only matters for full tunnels. Devices on
+the local network can reach this device, as they could before connecting.
+
 ## Split tunnels
 
 When the gateway advertises split-tunnel routes, clients route only those

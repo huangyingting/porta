@@ -48,6 +48,7 @@ tunnel.providerConfiguration = [
     "transport": "auto",
 ]
 tunnel.includeAllNetworks = true   // fail closed for a full tunnel
+tunnel.excludeLocalNetworks = true // the "Allow local network" option
 ```
 
 The extension's principal class is `PortaPacketTunnelProvider` (or a

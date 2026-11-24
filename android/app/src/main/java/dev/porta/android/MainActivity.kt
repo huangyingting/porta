@@ -730,6 +730,18 @@ class MainActivity : Activity() {
             setTextColor(COLOR_TEXT)
             buttonTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
         }
+        val allowLan = CheckBox(this).apply {
+            setText(R.string.allow_lan)
+            isChecked = initial?.allowLan ?: false
+            setTextColor(COLOR_TEXT)
+            buttonTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
+        }
+        val allowLanHelp = TextView(this).apply {
+            setText(R.string.allow_lan_help)
+            textSize = 12f
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(34), 0, dp(2), dp(4))
+        }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(4), dp(4), dp(4), 0)
@@ -748,6 +760,8 @@ class MainActivity : Activity() {
                 setPadding(dp(2), dp(14), dp(2), dp(4))
             })
             addView(autoConnect)
+            addView(allowLan)
+            addView(allowLanHelp)
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (existing == null) R.string.add_profile else R.string.edit_profile)
@@ -767,6 +781,7 @@ class MainActivity : Activity() {
                     server = server.text.toString().trim().trimEnd('/'),
                     token = token.text.toString().ifBlank { existing?.token.orEmpty() },
                     autoConnect = autoConnect.isChecked,
+                    allowLan = allowLan.isChecked,
                     backupServers = parseBackupServers(backups.text.toString()) ?: run {
                         backups.error = getString(R.string.https_required)
                         return@setOnClickListener
@@ -924,15 +939,7 @@ class MainActivity : Activity() {
         profileStore.select(profile.id)
         bandwidthChart.reset()
         updateBandwidth(TrafficSnapshot(), addSample = false)
-        startForegroundService(
-            Intent(this, TunnelService::class.java)
-                .setAction(TunnelService.ACTION_START)
-                .putExtra(TunnelService.EXTRA_PROFILE_ID, profile.id)
-                .putExtra(TunnelService.EXTRA_PROFILE_NAME, profile.name)
-                .putExtra(TunnelService.EXTRA_SERVER, profile.server)
-                .putExtra(TunnelService.EXTRA_BACKUP_SERVERS, profile.backupServers.toTypedArray())
-                .putExtra(TunnelService.EXTRA_TOKEN, profile.token),
-        )
+        startForegroundService(TunnelService.startIntent(this, profile))
         render("Connecting")
     }
 

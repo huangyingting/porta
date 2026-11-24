@@ -40,6 +40,9 @@ pub struct Profile {
     pub reconnect: bool,
     #[serde(with = "duration_nanos")]
     pub reconnect_max_delay: Duration,
+    /// Keep the local network reachable in a full tunnel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_lan: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -60,6 +63,7 @@ impl Profile {
             thumbprint: String::new(),
             reconnect: true,
             reconnect_max_delay: Duration::from_secs(30),
+            allow_lan: false,
             created_at: String::new(),
             updated_at: String::new(),
         }

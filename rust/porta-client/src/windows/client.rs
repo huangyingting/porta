@@ -35,6 +35,9 @@ pub struct Config {
     pub reconnect: bool,
     pub connect_timeout: Duration,
     pub reconnect_max_delay: Duration,
+    /// In a full tunnel, keep the directly connected private networks
+    /// reachable outside the tunnel.
+    pub allow_lan: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -147,7 +150,9 @@ pub async fn run(
     let mut network = if config.manual_network {
         None
     } else {
-        Some(NetworkManager::open(config.network_state_path.clone())?)
+        let mut manager = NetworkManager::open(config.network_state_path.clone())?;
+        manager.set_allow_lan(config.allow_lan);
+        Some(manager)
     };
     let mut network_active = network.as_ref().is_some_and(NetworkManager::needs_cleanup);
     let endpoints = if let Some(manager) = network.as_ref() {

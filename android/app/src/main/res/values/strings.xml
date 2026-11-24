@@ -50,6 +50,8 @@
     <string name="device_identity_unavailable">Could not load this device’s security key. See Log for details.</string>
     <string name="security_note">Protected by TLS and Android VPN security</string>
     <string name="auto_connect">Reconnect after device restart</string>
+    <string name="allow_lan">Allow local network</string>
+    <string name="allow_lan_help">Keep printers, file shares and casting on this network reachable while everything else uses the tunnel.</string>
     <string name="secure_storage_failed">Could not store the token securely</string>
     <string name="profile_delete_failed">Could not delete the VPN profile.</string>
     <string name="disconnect_before_editing">Disconnect this profile before editing it.</string>

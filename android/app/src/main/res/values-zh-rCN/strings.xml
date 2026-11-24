@@ -50,6 +50,8 @@
     <string name="device_identity_unavailable">无法加载此设备的安全密钥。请查看日志了解详情。</string>
     <string name="security_note">受 TLS 和 Android VPN 安全机制保护</string>
     <string name="auto_connect">设备重启后重新连接</string>
+    <string name="allow_lan">允许访问本地网络</string>
+    <string name="allow_lan_help">其他流量经由隧道时，仍可访问此网络上的打印机、文件共享和投屏设备。</string>
     <string name="secure_storage_failed">无法安全存储令牌</string>
     <string name="profile_delete_failed">无法删除 VPN 配置。</string>
     <string name="disconnect_before_editing">编辑前请先断开此配置。</string>

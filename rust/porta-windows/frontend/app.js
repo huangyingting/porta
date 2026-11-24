@@ -35,6 +35,8 @@ const messages = {
     gateway: "Gateway URL",
     backupGateways: "Backup gateways",
     backupGatewaysPlaceholder: "Optional, one per line: gateways that share this account",
+    allowLan: "Allow local network",
+    allowLanHelp: "Keep printers, file shares and media players on this network reachable while everything else uses the tunnel. DNS still uses the tunnel.",
     accessToken: "Access token",
     accessTokenPlaceholder: "Paste the token from your administrator",
     tokenHelpNew: "Stored securely for this Windows account.",
@@ -139,6 +141,8 @@ const messages = {
     gateway: "网关地址",
     backupGateways: "备用网关",
     backupGatewaysPlaceholder: "可选，每行一个：共享此账户的网关",
+    allowLan: "允许访问本地网络",
+    allowLanHelp: "其他流量经由隧道时，仍可访问此网络上的打印机、文件共享和媒体设备。DNS 仍经由隧道。",
     accessToken: "访问令牌",
     accessTokenPlaceholder: "粘贴管理员提供的令牌",
     tokenHelpNew: "令牌将为当前 Windows 账户安全存储。",
@@ -705,6 +709,7 @@ function openEditor(profile = null) {
   $("profile-name").value = profile?.name || "";
   $("profile-server").value = profile?.serverUrl || "https://";
   $("profile-backups").value = (profile?.backupServers || []).join("\n");
+  $("profile-allow-lan").checked = Boolean(profile?.allowLan);
   $("profile-token").value = "";
   $("delete-profile").classList.toggle("hidden", !profile);
   $("editor-error").classList.add("hidden");
@@ -778,6 +783,7 @@ async function saveProfile(event) {
     backupServers: $("profile-backups").value.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean),
     transport: state.editorProfile?.transport || "auto",
     token: $("profile-token").value,
+    allowLan: $("profile-allow-lan").checked,
   };
   const invalid = validateProfileInput(input);
   if (invalid) {

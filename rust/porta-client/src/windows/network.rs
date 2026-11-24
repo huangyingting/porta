@@ -152,6 +152,10 @@ struct NetworkState {
     /// Domains whose NRPT rules send queries to the tunnel resolver.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     nrpt_domains: Vec<String>,
+    /// Full tunnel with local network access: connected private networks
+    /// leak protection lets through outside the tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_networks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +169,9 @@ struct GuardSpec {
     /// IPv6 may leave through the tunnel interface (an IPv6 lease); otherwise
     /// a full tunnel blocks IPv6 everywhere.
     ipv6: bool,
+    /// Full tunnel: private networks reachable outside the tunnel, except
+    /// for DNS, together with link-local, multicast and broadcast.
+    local_networks: Vec<IpNet>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +183,8 @@ enum Condition {
     Protocol(u8),
     RemotePort(u16),
     LocalPort(u16),
+    /// An inclusive remote port range; WFP ORs ranges on one field.
+    RemotePortRange(u16, u16),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,9 +200,16 @@ pub struct NetworkManager {
     lock: Option<File>,
     state: NetworkState,
     protected: bool,
+    allow_lan: bool,
 }
 
 impl NetworkManager {
+    /// In a full tunnel, keeps directly connected private networks, such as
+    /// printers and media players on the LAN, reachable outside the tunnel.
+    pub fn set_allow_lan(&mut self, enabled: bool) {
+        self.allow_lan = enabled;
+    }
+
     pub fn open(state_path: PathBuf) -> Result<Self, NetworkError> {
         if state_path.as_os_str().is_empty() || state_path.file_name().is_none() {
             return Err(NetworkError::Invalid(
@@ -215,6 +231,7 @@ impl NetworkManager {
             lock: None,
             state,
             protected: false,
+            allow_lan: false,
         })
     }
 
@@ -250,6 +267,21 @@ impl NetworkManager {
         routing: &Routing,
     ) -> Result<(), NetworkError> {
         validate_lease(interface_name, remote_address, lease, routing)?;
+        // Local networks must not hold the tunnel's own addresses or DNS.
+        self.state.local_networks = if self.allow_lan && routing.is_full_tunnel() {
+            let excluded = [
+                Some(IpAddr::V4(lease.address.addr())),
+                lease.dns.map(IpAddr::V4),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(lease.ipv6().map(|address| IpAddr::V6(address.addr())))
+            .chain(std::iter::once(remote_address.ip()))
+            .collect::<Vec<_>>();
+            native_local_networks(native_interface_luid(interface_name)?, &excluded)?
+        } else {
+            Vec::new()
+        };
         let dns = lease
             .dns
             .filter(|_| routing.is_full_tunnel() || !routing.dns_domains.is_empty());
@@ -482,6 +514,7 @@ impl NetworkManager {
             application: self.state.application.clone(),
             split_prefixes: guarded,
             ipv6,
+            local_networks: parse_split_prefixes(&self.state.local_networks)?,
         };
         replace_guard(&spec).map_err(|error| {
             NetworkError::Combined(format!(
@@ -1114,6 +1147,9 @@ fn guard_filters(spec: &GuardSpec) -> Vec<Filter> {
                     }
                 }
             }
+            if !spec.local_networks.is_empty() {
+                filters.push(local_network_permit(spec, kind, family, layer));
+            }
             filters.push(Filter {
                 layer,
                 permit: false,
@@ -1127,6 +1163,41 @@ fn guard_filters(spec: &GuardSpec) -> Vec<Filter> {
         });
     }
     filters
+}
+
+/// Lets traffic to the local networks of `family` through, except DNS (53)
+/// and DNS over TLS (853), which stay in the tunnel. The IP packet layer has
+/// no ports; the connection layers decide those flows first.
+fn local_network_permit(spec: &GuardSpec, kind: &str, family: u8, layer: &'static str) -> Filter {
+    let discovery: &[&str] = if family == 4 {
+        &["224.0.0.0/4", "255.255.255.255/32"]
+    } else {
+        &["fe80::/10", "ff00::/8"]
+    };
+    let mut conditions = spec
+        .local_networks
+        .iter()
+        .filter(|network| network.addr().is_ipv4() == (family == 4))
+        .copied()
+        .chain(
+            discovery
+                .iter()
+                .map(|prefix| prefix.parse().expect("static discovery prefix")),
+        )
+        .map(Condition::Address)
+        .collect::<Vec<_>>();
+    if kind != "packet" {
+        conditions.extend([
+            Condition::RemotePortRange(0, 52),
+            Condition::RemotePortRange(54, 852),
+            Condition::RemotePortRange(854, u16::MAX),
+        ]);
+    }
+    Filter {
+        layer,
+        permit: true,
+        conditions,
+    }
 }
 
 /// A split tunnel guards only the tunneled prefixes: traffic to them may
@@ -1691,6 +1762,96 @@ fn native_interface_luid(_name: &str) -> Result<u64, NetworkError> {
     Err(NetworkError::Unsupported)
 }
 
+/// Whether `network` is private: RFC 1918, link-local, or IPv6 unique local.
+fn is_private_network(network: &IpNet) -> bool {
+    match network {
+        IpNet::V4(network) => {
+            (network.addr().is_private() || network.addr().is_link_local())
+                && network.prefix_len() >= 8
+        }
+        IpNet::V6(network) => {
+            network.addr().segments()[0] & 0xfe00 == 0xfc00 && network.prefix_len() >= 48
+        }
+    }
+}
+
+/// Private networks the host reaches directly (on-link routes) through
+/// adapters other than the tunnel's, which do not contain `excluded`.
+#[cfg(windows)]
+fn native_local_networks(
+    tunnel_luid: u64,
+    excluded: &[std::net::IpAddr],
+) -> Result<Vec<String>, NetworkError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let code = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) };
+    if code != 0 {
+        return Err(NetworkError::Windows {
+            action: "read the routing table",
+            code,
+        });
+    }
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let mut networks = Vec::new();
+    for row in rows {
+        if unsafe { row.InterfaceLuid.Value } == tunnel_luid {
+            continue;
+        }
+        let prefix = &row.DestinationPrefix;
+        let length = prefix.PrefixLength;
+        let (network, on_link) = unsafe {
+            match prefix.Prefix.si_family {
+                AF_INET => {
+                    let address = std::net::Ipv4Addr::from(u32::from_be(
+                        prefix.Prefix.Ipv4.sin_addr.S_un.S_addr,
+                    ));
+                    let next_hop = u32::from_be(row.NextHop.Ipv4.sin_addr.S_un.S_addr);
+                    (
+                        ipnet::Ipv4Net::new(address, length).ok().map(IpNet::V4),
+                        next_hop == 0,
+                    )
+                }
+                AF_INET6 => {
+                    let address = std::net::Ipv6Addr::from(prefix.Prefix.Ipv6.sin6_addr.u.Byte);
+                    let next_hop = std::net::Ipv6Addr::from(row.NextHop.Ipv6.sin6_addr.u.Byte);
+                    (
+                        ipnet::Ipv6Net::new(address, length).ok().map(IpNet::V6),
+                        next_hop.is_unspecified(),
+                    )
+                }
+                _ => (None, false),
+            }
+        };
+        let Some(network) = network.map(|network| network.trunc()) else {
+            continue;
+        };
+        if on_link
+            && is_private_network(&network)
+            && !excluded.iter().any(|address| network.contains(address))
+        {
+            networks.push(network.to_string());
+        }
+    }
+    unsafe { FreeMibTable(table.cast()) };
+    networks.sort();
+    networks.dedup();
+    Ok(networks)
+}
+
+#[cfg(not(windows))]
+fn native_local_networks(
+    _tunnel_luid: u64,
+    _excluded: &[std::net::IpAddr],
+) -> Result<Vec<String>, NetworkError> {
+    Err(NetworkError::Unsupported)
+}
+
 #[cfg(windows)]
 fn native_interface_guid(luid: u64) -> Result<String, NetworkError> {
     use windows_sys::core::GUID;
@@ -2073,6 +2234,7 @@ struct NativeConditions {
     _v6_masks: Vec<
         Box<windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_V6_ADDR_AND_MASK>,
     >,
+    _ranges: Vec<Box<windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_RANGE0>>,
 }
 
 #[cfg(windows)]
@@ -2093,6 +2255,7 @@ impl NativeConditions {
             _luids: Vec::new(),
             _v4_masks: Vec::new(),
             _v6_masks: Vec::new(),
+            _ranges: Vec::new(),
         };
         for condition in input {
             let mut native = FWPM_FILTER_CONDITION0 {
@@ -2134,6 +2297,28 @@ impl NativeConditions {
                         r#type: FWP_UINT8,
                         Anonymous: FWP_CONDITION_VALUE0_0 { uint8: *protocol },
                     };
+                }
+                Condition::RemotePortRange(low, high) => {
+                    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+                        FWP_MATCH_RANGE, FWP_RANGE0, FWP_RANGE_TYPE, FWP_VALUE0, FWP_VALUE0_0,
+                    };
+                    native.fieldKey = condition_guid("port");
+                    native.matchType = FWP_MATCH_RANGE;
+                    let value = |port: u16| FWP_VALUE0 {
+                        r#type: FWP_UINT16,
+                        Anonymous: FWP_VALUE0_0 { uint16: port },
+                    };
+                    let mut range = Box::new(FWP_RANGE0 {
+                        valueLow: value(*low),
+                        valueHigh: value(*high),
+                    });
+                    native.conditionValue = FWP_CONDITION_VALUE0 {
+                        r#type: FWP_RANGE_TYPE,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            rangeValue: range.as_mut(),
+                        },
+                    };
+                    result._ranges.push(range);
                 }
                 Condition::RemotePort(port) | Condition::LocalPort(port) => {
                     native.fieldKey =
@@ -2384,6 +2569,7 @@ mod tests {
             split_prefixes: Vec::new(),
             nrpt_domains: Vec::new(),
             mtu6: None,
+            local_networks: Vec::new(),
         }
     }
 
@@ -2499,6 +2685,7 @@ mod tests {
             application: r"C:\Porta\porta.exe".to_owned(),
             split_prefixes: Vec::new(),
             ipv6: false,
+            local_networks: Vec::new(),
         }
     }
 
@@ -2768,16 +2955,18 @@ mod tests {
             Condition::Application(_) => "application",
             Condition::Address(_) => "address",
             Condition::Protocol(_) => "protocol",
-            Condition::RemotePort(_) => "port",
+            Condition::RemotePort(_) | Condition::RemotePortRange(..) => "port",
             Condition::LocalPort(_) => "local-port",
         });
         if !same_guid(&actual.fieldKey, &expected_field) {
             return false;
         }
-        let expected_match = if matches!(expected, Condition::Loopback) {
-            FWP_MATCH_FLAGS_ALL_SET
-        } else {
-            FWP_MATCH_EQUAL
+        let expected_match = match expected {
+            Condition::Loopback => FWP_MATCH_FLAGS_ALL_SET,
+            Condition::RemotePortRange(..) => {
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_RANGE
+            }
+            _ => FWP_MATCH_EQUAL,
         };
         if actual.matchType != expected_match {
             return false;
@@ -2813,6 +3002,18 @@ mod tests {
             Condition::RemotePort(expected) | Condition::LocalPort(expected) => {
                 actual.conditionValue.r#type == FWP_UINT16
                     && unsafe { actual.conditionValue.Anonymous.uint16 } == *expected
+            }
+            Condition::RemotePortRange(low, high) => {
+                let range = unsafe { actual.conditionValue.Anonymous.rangeValue };
+                actual.conditionValue.r#type
+                    == windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_RANGE_TYPE
+                    && !range.is_null()
+                    && unsafe {
+                        (*range).valueLow.r#type == FWP_UINT16
+                            && (*range).valueHigh.r#type == FWP_UINT16
+                            && (*range).valueLow.Anonymous.uint16 == *low
+                            && (*range).valueHigh.Anonymous.uint16 == *high
+                    }
             }
             Condition::Address(IpNet::V4(expected)) => {
                 let value = unsafe { actual.conditionValue.Anonymous.v4AddrMask };
@@ -3222,6 +3423,69 @@ mod tests {
         assert!(!guard_filters(&spec)
             .iter()
             .any(|filter| filter.layer.ends_with('6')));
+    }
+
+    #[test]
+    fn local_network_access_permits_the_lan_except_dns_before_the_final_block() {
+        let mut spec = test_spec("192.0.2.1");
+        assert!(!guard_filters(&spec).iter().any(|filter| filter
+            .conditions
+            .iter()
+            .any(|condition| matches!(condition, Condition::RemotePortRange(..)))));
+        spec.local_networks = vec![
+            "192.168.1.0/24".parse().unwrap(),
+            "fd12::/64".parse().unwrap(),
+        ];
+        let filters = guard_filters(&spec);
+        for layer in ["connect4", "accept4", "transport4", "connect6"] {
+            let rules = filters
+                .iter()
+                .filter(|filter| filter.layer == layer)
+                .collect::<Vec<_>>();
+            let lan = rules
+                .iter()
+                .position(|filter| {
+                    filter.permit
+                        && filter
+                            .conditions
+                            .contains(&Condition::RemotePortRange(54, 852))
+                })
+                .unwrap_or_else(|| panic!("{layer} lacks the local network permit"));
+            assert_eq!(
+                lan,
+                rules.len() - 2,
+                "{layer} permit precedes the final block"
+            );
+            let conditions = &rules[lan].conditions;
+            assert!(!conditions.contains(&Condition::RemotePortRange(0, u16::MAX)));
+            let family_lan = if layer.ends_with('4') {
+                "192.168.1.0/24"
+            } else {
+                "fd12::/64"
+            };
+            assert!(conditions.contains(&Condition::Address(family_lan.parse().unwrap())));
+        }
+        let packet = filters
+            .iter()
+            .find(|filter| {
+                filter.layer == "packet4"
+                    && filter.permit
+                    && filter
+                        .conditions
+                        .contains(&Condition::Address("224.0.0.0/4".parse().unwrap()))
+            })
+            .expect("IP packet layer permits discovery multicast");
+        assert!(!packet
+            .conditions
+            .iter()
+            .any(|condition| matches!(condition, Condition::RemotePortRange(..))));
+
+        // Split tunnels leave the LAN alone already.
+        spec.split_prefixes = vec!["10.20.0.0/16".parse().unwrap()];
+        assert!(!guard_filters(&spec).iter().any(|filter| filter
+            .conditions
+            .iter()
+            .any(|condition| matches!(condition, Condition::RemotePortRange(..)))));
     }
 
     #[test]

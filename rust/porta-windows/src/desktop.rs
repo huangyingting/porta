@@ -36,6 +36,8 @@ struct ProfileInput {
     backup_servers: Vec<String>,
     transport: String,
     token: String,
+    #[serde(default)]
+    allow_lan: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -46,6 +48,7 @@ struct DesktopProfile {
     server_url: String,
     backup_servers: Vec<String>,
     transport: String,
+    allow_lan: bool,
     selected: bool,
     active: bool,
     status: String,
@@ -315,6 +318,7 @@ impl Controller {
             profile.transport = transport;
             profile
         };
+        profile.allow_lan = input.allow_lan;
         profile.id = input.id.trim().to_owned();
         let saved = self
             .store
@@ -480,6 +484,7 @@ impl Controller {
                     reconnect: profile.reconnect,
                     connect_timeout: Duration::from_secs(15),
                     reconnect_max_delay: profile.reconnect_max_delay,
+                    allow_lan: profile.allow_lan,
                 },
                 cancellation,
                 Arc::new(move |event| {
@@ -1169,6 +1174,7 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
                 server_url: profile.server_url,
                 backup_servers: profile.backup_servers,
                 transport: transport_name(profile.transport).to_owned(),
+                allow_lan: profile.allow_lan,
                 status,
             }
         })

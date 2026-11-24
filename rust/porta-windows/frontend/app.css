@@ -749,6 +749,36 @@ textarea::placeholder {
   color: #60748b;
 }
 
+.editor-card label.option-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.option-row input[type="checkbox"] {
+  margin: 3px 0 0;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  accent-color: var(--accent, #2f6fed);
+}
+
+.option-title {
+  display: block;
+  color: var(--text, inherit);
+  font-size: 0.82rem;
+}
+
+.option-help {
+  display: block;
+  margin-top: 3px;
+  color: var(--subtle);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
 .field-help {
   margin: -7px 0 18px;
   color: var(--subtle);

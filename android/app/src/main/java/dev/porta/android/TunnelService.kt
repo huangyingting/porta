@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
@@ -97,6 +98,7 @@ class TunnelService : VpnService() {
         }
         currentProfileId = profileId.ifBlank { server }
         currentProfileName = profileLabel.ifBlank { profileName(server) }
+        currentAllowLan = intent.getBooleanExtra(EXTRA_ALLOW_LAN, false)
         currentSessionId = runGeneration
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -551,7 +553,21 @@ class TunnelService : VpnService() {
         if (address6.isNotEmpty() && (parseIPv6Address(address6) == null || mtu < 1280)) {
             throw PermanentTunnelException("Gateway returned an invalid IPv6 address")
         }
-        return VpnConfiguration(addressParts[0], address6, prefix, dns, mtu, routing)
+        val local = if (currentAllowLan && routing.isFullTunnel) {
+            localNetworks(listOfNotNull(parseIPv4Address(addressParts[0]), parseIPv4Address(dns), parseIPv6Address(address6)))
+        } else {
+            emptyList()
+        }
+        return VpnConfiguration(
+            addressParts[0],
+            address6,
+            prefix,
+            dns,
+            mtu,
+            routing,
+            localAccess = currentAllowLan && routing.isFullTunnel,
+            localNetworks = local,
+        )
     }
 
     @Synchronized
@@ -570,7 +586,15 @@ class TunnelService : VpnService() {
             .addAddress(configuration.address, configuration.prefix)
             .setBlocking(true)
         if (sourceAddress6 != null) builder.addAddress(configuration.address6, 128)
-        if (configuration.routing.isFullTunnel) {
+        if (configuration.routing.isFullTunnel && configuration.localAccess) {
+            // Local network access routes everything except the local
+            // networks and the multicast and broadcast discovery uses.
+            val excluded = configuration.localNetworks + LOCAL_DISCOVERY
+            routesExcluding(ipv6 = false, excluded).forEach { builder.addRoute(it.address, it.prefixLength) }
+            if (sourceAddress6 != null) {
+                routesExcluding(ipv6 = true, excluded).forEach { builder.addRoute(it.address, it.prefixLength) }
+            }
+        } else if (configuration.routing.isFullTunnel) {
             builder.addRoute("0.0.0.0", 0)
             // Without an IPv6 address Android blocks IPv6 for a VPN that
             // claims none, so a full tunnel never leaks it.
@@ -1067,6 +1091,26 @@ class TunnelService : VpnService() {
         const val ACTION_STATS = "dev.porta.android.STATS"
         const val EXTRA_SERVER = "server"
         const val EXTRA_BACKUP_SERVERS = "backupServers"
+        const val EXTRA_ALLOW_LAN = "allowLan"
+
+        /** Multicast and broadcast that local discovery (mDNS, SSDP) uses. */
+        private val LOCAL_DISCOVERY = listOf(
+            RoutePrefix("224.0.0.0", 4),
+            RoutePrefix("255.255.255.255", 32),
+            RoutePrefix("fe80::", 10),
+            RoutePrefix("ff00::", 8),
+        )
+
+        /** Starts [profile]; the app and the boot receiver share it. */
+        internal fun startIntent(context: Context, profile: VpnProfile): Intent =
+            Intent(context, TunnelService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_PROFILE_ID, profile.id)
+                .putExtra(EXTRA_PROFILE_NAME, profile.name)
+                .putExtra(EXTRA_SERVER, profile.server)
+                .putExtra(EXTRA_BACKUP_SERVERS, profile.backupServers.toTypedArray())
+                .putExtra(EXTRA_TOKEN, profile.token)
+                .putExtra(EXTRA_ALLOW_LAN, profile.allowLan)
         const val EXTRA_TOKEN = "token"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
@@ -1079,6 +1123,7 @@ class TunnelService : VpnService() {
         @Volatile private var currentStatus = "Disconnected"
         @Volatile private var currentProfileId: String? = null
         @Volatile private var currentProfileName: String? = null
+        @Volatile private var currentAllowLan = false
         @Volatile private var currentSessionId = NO_SESSION
         @Volatile private var currentSnapshot = TrafficSnapshot()
         private val nextSessionId = AtomicLong()
@@ -1110,7 +1155,29 @@ class TunnelService : VpnService() {
         val dns: String,
         val mtu: Int,
         val routing: TunnelRouting,
+        /** Full tunnel that keeps the local network reachable. */
+        val localAccess: Boolean = false,
+        /** The local networks routed around the tunnel. */
+        val localNetworks: List<RoutePrefix> = emptyList(),
     )
+
+    /**
+     * Private networks the device is attached to outside the VPN, without
+     * the tunnel's own addresses [keep].
+     */
+    @Suppress("DEPRECATION")
+    private fun localNetworks(keep: List<ByteArray>): List<RoutePrefix> {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        return manager.allNetworks.flatMap { network ->
+            val capabilities = manager.getNetworkCapabilities(network)
+            if (capabilities == null || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                return@flatMap emptyList()
+            }
+            manager.getLinkProperties(network)?.linkAddresses.orEmpty().mapNotNull { link ->
+                localNetworkPrefix(link.address.address, link.prefixLength, keep)
+            }
+        }.distinct().sortedBy { it.toString() }
+    }
 
     private data class SelectedNetworkCallbacks(
         val defaultCallback: ConnectivityManager.NetworkCallback,

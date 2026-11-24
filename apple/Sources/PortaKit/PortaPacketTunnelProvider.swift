@@ -13,7 +13,8 @@ import Security
 /// - `identityTag` and `accessGroup`: where the device key lives, shared
 ///   with the app so both show the same device ID.
 ///
-/// Set `includeAllNetworks` on the protocol for a fail-closed full tunnel.
+/// Set `includeAllNetworks` on the protocol for a fail-closed full tunnel,
+/// and `excludeLocalNetworks` to keep the local network reachable beside it.
 open class PortaPacketTunnelProvider: NEPacketTunnelProvider {
     private let lock = NSLock()
     private var session: TunnelSession?

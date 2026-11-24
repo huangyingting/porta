@@ -160,6 +160,11 @@ not conceal transport fingerprints from network inspection.
   every client of a gateway, across all accounts, a peer. Leave it off unless
   all clients are mutually trusted; client hosts must protect their own
   services from their peers.
+- **Allow local network** sends traffic for the attached private networks,
+  and their multicast and broadcast, outside the tunnel. On an untrusted
+  network, such as public Wi-Fi, that traffic is visible to the network and
+  local hosts can reach the device, as without a VPN. Leave the option off
+  on profiles used on networks you do not trust.
 - With `--peer-to-peer`, peers learn each other's public IP addresses and
   traffic between them bypasses the gateway: it is not logged, counted
   toward usage or quotas, or rate limited there. Peers authenticate each

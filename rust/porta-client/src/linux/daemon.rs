@@ -56,6 +56,8 @@ struct StoredProfile {
     backup_servers: Vec<String>,
     transport: String,
     token: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_lan: bool,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -81,6 +83,8 @@ struct ProfileInput {
     transport: String,
     #[serde(default)]
     token: String,
+    #[serde(default)]
+    allow_lan: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +116,7 @@ struct SnapshotProfile {
     server_url: String,
     backup_servers: Vec<String>,
     transport: String,
+    allow_lan: bool,
     selected: bool,
     active: bool,
     status: String,
@@ -310,6 +315,7 @@ impl Daemon {
                 server_url: profile.server_url.clone(),
                 backup_servers: profile.backup_servers.clone(),
                 transport: profile.transport.clone(),
+                allow_lan: profile.allow_lan,
                 selected: profile.id == store.selected,
                 active: profile.id == status.active_id && status.running,
                 status: if profile.id == status.active_id {
@@ -443,6 +449,7 @@ impl Daemon {
             backup_servers,
             transport,
             token,
+            allow_lan: input.allow_lan,
         };
         let previous = match index {
             Some(index) => Some(std::mem::replace(
@@ -578,6 +585,7 @@ impl Daemon {
                 manual_network: false,
                 network_state: self.config.network_state.clone(),
                 subnet_router: false,
+                allow_lan: profile.allow_lan,
             },
             &cancellation,
             observer,

@@ -27,6 +27,8 @@ internal data class VpnProfile(
     val autoConnect: Boolean,
     /** Further gateways sharing the account; the fastest one is used. */
     val backupServers: List<String> = emptyList(),
+    /** In a full tunnel, keep the local network reachable outside it. */
+    val allowLan: Boolean = false,
 )
 
 internal class VpnProfileStore(private val context: Context) {
@@ -148,6 +150,7 @@ internal class VpnProfileStore(private val context: Context) {
             .put(KEY_SERVER, profile.server)
             .put(KEY_AUTO_CONNECT, profile.autoConnect)
             .put(KEY_BACKUP_SERVERS, org.json.JSONArray(profile.backupServers))
+            .put(KEY_ALLOW_LAN, profile.allowLan)
             .put(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .put(KEY_TOKEN, Base64.encodeToString(encrypted, Base64.NO_WRAP))
     }
@@ -166,6 +169,7 @@ internal class VpnProfileStore(private val context: Context) {
                 backupServers = entry.optJSONArray(KEY_BACKUP_SERVERS)?.let { array ->
                     (0 until array.length()).map { array.getString(it) }.filter(::isHttpsOrigin)
                 }.orEmpty(),
+                allowLan = entry.optBoolean(KEY_ALLOW_LAN),
             )
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
@@ -227,6 +231,7 @@ internal class VpnProfileStore(private val context: Context) {
         private const val KEY_NAME = "name"
         private const val KEY_SERVER = "server"
         private const val KEY_BACKUP_SERVERS = "backupServers"
+        private const val KEY_ALLOW_LAN = "allowLan"
         private const val KEY_VERSION = "version"
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_IV = "iv"
