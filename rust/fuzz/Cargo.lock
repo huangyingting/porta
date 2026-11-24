@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "porta-fuzz"
-version = "0.0.0"
+version = "0.1.41"
 dependencies = [
  "http",
  "libfuzzer-sys",
