@@ -1829,15 +1829,14 @@ class AutomationTests(unittest.TestCase):
                         self.assertIn(fragment, anchors[destination])
 
     def test_alert_rules_only_use_metrics_the_gateway_exports(self):
-        import yaml
-        rules = yaml.safe_load((ROOT / "deploy/prometheus/porta-alerts.yml").read_text())
-        expressions = [rule["expr"] for group in rules["groups"] for rule in group["rules"]]
-        self.assertTrue(expressions)
+        # Without PyYAML, which release runners do not guarantee: every
+        # porta_ identifier in the file is a metric name.
+        rules = (ROOT / "deploy/prometheus/porta-alerts.yml").read_text()
+        self.assertGreaterEqual(rules.count("- alert: "), 9)
         sources = "".join(
             path.read_text() for path in (ROOT / "rust/porta-server/src").rglob("*.rs")
         )
-        for name in sorted({name for expr in expressions
-                            for name in re.findall(r"\bporta_[a-z_]+", expr)}):
+        for name in sorted(set(re.findall(r"\bporta_[a-z_]+", rules))):
             with self.subTest(metric=name):
                 self.assertIn(f'"{name}"', sources)
 
