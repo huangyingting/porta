@@ -184,6 +184,109 @@ pub struct PacketMetadata {
     pub hash: u32,
 }
 
+/// The transport-layer fields access rules match on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Transport {
+    /// IP protocol number (6 TCP, 17 UDP, 1 ICMP, 58 ICMPv6).
+    pub protocol: u8,
+    /// TCP or UDP source and destination ports, when the header is present.
+    pub ports: Option<(u16, u16)>,
+    /// TCP flags, when the whole fixed TCP header is present.
+    pub tcp_flags: Option<u8>,
+    /// ICMP or ICMPv6 message type.
+    pub icmp_type: Option<u8>,
+    /// A fragment after the first, which carries no transport header.
+    pub later_fragment: bool,
+}
+
+impl Transport {
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_ACK: u8 = 0x10;
+
+    /// Whether the packet opens a TCP connection (SYN without ACK).
+    pub fn opens_tcp_connection(&self) -> bool {
+        self.protocol == 6
+            && self
+                .tcp_flags
+                .is_some_and(|flags| flags & Self::TCP_SYN != 0 && flags & Self::TCP_ACK == 0)
+    }
+
+    /// Whether the packet is an ICMP or ICMPv6 error about another packet.
+    pub fn is_icmp_error(&self) -> bool {
+        match (self.protocol, self.icmp_type) {
+            (1, Some(kind)) => matches!(kind, 3 | 11 | 12),
+            (58, Some(kind)) => matches!(kind, 1..=4),
+            _ => false,
+        }
+    }
+}
+
+/// The transport header fields of an IPv4 or IPv6 packet; malformed or
+/// truncated headers leave fields unset.
+pub fn transport(packet: &[u8]) -> Transport {
+    let Some((protocol, offset, fragmented, first_fragment)) = transport_header(packet) else {
+        return Transport::default();
+    };
+    let mut transport = Transport {
+        protocol,
+        later_fragment: fragmented && !first_fragment,
+        ..Transport::default()
+    };
+    if transport.later_fragment {
+        return transport;
+    }
+    let header = packet.get(offset..).unwrap_or_default();
+    match protocol {
+        6 | 17 if header.len() >= 4 => {
+            transport.ports = Some((
+                u16::from_be_bytes([header[0], header[1]]),
+                u16::from_be_bytes([header[2], header[3]]),
+            ));
+            if protocol == 6 && header.len() >= 20 {
+                transport.tcp_flags = Some(header[13]);
+            }
+        }
+        1 | PROTOCOL_ICMPV6 => transport.icmp_type = header.first().copied(),
+        _ => {}
+    }
+    transport
+}
+
+/// The protocol and offset of a packet's transport header, whether it is
+/// fragmented, and whether this is the first fragment.
+fn transport_header(packet: &[u8]) -> Option<(u8, usize, bool, bool)> {
+    match ip_version(packet)? {
+        4 => {
+            let info = parse_ipv4(packet).ok()?;
+            let flags_and_offset = u16::from_be_bytes([packet[6], packet[7]]);
+            let fragmented = flags_and_offset & 0x3fff != 0;
+            let first = flags_and_offset & 0x1fff == 0;
+            Some((packet[9], info.header_length, fragmented, first))
+        }
+        _ => {
+            parse_ipv6(packet).ok()?;
+            let mut next = packet[6];
+            let mut offset = IPV6_HEADER_LENGTH;
+            for _ in 0..4 {
+                match next {
+                    0 | 43 | 60 if packet.len() >= offset + 8 => {
+                        next = packet[offset];
+                        offset += (usize::from(packet[offset + 1]) + 1) * 8;
+                    }
+                    PROTOCOL_FRAGMENT if packet.len() >= offset + 8 => {
+                        let first = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]])
+                            & 0xfff8
+                            == 0;
+                        return Some((packet[offset], offset + 8, true, first));
+                    }
+                    _ => break,
+                }
+            }
+            Some((next, offset, false, true))
+        }
+    }
+}
+
 /// Classifies an IPv4 or IPv6 packet for queueing and lane selection.
 pub fn classify_packet(packet: &[u8]) -> PacketMetadata {
     match packet.first().map(|first| first >> 4) {
@@ -400,6 +503,35 @@ pub fn decrement_hop_limit(packet: &mut [u8]) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn transport_fields_follow_the_headers_rules_match_on() {
+        let mut syn = ipv4_packet([10, 66, 0, 2], [10, 1, 2, 3], 20);
+        syn[9] = 6;
+        syn[20..22].copy_from_slice(&40_000_u16.to_be_bytes());
+        syn[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        syn[33] = Transport::TCP_SYN;
+        let info = transport(&syn);
+        assert_eq!(info.ports, Some((40_000, 443)));
+        assert!(info.opens_tcp_connection());
+        syn[33] = Transport::TCP_SYN | Transport::TCP_ACK;
+        assert!(!transport(&syn).opens_tcp_connection());
+
+        let mut later = syn.clone();
+        later[6] = 0x00;
+        later[7] = 0x10;
+        let info = transport(&later);
+        assert!(info.later_fragment);
+        assert_eq!(info.ports, None);
+
+        let mut icmp = ipv4_packet([10, 66, 0, 2], [10, 1, 2, 3], 8);
+        icmp[9] = 1;
+        icmp[20] = 3;
+        assert!(transport(&icmp).is_icmp_error());
+        icmp[20] = 8;
+        assert!(!transport(&icmp).is_icmp_error());
+        assert_eq!(transport(&[0x45, 0, 0]), Transport::default());
+    }
 
     #[test]
     fn malformed_packets_keep_their_hop_limit() {

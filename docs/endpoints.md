@@ -243,9 +243,11 @@ quic-go/connect-ip-go client in `experiments/masque-interop`.
 ## Access policy and subnet routes
 
 `PUT /api/clients/{clientID}/access` replaces an account's access policy:
-`{"allow": ["10.20.0.0/16"], "deny": ["10.20.9.0/24"], "group": "team", "exit": null}`.
-Every field is optional; empty lists and `null` remove a rule. Prefixes may
-also be single addresses. Group names have at most 32 letters, digits, `-`
+`{"allow": ["10.20.0.0/16", "10.1.2.3 tcp/443"], "deny": ["10.20.9.0/24"], "group": "team", "exit": null}`.
+Every field is optional; empty lists and `null` remove a rule. Each list
+holds at most 64 rules: a prefix or address, optionally followed by
+`tcp`, `udp` (each with an optional `/PORT` or `/FIRST-LAST`) or `icmp`
+([rule semantics](deployment.md#client-to-client-traffic-and-access-policy)). Group names have at most 32 letters, digits, `-`
 or `_`, and are stored in lower case. The change reconnects the account's
 devices. Client summaries include the policy as `access`.
 

@@ -146,9 +146,9 @@ pub struct Authenticated {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NetworkPolicy {
     /// Destinations the device may reach; empty allows every destination.
-    pub allow: Vec<ipnet::IpNet>,
+    pub allow: Vec<crate::policy::AccessRule>,
     /// Destinations the device may never reach; takes precedence over `allow`.
-    pub deny: Vec<ipnet::IpNet>,
+    pub deny: Vec<crate::policy::AccessRule>,
     /// Devices of accounts in the same group reach each other.
     pub group: Option<String>,
     /// Named exit for the device's traffic; unset uses the gateway default.
@@ -160,11 +160,59 @@ pub struct NetworkPolicy {
 }
 
 impl NetworkPolicy {
-    /// Whether the allow and deny lists let the device exchange packets
-    /// with `address`.
+    /// Whether the allow and deny lists let the device exchange some
+    /// traffic with `address`.
     pub fn permits(&self, address: IpAddr) -> bool {
-        !self.deny.iter().any(|prefix| prefix.contains(&address))
-            && (self.allow.is_empty() || self.allow.iter().any(|prefix| prefix.contains(&address)))
+        !self
+            .deny
+            .iter()
+            .any(|rule| rule.is_whole() && rule.prefix.contains(&address))
+            && (self.allow.is_empty()
+                || self.allow.iter().any(|rule| rule.prefix.contains(&address)))
+    }
+
+    /// Whether the lists let the device exchange every kind of traffic with
+    /// `address`: no rule narrows what it may send there.
+    pub fn permits_fully(&self, address: IpAddr) -> bool {
+        !self.deny.iter().any(|rule| rule.prefix.contains(&address))
+            && (self.allow.is_empty()
+                || self
+                    .allow
+                    .iter()
+                    .any(|rule| rule.is_whole() && rule.prefix.contains(&address)))
+    }
+
+    /// Whether the device may send a packet with `transport` fields to
+    /// `destination`. Port rules decide which connections it may open; see
+    /// [`crate::policy`].
+    pub fn permits_packet(
+        &self,
+        destination: IpAddr,
+        transport: &porta_wire::ip::Transport,
+    ) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|rule| rule.matches(destination, transport))
+        {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        // Later segments of TCP connections, ICMP errors and later fragments
+        // belong to traffic whose opening packet the rules already decided.
+        let follows_up = transport.later_fragment
+            || transport.is_icmp_error()
+            || (transport.protocol == 6
+                && transport.tcp_flags.is_some()
+                && !transport.opens_tcp_connection());
+        if follows_up {
+            return self.permits(destination);
+        }
+        self.allow
+            .iter()
+            .any(|rule| rule.matches(destination, transport))
     }
 
     /// Whether `address` lies in a network behind this device.

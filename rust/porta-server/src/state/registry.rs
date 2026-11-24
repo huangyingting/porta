@@ -115,10 +115,10 @@ pub struct ClientRecord {
 pub struct AccessPolicy {
     /// Destinations the account may reach; empty allows every destination.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<IpNet>,
+    pub allow: Vec<crate::policy::AccessRule>,
     /// Destinations the account may never reach; takes precedence over `allow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny: Vec<IpNet>,
+    pub deny: Vec<crate::policy::AccessRule>,
     /// Accounts in the same group reach each other's devices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -2433,10 +2433,16 @@ impl Truncate for IpNet {
     }
 }
 
+impl Truncate for crate::policy::AccessRule {
+    fn trunc(&self) -> Self {
+        crate::policy::AccessRule::trunc(self)
+    }
+}
+
 fn validate_access(access: AccessPolicy, exits: &[String]) -> Result<AccessPolicy, RegistryError> {
     if access.allow.len() > MAX_ACCESS_PREFIXES || access.deny.len() > MAX_ACCESS_PREFIXES {
         return Err(RegistryError::InvalidInput(format!(
-            "allow and deny lists hold at most {MAX_ACCESS_PREFIXES} prefixes each"
+            "allow and deny lists hold at most {MAX_ACCESS_PREFIXES} rules each"
         )));
     }
     let group = access
@@ -3379,7 +3385,7 @@ mod tests {
         let pool: Ipv4Net = "10.66.0.0/24".parse().unwrap();
         let exits = vec!["local".to_owned()];
         let net = |value: &str| -> Ipv4Net { value.parse().unwrap() };
-        let prefix = |value: &str| -> IpNet { value.parse().unwrap() };
+        let prefix = |value: &str| -> crate::policy::AccessRule { value.parse().unwrap() };
 
         let summary = registry
             .set_access(

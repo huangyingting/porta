@@ -486,17 +486,43 @@ addresses to its own.
 Each account also has an access policy, set in the admin page's **Network
 access** section or with `PUT /api/clients/{id}/access`:
 
-- **Allowed destinations**: IPv4 prefixes the account may reach. Empty allows
+- **Allowed destinations**: rules for what the account may reach. Empty allows
   everything.
-- **Blocked destinations**: prefixes the account may never reach; they win
-  over allowed ones and over a shared group.
+- **Blocked destinations**: rules for what the account may never reach; they
+  win over allowed ones and over a shared group.
 - **Group**: accounts with the same group name reach each other's devices and
   subnets.
 
+A rule is a prefix or address, optionally narrowed to a protocol and ports,
+separated by commas in the admin page:
+
+| Rule | Matches |
+|---|---|
+| `10.20.0.0/16` | everything to the prefix |
+| `10.1.2.3 tcp/443` | TCP connections to port 443 |
+| `10.1.2.0/24 tcp/8000-8100` | TCP connections to a port range |
+| `10.1.2.0/24 tcp` | TCP connections to any port |
+| `192.0.2.53 udp/53` | UDP with port 53 at either end |
+| `10.1.2.0/24 icmp` | ICMP and ICMPv6 |
+
+The gateway filters each packet without tracking connections, so port rules
+decide which connections a device may open:
+- A TCP rule matches packets that open a connection (SYN without ACK).
+  Later packets of any connection, including replies to connections other
+  devices opened to this one, need only the address to be allowed.
+- A UDP rule matches packets with one of its ports at either end, so replies
+  from the service match.
+- ICMP errors and later fragments need only the address, so path MTU
+  discovery keeps working.
+
 The gateway address and its `--dns` server stay reachable whatever the lists
 say. Policies apply to traffic in both directions between clients, and to
-traffic toward the exit. Changing an account's policy reconnects its devices,
-which pick up the new rules automatically.
+traffic toward the exit; for traffic a device receives from another, that
+device's address must be allowed. With `--peer-to-peer`, devices are
+introduced for direct paths only when neither one's rules narrow what it may
+send to the other, since direct traffic bypasses the gateway. Changing an
+account's policy reconnects its devices, which pick up the new rules
+automatically.
 
 ## Subnet routing (site-to-site)
 

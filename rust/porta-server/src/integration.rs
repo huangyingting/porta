@@ -902,16 +902,17 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
 }
 
 /// Parses IPv4 or IPv6 prefixes, or bare addresses as host prefixes.
-fn parse_access_prefixes(values: &[String]) -> Result<Vec<ipnet::IpNet>, WebRegistryError> {
+fn parse_access_prefixes(
+    values: &[String],
+) -> Result<Vec<crate::policy::AccessRule>, WebRegistryError> {
     values
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(|value| {
             value
-                .parse::<ipnet::IpNet>()
-                .or_else(|_| value.parse::<IpAddr>().map(ipnet::IpNet::from))
-                .map_err(|_| WebRegistryError::Invalid(format!("{value:?} is not an IP prefix")))
+                .parse::<crate::policy::AccessRule>()
+                .map_err(|error| WebRegistryError::Invalid(error.to_string()))
         })
         .collect()
 }
@@ -1408,13 +1409,13 @@ impl PeerState {
             .filter_map(|other| {
                 let peer = self.announced.get(&other)?;
                 (may_peer(client_to_client, own, &peer.context)
-                    && own.network.permits(IpAddr::V4(other))
-                    && peer.context.network.permits(IpAddr::V4(address)))
+                    && own.network.permits_fully(IpAddr::V4(other))
+                    && peer.context.network.permits_fully(IpAddr::V4(address)))
                 .then(|| Peer {
                     address: other,
                     address6: own.ipv6.zip(peer.context.ipv6).and_then(|(mine, theirs)| {
-                        (own.network.permits(IpAddr::V6(theirs))
-                            && peer.context.network.permits(IpAddr::V6(mine)))
+                        (own.network.permits_fully(IpAddr::V6(theirs))
+                            && peer.context.network.permits_fully(IpAddr::V6(mine)))
                         .then_some(theirs)
                     }),
                     endpoint: peer.endpoint,
@@ -1498,6 +1499,7 @@ impl RouterAdapter {
         let info = porta_wire::ip::parse_ip(packet)
             .map_err(|_| RouterError::InvalidPacket("client packet"))?;
         let (source, destination) = (info.source, info.destination);
+        let transport = porta_wire::ip::transport(packet);
         let contexts = self.contexts.read();
         let sender = contexts.get(&lease);
         let own_source = match source {
@@ -1528,7 +1530,8 @@ impl RouterAdapter {
                     (Some(sender), Some(receiver)) => self.peers(sender, receiver),
                     _ => false,
                 };
-            let permitted = sender.is_none_or(|sender| sender.network.permits(destination))
+            let permitted = sender
+                .is_none_or(|sender| sender.network.permits_packet(destination, &transport))
                 && receiver.is_none_or(|receiver| receiver.network.permits(source));
             return Ok(if peers && permitted {
                 Verdict::Deliver(target)
@@ -1541,7 +1544,7 @@ impl RouterAdapter {
             return Ok(Verdict::Drop(DropReason::PolicyDenied));
         }
         if self.switching.always_reachable.contains(&destination)
-            || sender.is_none_or(|sender| sender.network.permits(destination))
+            || sender.is_none_or(|sender| sender.network.permits_packet(destination, &transport))
         {
             Ok(Verdict::Kernel)
         } else {
@@ -2353,6 +2356,111 @@ mod tests {
             }
             assert_eq!(directory.published(), 4_000);
         }
+    }
+
+    /// A TCP or UDP packet with ports and, for TCP, flags.
+    fn service_packet(
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        protocol: u8,
+        ports: (u16, u16),
+        flags: u8,
+    ) -> Bytes {
+        let mut packet = vec![0_u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = protocol;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..22].copy_from_slice(&ports.0.to_be_bytes());
+        packet[22..24].copy_from_slice(&ports.1.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = flags;
+        porta_wire::ip::set_ipv4_header_checksum(&mut packet).unwrap();
+        Bytes::from(packet)
+    }
+
+    #[tokio::test]
+    async fn port_rules_decide_which_connections_a_device_may_open() {
+        let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
+        let dns: Ipv4Addr = "192.0.2.53".parse().unwrap();
+        let router = Arc::new(Router::new(Arc::new(MemoryDevice::default()), None));
+        let adapter = RouterAdapter::with_switching(
+            router.clone(),
+            PoolAdapter::new(Arc::new(Pool::new("10.66.0.0/24").unwrap())),
+            RateLimiters::new(),
+            SwitchConfig::default(),
+        );
+        let parent = CancellationToken::new();
+        let _sessions = [a, b].map(|address| router.register(&parent, address));
+        let rules = |values: &[&str]| values.iter().map(|value| value.parse().unwrap()).collect();
+        adapter.contexts.write().insert(
+            a,
+            context(
+                "alpha",
+                NetworkPolicy {
+                    allow: rules(&[
+                        "10.66.0.3/32 tcp/22",
+                        "192.0.2.53/32 udp/53",
+                        "10.66.0.0/24 icmp",
+                    ]),
+                    deny: rules(&["192.0.2.53/32 tcp/53"]),
+                    ..NetworkPolicy::default()
+                },
+            ),
+        );
+        adapter
+            .contexts
+            .write()
+            .insert(b, context("alpha", NetworkPolicy::default()));
+        let syn = porta_wire::ip::Transport::TCP_SYN;
+        let ack = porta_wire::ip::Transport::TCP_ACK;
+        let verdict = |from, packet: Bytes| adapter.classify(from, &packet).unwrap();
+        let denied = Verdict::Drop(DropReason::PolicyDenied);
+
+        // a may open SSH to b, and nothing else over TCP.
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (40_000, 22), syn)),
+            Verdict::Deliver(b)
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (40_000, 80), syn)),
+            denied
+        );
+        // Segments after the opening pass, so replies to b's connections flow.
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (80, 40_000), syn | ack)),
+            Verdict::Deliver(b)
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (80, 40_000), ack)),
+            Verdict::Deliver(b)
+        );
+        // b is unrestricted and may connect to any of a's ports.
+        assert_eq!(
+            verdict(b, service_packet(b, a, 6, (40_000, 80), syn)),
+            Verdict::Deliver(a)
+        );
+        // UDP to the exit: DNS only; the deny rule wins over TCP DNS.
+        assert_eq!(
+            verdict(a, service_packet(a, dns, 17, (50_000, 53), 0)),
+            Verdict::Kernel
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, dns, 17, (50_000, 123), 0)),
+            denied
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, dns, 6, (50_000, 53), syn)),
+            denied
+        );
+
+        // Direct paths would bypass these rules, so a and b are not introduced.
+        let a_policy = adapter.contexts.read()[&a].network.clone();
+        assert!(a_policy.permits(IpAddr::V4(b)));
+        assert!(!a_policy.permits_fully(IpAddr::V4(b)));
     }
 
     #[tokio::test]

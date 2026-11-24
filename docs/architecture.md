@@ -192,8 +192,10 @@ packet whose destination is another live lease, or a subnet routed to another
 device, directly to that session's queue, decrementing its TTL. Before that,
 it checks the source (the sender's lease or one of its subnets), whether the
 two devices are peers (same account, shared access group, or
-`--client-to-client`), and both accounts' allow and deny lists. Packets toward
-the exit are checked against the sender's lists; packets sourced from a
+`--client-to-client`), and both accounts' allow and deny lists, whose rules
+may name protocols and ports for what the sender opens (`porta-server`'s
+`policy` module). Packets toward the exit are checked against the sender's
+lists; packets sourced from a
 subnet may only reach other clients. The kernel forward chain therefore drops
 all `porta0`-to-`porta0` traffic.
 

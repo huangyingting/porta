@@ -69,6 +69,9 @@ test-server-web:
 		node --check rust/porta-server/assets/portal-client.js; \
 		node --check rust/porta-server/assets/portal-join.js; \
 		node --check rust/porta-windows/frontend/app.js; \
+		inline=$$(mktemp --suffix=.js) && \
+		python3 -c 'import re,sys; print("\n".join(re.findall(r"<script[^>]*>(.*?)</script>", open(sys.argv[1]).read(), re.S)))' \
+			rust/porta-server/assets/admin.html >"$$inline" && node --check "$$inline"; status=$$?; rm -f "$$inline"; [ $$status -eq 0 ] || exit 1; \
 	else \
 		echo "node is not installed; skipping browser script checks"; \
 	fi

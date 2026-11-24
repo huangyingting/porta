@@ -265,6 +265,16 @@ expect_from_a 10.30.0.5 10.30.0.1 "allowed LAN"
 expect_refused_from_a 172.31.9.2 "destination outside the allow list"
 echo "deny and allow lists are enforced"
 
+# A port rule admits the LAN web server but not ping.
+admin_api -X PUT --data '{"group":"team","allow":["10.30.0.0/24 tcp/8080"]}' \
+  "http://127.0.0.1:9090/api/clients/$alpha/access" >/dev/null
+expect_from_a 10.30.0.5 10.30.0.1 "TCP 8080 under a port rule"
+if in_ns a ping -n -c 2 -W 2 10.30.0.5 >/dev/null 2>&1; then
+  echo "a tcp/8080 rule let ICMP through" >&2
+  exit 1
+fi
+echo "port and protocol rules admit only the named service"
+
 kill -INT "${client_pids[b]}"
 wait "${client_pids[b]}" 2>/dev/null || true
 unset 'client_pids[b]'
