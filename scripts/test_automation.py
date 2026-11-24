@@ -1451,7 +1451,7 @@ class AutomationTests(unittest.TestCase):
                 worker.join(timeout=5)
                 self.assertFalse(worker.is_alive())
 
-    def release_assets(self, landing_templates=True, proxy_headers=True):
+    def release_assets(self, landing_templates=True, proxy_headers=True, desktop=False):
         release = self.root / "release"
         release.mkdir()
         assets = [
@@ -1459,7 +1459,7 @@ class AutomationTests(unittest.TestCase):
             "porta-client-linux-arm64", "porta-client-windows-amd64.zip",
             "porta-android-arm64-v8a.apk", "porta-android-armeabi-v7a.apk",
             "porta-android-x86_64.apk",
-        ]
+        ] + (["porta-desktop-linux-amd64.tar.gz"] if desktop else [])
         checksums = []
         for name in assets:
             if name.startswith("porta-server"):
@@ -1494,6 +1494,32 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue((downloads / "release-signing-cert.der").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_releases_with_the_desktop_package_serve_it_and_others_do_not_need_it(self):
+        deploy = self.prepare_deploy()
+        self.release_assets(desktop=True)
+        result = self.run_deploy(deploy)
+        downloads = self.root / "system/var/lib/porta/downloads"
+        self.assertEqual((downloads / "porta-desktop-linux-amd64.tar.gz").read_text(),
+                         "porta-desktop-linux-amd64.tar.gz")
+        self.assertIn("Linux app:   https://vpn.example/download/porta-desktop-linux-amd64.tar.gz",
+                      result.stdout)
+        self.assertNotIn("\n\n  Linux ARM64", result.stdout)
+
+        shutil.rmtree(self.root / "release")
+        self.release_assets()
+        result = self.run_deploy(deploy)
+        self.assertFalse((downloads / "porta-desktop-linux-amd64.tar.gz").exists())
+        self.assertNotIn("Linux app:", result.stdout)
+        self.assertIn("  Linux AMD64: https://vpn.example/download/porta-client-linux-amd64\n"
+                      "  Linux ARM64:", result.stdout)
+
+        shutil.rmtree(self.root / "release")
+        self.release_assets(desktop=True)
+        (self.root / "release/porta-desktop-linux-amd64.tar.gz").write_text("corrupt")
+        before = self.snapshot()
+        self.run_deploy(deploy, success=False)
+        self.assertEqual(self.snapshot(), before)
 
     def test_release_token_is_not_exposed_in_curl_arguments(self):
         deploy = self.prepare_deploy()

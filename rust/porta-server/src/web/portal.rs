@@ -1193,6 +1193,13 @@ const DOWNLOAD_CATALOG: &[(&str, &str, &str, &str, bool)] = &[
         false,
     ),
     (
+        "porta-desktop-linux-amd64.tar.gz",
+        "Linux",
+        "x86-64",
+        "Desktop app with tray, and the client service it controls",
+        false,
+    ),
+    (
         "porta-client-linux-arm64",
         "Linux",
         "ARM64",
@@ -2461,9 +2468,13 @@ mod tests {
             assert_eq!(response.status, 200);
             assert_private_portal_headers(&response);
             let page = String::from_utf8(response.body).unwrap();
-            assert_eq!(page.matches("<article class=\"download-row\">").count(), 6);
+            let packages = DOWNLOAD_CATALOG.len();
+            assert_eq!(
+                page.matches("<article class=\"download-row\">").count(),
+                packages
+            );
             assert_eq!(page.matches("<span class=\"recommended\">").count(), 1);
-            assert_eq!(page.matches("<div class=\"meta\">").count(), 6);
+            assert_eq!(page.matches("<div class=\"meta\">").count(), packages);
             assert!(page.contains("<span class=\"version\">v1.2.3</span>"));
             for name in DOWNLOAD_CATALOG.iter().map(|artifact| artifact.0).chain([
                 "SHA256SUMS",

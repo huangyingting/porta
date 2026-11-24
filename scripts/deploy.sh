@@ -665,6 +665,21 @@ if not isinstance(value, str) or not value or len(value) > 128 or any(c.isspace(
 print(value)
 PY
   ) || die "release metadata does not contain a valid version"
+  # Packages added in later releases are served when the release has them.
+  mapfile -t optional_client_assets < <(python3 - \
+    "$release_download_directory/release.json" porta-desktop-linux-amd64.tar.gz <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as release_file:
+    names = {asset.get("name") for asset in json.load(release_file).get("assets", [])}
+for name in sys.argv[2:]:
+    if name in names:
+        print(name)
+PY
+  ) || die "could not read the release's assets"
+  client_release_assets+=("${optional_client_assets[@]}")
+  release_artifacts+=("${optional_client_assets[@]}")
   mapfile -t release_asset_urls < <(python3 - \
     "$release_download_directory/release.json" "${release_artifacts[@]}" <<'PY'
 import json
@@ -1285,9 +1300,13 @@ if [[ -f /var/lib/porta/downloads/porta-android-arm64-v8a.apk ]]; then
   if (( port != 443 )); then
     public_origin+=:$port
   fi
+  desktop_download_line=
+  if [[ -f /var/lib/porta/downloads/porta-desktop-linux-amd64.tar.gz ]]; then
+    desktop_download_line="  Linux app:   $public_origin/download/porta-desktop-linux-amd64.tar.gz"$'\n'
+  fi
   client_download_summary="Client downloads after portal sign-in:
   Linux AMD64: $public_origin/download/porta-client-linux-amd64
-  Linux ARM64: $public_origin/download/porta-client-linux-arm64
+${desktop_download_line}  Linux ARM64: $public_origin/download/porta-client-linux-arm64
   Windows:     $public_origin/download/porta-client-windows-amd64.zip
   Android:     $public_origin/download/porta-android-arm64-v8a.apk
   Checksums:   $public_origin/download/SHA256SUMS"

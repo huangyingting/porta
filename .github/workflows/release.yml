@@ -157,7 +157,17 @@ jobs:
           cp rust/target/aarch64-unknown-linux-gnu/release/porta-server dist/porta-server-linux-arm64
           cp rust/target/aarch64-unknown-linux-gnu/release/porta-client dist/porta-client-linux-arm64
           cp rust/target/aarch64-unknown-linux-gnu/release/porta-keygen dist/porta-keygen-linux-arm64
-          for binary in dist/porta-{server,client,keygen}-linux-*; do
+          # The desktop app links the system's GTK and WebKitGTK.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+          cargo build --manifest-path rust/Cargo.toml --locked --release \
+            --target x86_64-unknown-linux-gnu --package porta-linux --features gui
+          desktop=dist/desktop/porta-desktop
+          mkdir -p "$desktop/bin" "$desktop/deploy" "$desktop/scripts"
+          cp rust/target/x86_64-unknown-linux-gnu/release/porta-desktop "$desktop/bin/porta-desktop"
+          cp dist/porta-client-linux-amd64 "$desktop/bin/porta-client"
+          cp deploy/porta-client.service deploy/porta-desktop.desktop deploy/porta.png "$desktop/deploy/"
+          cp scripts/install-linux-desktop.sh "$desktop/scripts/"
+          for binary in dist/porta-{server,client,keygen}-linux-* "$desktop/bin/porta-desktop"; do
             if readelf --version-info "$binary" | grep -Eq 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
               echo "$binary requires glibc newer than the Ubuntu 22.04 deployment baseline" >&2
               exit 1
@@ -176,6 +186,7 @@ jobs:
             deploy/porta-backup.service deploy/porta-backup.timer \
             deploy/prometheus/porta-alerts.yml dist/deploy-bundle/porta/deploy/
           tar -C dist/deploy-bundle -czf dist/porta-deploy.tar.gz porta
+          tar -C dist/desktop -czf dist/porta-desktop-linux-amd64.tar.gz porta-desktop
       - name: Build Android release
         working-directory: android
         env:
@@ -200,7 +211,8 @@ jobs:
           cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk dist/porta-android-armeabi-v7a.apk
           cp android/app/build/outputs/apk/release/app-x86_64-release.apk dist/porta-android-x86_64.apk
           cd dist
-          sha256sum porta-server-* porta-client-* porta-keygen-* porta-android-* porta-deploy.tar.gz > SHA256SUMS
+          sha256sum porta-server-* porta-client-* porta-keygen-* porta-android-* porta-desktop-* \
+            porta-deploy.tar.gz > SHA256SUMS
       - name: Sign release manifest
         env:
           PORTA_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PORTA_ANDROID_KEYSTORE_PASSWORD }}
@@ -236,6 +248,7 @@ jobs:
             dist/porta-client-* \
             dist/porta-keygen-* \
             dist/porta-android-* \
+            dist/porta-desktop-* \
             dist/porta-deploy.tar.gz \
             dist/SHA256SUMS \
             dist/SHA256SUMS.sig \

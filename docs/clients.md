@@ -1,8 +1,9 @@
 # Client guide
 
-Porta releases provide Linux clients, a Windows desktop and CLI package, and
-per-architecture Android APKs. The deployed browser portal mirrors the matching
-release artifacts so end users do not need GitHub access.
+Porta releases provide Linux CLI clients, a Linux desktop app, a Windows
+desktop and CLI package, and per-architecture Android APKs. The deployed
+browser portal mirrors the matching release artifacts so end users do not
+need GitHub access.
 
 ## Get a client
 
@@ -15,6 +16,7 @@ Available packages:
 - `porta-client-linux-amd64`
 - `porta-client-linux-arm64`
 - `porta-client-windows-amd64.zip`
+- `porta-desktop-linux-amd64.tar.gz` (the Linux desktop app and its service)
 - `porta-android-arm64-v8a.apk`
 - `porta-android-armeabi-v7a.apk`
 - `porta-android-x86_64.apk`
@@ -240,9 +242,20 @@ tokens, in the root-only `/var/lib/porta-client/profiles.json` and owns the
 tunnel, so closing or quitting the window leaves the connection up; only
 root and members of the `porta-client` group may use the socket.
 
-Build and install it from a checkout (it needs the GTK and WebKitGTK
-development files, such as `libwebkit2gtk-4.1-dev` and `libgtk-3-dev` on
-Debian and Ubuntu):
+Download `porta-desktop-linux-amd64.tar.gz` from the gateway's downloads
+page or the GitHub release, check it against `SHA256SUMS`, and install it.
+It needs GTK 3 and WebKitGTK 4.1, which Ubuntu 22.04 and later and Debian 12
+and later provide:
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0
+tar -xzf porta-desktop-linux-amd64.tar.gz
+sudo ./porta-desktop/scripts/install-linux-desktop.sh
+```
+
+On other architectures, build and install it from a checkout (it needs the
+GTK and WebKitGTK development files, such as `libwebkit2gtk-4.1-dev` and
+`libgtk-3-dev` on Debian and Ubuntu):
 
 ```sh
 make build build-linux-desktop
