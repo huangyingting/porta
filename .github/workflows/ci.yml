@@ -93,6 +93,18 @@ jobs:
           cargo clippy --manifest-path rust/Cargo.toml --package porta-linux --features gui --all-targets --locked -- -D warnings
       - run: make test-rust-interop
 
+  dependencies:
+    # Known vulnerabilities, licenses and sources of every Rust dependency
+    # (rust/deny.toml).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check
+          arguments: --all-features
+
   masque-interop:
     # An independent RFC 9484 client (quic-go/connect-ip-go) against the
     # gateway's standard CONNECT-IP mode. Test tooling only.
@@ -274,7 +286,7 @@ jobs:
   required:
     name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}
     if: ${{ always() }}
-    needs: [rust, masque-interop, apple, windows, android]
+    needs: [rust, dependencies, masque-interop, apple, windows, android]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -289,12 +301,13 @@ jobs:
           ANDROID_RESULT: ${{ needs.android.result }}
           INTEROP_RESULT: ${{ needs.masque-interop.result }}
           APPLE_RESULT: ${{ needs.apple.result }}
+          DEPENDENCIES_RESULT: ${{ needs.dependencies.result }}
         run: |
           if [[ "$EVENT_NAME" == pull_request && ( "$HEAD_BRANCH" != rust || "$HEAD_REPOSITORY" != "$REPOSITORY" ) ]]; then
             echo "main only accepts promotion PRs from this repository's rust branch" >&2
             exit 1
           fi
-          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT" "$APPLE_RESULT"; do
+          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT" "$APPLE_RESULT" "$DEPENDENCIES_RESULT"; do
             if [[ "$result" != success ]]; then
               echo "A required Rust build/test job failed, was cancelled, or was skipped: $result" >&2
               exit 1

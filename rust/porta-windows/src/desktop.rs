@@ -638,7 +638,7 @@ impl Controller {
                         &mut state,
                         &format!(
                             "Reconnecting in {}: {reason}",
-                            humantime::format_duration(delay)
+                            porta_wire::duration::format_duration(delay)
                         ),
                     )
                 }

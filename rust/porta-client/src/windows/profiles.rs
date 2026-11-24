@@ -8,7 +8,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore as _};
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -273,7 +273,7 @@ fn validate(profile: &Profile) -> Result<(), ProfileError> {
 
 fn random_id() -> String {
     let mut bytes = [0_u8; 12];
-    OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -295,7 +295,7 @@ fn persist(path: &Path, state: &State) -> std::io::Result<()> {
     })?;
     fs::create_dir_all(directory)?;
     let mut random = [0_u8; 8];
-    OsRng.fill_bytes(&mut random);
+    rand::rng().fill_bytes(&mut random);
     let pending = directory.join(format!(".profiles-{}.tmp", hex::encode(random)));
     let result = (|| {
         let mut file = OpenOptions::new()

@@ -880,7 +880,7 @@ impl Config {
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    humantime::parse_duration(value).map_err(|error| error.to_string())
+    crate::wire::duration::parse_duration(value).map_err(|error| error.to_string())
 }
 
 fn parse_path(value: &str) -> Result<PathBuf, String> {

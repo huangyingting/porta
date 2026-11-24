@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate as _;
 use porta_client::identity::Identity;
 use porta_client::tls::platform_config;
 use porta_client::tunnel::{
@@ -84,8 +84,7 @@ async fn public_gateway_uses_platform_trust_over_tcp_and_quic() {
     timeout(limit, endpoint.wait_idle()).await.unwrap();
 
     let identity = Arc::new(
-        Identity::from_signing_key(SigningKey::random(&mut OsRng), "CI live transport probe")
-            .unwrap(),
+        Identity::from_signing_key(SigningKey::generate(), "CI live transport probe").unwrap(),
     );
     for transport in [Transport::Http2, Transport::Http3] {
         let identity = Arc::clone(&identity);

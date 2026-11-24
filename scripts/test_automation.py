@@ -1543,16 +1543,17 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("secrets.", workflow)
         self.assertIn("name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}\n"
                       "    if: ${{ always() }}", workflow)
-        self.assertIn("needs: [rust, masque-interop, apple, windows, android]", workflow)
+        self.assertIn("needs: [rust, dependencies, masque-interop, apple, windows, android]", workflow)
         script = self.workflow_script("ci.yml", "Require Rust promotion and every build")
         good = {
             "EVENT_NAME": "pull_request", "HEAD_BRANCH": "rust",
             "HEAD_REPOSITORY": "huangyingting/porta", "REPOSITORY": "huangyingting/porta",
             "RUST_RESULT": "success", "WINDOWS_RESULT": "success", "ANDROID_RESULT": "success",
             "INTEROP_RESULT": "success", "APPLE_RESULT": "success",
+            "DEPENDENCIES_RESULT": "success",
         }
         cases = [(good, True), (good | {"EVENT_NAME": "push", "HEAD_BRANCH": ""}, True)]
-        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT", "INTEROP_RESULT", "APPLE_RESULT"):
+        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT", "INTEROP_RESULT", "APPLE_RESULT", "DEPENDENCIES_RESULT"):
             for outcome in ("failure", "cancelled", "skipped"):
                 cases.append((good | {job: outcome}, False))
         cases.extend([
@@ -1723,10 +1724,9 @@ class AutomationTests(unittest.TestCase):
             "rust/porta-server/vendor/h3/src",
             "rust/porta-server/vendor/hyper/Cargo.toml",
             "rust/porta-server/vendor/hyper/src",
-            "rust/porta-server/vendor/quinn-proto/Cargo.toml",
-            "rust/porta-server/vendor/quinn-proto/src",
         ):
             self.assertIn(path, gradle)
+        self.assertNotIn("vendor/quinn-proto", gradle)
         build = (ROOT / "scripts/build-android-rust.sh").read_text()
         self.assertIn("max-page-size=16384", build)
         self.assertIn("common-page-size=16384", build)

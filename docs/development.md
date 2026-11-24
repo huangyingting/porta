@@ -14,6 +14,7 @@ Node.js or npm build.
 
 ```sh
 make check-version
+make check-dependencies
 make test-automation
 make test
 make test-rust-server
@@ -384,6 +385,22 @@ no release signing secrets. These developer artifacts are not release updates
 and must not be copied into the download portal. Post-merge releases use
 the persistent key and are the distributable update artifacts.
 
+## Dependencies
+
+`rust/deny.toml` is the dependency policy: no known vulnerable, unsound or
+unmaintained crate without a recorded reason, only permissive licenses (and
+MPL-2.0 for unmodified Tauri dependencies), and only crates.io plus the
+pinned h3 revision as sources. `make check-dependencies` runs it with
+`cargo-deny` (`cargo install cargo-deny --locked`), and the required
+**dependencies** CI job runs it on every push, so a newly published advisory
+fails CI until the dependency is updated or the exception is justified in
+`deny.toml`. Dependabot proposes weekly updates to the `rust` branch.
+
+`rustls-platform-verifier` is pinned to exactly 0.7.0: later releases stop
+bundling the Android verifier AAR that the Android build loads from the
+crate. Moving past it means fetching that AAR from a pinned, checksummed
+source in `android/app/build.gradle.kts`.
+
 ## Version policy
 
 The application version is stored in `internal/buildinfo/VERSION` and currently
@@ -417,8 +434,9 @@ workflows. `golang` is a separate implementation branch; do not merge its Go
 build/release workflows into `main`.
 
 **CI** builds and tests branch pushes, PRs targeting `main`, and manual runs.
-Linux/Rust, the standard CONNECT-IP interop job, the macOS job that builds
-and tests PortaKit, native Windows, and Android must all pass. The stable
+Linux/Rust, the dependency policy, the standard CONNECT-IP interop job, the
+macOS job that builds and tests PortaKit, native Windows, and Android must
+all pass. The stable
 **Rust PR required** check rejects failed, cancelled or skipped jobs and rejects
 promotion PRs whose source is not this repository's `rust` branch. Branch/main
 and manual runs use **Rust CI required**, so they cannot substitute for the

@@ -135,7 +135,7 @@ mod linux {
     }
 
     fn parse_duration(value: &str) -> Result<Duration, String> {
-        humantime::parse_duration(value).map_err(|error| error.to_string())
+        porta_wire::duration::parse_duration(value).map_err(|error| error.to_string())
     }
 
     pub async fn run() -> Result<(), client::RunError> {
@@ -368,7 +368,7 @@ mod windows {
     }
 
     fn parse_duration(value: &str) -> Result<Duration, String> {
-        humantime::parse_duration(value).map_err(|error| error.to_string())
+        porta_wire::duration::parse_duration(value).map_err(|error| error.to_string())
     }
 
     pub async fn run() -> Result<(), client::RunError> {
@@ -507,7 +507,7 @@ mod windows {
             } => eprintln!("porta-client: uploaded={uploaded_bytes} downloaded={downloaded_bytes}"),
             Event::Reconnecting { reason, delay } => eprintln!(
                 "porta-client: reconnecting in {}: {reason}",
-                humantime::format_duration(delay)
+                porta_wire::duration::format_duration(delay)
             ),
             Event::DirectPeers(peers) => {
                 eprintln!("porta-client: {}", porta_client::tunnel::direct_summary(&peers))
@@ -556,13 +556,13 @@ fn account_summary(account: &porta_client::tunnel::AccountStatus) -> String {
     let mut summary = String::new();
     if let Some(expires) = account
         .expires_at
-        .and_then(|seconds| u64::try_from(seconds).ok())
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
     {
-        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires);
-        summary.push_str(&format!(
-            " expires={}",
-            humantime::format_rfc3339_seconds(at)
-        ));
+        summary.push_str(&format!(" expires={expires}"));
     }
     if let Some(quota) = account.quota_bytes {
         let used = account

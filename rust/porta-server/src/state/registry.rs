@@ -2647,6 +2647,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::Generate as _;
     use p256::pkcs8::EncodePublicKey;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2654,7 +2655,7 @@ mod tests {
     const BOOTSTRAP_TOKEN: &str = "bootstrap-token-0123456789";
 
     fn test_device(name: &str, at: OffsetDateTime) -> DeviceRecord {
-        let key = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let key = p256::SecretKey::generate();
         let encoded = key
             .public_key()
             .to_public_key_der()
@@ -2716,7 +2717,7 @@ mod tests {
         let persistence = registry.inner.persistence.lock().await;
         let sequence = persistence.persisted_sequence;
         let authenticating = if native {
-            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let key = SigningKey::generate();
             let proof = signed_proof(&key, "phone", BOOTSTRAP_TOKEN, 1);
             let authenticator = NativeAuthenticator::new(
                 registry.clone(),
@@ -2981,7 +2982,7 @@ mod tests {
         let registry = ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
             .await
             .unwrap();
-        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let key = SigningKey::generate();
         let first = signed_proof(&key, "phone", BOOTSTRAP_TOKEN, 1);
         let session = registry
             .authenticate_device_session(BOOTSTRAP_TOKEN, &first, "POST", "/v1/tunnel")
@@ -3042,7 +3043,7 @@ mod tests {
             Err(RegistryError::InvalidInput(_))
         ));
 
-        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let key = SigningKey::generate();
         let session = registry
             .authenticate_device_session(
                 BOOTSTRAP_TOKEN,
@@ -3186,7 +3187,7 @@ mod tests {
             .await
             .unwrap();
         let account = primary.list()[0].id.clone();
-        let laptop = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let laptop = SigningKey::generate();
         let laptop_id = enroll(&primary, &laptop, 1).await.unwrap().device_id;
 
         let path = directory.path().join("replica").join("clients.json");
@@ -3206,7 +3207,7 @@ mod tests {
             session.cancellation.cancelled().await;
             drop(session);
         });
-        let phone = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let phone = SigningKey::generate();
         assert!(matches!(
             enroll(&replica, &phone, 3).await,
             Err(RegistryError::EnrollOnPrimary)
@@ -3372,7 +3373,7 @@ mod tests {
         let id = registry.list()[0].id.clone();
         let mut devices = Vec::new();
         for nonce in [1, 2] {
-            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let key = SigningKey::generate();
             devices.push(enroll(&registry, &key, nonce).await.unwrap().device_id);
         }
         let pool: Ipv4Net = "10.66.0.0/24".parse().unwrap();
@@ -3476,7 +3477,7 @@ mod tests {
         let path = directory.path().join("clients.json");
         let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
         let id = registry.list()[0].id.clone();
-        let existing = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let existing = SigningKey::generate();
         drop(enroll(&registry, &existing, 1).await.unwrap());
         registry
             .set_enrollment(&id, EnrollmentPolicy::Approval, None)
@@ -3485,7 +3486,7 @@ mod tests {
 
         // Enrolled devices keep working; a new one waits for approval.
         drop(enroll(&registry, &existing, 2).await.unwrap());
-        let newcomer = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let newcomer = SigningKey::generate();
         assert!(matches!(
             enroll(&registry, &newcomer, 3).await,
             Err(RegistryError::DevicePending)
@@ -3537,7 +3538,7 @@ mod tests {
             .set_enrollment(&id, EnrollmentPolicy::Closed, None)
             .await
             .unwrap();
-        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let key = SigningKey::generate();
         assert!(matches!(
             enroll(&registry, &key, 1).await,
             Err(RegistryError::EnrollmentClosed)
@@ -3575,13 +3576,13 @@ mod tests {
             .await
             .unwrap();
         for nonce in 0..MAX_UNAPPROVED_DEVICES {
-            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let key = SigningKey::generate();
             assert!(matches!(
                 enroll(&registry, &key, nonce as u8).await,
                 Err(RegistryError::DevicePending)
             ));
         }
-        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let key = SigningKey::generate();
         assert!(matches!(
             enroll(&registry, &key, 200).await,
             Err(RegistryError::EnrollmentClosed)
@@ -3600,7 +3601,7 @@ mod tests {
         let registry = ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
             .await
             .unwrap();
-        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let key = SigningKey::generate();
         let first = signed_proof(&key, "Office-PC", BOOTSTRAP_TOKEN, 1);
         let session = registry
             .authenticate_device_session(BOOTSTRAP_TOKEN, &first, "POST", "/v1/tunnel")
@@ -3628,7 +3629,7 @@ mod tests {
             .update(&account_id, "Default client", 1, true)
             .await
             .unwrap();
-        let second_key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let second_key = SigningKey::generate();
         let second = signed_proof(&second_key, "tablet", BOOTSTRAP_TOKEN, 3);
         assert!(matches!(
             registry
@@ -3647,7 +3648,7 @@ mod tests {
                 ClientRegistry::open(directory.path().join("clients.json"), BOOTSTRAP_TOKEN)
                     .await
                     .unwrap();
-            let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let key = SigningKey::generate();
             let proof = signed_proof(&key, "phone", BOOTSTRAP_TOKEN, 1);
             let session = registry
                 .authenticate_device_session(BOOTSTRAP_TOKEN, &proof, "POST", "/v1/tunnel")

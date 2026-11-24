@@ -641,9 +641,7 @@ mod tests {
 
     #[test]
     fn external_signers_produce_proofs_the_gateway_accepts() {
-        let key = Box::new(SigningKey::random(
-            &mut p256::elliptic_curve::rand_core::OsRng,
-        ));
+        let key = Box::new(<SigningKey as p256::elliptic_curve::Generate>::generate());
         let public_key = key.verifying_key().to_public_key_der().unwrap();
         let mut error = [0 as c_char; 256];
         let identity = unsafe {

@@ -312,14 +312,15 @@ async fn install_cached_certificate(target: PathBuf, cached: Zeroizing<Vec<u8>>)
 }
 
 fn prepare_cached_certificate(cached: Zeroizing<Vec<u8>>) -> Result<PreparedCachedCertificate> {
-    let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(cached.as_slice()))
+    use rustls::pki_types::pem::PemObject as _;
+    let certificates = CertificateDer::pem_slice_iter(cached.as_slice())
         .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .context("parse cached ACME certificate")?;
     if certificates.is_empty() {
         bail!("cached ACME certificate is empty");
     }
     let private_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut std::io::Cursor::new(cached.as_slice()))
+        crate::ops::tls::private_key_from_pem(cached.as_slice())
             .context("parse cached ACME private key")?
             .context("cached ACME private key is empty")?;
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&private_key)

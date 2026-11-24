@@ -312,8 +312,11 @@ mod native {
         }
 
         fn from_file(file: File, name: String, mtu: usize) -> io::Result<Self> {
+            // SAFETY: the File keeps its descriptor open and unchanged until
+            // the AsyncFd that owns it is dropped.
+            let fd = unsafe { AsyncFd::register(file) }.map_err(|error| error.into_parts().1)?;
             Ok(Self {
-                fd: AsyncFd::new(file)?,
+                fd,
                 name,
                 mtu: AtomicUsize::new(mtu),
             })

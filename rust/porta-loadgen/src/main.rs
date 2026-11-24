@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate as _;
 use porta_client::tunnel::{self, ClientError, Connection, Transport};
 use serde::Serialize;
 use tokio::sync::Barrier;
@@ -128,7 +128,7 @@ fn parse_duration(name: &str, value: &str) -> Result<Duration> {
     if value == "0" {
         return Ok(Duration::ZERO);
     }
-    let duration = humantime::parse_duration(value)
+    let duration = porta_wire::duration::parse_duration(value)
         .map_err(|error| anyhow!("invalid value {value:?} for -{name}: {error}"))?;
     if duration.as_nanos() > i64::MAX as u128 {
         bail!("invalid value {value:?} for -{name}: duration out of range");
@@ -384,7 +384,7 @@ async fn connect_all(
         let tls = Arc::clone(&tls);
         let connection_cancellation = cancellation.child_token();
         tasks.spawn(async move {
-            let signing_key = SigningKey::random(&mut OsRng);
+            let signing_key = SigningKey::generate();
             let device_name = format!("benchmark-{index}");
             let proof = Arc::new(move |method: &str, path: &str| {
                 porta_client::device::create_proof(

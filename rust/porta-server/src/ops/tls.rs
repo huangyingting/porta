@@ -1,13 +1,13 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -179,16 +179,15 @@ fn load_key_pair(certificate_path: &Path, private_key_path: &Path) -> Result<Loa
         std::fs::read(private_key_path)
             .with_context(|| format!("read TLS private key {}", private_key_path.display()))?,
     );
-    let certificates = rustls_pemfile::certs(&mut Cursor::new(&certificate_bytes))
+    let certificates = CertificateDer::pem_slice_iter(&certificate_bytes)
         .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .context("parse TLS certificate")?;
     if certificates.is_empty() {
         bail!("TLS certificate file is empty");
     }
-    let private_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut Cursor::new(private_key_bytes.as_slice()))
-            .context("parse TLS private key")?
-            .context("TLS private key file is empty")?;
+    let private_key = private_key_from_pem(&private_key_bytes)
+        .context("parse TLS private key")?
+        .context("TLS private key file is empty")?;
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&private_key)
         .context("TLS private key is unsupported")?;
     let key = Arc::new(CertifiedKey::new(certificates, signing_key));
@@ -200,6 +199,17 @@ fn load_key_pair(certificate_path: &Path, private_key_path: &Path) -> Result<Loa
     hasher.update(private_key_bytes.as_slice());
     let digest = hasher.finalize().into();
     Ok(LoadedKeyPair { key, digest })
+}
+
+/// The first private key in `pem`, or `None` when it holds none.
+pub(crate) fn private_key_from_pem(
+    pem: &[u8],
+) -> std::result::Result<Option<PrivateKeyDer<'static>>, rustls::pki_types::pem::Error> {
+    match PrivateKeyDer::from_pem_slice(pem) {
+        Ok(key) => Ok(Some(key)),
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
