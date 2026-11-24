@@ -179,7 +179,7 @@ if ! $exit_rules_removed; then
   status=1
 fi
 if links=$(ip -o link show); then
-  while read -r index name rest; do
+  while read -r _ name rest; do
     name=${name%:}
     name=${name%%@*}
     if [[ $name == "$tun_interface" ]]; then

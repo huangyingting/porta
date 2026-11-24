@@ -15,6 +15,7 @@ Node.js or npm build.
 ```sh
 make check-version
 make check-dependencies
+make lint-scripts
 make test-automation
 make test
 make test-rust-server

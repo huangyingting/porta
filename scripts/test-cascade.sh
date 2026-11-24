@@ -72,7 +72,8 @@ trap cleanup EXIT
 
 # Nodes in a line: client(0), gateways 1..N, web(N+1). Link k joins node k
 # ("east") to node k+1 ("west") on 172.31.k.0/30.
-nodes=(client $(seq 1 "$gateways") web)
+mapfile -t hops < <(seq 1 "$gateways")
+nodes=(client "${hops[@]}" web)
 for node in "${nodes[@]}"; do
   ip netns add "$(ns "$node")"
   in_ns "$node" ip link set lo up
@@ -317,7 +318,7 @@ bulk=$(in_ns client curl -fsS --max-time 60 -o /dev/null -w '%{size_download} %{
 [[ ${bulk%% *} == 16777216 ]] || { echo "bulk transfer was incomplete: $bulk" >&2; exit 1; }
 echo "16 MiB bulk transfer completed through the chain (${bulk#* } bytes/s)"
 mtu=$(in_ns client cat /sys/class/net/porta-ci0/mtu)
-in_ns client ping -n -c 2 -W 5 -M do -s $((mtu - 28)) "$web_address" >/dev/null
+in_ns client ping -n -c 2 -W 5 -M "do" -s $((mtu - 28)) "$web_address" >/dev/null
 echo "full-size DF ping crosses the chain (client MTU $mtu)"
 for gateway in $(seq 1 $((gateways - 1))); do
   in_ns "$gateway" curl -fsS --max-time 5 http://127.0.0.1:9090/readyz | grep -q '"upstream_tunnel"'

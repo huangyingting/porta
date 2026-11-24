@@ -2026,7 +2026,7 @@ class AutomationTests(unittest.TestCase):
             "ping -n -c 3",
             "interface_mtu=$(<\"/sys/class/net/$interface/mtu\")",
             "df_payload=$((interface_mtu - 28))",
-            "ping -n -c 1 -W 5 -M do -s \"$df_payload\"",
+            "ping -n -c 1 -W 5 -M \"do\" -s \"$df_payload\"",
             "Porta-owned routes remain",
             "Porta leak-protection table remains",
             "private Porta gateway remains reachable",

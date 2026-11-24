@@ -65,6 +65,10 @@ jobs:
             sudo ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
           fi
           ls -l /etc/resolv.conf
+      - name: Lint shell scripts
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update; sudo apt-get install -y shellcheck; }
+          make lint-scripts
       - run: make test
       - name: Test native firewall and client networking
         run: make test-native-firewall
