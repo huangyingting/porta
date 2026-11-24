@@ -27,6 +27,7 @@ pub struct EffectiveClientAddress(pub IpAddr);
 
 pub struct PublicHttpHandler {
     proxy: Option<Arc<ForwardProxy>>,
+    attestation: Option<Arc<crate::attestation::service::AttestationService>>,
     portal: Arc<Portal>,
     landing: Arc<LandingSite>,
     transport: Arc<dyn Handler>,
@@ -45,12 +46,22 @@ impl PublicHttpHandler {
     ) -> Self {
         Self {
             proxy,
+            attestation: None,
             portal,
             landing,
             transport,
             trust_proxy_headers,
             shutdown,
         }
+    }
+
+    /// Serves the endpoints devices prove their hardware key at.
+    pub fn with_attestation(
+        mut self,
+        attestation: Arc<crate::attestation::service::AttestationService>,
+    ) -> Self {
+        self.attestation = Some(attestation);
+        self
     }
 
     async fn handle(
@@ -117,6 +128,11 @@ impl PublicHttpHandler {
             Ok(context) => context,
             Err(response) => return Ok(*response),
         };
+        if let Some(attestation) = &self.attestation {
+            if let Some(response) = attestation.handle(&context).await {
+                return web_response(response).await;
+            }
+        }
         if let Some(response) = self.portal.handle(&context).await {
             return web_response(response).await;
         }

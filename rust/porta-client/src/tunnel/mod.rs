@@ -499,6 +499,35 @@ impl Drop for ConnectionInner {
     }
 }
 
+/// Sends device key evidence to the gateway, which records the device as
+/// hardware-protected when the evidence holds.
+pub async fn attest(
+    config: &ClientConfig,
+    request: &porta_wire::attestation::AttestationRequest,
+) -> Result<porta_wire::attestation::AttestationResult, ClientError> {
+    let body = serde_json::to_vec(request).map_err(ClientError::permanent)?;
+    let answer =
+        h2::post_signed(config, porta_wire::attestation::ATTESTATION_PATH, body).await?;
+    serde_json::from_slice(&answer)
+        .map_err(|_| ClientError::permanent("the gateway's attestation answer is malformed"))
+}
+
+/// Asks the gateway for a TPM credential challenge for this device key.
+pub async fn tpm_challenge(
+    config: &ClientConfig,
+    request: &porta_wire::attestation::TpmChallengeRequest,
+) -> Result<porta_wire::attestation::TpmChallenge, ClientError> {
+    let body = serde_json::to_vec(request).map_err(ClientError::permanent)?;
+    let answer = h2::post_signed(
+        config,
+        porta_wire::attestation::ATTESTATION_CHALLENGE_PATH,
+        body,
+    )
+    .await?;
+    serde_json::from_slice(&answer)
+        .map_err(|_| ClientError::permanent("the gateway's challenge is malformed"))
+}
+
 /// Parses where to dial instead of the gateway's resolved address, such as
 /// a relay that forwards TCP and UDP to the gateway unchanged: `IP:PORT`,
 /// `[IPv6]:PORT`, or a bare IP that uses `default_port`. The URL, TLS name

@@ -153,10 +153,11 @@ class TunnelService : VpnService() {
     private fun runTunnel(
         servers: List<String>,
         token: String,
-        deviceIdentity: AndroidDeviceIdentity,
+        initialIdentity: AndroidDeviceIdentity,
         runGeneration: Long,
         startId: Int,
     ) {
+        var deviceIdentity = initialIdentity
         val clientId = deviceIdentity.id
         val backoff = ReconnectBackoff(clientId)
         var finalStatus = "Disconnected"
@@ -207,6 +208,22 @@ class TunnelService : VpnService() {
                         attemptConnectedAt = System.currentTimeMillis()
                     }
                     networkChange.get()?.let { throw it }
+                } catch (_: HardwareKeyUpgradeRequired) {
+                    if (!isRunActive(runGeneration)) break
+                    clearConnectionDetails(attemptToken)
+                    deviceIdentity = try {
+                        logEvent("The account requires a hardware-attested key; creating one for this device")
+                        upgradeToAttestedKey(this)
+                    } catch (error: DeviceIdentityUnavailableException) {
+                        finalStatus = "Connection rejected: ${error.message.orEmpty()}"
+                        logEvent(finalStatus)
+                        break
+                    }
+                    if (deviceIdentity.attestation.isEmpty()) {
+                        finalStatus = "Connection rejected: ${getString(R.string.hardware_key_unavailable)}"
+                        logEvent(finalStatus)
+                        break
+                    }
                 } catch (error: PermanentTunnelException) {
                     if (!isRunActive(runGeneration)) break
                     val detail = safeErrorMessage(error, token)
@@ -242,6 +259,34 @@ class TunnelService : VpnService() {
                 finishTunnel(runGeneration, startId, finalStatus)
             }
         }
+    }
+
+    /** Whether this device's key was verified at [server] already. */
+    private fun attested(server: String, deviceId: String): Boolean =
+        getSharedPreferences(ATTESTATION_PREFERENCES, MODE_PRIVATE)
+            .getBoolean("${gatewayHost(server)}|$deviceId", false)
+
+    /**
+     * Sends the key's attestation to [server]; returns why it failed, or null
+     * once the gateway has recorded the key as hardware-protected.
+     */
+    private fun attestDevice(
+        dialer: Dialer,
+        server: String,
+        token: String,
+        remoteAddress: String,
+        identity: AndroidDeviceIdentity,
+        proofProvider: ProofProvider,
+        protector: Protector,
+    ): String? = try {
+        dialer.attest(server, token, remoteAddress, identity.attestation, proofProvider, protector)
+        getSharedPreferences(ATTESTATION_PREFERENCES, MODE_PRIVATE).edit()
+            .putBoolean("${gatewayHost(server)}|${identity.id}", true)
+            .apply()
+        logEvent("Device key verified as hardware-protected")
+        null
+    } catch (error: Exception) {
+        safeErrorMessage(error, token)
     }
 
     private fun connectNativeOnce(
@@ -344,15 +389,26 @@ class TunnelService : VpnService() {
                     if (!attemptActive.get()) {
                         throw IOException("Underlying network changed during connection")
                     }
-                    session = dialer.dial(
-                        server,
-                        token,
-                        remoteAddress,
-                        proofProvider,
-                        protector,
-                    )
+                    session = try {
+                        dialer.dial(server, token, remoteAddress, proofProvider, protector)
+                    } catch (error: Exception) {
+                        if (accountDenialIn(error.message.orEmpty()) != AccountDenial.HARDWARE_REQUIRED) throw error
+                        // Prove the key, then connect again.
+                        if (deviceIdentity.attestation.isEmpty()) throw HardwareKeyUpgradeRequired()
+                        attestDevice(dialer, server, token, remoteAddress, deviceIdentity, proofProvider, protector)
+                            ?.let { failure -> throw PermanentTunnelException(failure) }
+                        dialer.dial(server, token, remoteAddress, proofProvider, protector)
+                    }
                     connected = true
+                    if (deviceIdentity.attestation.isNotEmpty() && !attested(server, deviceIdentity.id)) {
+                        attestDevice(dialer, server, token, remoteAddress, deviceIdentity, proofProvider, protector)
+                            ?.let { failure -> logEvent("Device key not verified: $failure") }
+                    }
                     break
+                } catch (error: HardwareKeyUpgradeRequired) {
+                    throw error
+                } catch (error: PermanentTunnelException) {
+                    throw error
                 } catch (error: Exception) {
                     if (!isRunActive(runGeneration)) throw InterruptedException("Tunnel stopped")
                     if (!attemptActive.get()) {
@@ -1128,6 +1184,7 @@ class TunnelService : VpnService() {
         const val EXTRA_APP_MODE = "appMode"
         const val EXTRA_APPS = "apps"
         const val EXTRA_RELAY = "relay"
+        private const val ATTESTATION_PREFERENCES = "porta-attestation"
 
         /** Multicast and broadcast that local discovery (mDNS, SSDP) uses. */
         private val LOCAL_DISCOVERY = listOf(

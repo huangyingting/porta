@@ -1,4 +1,5 @@
 pub mod app;
+pub mod attestation;
 pub mod config;
 pub mod data;
 pub mod dns;

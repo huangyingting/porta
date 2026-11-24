@@ -133,4 +133,5 @@
     <string name="relay_invalid">请输入中继的 IP 地址和端口，例如 203.0.113.7:8443</string>
     <string name="relay_one_gateway">中继只能转发到一个网关。请移除备用网关或中继。</string>
     <string name="hardware_required_denied">此账户只接受密钥受安全硬件保护的设备，而此设备无法证明这一点。请联系管理员。</string>
+    <string name="hardware_key_unavailable">此设备无法创建经硬件认证的密钥，而此账户要求这样的密钥。</string>
 </resources>
