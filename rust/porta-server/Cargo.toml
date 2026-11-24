@@ -31,7 +31,7 @@ ipnet = { version = "2.11.0", features = ["serde"] }
 libc = "0.2.178"
 parking_lot = "0.12.5"
 p256 = { version = "0.14.0", features = ["ecdsa", "getrandom", "pkcs8"] }
-pem = "3.0.6"
+pem = "4.0.0"
 porta-client-rust = { path = "../porta-client" }
 porta-wire = { path = "../porta-wire" }
 quinn = { version = "0.11.9", default-features = false, features = ["bloom", "runtime-tokio", "rustls-aws-lc-rs"] }
