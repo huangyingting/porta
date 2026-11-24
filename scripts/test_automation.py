@@ -1798,6 +1798,36 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("previous state kept in", restored)
         self.assertEqual(log.read_text().split("\n")[:2], ["stop porta.service", "start porta.service"])
 
+    def test_documentation_links_and_anchors_resolve(self):
+        def slug(heading):
+            heading = re.sub(r"[`*_]", "", heading.strip().lower())
+            return re.sub(r"[^\w\- ]", "", heading).replace(" ", "-")
+
+        documents = [path for path in ROOT.rglob("*.md")
+                     if not {"target", "vendor", ".build", "node_modules"} & set(path.parts)
+                     and not any(part.startswith(".automation") for part in path.parts)]
+        anchors = {}
+        for document in documents:
+            seen, found = {}, set()
+            for line in document.read_text().splitlines():
+                heading = re.match(r"^#{1,6}\s+(.*)", line)
+                if heading:
+                    name = slug(heading.group(1))
+                    found.add(name if name not in seen else f"{name}-{seen[name]}")
+                    seen[name] = seen.get(name, 0) + 1
+            anchors[document.resolve()] = found
+        for document in documents:
+            text = re.sub(r"```.*?```", "", document.read_text(), flags=re.DOTALL)
+            for target in re.findall(r"\]\(([^)\s]+)\)", text):
+                if re.match(r"^[a-z]+:", target):
+                    continue
+                path, _, fragment = target.partition("#")
+                destination = (document.parent / path).resolve() if path else document.resolve()
+                with self.subTest(document=str(document.relative_to(ROOT)), target=target):
+                    self.assertTrue(destination.exists())
+                    if fragment and destination.suffix == ".md":
+                        self.assertIn(fragment, anchors[destination])
+
     def test_alert_rules_only_use_metrics_the_gateway_exports(self):
         import yaml
         rules = yaml.safe_load((ROOT / "deploy/prometheus/porta-alerts.yml").read_text())
