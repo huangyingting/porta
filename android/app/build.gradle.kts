@@ -211,12 +211,12 @@ android {
 
 dependencies {
     implementation(files(rustlsPlatformVerifierAar()))
-    implementation("com.squareup.okio:okio:3.9.0")
-    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.squareup.okio:okio:3.18.2")
+    implementation("com.google.zxing:core:3.5.4")
     implementation("androidx.activity:activity:1.9.3")
-    implementation("androidx.camera:camera-camera2:1.4.2")
-    implementation("androidx.camera:camera-lifecycle:1.4.2")
-    implementation("androidx.camera:camera-view:1.4.2")
+    implementation("androidx.camera:camera-camera2:1.7.0")
+    implementation("androidx.camera:camera-lifecycle:1.7.0")
+    implementation("androidx.camera:camera-view:1.7.0")
     testImplementation("junit:junit:4.13.2")
     androidTestCompileOnly(files(
         android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.base.jar"),
