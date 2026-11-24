@@ -16,6 +16,7 @@ is in [deployment.md](deployment.md).
 | `/var/lib/porta/leases.json` | Stable tunnel addresses per device | yes |
 | `/var/lib/porta/usage.json` | Monthly data usage per account | yes |
 | `/var/lib/porta/admins.json` | Named administrators, roles and TOTP secrets | yes |
+| `/var/lib/porta/sso-users.json` | Accounts of users who sign in with single sign-on | yes |
 | `/var/lib/porta/audit.log*` | Administrative changes, sign-ins and connections | yes |
 | `/var/lib/porta/acme/` | Let's Encrypt account and certificates | yes |
 | `/var/lib/porta/upstream-identity.json` | A relay's device key at its next hop | yes |

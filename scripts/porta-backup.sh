@@ -41,7 +41,7 @@ umask 077
 # (downloads, deploy rollback leftovers) is reproducible.
 state_entries() {
   local entry path
-  for entry in clients.json leases.json usage.json admins.json audit.log audit.log.* \
+  for entry in clients.json leases.json usage.json admins.json sso-users.json audit.log audit.log.* \
     upstream-identity.json client-identity.json acme; do
     compgen -G "$state_directory/$entry" >/dev/null || continue
     for path in "$state_directory"/$entry; do

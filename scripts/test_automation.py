@@ -1750,7 +1750,7 @@ class AutomationTests(unittest.TestCase):
         (config / "porta.env").write_text("PORTA_ADMIN_TOKEN=secret\n")
         (config / "tls/server.key").write_text("key")
         for name, text in {"clients.json": "clients-v1", "leases.json": "leases-v1",
-                           "usage.json": "{}", "admins.json": "[]", "audit.log": "line\n",
+                           "usage.json": "{}", "admins.json": "[]", "sso-users.json": "{}", "audit.log": "line\n",
                            "audit.log.1": "older\n", "acme/cert": "acme",
                            "downloads/porta-client": "binary", "clients.json.lock": ""}.items():
             (state / name).write_text(text)
@@ -1774,7 +1774,7 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(first.stat().st_mode & 0o777, 0o600)
         listing = subprocess.run(["tar", "-tzf", str(first)], text=True, capture_output=True).stdout
         for member in ("config/porta.env", "config/tls/server.key", "state/clients.json",
-                       "state/audit.log.1", "state/acme/cert", "MANIFEST", "SHA256SUMS"):
+                       "state/sso-users.json", "state/audit.log.1", "state/acme/cert", "MANIFEST", "SHA256SUMS"):
             self.assertIn(member, listing)
         self.assertNotIn("downloads", listing)
         self.assertNotIn("clients.json.lock", listing)
