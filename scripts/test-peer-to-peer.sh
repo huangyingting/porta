@@ -235,7 +235,10 @@ after=$(direct_packets)
 echo "traffic between the clients takes the direct path"
 
 block_direct
+# Each side gives up on a silent path on its own clock; until both have,
+# replies may still take the broken path.
 wait_direct a "direct paths: none" 20
+wait_direct b "direct paths: none" 20
 in_ns a ping -n -c 3 -i 0.2 -W 2 "$lease_b" >/dev/null
 echo "traffic returns to the gateway when the direct path breaks"
 unblock_direct
