@@ -61,6 +61,18 @@ pub struct Config {
     pub oidc_ca: Option<PathBuf>,
     #[arg(skip)]
     pub oidc_client_secret: String,
+    /// Let users whose verified email is in these domains sign in on the
+    /// portal with the OpenID Connect provider; their accounts are created
+    /// on first sign-in.
+    #[arg(long, value_delimiter = ',')]
+    pub sso_user_domains: Vec<String>,
+    /// Devices each account created by single sign-on may enroll.
+    #[arg(long, default_value_t = 5)]
+    pub sso_max_devices: usize,
+    /// Accounts created by single sign-on. Defaults to sso-users.json
+    /// beside the client registry.
+    #[arg(long, value_parser = parse_path)]
+    pub sso_users: Option<PathBuf>,
     /// Mirror accounts from this primary gateway (HTTPS origin) instead of
     /// managing them here. Needs PORTA_FEDERATION_TOKEN.
     #[arg(long)]
@@ -283,6 +295,9 @@ impl fmt::Debug for Config {
             .field("oidc_redirect_url", &self.oidc_redirect_url)
             .field("oidc_ca", &self.oidc_ca)
             .field("oidc_client_secret", &redacted(&self.oidc_client_secret))
+            .field("sso_user_domains", &self.sso_user_domains)
+            .field("sso_max_devices", &self.sso_max_devices)
+            .field("sso_users", &self.sso_users)
             .field("federation_primary", &self.federation_primary)
             .field("federation_ca", &self.federation_ca)
             .field("federation_token", &redacted(&self.federation_token))
@@ -478,6 +493,52 @@ impl Config {
             .join(name)
     }
 
+    fn validate_user_sign_in(&mut self, oidc: bool) -> Result<()> {
+        self.sso_user_domains = self
+            .sso_user_domains
+            .iter()
+            .map(|domain| domain.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty())
+            .collect();
+        if self.sso_user_domains.is_empty() {
+            if self.sso_users.is_some() {
+                bail!("--sso-users requires --sso-user-domains");
+            }
+            return Ok(());
+        }
+        for domain in &self.sso_user_domains {
+            let valid = domain.len() <= 253
+                && domain.contains('.')
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                });
+            if !valid {
+                bail!("--sso-user-domains: {domain:?} is not a domain name");
+            }
+        }
+        if !oidc {
+            bail!("--sso-user-domains requires --oidc-issuer, --oidc-client-id and --oidc-redirect-url");
+        }
+        if self.admin_token.is_empty() {
+            bail!("--sso-user-domains requires PORTA_ADMIN_TOKEN, which seals the tokens of the accounts it creates");
+        }
+        if self.federation_primary.is_some() {
+            bail!("--sso-user-domains belongs on the primary gateway, not on a replica");
+        }
+        if !(1..=100).contains(&self.sso_max_devices) {
+            bail!("--sso-max-devices must be between 1 and 100");
+        }
+        if self.sso_users.is_none() {
+            self.sso_users = Some(self.beside_registry("sso-users.json"));
+        }
+        Ok(())
+    }
+
     fn validate_federation(&mut self) -> Result<()> {
         if !self.federation_token.is_empty()
             && self.federation_token.len() < crate::ops::federation::MIN_TOKEN_LENGTH
@@ -516,6 +577,7 @@ impl Config {
         .iter()
         .filter(|value| !value.is_empty())
         .count();
+        self.validate_user_sign_in(configured == 3)?;
         if configured == 0 {
             if self.oidc_ca.is_some() || !self.oidc_client_secret.is_empty() {
                 bail!("--oidc-ca and PORTA_OIDC_CLIENT_SECRET require --oidc-issuer");
@@ -1056,6 +1118,46 @@ mod tests {
         .unwrap();
         assert_eq!(config.admin_listen, None);
         assert_eq!(config.usage_state.unwrap(), PathBuf::from("usage.json"));
+    }
+
+    #[test]
+    fn user_sign_in_needs_the_provider_the_admin_token_and_domain_names() {
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec![
+                "porta-server",
+                "--listen=:8443",
+                "--client-registry=/var/lib/porta/clients.json",
+            ];
+            arguments.extend_from_slice(extra);
+            Config::try_parse_from(arguments).unwrap()
+        };
+        let failure = |config: &mut Config, oidc: bool| {
+            config.validate_user_sign_in(oidc).unwrap_err().to_string()
+        };
+        let mut config = parse(&["--sso-user-domains", "Example.ORG, @corp.example"]);
+        config.admin_token = "admin-token-0123456789abcdef".into();
+        config.validate_user_sign_in(true).unwrap();
+        assert_eq!(config.sso_user_domains, ["example.org", "corp.example"]);
+        assert_eq!(
+            config.sso_users.unwrap(),
+            PathBuf::from("/var/lib/porta/sso-users.json")
+        );
+
+        let mut config = parse(&["--sso-user-domains=example.org"]);
+        assert!(failure(&mut config, false).contains("--oidc-issuer"));
+        assert!(failure(&mut config, true).contains("PORTA_ADMIN_TOKEN"));
+        for domain in ["localhost", "exa mple.org", "-bad.example", "a..example"] {
+            let mut config = parse(&[&format!("--sso-user-domains={domain}")]);
+            assert!(
+                failure(&mut config, true).contains("not a domain name"),
+                "{domain}"
+            );
+        }
+        let mut config = parse(&["--sso-users=/var/lib/porta/users.json"]);
+        assert!(failure(&mut config, true).contains("requires --sso-user-domains"));
+        let mut config = parse(&["--sso-user-domains=example.org", "--sso-max-devices=0"]);
+        config.admin_token = "admin-token-0123456789abcdef".into();
+        assert!(failure(&mut config, true).contains("--sso-max-devices"));
     }
 
     #[test]

@@ -308,7 +308,9 @@ request the role does not allow returns HTTP 403.
 
 Browser sign-in uses `POST /admin/sign-in` (form fields `username`,
 `password`, `code`), and single sign-on `GET /auth/oidc/start` and
-`GET /auth/oidc/callback`.
+`GET /auth/oidc/callback`. With `--sso-user-domains`, `GET /auth/sso/start`
+signs a user in to their account through the same callback and redirects to
+`/portal/downloads`.
 
 ## Session administration
 

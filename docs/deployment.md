@@ -886,6 +886,37 @@ authorization code flow with PKCE and a nonce, and checks the ID token's
 RS256 or ES256 signature against the issuer's keys, its issuer, audience and
 expiry. Users without a matching administrator are refused.
 
+### Letting users sign in with single sign-on
+
+Instead of handing out account tokens, let people sign in on the portal with
+the same OpenID Connect provider. Deploy with
+`--sso-user-domains example.com[,example.org]` (and optionally
+`--sso-max-devices N`, default 5) next to the `--oidc-*` options. The
+portal's **Get access** page then offers **Sign in with your organisation**.
+No second redirect URL is needed.
+
+- A user whose verified email is in one of the domains gets an account on
+  first sign-in, named after the email, with the configured device limit and
+  the default policies. The downloads page then shows their setup, as for a
+  token sign-in. Signing in again shows the same account and token, so their
+  other devices keep working.
+- Other emails, and emails the provider has not verified, are refused.
+- Administrators manage these accounts like any other. **Disabling** one
+  refuses the user's sign-in and disconnects their devices. Deleting one lets
+  the user start afresh with a new account at their next sign-in. To block a
+  person, disable the account or remove them at the provider. Rotating the
+  token disconnects their devices; their next sign-in shows the new token.
+- Sign-ins and refusals are audited as `user.sign_in`, and created accounts
+  as `client.create` by the `sso` actor.
+
+The gateway keeps each user's account and token in
+`/var/lib/porta/sso-users.json` (daemon option `--sso-users`), written `0600`.
+Tokens there are encrypted with a key derived from `PORTA_ADMIN_TOKEN`, which
+is therefore required, so the file alone does not reveal them. Changing the
+admin token makes them unreadable: each user's token is rotated at their next
+sign-in, and their devices need the new setup. Configure user sign-in on the
+primary gateway; replicas mirror the accounts it creates.
+
 Every admin API change, denied request, administrator sign-in (successful or
 not) and tunnel connection is appended to `/var/lib/porta/audit.log` as JSON
 lines with the actor, action, target, outcome, address and time. Request

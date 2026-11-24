@@ -1013,6 +1013,19 @@ class AutomationTests(unittest.TestCase):
         environment = self.root / "system/etc/porta/porta.env"
         self.assertIn("PORTA_OIDC_CLIENT_SECRET=oidc-client-secret-0123456789\n", environment.read_text())
         self.assertNotIn("oidc-client-secret", unit + result.stdout + result.stderr)
+        self.assertIn("User sign-in:    access tokens from an administrator", result.stdout)
+        result = self.run_deploy(deploy, "--build-local", "--sso-user-domains", "example.org,corp.example",
+                                 "--sso-max-devices", "3")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("/auth/oidc/callback --sso-user-domains example.org,corp.example --sso-max-devices 3", unit)
+        self.assertIn("User sign-in:    single sign-on for example.org, corp.example (up to 3 devices each)",
+                      result.stdout)
+        for options in (("--sso-user-domains", "not a domain"), ("--sso-max-devices", "0"),
+                        ("--sso-max-devices", "101"), ("--sso-max-devices", "08")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+        self.run_deploy(deploy, "--build-local", "--sso-user-domains=")
+        self.assertNotIn("--sso-user-domains", (self.root / "system/etc/systemd/system/porta.service").read_text())
         del self.env["PORTA_OIDC_CLIENT_SECRET"]
         self.run_deploy(deploy, "--build-local")
         self.assertIn("PORTA_OIDC_CLIENT_SECRET=", environment.read_text())

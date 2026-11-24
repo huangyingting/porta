@@ -65,6 +65,12 @@
   the least role they need, two-factor authentication or single sign-on.
 - Protect `/var/lib/porta/admins.json` (password hashes and TOTP secrets) and
   `/var/lib/porta/audit.log`; both are written `0600` for the service user.
+- User single sign-on trusts the identity provider to verify emails: anyone
+  it signs in with a verified address in an allowed domain gets an account.
+  Allow only domains the provider controls. Account tokens in
+  `/var/lib/porta/sso-users.json` are encrypted with a key derived from
+  `PORTA_ADMIN_TOKEN`, so reading the file alone does not reveal them, but
+  anyone with both can.
   Ship the audit log off the host if it must survive a host compromise. The server can obtain its
   certificate from Let's Encrypt or load an externally managed certificate;
   clients validate either through their system trust store.

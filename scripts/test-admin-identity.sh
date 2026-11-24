@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test of administrator identities: named accounts and roles,
-# TOTP, OpenID Connect single sign-on against a fake identity provider, and
-# the audit log. Runs a real gateway in a network namespace.
+# TOTP, OpenID Connect single sign-on against a fake identity provider, user
+# sign-in that provisions accounts for allowed email domains, and the audit
+# log. Runs a real gateway in a network namespace.
 #
 #   browser + identity provider (172.31.0.1) -- gateway (172.31.0.2)
 #
@@ -156,7 +157,8 @@ ip netns exec "$(ns gateway)" env \
   --client-registry "$work/state/clients.json" --lease-state "$work/state/leases.json" \
   --interface porta0 --egress-interface west --pool 10.66.0.0/24 \
   --oidc-issuer "$idp" --oidc-client-id porta-admin --oidc-ca "$work/ca.pem" \
-  --oidc-redirect-url "$gateway/auth/oidc/callback" >>"$work/gateway.log" 2>&1 &
+  --oidc-redirect-url "$gateway/auth/oidc/callback" \
+  --sso-user-domains example.org --sso-max-devices 3 >>"$work/gateway.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 1 100); do
   in_ns gateway curl -fsS --max-time 2 http://127.0.0.1:9090/healthz >/dev/null 2>&1 && break
@@ -265,6 +267,65 @@ printf 'mallory@example.com\n' >"$work/email"
 [[ $(sso_sign_in mallory) == 403 ]] || { echo "an unknown single sign-on user became an administrator" >&2; exit 1; }
 echo "single sign-on maps verified emails to administrators and refuses others"
 
+# Users in an allowed domain sign in and get an account of their own.
+user_sign_in() {
+  local jar=$1
+  rm -f "$work/$jar.jar"
+  local start callback
+  start=$(browser "$jar" -o /dev/null -w '%{redirect_url}' "$gateway/auth/sso/start")
+  [[ $start == "$idp/authorize?"* && $start == *code_challenge_method=S256* ]] || {
+    echo "user sign-in did not redirect to the provider: $start" >&2
+    return 1
+  }
+  callback=$(browser "$jar" -o /dev/null -w '%{redirect_url}' "$start")
+  browser "$jar" -o /dev/null -w '%{http_code} %{redirect_url}' "$callback"
+}
+# The token in the setup the downloads page offers the signed-in user.
+setup_token() {
+  browser "$1" "$gateway/portal/downloads" | python3 -c '
+import html, re, sys, urllib.parse
+setup = re.search(r"porta://profile\?[^\"]+", sys.stdin.read())
+print(urllib.parse.parse_qs(html.unescape(setup.group(0)).split("?", 1)[1])["token"][0])'
+}
+accounts() {
+  token_api http://127.0.0.1:9090/api/clients |
+    json "[c for c in json.load(sys.stdin)['clients'] if c['name'] == '$1']"
+}
+grep -q 'href="/auth/sso/start"' <(browser probe "$gateway/access") || {
+  echo "the access page does not offer user sign-in" >&2
+  exit 1
+}
+printf 'Dana@Example.org\n' >"$work/email"
+[[ $(user_sign_in dana) == "303 $gateway/portal/downloads" ]] || { echo "dana could not sign in" >&2; exit 1; }
+first=$(setup_token dana)
+[[ ${#first} -ge 16 ]] || { echo "the downloads page offers no setup after sign-in" >&2; exit 1; }
+[[ $(user_sign_in dana-again) == "303 $gateway/portal/downloads" && $(setup_token dana-again) == "$first" ]] || {
+  echo "signing in again did not show the same account" >&2
+  exit 1
+}
+account=$(accounts dana@example.org)
+[[ $(json 'len(eval(sys.stdin.read()))' <<<"$account") == 1 && $(json 'eval(sys.stdin.read())[0]["max_devices"]' <<<"$account") == 3 ]] || {
+  echo "single sign-on did not create one account with the configured device limit: $account" >&2
+  exit 1
+}
+dana_id=$(json 'eval(sys.stdin.read())[0]["id"]' <<<"$account")
+token_api -X POST "http://127.0.0.1:9090/api/clients/$dana_id/token" >/dev/null
+[[ $(user_sign_in dana-rotated) == "303 $gateway/portal/downloads" ]] || { echo "dana could not sign in after a rotation" >&2; exit 1; }
+rotated=$(setup_token dana-rotated)
+[[ $rotated != "$first" && ${#rotated} -ge 16 ]] || { echo "a rotated account showed its old token" >&2; exit 1; }
+token_api -X PUT --data '{"name":"dana@example.org","max_devices":3,"enabled":false}' \
+  "http://127.0.0.1:9090/api/clients/$dana_id" >/dev/null
+[[ $(user_sign_in dana-disabled) == "403 " ]] || { echo "a disabled account signed in" >&2; exit 1; }
+printf 'erin@example.net\n' >"$work/email"
+[[ $(user_sign_in erin) == "403 " ]] || { echo "an email outside the allowed domains got an account" >&2; exit 1; }
+[[ $(json 'len(eval(sys.stdin.read()))' <<<"$(accounts erin@example.net)") == 0 ]]
+[[ $(stat -c %a "$work/state/sso-users.json") == 600 ]] || { echo "the single sign-on users are readable by others" >&2; exit 1; }
+if grep -q "$rotated" "$work/state/sso-users.json"; then
+  echo "the single sign-on users store a plaintext token" >&2
+  exit 1
+fi
+echo "users in allowed domains sign in to an account of their own, which administrators control"
+
 # Disabling an administrator ends what their sessions can do.
 bob_id=$(token_api http://127.0.0.1:9090/api/admins | json 'next(a["id"] for a in json.load(sys.stdin)["admins"] if a["username"] == "bob")')
 token_api -X PUT --data '{"disabled":true}' "http://127.0.0.1:9090/api/admins/$bob_id" >/dev/null
@@ -283,6 +344,9 @@ assert has("admin", "alice", "admin.sign_in", "ok"), events
 assert has("admin", "alice", "admin.sign_in", "denied"), events
 assert has("sso", "carol", "admin.sign_in", "ok"), events
 assert has("sso", "mallory@example.com", "admin.sign_in", "denied"), events
+assert has("sso", "dana@example.org", "user.sign_in", "ok"), events
+assert has("sso", "dana@example.org", "user.sign_in", "denied"), events
+assert has("sso", "erin@example.net", "user.sign_in", "denied"), events
 assert has("token", "break-glass token", "POST /api/admins", "ok"), events
 assert has("admin", "bob", "POST /api/clients", "denied"), events
 assert has("sso", "carol", "POST /api/clients", "ok"), events

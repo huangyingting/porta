@@ -1,7 +1,8 @@
-//! OpenID Connect sign-in for administrators: the authorization code flow
-//! with PKCE (S256) and a nonce. The ID token's signature (RS256 or ES256
-//! from the issuer's JWKS), issuer, audience, expiry and nonce are verified
-//! before its verified email is mapped to an administrator.
+//! OpenID Connect sign-in for administrators and users: the authorization
+//! code flow with PKCE (S256) and a nonce. The ID token's signature (RS256 or
+//! ES256 from the issuer's JWKS), issuer, audience, expiry and nonce are
+//! verified before its verified email is mapped to an administrator or, for
+//! users, to the account provisioned for it.
 
 use aws_lc_rs::digest;
 use aws_lc_rs::rand::SecureRandom;
@@ -70,9 +71,17 @@ struct JwkSet {
     keys: Vec<Jwk>,
 }
 
+/// What a sign-in is for; both share the one registered redirect URL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignInPurpose {
+    Admin,
+    User,
+}
+
 struct Pending {
     nonce: String,
     verifier: String,
+    purpose: SignInPurpose,
     created: Instant,
 }
 
@@ -117,7 +126,7 @@ impl OidcClient {
     }
 
     /// The identity provider URL that starts a sign-in.
-    pub async fn start(&self) -> Result<String, OidcError> {
+    pub async fn start(&self, purpose: SignInPurpose) -> Result<String, OidcError> {
         let metadata = self.metadata().await?;
         let state = random_token(16)?;
         let nonce = random_token(16)?;
@@ -135,6 +144,7 @@ impl OidcClient {
                 Pending {
                     nonce: nonce.clone(),
                     verifier,
+                    purpose,
                     created: Instant::now(),
                 },
             );
@@ -154,7 +164,11 @@ impl OidcClient {
     }
 
     /// Redeems the authorization `code` of the sign-in started with `state`.
-    pub async fn finish(&self, code: &str, state: &str) -> Result<OidcIdentity, OidcError> {
+    pub async fn finish(
+        &self,
+        code: &str,
+        state: &str,
+    ) -> Result<(OidcIdentity, SignInPurpose), OidcError> {
         let pending = self
             .pending
             .lock()
@@ -206,15 +220,17 @@ impl OidcClient {
             .map_err(|failure| error(format!("invalid token response: {failure}")))?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let keys = self.keys(false).await?;
-        match verify_id_token(&token.id_token, &keys, &self.config, &pending.nonce, now) {
-            Err(KeyLookup::UnknownKey) => {
-                // The provider may have rotated its keys.
-                let keys = self.keys(true).await?;
-                verify_id_token(&token.id_token, &keys, &self.config, &pending.nonce, now)
-                    .map_err(KeyLookup::into_error)
-            }
-            result => result.map_err(KeyLookup::into_error),
-        }
+        let identity =
+            match verify_id_token(&token.id_token, &keys, &self.config, &pending.nonce, now) {
+                Err(KeyLookup::UnknownKey) => {
+                    // The provider may have rotated its keys.
+                    let keys = self.keys(true).await?;
+                    verify_id_token(&token.id_token, &keys, &self.config, &pending.nonce, now)
+                        .map_err(KeyLookup::into_error)
+                }
+                result => result.map_err(KeyLookup::into_error),
+            }?;
+        Ok((identity, pending.purpose))
     }
 
     async fn metadata(&self) -> Result<Metadata, OidcError> {

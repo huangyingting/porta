@@ -7,8 +7,10 @@ need GitHub access.
 
 ## Get a client
 
-Open the deployed Porta URL and enter an active client token. The protected
-downloads page shows the server address, client release version, package sizes,
+Open the deployed Porta URL and enter an active client token, or choose
+**Sign in with your organisation** when the gateway offers single sign-on
+(see [Letting users sign in with single sign-on](deployment.md#letting-users-sign-in-with-single-sign-on)).
+The protected downloads page shows the server address, client release version, package sizes,
 and SHA-256 checksums.
 
 Available packages:

@@ -29,6 +29,7 @@ use porta_server_rust::server::{listen_tcp, listen_udp, serve_tcp, Handler, Serv
 use porta_server_rust::state::admins::AdminStore;
 use porta_server_rust::state::pool::Pool;
 use porta_server_rust::state::registry::ClientRegistry;
+use porta_server_rust::state::sso_users::SsoUsers;
 use porta_server_rust::state::usage::Store as UsageStore;
 use porta_server_rust::transport::http2::{Http2Config, Http2Handler};
 use porta_server_rust::transport::http3::{serve_quinn, Http3Config, Http3Server};
@@ -41,7 +42,7 @@ use porta_server_rust::web::admin::{
 use porta_server_rust::web::landing::{load_landing_template_set, LandingSite};
 use porta_server_rust::web::oidc::{OidcClient, OidcConfig};
 use porta_server_rust::web::portal::FederationSource;
-use porta_server_rust::web::portal::Portal;
+use porta_server_rust::web::portal::{Portal, UserSignIn};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -417,6 +418,17 @@ async fn run() -> Result<Stop> {
     portal.set_abuse_guard(Some(abuse.clone()));
     portal.set_gateway_status(gateway_status.clone());
     portal.set_identity(Some(admins.clone()), Some(audit.clone()), oidc);
+    if let Some(path) = config.sso_users.clone() {
+        let users = SsoUsers::open(&path)
+            .with_context(|| format!("open the single sign-on users at {}", path.display()))?;
+        portal
+            .set_user_sign_in(Some(UserSignIn {
+                users: Arc::new(users),
+                domains: config.sso_user_domains.clone(),
+                max_devices: config.sso_max_devices,
+            }))
+            .map_err(anyhow::Error::msg)?;
+    }
     if config.federation_primary.is_none() && !federation_token.is_empty() {
         let source = registry.clone();
         portal.set_federation(Some(FederationSource {

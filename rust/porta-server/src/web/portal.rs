@@ -1,7 +1,7 @@
 use super::admin::{json_response, AdminActor, AdminService, ClientRegistry, RegistryError};
 use super::downloads::{open_download_file, DownloadService, CLIENT_DOWNLOAD_PREFIX};
 use super::landing::set_crawler_policy;
-use super::oidc::OidcClient;
+use super::oidc::{OidcClient, OidcIdentity, SignInPurpose};
 use super::session::{
     constant_time_eq, expired_session_cookie, form_urlencode, hash_token, html_escape, parse_form,
     unix_time_now, CredentialCipher, PortalRole, PortalSession, RequestContext, Response,
@@ -10,6 +10,7 @@ use super::session::{
 use crate::ops::abuse::{AbuseGuard, Surface};
 use crate::ops::audit::{Actor, AuditEvent, AuditLog};
 use crate::state::admins::{AdminError, AdminStore};
+use crate::state::sso_users::{email_domain, SsoUser, SsoUsers};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -26,6 +27,8 @@ pub const CLIENT_ACCESS_ERROR: &str =
     "This access link is invalid or no longer authorized. Ask your administrator for a new link.";
 pub const PORTAL_JOIN_SCRIPT_PATH: &str = "/assets/portal-join.js";
 pub const PORTAL_CLIENT_SCRIPT_PATH: &str = "/assets/portal-client.js";
+const ACCESS_DENIED: &str = "Access could not be verified.";
+const SSO_TOKEN_PURPOSE: &str = "sso-user-token-v1";
 
 const PORTAL_ACCESS_HTML: &str = include_str!("../../assets/portal-access.html");
 const ADMIN_SIGN_IN_HTML: &str = include_str!("../../assets/admin-sign-in.html");
@@ -81,7 +84,26 @@ pub struct Portal {
     admins: Option<Arc<AdminStore>>,
     audit: Option<Arc<AuditLog>>,
     oidc: Option<Arc<OidcClient>>,
+    user_sign_in: Option<UserSso>,
     federation: Option<FederationSource>,
+}
+
+/// User single sign-on: a verified email in one of `domains` gets an
+/// account, created on first sign-in with `max_devices` devices.
+pub struct UserSignIn {
+    pub users: Arc<SsoUsers>,
+    pub domains: Vec<String>,
+    pub max_devices: usize,
+}
+
+struct UserSso {
+    users: Arc<SsoUsers>,
+    domains: Vec<String>,
+    max_devices: usize,
+    /// Seals account tokens in the store; derived from the admin token.
+    cipher: CredentialCipher,
+    /// Concurrent first sign-ins of one user must create one account.
+    provisioning: tokio::sync::Mutex<()>,
 }
 
 /// What a primary gateway serves to replicas that present its token.
@@ -118,8 +140,41 @@ impl Portal {
             admins: None,
             audit: None,
             oidc: None,
+            user_sign_in: None,
             federation: None,
         })
+    }
+
+    /// Lets users sign in with the single sign-on provider; needs the admin
+    /// token, which keys the sealed account tokens.
+    pub fn set_user_sign_in(&mut self, sign_in: Option<UserSignIn>) -> Result<(), &'static str> {
+        let Some(sign_in) = sign_in else {
+            self.user_sign_in = None;
+            return Ok(());
+        };
+        if self.admin_token.is_empty() {
+            return Err("user single sign-on requires PORTA_ADMIN_TOKEN");
+        }
+        self.user_sign_in = Some(UserSso {
+            users: sign_in.users,
+            domains: sign_in
+                .domains
+                .iter()
+                .map(|domain| domain.trim().to_ascii_lowercase())
+                .collect(),
+            max_devices: sign_in.max_devices,
+            cipher: CredentialCipher::derive(self.admin_token.as_bytes(), SSO_TOKEN_PURPOSE),
+            provisioning: tokio::sync::Mutex::new(()),
+        });
+        Ok(())
+    }
+
+    fn user_sso_enabled(&self) -> bool {
+        self.oidc.is_some() && self.user_sign_in.is_some()
+    }
+
+    fn access_page(&self, request: &RequestContext, message: &str, status: u16) -> Response {
+        render_access_page(request, self.user_sso_enabled(), message, status)
     }
 
     /// Serves this primary gateway's accounts to replicas.
@@ -250,9 +305,7 @@ impl Portal {
                     Some(self.redeem_client_access(request, now))
                 }
             }
-            "/access" if request.is_get_or_head() => {
-                Some(access_page_response(request, false, 200))
-            }
+            "/access" if request.is_get_or_head() => Some(self.access_page(request, "", 200)),
             "/access" if request.method == "POST" => Some(self.sign_in(request, now)),
             crate::ops::federation::REGISTRY_PATH if request.method == "GET" => {
                 Some(self.serve_federation(request))
@@ -266,6 +319,9 @@ impl Portal {
             )),
             "/admin/sign-in" if request.method == "POST" => Some(self.admin_sign_in(request, now)),
             "/auth/oidc/start" if request.method == "GET" => Some(self.oidc_start(request).await),
+            "/auth/sso/start" if request.method == "GET" => {
+                Some(self.user_sso_start(request).await)
+            }
             "/auth/oidc/callback" if request.method == "GET" => {
                 Some(self.oidc_callback(request, now).await)
             }
@@ -284,17 +340,17 @@ impl Portal {
         // Without this, another site could sign a visitor in with the
         // attacker's token and show them the attacker's VPN profile.
         if !same_origin_portal_request(request, self.trust_proxy_headers) {
-            return access_page_response(request, true, 403);
+            return self.access_page(request, ACCESS_DENIED, 403);
         }
         let Some(form) = parse_form(&request.body, 4 << 10) else {
-            return access_page_response(request, true, 401);
+            return self.access_page(request, ACCESS_DENIED, 401);
         };
         let token = form
             .iter()
             .find_map(|(key, value)| (key == "token").then_some(value.trim()))
             .unwrap_or_default();
         if !(16..=512).contains(&token.len()) {
-            return access_page_response(request, true, 401);
+            return self.access_page(request, ACCESS_DENIED, 401);
         }
         let reservation = match self.reserve_authentication(request, Surface::Portal) {
             Ok(reservation) => reservation,
@@ -318,7 +374,7 @@ impl Portal {
         let session = match self.client_session(token, now) {
             Ok(session) => session,
             Err(RegistryError::Unauthorized | RegistryError::Disabled) => {
-                return access_page_response(request, true, 401)
+                return self.access_page(request, ACCESS_DENIED, 401)
             }
             Err(_) => {
                 return Response::text(
@@ -434,7 +490,7 @@ impl Portal {
         let Some(oidc) = &self.oidc else {
             return Response::not_found();
         };
-        match oidc.start().await {
+        match oidc.start(SignInPurpose::Admin).await {
             Ok(location) => {
                 let mut response = Response::redirect(&location);
                 response.set_header("Cache-Control", "no-store");
@@ -453,8 +509,25 @@ impl Portal {
         }
     }
 
+    async fn user_sso_start(&self, request: &RequestContext) -> Response {
+        let Some(oidc) = self.oidc.as_ref().filter(|_| self.user_sign_in.is_some()) else {
+            return Response::not_found();
+        };
+        match oidc.start(SignInPurpose::User).await {
+            Ok(location) => {
+                let mut response = Response::redirect(&location);
+                response.set_header("Cache-Control", "no-store");
+                response
+            }
+            Err(error) => {
+                tracing::warn!(%error, "user single sign-on could not start");
+                self.access_page(request, "Single sign-on is unavailable right now.", 503)
+            }
+        }
+    }
+
     async fn oidc_callback(&self, request: &RequestContext, now: u64) -> Response {
-        let (Some(oidc), Some(store)) = (&self.oidc, &self.admins) else {
+        let Some(oidc) = &self.oidc else {
             return Response::not_found();
         };
         let parameter = |name: &str| {
@@ -471,7 +544,10 @@ impl Portal {
             return admin_sign_in_page(request, true, "", "Single sign-on was cancelled.", 400);
         }
         let identity = match oidc.finish(&code, &state).await {
-            Ok(identity) => identity,
+            Ok((identity, SignInPurpose::User)) => {
+                return self.user_sso_finish(request, identity, now).await
+            }
+            Ok((identity, SignInPurpose::Admin)) => identity,
             Err(error) => {
                 tracing::warn!(%error, "single sign-on failed");
                 self.record(
@@ -496,6 +572,9 @@ impl Portal {
                     401,
                 );
             }
+        };
+        let Some(store) = &self.admins else {
+            return Response::not_found();
         };
         let admin = identity
             .email_verified
@@ -544,6 +623,171 @@ impl Portal {
         )
     }
 
+    /// Signs a user in with their account, provisioned on first sign-in.
+    async fn user_sso_finish(
+        &self,
+        request: &RequestContext,
+        identity: OidcIdentity,
+        now: u64,
+    ) -> Response {
+        let Some(sign_in) = &self.user_sign_in else {
+            return Response::not_found();
+        };
+        let address = request.client_ip.or(request.peer_ip);
+        let actor = Actor {
+            kind: "sso",
+            id: identity.subject.clone(),
+            name: identity.email.clone(),
+        };
+        let refuse = |reason: &str, message: &str, status: u16| {
+            self.record(
+                AuditEvent::new(actor.clone(), "user.sign_in", "")
+                    .outcome("denied")
+                    .address(address)
+                    .detail(serde_json::json!({ "error": reason })),
+            );
+            self.access_page(request, message, status)
+        };
+        let domain = email_domain(&identity.email);
+        if !identity.email_verified
+            || !domain.is_some_and(|domain| sign_in.domains.contains(&domain))
+        {
+            return refuse(
+                "email not verified or outside the allowed domains",
+                "This account cannot use this gateway. Sign in with your organisation account.",
+                403,
+            );
+        }
+        let token = match self.sso_account_token(sign_in, &identity).await {
+            Ok(token) => token,
+            Err(RegistryError::Disabled) => {
+                return refuse(
+                    "account disabled",
+                    "Your account is disabled. Ask your administrator.",
+                    403,
+                )
+            }
+            Err(error) => {
+                tracing::warn!(?error, "user single sign-on could not provision an account");
+                return refuse(
+                    "account unavailable",
+                    "Your account could not be set up right now. Try again later.",
+                    503,
+                );
+            }
+        };
+        let session = match self.client_session(&token, now) {
+            Ok(session) => session,
+            Err(RegistryError::Disabled) => {
+                return refuse(
+                    "account disabled",
+                    "Your account is disabled. Ask your administrator.",
+                    403,
+                )
+            }
+            Err(_) => {
+                return refuse(
+                    "account unavailable",
+                    "Your account could not be set up right now. Try again later.",
+                    503,
+                )
+            }
+        };
+        self.record(AuditEvent::new(actor, "user.sign_in", &session.client_id).address(address));
+        self.start_session(session, "/portal/downloads", now)
+    }
+
+    /// The token of the user's account, creating the account on first
+    /// sign-in. A token rotated by an administrator is rotated again, as
+    /// the sealed copy no longer matches; the user sets up devices anew.
+    async fn sso_account_token(
+        &self,
+        sign_in: &UserSso,
+        identity: &OidcIdentity,
+    ) -> Result<Zeroizing<String>, RegistryError> {
+        let _provisioning = sign_in.provisioning.lock().await;
+        let binding = |client_id: &str| {
+            format!(
+                "{SSO_TOKEN_PURPOSE}
+{}
+{client_id}",
+                identity.subject
+            )
+        };
+        let email = identity.email.trim().to_ascii_lowercase();
+        let store = |client_id: &str, token: &str, created_at| {
+            let sealed_token = sign_in
+                .cipher
+                .seal(token.as_bytes(), &binding(client_id))
+                .map_err(|_| RegistryError::Internal)?;
+            sign_in
+                .users
+                .put(SsoUser {
+                    subject: identity.subject.clone(),
+                    email: email.clone(),
+                    client_id: client_id.to_owned(),
+                    sealed_token,
+                    created_at,
+                })
+                .map_err(|error| {
+                    tracing::warn!(%error, "could not save a single sign-on user");
+                    RegistryError::Internal
+                })
+        };
+        if let Some(user) = sign_in.users.get(&identity.subject) {
+            let account = self
+                .registry
+                .list_clients()?
+                .into_iter()
+                .find(|client| client.id == user.client_id);
+            if let Some(account) = account {
+                if !account.enabled {
+                    return Err(RegistryError::Disabled);
+                }
+                let sealed = sign_in
+                    .cipher
+                    .open(&user.sealed_token, &binding(&user.client_id), 4096)
+                    .ok()
+                    .and_then(|token| String::from_utf8(token).ok())
+                    .map(Zeroizing::new);
+                if let Some(token) = sealed.filter(|token| {
+                    self.registry
+                        .portal_client_active(&user.client_id, &hash_token(token))
+                }) {
+                    if user.email != email {
+                        store(&user.client_id, &token, user.created_at)?;
+                    }
+                    return Ok(token);
+                }
+                let token =
+                    Zeroizing::new(self.registry.rotate_client_token(&user.client_id).await?);
+                store(&user.client_id, &token, user.created_at)?;
+                return Ok(token);
+            }
+            // The administrator deleted the account: start afresh.
+        }
+        let name = email.chars().take(80).collect::<String>();
+        let (account, token) = self
+            .registry
+            .create_client(&name, sign_in.max_devices)
+            .await?;
+        let token = Zeroizing::new(token);
+        store(&account.id, &token, time::OffsetDateTime::now_utc())?;
+        self.record(
+            AuditEvent::new(
+                Actor {
+                    kind: "sso",
+                    id: identity.subject.clone(),
+                    name: email.clone(),
+                },
+                "client.create",
+                &account.id,
+            )
+            .detail(serde_json::json!({ "provisioned": "single sign-on" })),
+        );
+        Ok(token)
+    }
+
     fn reserve_authentication(
         &self,
         request: &RequestContext,
@@ -560,7 +804,7 @@ impl Portal {
             .reserve(surface, address)
             .map(Some)
             .ok_or_else(|| match surface {
-                Surface::Portal => access_page_response(request, true, 429),
+                Surface::Portal => self.access_page(request, ACCESS_DENIED, 429),
                 Surface::Invitation => join_response(request, CLIENT_ACCESS_ERROR, 429),
                 _ => Response::not_found(),
             })
@@ -1320,13 +1564,27 @@ fn admin_sign_in_page(
     response.without_body_for_head(request)
 }
 
-fn access_page_response(request: &RequestContext, invalid: bool, status: u16) -> Response {
-    let message = if invalid {
-        "<p class=\"error\" role=\"alert\">Access could not be verified.</p>"
+fn render_access_page(request: &RequestContext, sso: bool, message: &str, status: u16) -> Response {
+    let message = if message.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"error\" role=\"alert\">{}</p>",
+            html_escape(message)
+        )
+    };
+    let sso = if sso {
+        "<a class=\"sso\" href=\"/auth/sso/start\">Sign in with your organisation</a>"
     } else {
         ""
     };
-    let body = render_asset_template(PORTAL_ACCESS_HTML, &[("%%PORTA_ACCESS_MESSAGE%%", message)]);
+    let body = render_asset_template(
+        PORTAL_ACCESS_HTML,
+        &[
+            ("%%PORTA_ACCESS_MESSAGE%%", message.as_str()),
+            ("%%PORTA_ACCESS_SSO%%", sso),
+        ],
+    );
     let mut response = Response::html(status, body.into_bytes());
     response.set_header("Cache-Control", "no-store");
     set_portal_security_headers(&mut response);
@@ -2267,7 +2525,12 @@ mod tests {
     fn access_page_restores_go_layout_and_responsive_styles() {
         for (method, invalid, status) in [("GET", false, 200), ("POST", true, 401)] {
             let request = RequestContext::new(method, "/access");
-            let response = access_page_response(&request, invalid, status);
+            let response = render_access_page(
+                &request,
+                false,
+                if invalid { ACCESS_DENIED } else { "" },
+                status,
+            );
             assert_eq!(response.status, status);
             assert_private_portal_headers(&response);
             let page = String::from_utf8(response.body).unwrap();
@@ -2303,7 +2566,7 @@ mod tests {
             assert!(!page.contains("%%PORTA_"));
             assert!(!page.contains("<script"));
         }
-        let head = access_page_response(&RequestContext::new("HEAD", "/access"), false, 200);
+        let head = render_access_page(&RequestContext::new("HEAD", "/access"), false, "", 200);
         assert_eq!(head.status, 200);
         assert_private_portal_headers(&head);
         assert!(head.body.is_empty());

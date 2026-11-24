@@ -127,6 +127,9 @@ Open the deployed URL, such as `https://vpn.example.com:8443`.
   usage.
 - Enter an active client token to download the matching Linux, Windows, or
   Android client.
+- With [user single sign-on](docs/deployment.md#letting-users-sign-in-with-single-sign-on),
+  people choose **Sign in with your organisation** and get an account of
+  their own instead of a token.
 
 Retrieve the initial tokens on the server:
 

@@ -76,6 +76,12 @@ Options:
   --oidc-client-id ID       Client ID registered with the issuer; the secret, if
                             any, comes from $PORTA_OIDC_CLIENT_SECRET or the
                             saved one. Register https://DOMAIN[:PORT]/auth/oidc/callback
+  --sso-user-domains D[,D...]
+                            Let users with a verified email in these domains sign
+                            in on the portal with the issuer and get an account;
+                            --sso-user-domains= turns user sign-in off
+  --sso-max-devices N       Devices each account created by user sign-in may
+                            enroll (default 5)
   --federation-primary URL  Mirror accounts from this primary gateway, so one
                             profile can fail over between them; --federation-primary=
                             makes this gateway manage its own accounts again
@@ -147,6 +153,8 @@ dns_resolver=false
 oidc_issuer=
 min_client_version=
 oidc_client_id=
+sso_user_domains=
+sso_max_devices=5
 federation_primary=
 disable_federation=false
 dns_upstreams=
@@ -164,7 +172,7 @@ saved_option_names=(
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client peer_to_peer client_host_access routes
   dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist oidc_issuer
-  min_client_version
+  min_client_version sso_user_domains sso_max_devices
   oidc_client_id federation_primary ipv6_pool ipv6_routed
 )
 declare -A saved_options=()
@@ -234,6 +242,10 @@ while [[ $# -gt 0 ]]; do
     --min-client-version=*) min_client_version=${1#*=}; shift ;;
     --oidc-issuer=*) oidc_issuer=${1#*=}; shift ;;
     --oidc-client-id) require_value "$@"; oidc_client_id=$2; shift 2 ;;
+    --sso-user-domains) require_value "$@"; sso_user_domains=$2; shift 2 ;;
+    --sso-user-domains=*) sso_user_domains=${1#*=}; shift ;;
+    --sso-max-devices) require_value "$@"; sso_max_devices=$2; shift 2 ;;
+    --sso-max-devices=*) sso_max_devices=${1#*=}; shift ;;
     --oidc-client-id=*) oidc_client_id=${1#*=}; shift ;;
     --dns-resolver) dns_resolver=true; shift ;;
     --dns-resolver=*) dns_resolver=$(parse_bool --dns-resolver "${1#*=}"); shift ;;
@@ -374,6 +386,16 @@ if [[ -n $oidc_issuer || -n $oidc_client_id ]]; then
   [[ $oidc_client_id =~ ^[A-Za-z0-9._:@-]{1,200}$ ]] || die "--oidc-client-id is required with --oidc-issuer"
   oidc_redirect="https://$domain$([[ $port == 443 ]] || printf ':%s' "$port")/auth/oidc/callback"
   oidc_arguments=" --oidc-issuer ${oidc_issuer%/} --oidc-client-id $oidc_client_id --oidc-redirect-url $oidc_redirect"
+fi
+if [[ ! $sso_max_devices =~ ^[1-9][0-9]{0,2}$ ]] || ((sso_max_devices > 100)); then
+  die "--sso-max-devices must be between 1 and 100"
+fi
+if [[ -n $sso_user_domains ]]; then
+  [[ $sso_user_domains =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(,[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+)*$ ]] ||
+    die "invalid --sso-user-domains; use comma-separated domain names"
+  [[ -n $oidc_arguments ]] || die "--sso-user-domains requires --oidc-issuer and --oidc-client-id"
+  [[ -z $federation_primary ]] || die "--sso-user-domains belongs on the primary gateway"
+  oidc_arguments+=" --sso-user-domains $sso_user_domains --sso-max-devices $sso_max_devices"
 fi
 resolver_arguments=
 if $dns_resolver; then
@@ -1354,6 +1376,7 @@ Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_
 Accounts:        $([[ -n $federation_primary ]] && echo "mirrored from $federation_primary (read-only here)" || echo "managed here")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Admin sign-in:   https://$domain$([[ $port == 443 ]] || printf ':%s' "$port")/admin/sign-in$([[ -n $oidc_arguments ]] && echo " (single sign-on through $oidc_issuer)")
+User sign-in:    $([[ -n $sso_user_domains ]] && echo "single sign-on for ${sso_user_domains//,/, } (up to $sso_max_devices devices each)" || echo "access tokens from an administrator")
 Browser portal:  https://$domain:$port
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env
 Initial client:  sudo sed -n 's/^PORTA_TOKEN=//p' /etc/porta/porta.env
