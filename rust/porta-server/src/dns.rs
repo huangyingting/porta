@@ -74,6 +74,7 @@ pub struct Listeners {
 pub struct Resolver {
     config: ResolverConfig,
     directory: Arc<dyn Directory>,
+    metrics: Arc<crate::ops::metrics::Metrics>,
     blocklist: RwLock<Blocklist>,
     queries: Arc<Semaphore>,
 }
@@ -95,10 +96,15 @@ struct Question {
 }
 
 impl Resolver {
-    pub fn new(config: ResolverConfig, directory: Arc<dyn Directory>) -> Result<Arc<Self>> {
+    pub fn new(
+        config: ResolverConfig,
+        directory: Arc<dyn Directory>,
+        metrics: Arc<crate::ops::metrics::Metrics>,
+    ) -> Result<Arc<Self>> {
         let resolver = Arc::new(Self {
             config,
             directory,
+            metrics,
             blocklist: RwLock::new(Blocklist::default()),
             queries: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
@@ -206,16 +212,33 @@ impl Resolver {
     /// The reply to `query` from `querier`, or nothing for responses and
     /// messages too short to answer.
     pub async fn answer(&self, querier: Ipv4Addr, query: &[u8], tcp: bool) -> Option<Vec<u8>> {
+        let (response, outcome) = self.respond(querier, query, tcp).await?;
+        self.metrics.dns_answer(outcome);
+        Some(response)
+    }
+
+    /// The reply to `query` and how it was answered, for metrics.
+    async fn respond(
+        &self,
+        querier: Ipv4Addr,
+        query: &[u8],
+        tcp: bool,
+    ) -> Option<(Vec<u8>, &'static str)> {
         if query.len() < 12 || query[2] & 0x80 != 0 {
             return None;
         }
         let opcode = (query[2] >> 3) & 0x0f;
         let question = match parse_question(query) {
             Some(question) if opcode == 0 => question,
-            Some(question) => return Some(reply(query, &question, RCODE_NOTIMP, false, &[])),
+            Some(question) => {
+                return Some((reply(query, &question, RCODE_NOTIMP, false, &[]), "invalid"))
+            }
             None => {
                 let id = u16::from_be_bytes([query[0], query[1]]);
-                return Some(header_only(id, query[2] & 0x01 != 0, RCODE_FORMERR));
+                return Some((
+                    header_only(id, query[2] & 0x01 != 0, RCODE_FORMERR),
+                    "invalid",
+                ));
             }
         };
         if let Some(relative) = zone_relative(&question.name) {
@@ -223,43 +246,49 @@ impl Resolver {
                 Some(name) => self.directory.resolve(querier, name),
                 None => None,
             };
-            return Some(match (address, question.kind) {
-                (Some(address), TYPE_A | TYPE_AAAA | TYPE_ANY) => {
-                    let mut records = Vec::new();
-                    if question.kind != TYPE_AAAA {
-                        records.push(record(TYPE_A, &address.ipv4.octets()));
+            return Some((
+                match (address, question.kind) {
+                    (Some(address), TYPE_A | TYPE_AAAA | TYPE_ANY) => {
+                        let mut records = Vec::new();
+                        if question.kind != TYPE_AAAA {
+                            records.push(record(TYPE_A, &address.ipv4.octets()));
+                        }
+                        if let Some(ipv6) = address.ipv6.filter(|_| question.kind != TYPE_A) {
+                            records.push(record(TYPE_AAAA, &ipv6.octets()));
+                        }
+                        reply(query, &question, 0, true, &records)
                     }
-                    if let Some(ipv6) = address.ipv6.filter(|_| question.kind != TYPE_A) {
-                        records.push(record(TYPE_AAAA, &ipv6.octets()));
-                    }
-                    reply(query, &question, 0, true, &records)
-                }
-                // The name exists but has no record of the requested type.
-                (Some(_), _) => reply(query, &question, 0, true, &[]),
-                (None, _) if relative.is_none() => reply(query, &question, 0, true, &[]),
-                (None, _) => reply(query, &question, RCODE_NXDOMAIN, true, &[]),
-            });
+                    // The name exists but has no record of the requested type.
+                    (Some(_), _) => reply(query, &question, 0, true, &[]),
+                    (None, _) if relative.is_none() => reply(query, &question, 0, true, &[]),
+                    (None, _) => reply(query, &question, RCODE_NXDOMAIN, true, &[]),
+                },
+                "local",
+            ));
         }
         if let Some(address) = reverse_address(&question.name) {
             if question.kind == TYPE_PTR || question.kind == TYPE_ANY {
                 if let Some(name) = self.directory.reverse(querier, address) {
                     let target = encode_name(&format!("{name}.{ZONE}"));
-                    return Some(reply(
-                        query,
-                        &question,
-                        0,
-                        true,
-                        &[record(TYPE_PTR, &target)],
+                    return Some((
+                        reply(query, &question, 0, true, &[record(TYPE_PTR, &target)]),
+                        "local",
                     ));
                 }
             }
         }
         if self.blocked(&question.name) {
-            return Some(reply(query, &question, RCODE_NXDOMAIN, false, &[]));
+            return Some((
+                reply(query, &question, RCODE_NXDOMAIN, false, &[]),
+                "blocked",
+            ));
         }
         Some(match self.forward(query, &question.name, tcp).await {
-            Some(response) => response,
-            None => reply(query, &question, RCODE_SERVFAIL, false, &[]),
+            Some(response) => (response, "forwarded"),
+            None => (
+                reply(query, &question, RCODE_SERVFAIL, false, &[]),
+                "failed",
+            ),
         })
     }
 
@@ -631,6 +660,7 @@ mod tests {
                 blocklist,
             },
             Arc::new(FakeDirectory),
+            Arc::default(),
         )
         .unwrap()
     }
@@ -760,6 +790,7 @@ mod tests {
                 blocklist: None,
             },
             Arc::new(FakeDirectory),
+            Arc::default(),
         )
         .unwrap();
         let client = Ipv4Addr::new(10, 66, 0, 2);

@@ -452,6 +452,7 @@ impl UsageSession for NoopUsageSession {
 
 struct CountedUsage {
     inner: Arc<dyn UsageSession>,
+    metrics: Option<Arc<dyn Metrics>>,
     uploaded_bytes: AtomicU64,
     uploaded_packets: AtomicU64,
     downloaded_bytes: AtomicU64,
@@ -462,6 +463,7 @@ impl CountedUsage {
     fn new(inner: Arc<dyn UsageSession>) -> Self {
         Self {
             inner,
+            metrics: None,
             uploaded_bytes: AtomicU64::new(0),
             uploaded_packets: AtomicU64::new(0),
             downloaded_bytes: AtomicU64::new(0),
@@ -474,6 +476,9 @@ impl UsageSession for CountedUsage {
     fn uploaded(&self, bytes: u64, packets: u64) {
         self.uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.uploaded_packets.fetch_add(packets, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.traffic(bytes, 0);
+        }
         self.inner.uploaded(bytes, packets);
     }
 
@@ -481,6 +486,9 @@ impl UsageSession for CountedUsage {
         self.downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.downloaded_packets
             .fetch_add(packets, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.traffic(0, bytes);
+        }
         self.inner.downloaded(bytes, packets);
     }
 
@@ -504,6 +512,8 @@ pub trait Metrics: Send + Sync {
     fn disconnected(&self) {}
     fn received_from_client(&self) {}
     fn sent_to_client(&self) {}
+    /// IP bytes accounted to a client's usage, by direction.
+    fn traffic(&self, _from_client: u64, _to_client: u64) {}
     fn dropped_from_client(&self) {}
     fn datagram_oversize(&self) {}
     fn datagram_mtu_reduced(&self) {}
@@ -754,14 +764,17 @@ impl Services {
                 return Err(error.into());
             }
         };
-        let usage = Arc::new(CountedUsage::new(self.usage.begin(UsageMetadata {
-            account_id: authenticated.identity.account_id.clone(),
-            device_id: proof.device_id.clone(),
-            transport: transport.clone(),
-            address: lease.address,
-            address6: lease.ipv6.map(|ipv6| ipv6.address),
-            session_id: session_id.clone(),
-        })));
+        let usage = Arc::new(CountedUsage {
+            metrics: Some(self.metrics.clone()),
+            ..CountedUsage::new(self.usage.begin(UsageMetadata {
+                account_id: authenticated.identity.account_id.clone(),
+                device_id: proof.device_id.clone(),
+                transport: transport.clone(),
+                address: lease.address,
+                address6: lease.ipv6.map(|ipv6| ipv6.address),
+                session_id: session_id.clone(),
+            }))
+        });
         let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
         let shutdown = self.shutdown.clone();
         let ended = route.cancellation.clone();

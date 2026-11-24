@@ -139,6 +139,34 @@ async fn run() -> Result<Stop> {
         .federation_primary
         .as_deref()
         .map(FederationSync::status_for);
+    if let Some(status) = federation_status.clone() {
+        metrics.register(Box::new(move |output| {
+            let status = status.lock().clone();
+            porta_server_rust::ops::metrics::metric(
+                output,
+                "porta_federation_connected",
+                "gauge",
+                "Whether this replica's last sync with its primary succeeded.",
+                u8::from(status.connected),
+            );
+            if let Some(last_sync) = status.last_sync {
+                porta_server_rust::ops::metrics::metric(
+                    output,
+                    "porta_federation_last_sync_timestamp_seconds",
+                    "gauge",
+                    "When this replica last mirrored its primary's accounts, in Unix seconds.",
+                    last_sync.unix_timestamp(),
+                );
+            }
+            porta_server_rust::ops::metrics::metric(
+                output,
+                "porta_federation_clients",
+                "gauge",
+                "Accounts mirrored from the primary.",
+                status.clients,
+            );
+        }));
+    }
     let gateway_status = {
         let base = upstream::gateway_status(&relays);
         let federation = federation_status.clone();
@@ -256,6 +284,18 @@ async fn run() -> Result<Stop> {
             names: Some(registry.clone()),
         },
     );
+    if config.peer_to_peer {
+        let router = packet_router.clone();
+        metrics.register(Box::new(move |output| {
+            porta_server_rust::ops::metrics::metric(
+                output,
+                "porta_direct_path_devices",
+                "gauge",
+                "Connected devices published for direct paths (--peer-to-peer).",
+                router.published_peers(),
+            );
+        }));
+    }
     let resolver = if config.dns_resolver {
         Some(Resolver::new(
             ResolverConfig {
@@ -265,6 +305,7 @@ async fn run() -> Result<Stop> {
                 blocklist: config.dns_blocklist.clone(),
             },
             packet_router.clone(),
+            metrics.clone(),
         )?)
     } else {
         None
@@ -487,13 +528,14 @@ async fn run() -> Result<Stop> {
         None => None,
     };
     let admission = Arc::new(ConnectionAdmission::new(metrics.clone()));
-    let retry = Arc::new(RetryController::new(admission.as_ref(), metrics));
+    let retry = Arc::new(RetryController::new(admission.as_ref(), metrics.clone()));
     let mut acme_manager = None;
     let mut tls_reload_task = None;
     let (tls, quinn_tls) = if config.behind_proxy {
         (None, None)
     } else if let (Some(certificate), Some(private_key)) = (&config.tls_cert, &config.tls_key) {
         let resolver = StaticCertificateResolver::open(certificate, private_key)?;
+        resolver.expiry().export(&metrics);
         tls_reload_task = Some(resolver.spawn_reload(Duration::from_secs(1), drain.cancellation()));
         let quinn = resolver.quinn_server_config()?;
         (
@@ -517,6 +559,7 @@ async fn run() -> Result<Stop> {
             drain.cancellation(),
         )
         .await?;
+        manager.expiry().export(&metrics);
         let acceptor = TlsAcceptor::from(manager.tcp_server_config());
         let quinn = manager.quinn_server_config();
         acme_manager = Some(manager);

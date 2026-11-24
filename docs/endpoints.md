@@ -88,7 +88,22 @@ The operations listener defaults to `127.0.0.1:9090`:
   external probes; failed required components return HTTP 503. Cascade relays
   add the required `upstream_tunnel` and `upstream_route` components.
 - `GET /metrics` is available only when `PORTA_METRICS_TOKEN` is configured and
-  requires that bearer token.
+  requires that bearer token. It serves Prometheus text:
+  - `porta_build_info{version}`;
+  - tunnels and connections: `porta_active_tunnels`, `porta_connections_total`,
+    `porta_public_connections`, `porta_public_connection_rejections_total`;
+  - traffic: `porta_traffic_bytes_total{direction}`, packet counters, and
+    `porta_router_dropped_packets_total{reason}`;
+  - authentication: `porta_auth_failures_total`, `porta_abuse_rejections_total`;
+  - `porta_tls_certificate_expiry_timestamp_seconds` for the certificate being
+    served;
+  - `porta_dns_answers_total{outcome}` with the built-in resolver;
+  - `porta_upstream_*` on cascade relays;
+  - `porta_federation_connected`, `porta_federation_last_sync_timestamp_seconds`
+    and `porta_federation_clients` on replicas;
+  - `porta_direct_path_devices` with `--peer-to-peer`.
+
+  `deploy/prometheus/porta-alerts.yml` holds alerting rules built on them.
 - `/api/*` accepts `PORTA_ADMIN_TOKEN` as a bearer token for local automation.
 
 Keep this listener private. Public browser sessions are handled separately on

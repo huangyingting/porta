@@ -1305,6 +1305,11 @@ impl RouterAdapter {
         may_peer(self.switching.client_to_client, sender, receiver)
     }
 
+    /// Sessions currently published for direct paths.
+    pub fn published_peers(&self) -> usize {
+        self.peers.announced.lock().len()
+    }
+
     /// Whether `querier` may learn about the device at `address`.
     fn visible(
         &self,
@@ -1819,6 +1824,10 @@ impl Metrics for OperationalMetrics {
 
     fn sent_to_client(&self) {
         OperationalMetrics::sent_to_client(self);
+    }
+
+    fn traffic(&self, from_client: u64, to_client: u64) {
+        OperationalMetrics::traffic(self, from_client, to_client);
     }
 
     fn dropped_from_client(&self) {

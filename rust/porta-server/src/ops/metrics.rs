@@ -5,9 +5,27 @@ const PUBLIC_TRANSPORTS: usize = 2;
 const PUBLIC_REJECTIONS: usize = 5;
 const ABUSE_SURFACES: usize = 4;
 const TUNNEL_LANES: usize = 4;
+const DNS_OUTCOMES: [&str; 5] = ["local", "forwarded", "blocked", "failed", "invalid"];
+
+/// Renders metrics owned by other components, such as the served TLS
+/// certificate or account federation, when `/metrics` is scraped.
+pub type Collector = Box<dyn Fn(&mut String) + Send + Sync>;
+
+#[derive(Default)]
+struct Collectors(parking_lot::Mutex<Vec<Collector>>);
+
+impl std::fmt::Debug for Collectors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Collectors")
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Metrics {
+    collectors: Collectors,
+    bytes_from_client: AtomicU64,
+    bytes_to_client: AtomicU64,
+    dns_answers: [AtomicU64; DNS_OUTCOMES.len()],
     active_tunnels: AtomicI64,
     connections_total: AtomicU64,
     auth_failures: AtomicU64,
@@ -46,6 +64,25 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Adds metrics rendered by `collector` on every scrape.
+    pub fn register(&self, collector: Collector) {
+        self.collectors.0.lock().push(collector);
+    }
+
+    /// IP bytes accounted to tunnel clients in each direction.
+    pub fn traffic(&self, from_client: u64, to_client: u64) {
+        self.bytes_from_client
+            .fetch_add(from_client, Ordering::Relaxed);
+        self.bytes_to_client.fetch_add(to_client, Ordering::Relaxed);
+    }
+
+    /// One DNS answer: `local`, `forwarded`, `blocked`, `failed` or `invalid`.
+    pub fn dns_answer(&self, outcome: &str) {
+        if let Some(index) = DNS_OUTCOMES.iter().position(|known| *known == outcome) {
+            self.dns_answers[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn upstream_state(&self, connected: bool) {
         if connected {
             self.upstream_connections_total
@@ -202,6 +239,42 @@ impl Metrics {
 
     pub fn render_prometheus(&self) -> String {
         let mut output = String::with_capacity(4096);
+        family(
+            &mut output,
+            "porta_build_info",
+            "gauge",
+            "The running gateway's version.",
+            [(format!("version={:?}", crate::VERSION.trim()), 1)],
+        );
+        family(
+            &mut output,
+            "porta_traffic_bytes_total",
+            "counter",
+            "IP bytes accounted to tunnel clients by direction, as counted toward usage.",
+            [
+                ("from_client", &self.bytes_from_client),
+                ("to_client", &self.bytes_to_client),
+            ]
+            .into_iter()
+            .map(|(direction, value)| {
+                (
+                    format!("direction={direction:?}"),
+                    value.load(Ordering::Relaxed),
+                )
+            }),
+        );
+        family(
+            &mut output,
+            "porta_dns_answers_total",
+            "counter",
+            "Built-in resolver answers by outcome: device names, forwarded, blocklisted, upstream failure or malformed query.",
+            DNS_OUTCOMES
+                .iter()
+                .zip(&self.dns_answers)
+                .map(|(outcome, value)| {
+                    (format!("outcome={outcome:?}"), value.load(Ordering::Relaxed))
+                }),
+        );
         metric(
             &mut output,
             "porta_active_tunnels",
@@ -434,6 +507,9 @@ impl Metrics {
                 )
             }),
         );
+        for collector in self.collectors.0.lock().iter() {
+            collector(&mut output);
+        }
         output.push('\n');
         output
     }
@@ -447,13 +523,19 @@ fn public_transport_index(transport: &str) -> Option<usize> {
     }
 }
 
-fn metric(output: &mut String, name: &str, kind: &str, help: &str, value: impl std::fmt::Display) {
+pub fn metric(
+    output: &mut String,
+    name: &str,
+    kind: &str,
+    help: &str,
+    value: impl std::fmt::Display,
+) {
     let _ = writeln!(output, "# HELP {name} {help}");
     let _ = writeln!(output, "# TYPE {name} {kind}");
     let _ = writeln!(output, "{name} {value}");
 }
 
-fn family<V>(
+pub fn family<V>(
     output: &mut String,
     name: &str,
     kind: &str,
@@ -487,6 +569,28 @@ mod tests {
         assert!(output.contains("not confirmed delivered"));
         assert!(output.contains("porta_datagram_mtu_reductions_total 1"));
         assert!(output.contains("porta_datagram_oversize_total 1"));
+    }
+
+    #[test]
+    fn renders_traffic_dns_build_and_collected_metrics() {
+        let metrics = Metrics::default();
+        metrics.traffic(1200, 0);
+        metrics.traffic(0, 3000);
+        metrics.dns_answer("blocked");
+        metrics.dns_answer("not-an-outcome");
+        metrics.register(Box::new(|output| {
+            metric(output, "porta_example", "gauge", "An example.", 7)
+        }));
+        let output = metrics.render_prometheus();
+        assert!(output.contains("porta_traffic_bytes_total{direction=\"from_client\"} 1200"));
+        assert!(output.contains("porta_traffic_bytes_total{direction=\"to_client\"} 3000"));
+        assert!(output.contains("porta_dns_answers_total{outcome=\"blocked\"} 1"));
+        assert!(output.contains("porta_dns_answers_total{outcome=\"local\"} 0"));
+        assert!(output.contains(&format!(
+            "porta_build_info{{version=\"{}\"}} 1",
+            crate::VERSION.trim()
+        )));
+        assert!(output.contains("porta_example 7"));
     }
 
     #[test]

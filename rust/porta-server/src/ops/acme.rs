@@ -46,6 +46,7 @@ pub struct AutomaticCertificateConfig {
 
 pub struct AutomaticCertificateManager {
     domain: String,
+    expiry: Arc<crate::ops::tls::CertificateExpiry>,
     resolver: Arc<ResolvesServerCertAcme>,
     tcp_config: Arc<ServerConfig>,
     quinn_config: quinn::ServerConfig,
@@ -105,14 +106,23 @@ impl AutomaticCertificateManager {
 
         let mut state = acme.state();
         let resolver = state.resolver();
-        let server_resolver: Arc<dyn ResolvesServerCert> = match cached_fallback {
-            Some(fallback) => Arc::new(CachedCertificateResolver {
-                primary: resolver.clone(),
-                fallback,
-                domain: domain.clone(),
-            }),
+        let expiry = Arc::new(crate::ops::tls::CertificateExpiry::default());
+        let served: Arc<dyn ResolvesServerCert> = match cached_fallback {
+            Some(fallback) => {
+                expiry.record(&fallback);
+                Arc::new(CachedCertificateResolver {
+                    primary: resolver.clone(),
+                    fallback,
+                    domain: domain.clone(),
+                })
+            }
             None => resolver.clone(),
         };
+        let server_resolver: Arc<dyn ResolvesServerCert> =
+            Arc::new(crate::ops::tls::ExpiryRecordingResolver {
+                inner: served,
+                expiry: expiry.clone(),
+            });
 
         let mut tcp_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         if http_listener.is_none() {
@@ -159,6 +169,7 @@ impl AutomaticCertificateManager {
 
         Ok(Self {
             domain,
+            expiry,
             resolver,
             tcp_config,
             quinn_config,
@@ -170,6 +181,11 @@ impl AutomaticCertificateManager {
 
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// When the certificate being served expires.
+    pub fn expiry(&self) -> Arc<crate::ops::tls::CertificateExpiry> {
+        self.expiry.clone()
     }
 
     pub fn allows_domain(&self, candidate: &str) -> bool {

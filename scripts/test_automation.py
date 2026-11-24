@@ -1665,6 +1665,19 @@ class AutomationTests(unittest.TestCase):
         command.write_text("#!/bin/sh\nset -eu\n" + script)
         command.chmod(0o755)
 
+    def test_alert_rules_only_use_metrics_the_gateway_exports(self):
+        import yaml
+        rules = yaml.safe_load((ROOT / "deploy/prometheus/porta-alerts.yml").read_text())
+        expressions = [rule["expr"] for group in rules["groups"] for rule in group["rules"]]
+        self.assertTrue(expressions)
+        sources = "".join(
+            path.read_text() for path in (ROOT / "rust/porta-server/src").rglob("*.rs")
+        )
+        for name in sorted({name for expr in expressions
+                            for name in re.findall(r"\bporta_[a-z_]+", expr)}):
+            with self.subTest(metric=name):
+                self.assertIn(f'"{name}"', sources)
+
     def test_workflows_pin_actions_and_gradle_distribution(self):
         action_reference = re.compile(r"^[^@\s]+@[0-9a-f]{40}(?:\s+#\s+v\S+)?$")
         for workflow in (ROOT / ".github/workflows").glob("*.yml"):
