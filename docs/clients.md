@@ -95,6 +95,22 @@ reachable outside the tunnel. While protection is active the order is not
 re-measured and DNS is unavailable, so failover uses the endpoints resolved
 when the client started.
 
+## Connecting automatically
+
+Mark one profile **Connect automatically** to connect it without opening the
+app:
+- **Linux desktop:** the `porta-client.service` connects it whenever the
+  service starts, which is at boot.
+- **Windows:** the app registers a **Porta** scheduled task that starts it
+  hidden in the tray at sign-in, with the elevation it needs, and connects
+  the profile. Turning the option off removes the task, as does deleting
+  the profile.
+- **Android:** **Reconnect after device restart** does the same after a
+  reboot, with the profile's backup gateways and options.
+
+A connection that fails at startup, for example with no network yet, is
+retried like any other and shows its error in the app.
+
 ## Local network access
 
 A full tunnel sends everything through the gateway, so printers, file

@@ -163,12 +163,15 @@ install -d "/etc/netns/$(ns client)"
 printf 'nameserver 127.0.0.53\n' >"/etc/netns/$(ns client)/resolv.conf"
 install -d -m 0700 "$work/client"
 install -d -m 0755 "$work/run"
-ip netns exec "$(ns client)" env PATH="$work/bin:$PATH" \
-  "$client_binary" --daemon --control-socket "$socket" --control-group "$control_group" \
-  --profiles "$work/client/profiles.json" --network-state "$work/client/network-state.json" \
-  --identity "$work/client/identity.json" --interface porta-ci0 --ca "$work/ca.pem" \
-  >"$work/daemon.log" 2>&1 &
-daemon_pid=$!
+start_daemon() {
+  ip netns exec "$(ns client)" env PATH="$work/bin:$PATH" \
+    "$client_binary" --daemon --control-socket "$socket" --control-group "$control_group" \
+    --profiles "$work/client/profiles.json" --network-state "$work/client/network-state.json" \
+    --identity "$work/client/identity.json" --interface porta-ci0 --ca "$work/ca.pem" \
+    >>"$work/daemon.log" 2>&1 &
+  daemon_pid=$!
+}
+start_daemon
 for _ in $(seq 1 50); do
   [[ -S $socket ]] && break
   sleep 0.1
@@ -259,6 +262,25 @@ fi
 control '{"command":"disconnect"}' >/dev/null
 wait_for 'not s["running"] and s["status"] == "Disconnected"' "a disconnection"
 echo "a profile that allows the local network reaches it beside a full tunnel"
+
+# A profile marked to connect automatically connects when the service starts.
+control "{\"command\":\"save_profile\",\"input\":{\"id\":\"$id\",\"name\":\"Office\",\"serverUrl\":\"https://172.31.0.2:$port\",\"transport\":\"auto\",\"allowLan\":true,\"connectAtLogin\":true}}" >/dev/null
+kill "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  [[ ! -e $socket ]] && break
+  sleep 0.1
+done
+start_daemon
+for _ in $(seq 1 100); do
+  [[ -S $socket ]] && break
+  sleep 0.1
+done
+wait_for 's["connected"] and s["profiles"][0]["connectAtLogin"]' "an automatic connection at startup"
+[[ $(seen) == 172.31.9.1 ]] || { echo "the automatic connection does not carry traffic" >&2; exit 1; }
+control '{"command":"disconnect"}' >/dev/null
+wait_for 'not s["running"] and s["status"] == "Disconnected"' "a disconnection"
+echo "a profile marked to connect automatically connects when the service starts"
 
 wrong=$(control "{\"command\":\"save_profile\",\"input\":{\"name\":\"Wrong\",\"serverUrl\":\"https://172.31.0.2:$port\",\"token\":\"wrong-token-0123456789abcdef\"}}")
 wrong_id=$(python3 -c 'import json, sys; print(next(p["id"] for p in json.load(sys.stdin)["profiles"] if p["name"] == "Wrong"))' <<<"$wrong")

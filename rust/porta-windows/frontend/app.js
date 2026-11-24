@@ -37,6 +37,9 @@ const messages = {
     backupGatewaysPlaceholder: "Optional, one per line: gateways that share this account",
     allowLan: "Allow local network",
     allowLanHelp: "Keep printers, file shares and media players on this network reachable while everything else uses the tunnel. DNS still uses the tunnel.",
+    connectAtLogin: "Connect automatically",
+    connectAtLoginHelp: "Connect this profile when you sign in to Windows. Only one profile can connect automatically.",
+    connectAtLoginHelpLinux: "Connect this profile when this computer starts. Only one profile can connect automatically.",
     accessToken: "Access token",
     accessTokenPlaceholder: "Paste the token from your administrator",
     tokenHelpNew: "Stored securely for this Windows account.",
@@ -143,6 +146,9 @@ const messages = {
     backupGatewaysPlaceholder: "可选，每行一个：共享此账户的网关",
     allowLan: "允许访问本地网络",
     allowLanHelp: "其他流量经由隧道时，仍可访问此网络上的打印机、文件共享和媒体设备。DNS 仍经由隧道。",
+    connectAtLogin: "自动连接",
+    connectAtLoginHelp: "登录 Windows 时连接此配置。只能有一个配置自动连接。",
+    connectAtLoginHelpLinux: "此电脑启动时连接此配置。只能有一个配置自动连接。",
     accessToken: "访问令牌",
     accessTokenPlaceholder: "粘贴管理员提供的令牌",
     tokenHelpNew: "令牌将为当前 Windows 账户安全存储。",
@@ -710,6 +716,7 @@ function openEditor(profile = null) {
   $("profile-server").value = profile?.serverUrl || "https://";
   $("profile-backups").value = (profile?.backupServers || []).join("\n");
   $("profile-allow-lan").checked = Boolean(profile?.allowLan);
+  $("profile-connect-at-login").checked = Boolean(profile?.connectAtLogin);
   $("profile-token").value = "";
   $("delete-profile").classList.toggle("hidden", !profile);
   $("editor-error").classList.add("hidden");
@@ -721,6 +728,10 @@ function openEditor(profile = null) {
 function updateEditorLabels() {
   setText("editor-title", t(state.editorProfile ? "editProfileTitle" : "addProfileTitle"));
   const newTokenHelp = state.snapshot?.platform === "linux" ? "tokenHelpNewLinux" : "tokenHelpNew";
+  setText(
+    "connect-at-login-help",
+    t(state.snapshot?.platform === "linux" ? "connectAtLoginHelpLinux" : "connectAtLoginHelp"),
+  );
   setText("token-help", t(state.editorProfile ? "tokenHelpEdit" : newTokenHelp));
   if (!state.deleteArmed) setText("delete-profile", t("delete"));
 }
@@ -784,6 +795,7 @@ async function saveProfile(event) {
     transport: state.editorProfile?.transport || "auto",
     token: $("profile-token").value,
     allowLan: $("profile-allow-lan").checked,
+    connectAtLogin: $("profile-connect-at-login").checked,
   };
   const invalid = validateProfileInput(input);
   if (invalid) {

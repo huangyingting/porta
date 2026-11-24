@@ -25,6 +25,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 const MAX_ACTIVITY_LINES: usize = 200;
 const NETWORK_ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// The scheduled task that connects a profile when the user signs in.
+const LOGIN_TASK: &str = "Porta";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +40,8 @@ struct ProfileInput {
     token: String,
     #[serde(default)]
     allow_lan: bool,
+    #[serde(default)]
+    connect_at_login: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -49,6 +53,7 @@ struct DesktopProfile {
     backup_servers: Vec<String>,
     transport: String,
     allow_lan: bool,
+    connect_at_login: bool,
     selected: bool,
     active: bool,
     status: String,
@@ -319,11 +324,23 @@ impl Controller {
             profile
         };
         profile.allow_lan = input.allow_lan;
+        profile.connect_at_login = input.connect_at_login;
         profile.id = input.id.trim().to_owned();
         let saved = self
             .store
             .save(profile, input.token.trim())
             .map_err(|error| error.to_string())?;
+        if saved.connect_at_login {
+            for mut other in self.store.list().map_err(|error| error.to_string())? {
+                if other.id != saved.id && other.connect_at_login {
+                    other.connect_at_login = false;
+                    self.store
+                        .save(other, "")
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        self.sync_login_task()?;
         let line;
         {
             let mut state = self.lock_state()?;
@@ -349,6 +366,7 @@ impl Controller {
         let profile = self.profile(id)?;
         self.store.delete(id).map_err(|error| error.to_string())?;
         let profiles = self.store.list().map_err(|error| error.to_string())?;
+        self.sync_login_task()?;
         let line;
         {
             let mut state = self.lock_state()?;
@@ -368,6 +386,54 @@ impl Controller {
         self.write_activity(line);
         self.publish(app);
         self.snapshot()
+    }
+
+    /// Keeps the "Porta" logon task in step with the profiles. Windows
+    /// starts the app elevated and hidden at sign-in to connect the profile
+    /// marked Connect at login; a Run key cannot start an elevated app.
+    fn sync_login_task(&self) -> Result<(), String> {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let enabled = self
+            .store
+            .list()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|profile| profile.connect_at_login);
+        let schtasks = std::path::Path::new(
+            &std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+        )
+        .join("System32")
+        .join("schtasks.exe");
+        let mut command = std::process::Command::new(schtasks);
+        command.creation_flags(CREATE_NO_WINDOW);
+        if enabled {
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            command.args([
+                "/Create",
+                "/TN",
+                LOGIN_TASK,
+                "/TR",
+                &format!("\"{}\" --connect-at-login", executable.display()),
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ]);
+            let output = command.output().map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(format!(
+                    "could not register Porta to start at sign-in: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        } else {
+            // Deleting a task that does not exist fails harmlessly.
+            command.args(["/Delete", "/TN", LOGIN_TASK, "/F"]);
+            let _ = command.output();
+        }
+        Ok(())
     }
 
     fn connect(self: &Arc<Self>, app: &AppHandle, id: &str) -> Result<(), String> {
@@ -1042,8 +1108,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         return Ok(());
     }
-    if !arguments.is_empty() {
-        return Err("unsupported arguments; use --version or --cleanup-network".into());
+    let at_login = arguments == ["--connect-at-login"];
+    if !arguments.is_empty() && !at_login {
+        return Err(
+            "unsupported arguments; use --version, --cleanup-network or --connect-at-login".into(),
+        );
     }
     fs::create_dir_all(&data_directory)?;
     let store = Store::open(data_directory.join("profiles.json"))?;
@@ -1067,7 +1136,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             clear_activity,
             save_activity_log
         ])
-        .setup(|app| {
+        .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("Porta {}", porta_client::VERSION.trim()));
             }
@@ -1124,8 +1193,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 })
                 .build(app)?;
-            let controller = app.state::<Arc<Controller>>();
+            let controller = app.state::<Arc<Controller>>().inner().clone();
             controller.publish(app.handle());
+            if at_login {
+                // Started by the logon task: stay in the tray and connect.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                let automatic = controller.store.list().ok().and_then(|profiles| {
+                    profiles
+                        .into_iter()
+                        .find(|profile| profile.connect_at_login)
+                });
+                if let Some(profile) = automatic {
+                    if let Err(error) = controller.connect(app.handle(), &profile.id) {
+                        controller.record_error(
+                            app.handle(),
+                            "Automatic connection failed",
+                            &error,
+                        );
+                    }
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1175,6 +1264,7 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
                 backup_servers: profile.backup_servers,
                 transport: transport_name(profile.transport).to_owned(),
                 allow_lan: profile.allow_lan,
+                connect_at_login: profile.connect_at_login,
                 status,
             }
         })

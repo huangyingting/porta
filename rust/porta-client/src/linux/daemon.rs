@@ -58,6 +58,9 @@ struct StoredProfile {
     token: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_lan: bool,
+    /// Connected when the service starts; at most one profile has it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    connect_at_login: bool,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -85,6 +88,8 @@ struct ProfileInput {
     token: String,
     #[serde(default)]
     allow_lan: bool,
+    #[serde(default)]
+    connect_at_login: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +122,7 @@ struct SnapshotProfile {
     backup_servers: Vec<String>,
     transport: String,
     allow_lan: bool,
+    connect_at_login: bool,
     selected: bool,
     active: bool,
     status: String,
@@ -210,6 +216,18 @@ pub async fn run(config: DaemonConfig, cancellation: &CancellationToken) -> Resu
         }),
     });
     daemon.log("Porta service started");
+    let automatic = daemon
+        .lock_store()
+        .profiles
+        .iter()
+        .find(|profile| profile.connect_at_login)
+        .map(|profile| (profile.id.clone(), profile.name.clone()));
+    if let Some((id, name)) = automatic {
+        match daemon.connect(&id) {
+            Ok(()) => daemon.log(&format!("Connecting {name} automatically")),
+            Err(error) => daemon.log(&format!("Could not connect {name} automatically: {error}")),
+        }
+    }
     let clients = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     loop {
         tokio::select! {
@@ -316,6 +334,7 @@ impl Daemon {
                 backup_servers: profile.backup_servers.clone(),
                 transport: profile.transport.clone(),
                 allow_lan: profile.allow_lan,
+                connect_at_login: profile.connect_at_login,
                 selected: profile.id == store.selected,
                 active: profile.id == status.active_id && status.running,
                 status: if profile.id == status.active_id {
@@ -450,25 +469,21 @@ impl Daemon {
             transport,
             token,
             allow_lan: input.allow_lan,
+            connect_at_login: input.connect_at_login,
         };
-        let previous = match index {
-            Some(index) => Some(std::mem::replace(
-                &mut store.profiles[index],
-                profile.clone(),
-            )),
-            None => {
-                store.profiles.push(profile.clone());
-                None
+        let previous_profiles = store.profiles.clone();
+        if profile.connect_at_login {
+            for other in &mut store.profiles {
+                other.connect_at_login = false;
             }
-        };
+        }
+        match index {
+            Some(index) => store.profiles[index] = profile.clone(),
+            None => store.profiles.push(profile.clone()),
+        }
         let previous_selected = std::mem::replace(&mut store.selected, profile.id.clone());
         if let Err(error) = persist_store(&self.config.profiles, &store) {
-            match (index, previous) {
-                (Some(index), Some(previous)) => store.profiles[index] = previous,
-                _ => {
-                    store.profiles.pop();
-                }
-            }
+            store.profiles = previous_profiles;
             store.selected = previous_selected;
             return Err(error.to_string());
         }
