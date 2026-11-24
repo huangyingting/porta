@@ -3758,6 +3758,7 @@ version = "0.1.41"
 dependencies = [
  "chrono",
  "porta-client-rust",
+ "porta-wire",
  "serde",
  "tauri",
  "tauri-build",
