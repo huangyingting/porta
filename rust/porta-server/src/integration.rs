@@ -186,6 +186,9 @@ impl Authenticator for NativeAuthenticator {
                 StateRegistryError::StandardClientsDisabled => {
                     AuthenticationError::Forbidden(DenialReason::StandardClientsDisabled)
                 }
+                StateRegistryError::HardwareRequired => {
+                    AuthenticationError::Forbidden(DenialReason::HardwareRequired)
+                }
                 // A client with several gateways moves on to the primary.
                 StateRegistryError::EnrollOnPrimary => AuthenticationError::Unavailable(
                     "new devices enroll on the primary gateway first",
@@ -777,11 +780,18 @@ impl WebRegistry for WebRegistryAdapter {
                 .open_for_minutes
                 .map(|minutes| std::time::Duration::from_secs(u64::from(minutes) * 60));
             let standard_clients = enrollment.standard_clients;
+            let require_hardware = enrollment.require_hardware;
             join_web_mutation(tokio::spawn(async move {
                 registry
                     .set_enrollment(&owned_id, policy, window)
                     .await
                     .map_err(web_registry_error)?;
+                if let Some(required) = require_hardware {
+                    registry
+                        .set_require_hardware(&owned_id, required)
+                        .await
+                        .map_err(web_registry_error)?;
+                }
                 if let Some(allowed) = standard_clients {
                     registry
                         .set_standard_clients(&owned_id, allowed)
@@ -999,6 +1009,7 @@ fn web_client_summary(
             exit: summary.access.exit,
         },
         standard_clients: summary.standard_clients,
+        require_hardware: summary.require_hardware,
         devices: summary
             .devices
             .into_iter()
@@ -1024,6 +1035,14 @@ fn web_client_summary(
                 assigned_address: device.assigned_address,
                 target: device.target,
                 subnets: device.subnets.iter().map(ToString::to_string).collect(),
+                hardware: device
+                    .hardware
+                    .map(|hardware| crate::web::admin::HardwareSummary {
+                        platform: hardware.platform,
+                        level: hardware.level,
+                        vendor: hardware.vendor,
+                        verified_at: format_time(hardware.verified_at),
+                    }),
             })
             .collect(),
     }

@@ -364,6 +364,7 @@ fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
                 DenialReason::DeviceDenied => "device-denied\n",
                 DenialReason::StandardClientsDisabled => "standard-clients-disabled\n",
                 DenialReason::ClientOutdated => "client-outdated\n",
+                DenialReason::HardwareRequired => "hardware-required\n",
             };
             let mut response = plain_response(StatusCode::FORBIDDEN, body);
             response.headers_mut().insert(
