@@ -1172,10 +1172,26 @@ fn may_peer(client_to_client: bool, first: &RouteContext, second: &RouteContext)
 }
 
 /// Sessions published for direct paths, and the peer list each receives.
+///
+/// A change to one device only rewrites the lists of devices that may peer
+/// with it, and inside the runtime rewrites are coalesced, so a gateway
+/// restart that reconnects every device costs a few passes, not one per
+/// device.
 #[derive(Default)]
 struct PeerDirectory {
     client_to_client: bool,
-    announced: Mutex<HashMap<Ipv4Addr, Announced>>,
+    state: Mutex<PeerState>,
+    publisher: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+}
+
+#[derive(Default)]
+struct PeerState {
+    announced: std::collections::BTreeMap<Ipv4Addr, Announced>,
+    by_account: HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+    by_group: HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+    /// Sessions whose lists may be stale; `all_dirty` covers every one.
+    dirty: std::collections::HashSet<Ipv4Addr>,
+    all_dirty: bool,
 }
 
 struct Announced {
@@ -1185,67 +1201,115 @@ struct Announced {
     updates: tokio::sync::watch::Sender<Vec<Peer>>,
 }
 
+/// How long changes collect before peer lists are rewritten.
+const PEER_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl PeerDirectory {
     fn announce(
-        &self,
+        self: &Arc<Self>,
         lease: Ipv4Addr,
         context: Arc<RouteContext>,
         endpoint: SocketAddr,
         fingerprint: Fingerprint,
     ) -> tokio::sync::watch::Receiver<Vec<Peer>> {
-        let (updates, receiver) = tokio::sync::watch::channel(Vec::new());
-        let mut announced = self.announced.lock();
-        announced.insert(
-            lease,
-            Announced {
-                context,
-                endpoint: SocketAddr::new(endpoint.ip().to_canonical(), endpoint.port()),
-                fingerprint,
-                updates,
-            },
-        );
-        self.publish(&announced);
+        let mut state = self.state.lock();
+        // A reconnect may change the account or group, and with it the
+        // devices whose lists hold this one.
+        if let Some(previous) = state.announced.remove(&lease) {
+            self.mark_peers_of(&mut state, lease, &previous.context);
+            state.unindex(lease, &previous.context);
+        }
+        state.index(lease, &context);
+        // The new session gets its list at once; its peers' lists follow.
+        let entry = Announced {
+            context,
+            endpoint: SocketAddr::new(endpoint.ip().to_canonical(), endpoint.port()),
+            fingerprint,
+            updates: tokio::sync::watch::channel(Vec::new()).0,
+        };
+        let own = state.list_for(self.client_to_client, lease, &entry);
+        entry.updates.send_replace(own);
+        let receiver = entry.updates.subscribe();
+        state.announced.insert(lease, entry);
+        let context = state.announced[&lease].context.clone();
+        self.mark_peers_of(&mut state, lease, &context);
+        state.dirty.remove(&lease);
+        drop(state);
+        self.schedule();
         receiver
     }
 
     /// Removes the session at `lease` if `context` is still its session.
-    fn withdraw(&self, lease: Ipv4Addr, context: &Arc<RouteContext>) {
-        let mut announced = self.announced.lock();
-        if announced
+    fn withdraw(self: &Arc<Self>, lease: Ipv4Addr, context: &Arc<RouteContext>) {
+        let mut state = self.state.lock();
+        if !state
+            .announced
             .get(&lease)
             .is_some_and(|entry| Arc::ptr_eq(&entry.context, context))
         {
-            announced.remove(&lease);
-            self.publish(&announced);
+            return;
         }
+        state.announced.remove(&lease);
+        state.unindex(lease, context);
+        self.mark_peers_of(&mut state, lease, context);
+        state.dirty.remove(&lease);
+        drop(state);
+        self.schedule();
     }
 
-    /// Sends each session the devices it and they may both reach: the same
-    /// rules as traffic switched through the gateway, in both directions.
-    fn publish(&self, announced: &HashMap<Ipv4Addr, Announced>) {
-        for (address, entry) in announced {
-            let own = &entry.context;
-            let mut peers = announced
-                .iter()
-                .filter(|(other, peer)| {
-                    *other != address
-                        && may_peer(self.client_to_client, own, &peer.context)
-                        && own.network.permits(IpAddr::V4(**other))
-                        && peer.context.network.permits(IpAddr::V4(*address))
-                })
-                .map(|(other, peer)| Peer {
-                    address: *other,
-                    address6: own.ipv6.zip(peer.context.ipv6).and_then(|(mine, theirs)| {
-                        (own.network.permits(IpAddr::V6(theirs))
-                            && peer.context.network.permits(IpAddr::V6(mine)))
-                        .then_some(theirs)
-                    }),
-                    endpoint: peer.endpoint,
-                    fingerprint: peer.fingerprint,
-                })
-                .collect::<Vec<_>>();
-            peers.sort_by_key(|peer| peer.address);
-            peers.truncate(MAX_PEERS);
+    /// Marks the lists that may include the device at `lease`.
+    fn mark_peers_of(&self, state: &mut PeerState, lease: Ipv4Addr, context: &RouteContext) {
+        if self.client_to_client {
+            state.all_dirty = true;
+            return;
+        }
+        let candidates = state.candidates(false, context).collect::<Vec<_>>();
+        state.dirty.extend(candidates);
+        state.dirty.insert(lease);
+    }
+
+    /// Rewrites stale lists now, or soon when running inside the runtime.
+    fn schedule(self: &Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.publish();
+            return;
+        };
+        let publisher = self.publisher.get_or_init(|| {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let directory = Arc::downgrade(self);
+            let wake = notify.clone();
+            runtime.spawn(async move {
+                loop {
+                    wake.notified().await;
+                    tokio::time::sleep(PEER_PUBLISH_DELAY).await;
+                    let Some(directory) = directory.upgrade() else {
+                        return;
+                    };
+                    directory.publish();
+                }
+            });
+            notify
+        });
+        publisher.notify_one();
+    }
+
+    /// Sends every stale session the devices it and they may both reach:
+    /// the same rules as traffic switched through the gateway, in both
+    /// directions.
+    fn publish(&self) {
+        let mut state = self.state.lock();
+        let targets: Vec<Ipv4Addr> = if state.all_dirty {
+            state.announced.keys().copied().collect()
+        } else {
+            state.dirty.iter().copied().collect()
+        };
+        state.dirty.clear();
+        state.all_dirty = false;
+        for address in targets {
+            let Some(entry) = state.announced.get(&address) else {
+                continue;
+            };
+            let peers = state.list_for(self.client_to_client, address, entry);
             entry.updates.send_if_modified(|current| {
                 let changed = *current != peers;
                 if changed {
@@ -1254,6 +1318,96 @@ impl PeerDirectory {
                 changed
             });
         }
+    }
+
+    fn published(&self) -> usize {
+        self.state.lock().announced.len()
+    }
+}
+
+impl PeerState {
+    fn index(&mut self, lease: Ipv4Addr, context: &RouteContext) {
+        self.by_account
+            .entry(context.account_id.clone())
+            .or_default()
+            .insert(lease);
+        if let Some(group) = &context.network.group {
+            self.by_group
+                .entry(group.clone())
+                .or_default()
+                .insert(lease);
+        }
+    }
+
+    fn unindex(&mut self, lease: Ipv4Addr, context: &RouteContext) {
+        fn remove(
+            index: &mut HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+            key: &str,
+            lease: Ipv4Addr,
+        ) {
+            if let Some(members) = index.get_mut(key) {
+                members.remove(&lease);
+                if members.is_empty() {
+                    index.remove(key);
+                }
+            }
+        }
+        remove(&mut self.by_account, &context.account_id, lease);
+        if let Some(group) = &context.network.group {
+            remove(&mut self.by_group, group, lease);
+        }
+    }
+
+    /// Devices that may peer with `context`, in address order: everyone
+    /// with `client_to_client`, otherwise its account and access group.
+    fn candidates<'a>(
+        &'a self,
+        client_to_client: bool,
+        context: &RouteContext,
+    ) -> Box<dyn Iterator<Item = Ipv4Addr> + 'a> {
+        if client_to_client {
+            return Box::new(self.announced.keys().copied());
+        }
+        let mut members = self
+            .by_account
+            .get(&context.account_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(group) = context
+            .network
+            .group
+            .as_ref()
+            .and_then(|group| self.by_group.get(group))
+        {
+            members.extend(group.iter().copied());
+        }
+        Box::new(members.into_iter())
+    }
+
+    /// The first `MAX_PEERS` devices, by address, that the device at
+    /// `address` and they may both reach.
+    fn list_for(&self, client_to_client: bool, address: Ipv4Addr, entry: &Announced) -> Vec<Peer> {
+        let own = &entry.context;
+        self.candidates(client_to_client, own)
+            .filter(|other| *other != address)
+            .filter_map(|other| {
+                let peer = self.announced.get(&other)?;
+                (may_peer(client_to_client, own, &peer.context)
+                    && own.network.permits(IpAddr::V4(other))
+                    && peer.context.network.permits(IpAddr::V4(address)))
+                .then(|| Peer {
+                    address: other,
+                    address6: own.ipv6.zip(peer.context.ipv6).and_then(|(mine, theirs)| {
+                        (own.network.permits(IpAddr::V6(theirs))
+                            && peer.context.network.permits(IpAddr::V6(mine)))
+                        .then_some(theirs)
+                    }),
+                    endpoint: peer.endpoint,
+                    fingerprint: peer.fingerprint,
+                })
+            })
+            .take(MAX_PEERS)
+            .collect()
     }
 }
 
@@ -1307,7 +1461,7 @@ impl RouterAdapter {
 
     /// Sessions currently published for direct paths.
     pub fn published_peers(&self) -> usize {
-        self.peers.announced.lock().len()
+        self.peers.published()
     }
 
     /// Whether `querier` may learn about the device at `address`.
@@ -2011,7 +2165,7 @@ mod tests {
 
     #[test]
     fn peer_lists_follow_switching_rules_both_ways_and_withdrawals() {
-        let directory = PeerDirectory::default();
+        let directory = Arc::new(PeerDirectory::default());
         let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
         let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
         let c: Ipv4Addr = "10.66.0.4".parse().unwrap();
@@ -2060,17 +2214,26 @@ mod tests {
         );
         assert!(other.borrow().is_empty());
 
+        // Reconnecting under another account leaves the old account's lists,
+        // and moving back returns to them.
+        drop(second);
+        let moved = context("gamma", NetworkPolicy::default());
+        directory.announce(b, moved.clone(), endpoint(2000), [2; 32]);
+        assert!(first.borrow_and_update().is_empty());
+        directory.announce(b, dual.clone(), endpoint(2000), [2; 32]);
+        assert_eq!(first.borrow_and_update().len(), 1);
+
         // A stale session's withdrawal does not remove its successor.
+        directory.withdraw(b, &moved);
         directory.withdraw(b, &alpha);
         assert!(!first.has_changed().unwrap());
         directory.withdraw(b, &dual);
         assert!(first.borrow_and_update().is_empty());
-        drop(second);
 
-        let switching = PeerDirectory {
+        let switching = Arc::new(PeerDirectory {
             client_to_client: true,
             ..PeerDirectory::default()
-        };
+        });
         let first = switching.announce(a, alpha, endpoint(1000), [1; 32]);
         switching.announce(
             d,
@@ -2082,6 +2245,58 @@ mod tests {
             first.borrow()[0].endpoint,
             "203.0.113.9:4000".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_lists_stay_cheap_when_thousands_of_devices_reconnect() {
+        let address = |index: u32| Ipv4Addr::from(0x0a40_0000 + index);
+        let endpoint =
+            |index: u32| SocketAddr::new("198.51.100.7".parse().unwrap(), 1024 + index as u16);
+        for client_to_client in [true, false] {
+            let directory = Arc::new(PeerDirectory {
+                client_to_client,
+                ..PeerDirectory::default()
+            });
+            let started = std::time::Instant::now();
+            // Without client-to-client, accounts of two devices each.
+            let receivers = (0..4_000_u32)
+                .map(|index| {
+                    let account = if client_to_client {
+                        "one".to_owned()
+                    } else {
+                        format!("a{}", index / 2)
+                    };
+                    directory.announce(
+                        address(index),
+                        context(&account, NetworkPolicy::default()),
+                        endpoint(index),
+                        [index as u8; 32],
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "announcing took {:?}",
+                started.elapsed()
+            );
+            tokio::time::sleep(PEER_PUBLISH_DELAY * 4).await;
+            let expected = if client_to_client { MAX_PEERS } else { 1 };
+            for (index, receiver) in receivers.iter().enumerate() {
+                let peers = receiver.borrow();
+                assert_eq!(peers.len(), expected, "device {index}");
+                assert!(peers
+                    .iter()
+                    .all(|peer| peer.address != address(index as u32)));
+                assert!(peers
+                    .windows(2)
+                    .all(|pair| pair[0].address < pair[1].address));
+            }
+            if !client_to_client {
+                assert_eq!(receivers[0].borrow()[0].address, address(1));
+                assert_eq!(receivers[1].borrow()[0].address, address(0));
+            }
+            assert_eq!(directory.published(), 4_000);
+        }
     }
 
     #[tokio::test]
