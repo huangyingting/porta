@@ -765,8 +765,10 @@ had_active_timer=false
 services_paused=false
 deployment_started=false
 leases_archive=
+pre_upgrade_backup=
 service_enabled=$(systemctl is-enabled porta.service 2>/dev/null || true)
 timer_enabled=$(systemctl is-enabled porta-cert-sync.timer 2>/dev/null || true)
+backup_timer_enabled=$(systemctl is-enabled porta-backup.timer 2>/dev/null || true)
 [[ $service_enabled != masked* && $timer_enabled != masked* ]] ||
   die "unmask Porta services before deploying"
 if systemctl is-active --quiet porta.service; then
@@ -834,6 +836,7 @@ rollback() {
       rollback_run systemctl stop porta.service
       systemctl stop porta-cert-sync.timer porta-cert-sync.service >/dev/null 2>&1
       systemctl disable porta.service porta-cert-sync.timer >/dev/null 2>&1
+      systemctl disable --now porta-backup.timer >/dev/null 2>&1
       rollback_run restore_file porta-server /usr/local/bin/porta-server
       rollback_run restore_file server-up.sh /usr/local/libexec/porta/server-up.sh
       rollback_run restore_file server-down.sh /usr/local/libexec/porta/server-down.sh
@@ -848,12 +851,19 @@ rollback() {
       if [[ -n $leases_archive ]]; then
         rollback_run rm -f "$leases_archive"
       fi
-      for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
+      # Nothing changed, so the backup this run took is not needed.
+      if [[ -n $pre_upgrade_backup ]]; then
+        rollback_run rm -f "$pre_upgrade_backup"
+      fi
+      rollback_run restore_file porta-backup /usr/local/sbin/porta-backup
+      for unit in porta.service porta-cert-sync.service porta-cert-sync.timer \
+        porta-backup.service porta-backup.timer; do
         rollback_run restore_file "$unit" "/etc/systemd/system/$unit"
       done
       rollback_run systemctl daemon-reload
       rollback_run restore_enablement porta.service "$service_enabled"
       rollback_run restore_enablement porta-cert-sync.timer "$timer_enabled"
+      rollback_run restore_enablement porta-backup.timer "$backup_timer_enabled"
       for index in "${!sysctl_keys[@]}"; do
         rollback_run sysctl -w "${sysctl_keys[$index]}=${sysctl_values[$index]}"
       done
@@ -936,7 +946,16 @@ systemctl stop porta-cert-sync.timer porta-cert-sync.service >/dev/null 2>&1 || 
 if $had_active_service && ! $in_place; then
   systemctl stop porta.service
 fi
+# A complete backup to restore when rolling back to an older release later
+# (docs/operations.md); the rollback below only covers this run.
+if [[ -f /var/lib/porta/clients.json ]]; then
+  pre_upgrade_backup=$(PORTA_CONFIG_DIR=/etc/porta PORTA_STATE_DIR=/var/lib/porta \
+    PORTA_BACKUP_DIR=/var/backups/porta bash scripts/porta-backup.sh create --keep 14) ||
+    die "could not back up the gateway before upgrading it"
+  echo "deploy: backed up the current gateway to $pre_upgrade_backup"
+fi
 backup_file /usr/local/bin/porta-server porta-server
+backup_file /usr/local/sbin/porta-backup porta-backup
 backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
 backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
 backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
@@ -947,7 +966,8 @@ backup_directory /var/lib/porta/downloads downloads
 for state in leases clients usage; do
   backup_file "/var/lib/porta/$state.json" "$state.json"
 done
-for unit in porta.service porta-cert-sync.service porta-cert-sync.timer; do
+for unit in porta.service porta-cert-sync.service porta-cert-sync.timer \
+  porta-backup.service porta-backup.timer; do
   backup_file "/etc/systemd/system/$unit" "$unit"
 done
 deployment_started=true
@@ -963,6 +983,10 @@ fi
 install -m 0755 "$server_binary" /usr/local/bin/porta-server
 install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
   /usr/local/libexec/porta/
+install -d -m 0755 /usr/local/sbin
+install -m 0755 scripts/porta-backup.sh /usr/local/sbin/porta-backup
+install -d -m 0700 /var/backups/porta
+install -m 0644 deploy/porta-backup.service deploy/porta-backup.timer /etc/systemd/system/
 install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
 install -m 0644 deploy/porta-tmpfiles.conf /etc/tmpfiles.d/porta.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/porta.conf
@@ -1201,6 +1225,7 @@ fi
 sysctl -p /etc/sysctl.d/99-porta-quic.conf >/dev/null
 systemctl daemon-reload
 systemctl enable porta.service >/dev/null
+systemctl enable --now porta-backup.timer >/dev/null
 if [[ $tls_mode == static ]]; then
   systemctl enable porta-cert-sync.timer >/dev/null
   systemctl start porta-cert-sync.service
@@ -1289,6 +1314,7 @@ Server source:   $([[ $build_local == true ]] && echo "local checkout" || echo "
 Exit traffic:    $([[ -n $upstream ]] && echo "relayed through $upstream via $upstream_interface" || echo "this host via $external_interface")
 Selectable exits: ${selectable_exits:-none}
 Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
+Backups:         daily to /var/backups/porta (porta-backup.timer); restore with sudo porta-backup restore
 Direct paths:    $([[ $peer_to_peer == true ]] && echo "offered to HTTP/3 split-tunnel clients" || echo "off (client traffic goes through this gateway)")
 Client IPv6:     $([[ -n $ipv6_pool ]] && echo "$ipv6_pool, $([[ $ipv6_routed == true ]] && echo "routed" || echo "masqueraded") through $external_interface" || echo "off (clients keep IPv6 off the tunnel)")
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")

@@ -166,6 +166,10 @@ not conceal transport fingerprints from network inspection.
   other only through fingerprints the gateway vouches for, so a compromised
   gateway can impersonate peers either way. Each client drops direct
   packets that are not from the peer's tunnel addresses to its own.
+- Backup archives (`porta-backup`, `/var/backups/porta`) hold every gateway
+  secret: tokens, TLS and ACME keys, administrator TOTP secrets and a relay's
+  device key. They are root-only on the host; encrypt them before they leave
+  it, and treat a leaked archive like a leaked admin token.
 - `PORTA_FEDERATION_TOKEN` lets its holder download every account's token
   hash, devices and policies from a primary; token hashes are SHA-256 of
   random tokens and cannot be reversed, but treat the federation token like

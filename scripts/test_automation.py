@@ -7,6 +7,7 @@ import fcntl
 import http.server
 import json
 import os
+import pathlib
 from pathlib import Path
 import re
 import shutil
@@ -40,6 +41,7 @@ class AutomationTests(unittest.TestCase):
             "GH_TOKEN": "",
             "GITHUB_TOKEN": "",
             "PORTA_RUNTIME_DIRECTORY": str(self.root / "runtime"),
+            "PORTA_BACKUP_ALLOW_NONROOT": "1",
         }
         self.write_state(
             sysctl={
@@ -747,9 +749,9 @@ class AutomationTests(unittest.TestCase):
         shutil.copytree(ROOT / "deploy", checkout / "deploy")
         source = (checkout / "scripts/deploy.sh").read_text()
         for prefix in (
-            "/usr/local/bin", "/usr/local/libexec/porta", "/etc/porta",
+            "/usr/local/bin", "/usr/local/sbin", "/usr/local/libexec/porta", "/etc/porta",
             "/etc/sysctl.d", "/etc/tmpfiles.d", "/etc/systemd/system", "/var/lib/porta",
-            "/run/lock",
+            "/var/backups/porta", "/run/lock",
         ):
             source = source.replace(prefix, str(self.root / "system" / prefix[1:]))
         source = source.replace("[[ $EUID -eq 0 ]]", "true")
@@ -1064,6 +1066,33 @@ class AutomationTests(unittest.TestCase):
         self.run_deploy(deploy, "--build-local", "--peer-to-peer=false")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertNotIn("--peer-to-peer", unit)
+
+    def test_deploy_backs_up_before_upgrading_and_installs_daily_backups(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local")
+        system = self.root / "system"
+        archives = sorted((system / "var/backups/porta").glob("porta-*.tar.gz"))
+        self.assertEqual(len(archives), 1, result.stdout)
+        self.assertIn(f"backed up the current gateway to {archives[0]}", result.stdout)
+        listing = subprocess.run(["tar", "-tzf", str(archives[0])], text=True,
+                                 capture_output=True, check=True).stdout
+        self.assertIn("state/clients.json", listing)
+        self.assertIn("config/porta.env", listing)
+        restored = subprocess.run(["tar", "-xOzf", str(archives[0]), "state/clients.json"],
+                                  capture_output=True, check=True).stdout
+        self.assertEqual(restored, b'{"old":"client"}')
+        self.assertTrue((system / "usr/local/sbin/porta-backup").stat().st_mode & 0o111)
+        for unit in ("porta-backup.service", "porta-backup.timer"):
+            self.assertTrue((system / "etc/systemd/system" / unit).is_file())
+        self.assertIn("porta-backup.timer", self.state()["enabled"])
+        self.assertIn("Backups:         daily to", result.stdout)
+
+        # A fresh installation has nothing to back up.
+        shutil.rmtree(self.root / "system")
+        shutil.rmtree(self.root / "checkout")
+        fresh = self.prepare_deploy(existing=False, timer=False)
+        self.run_deploy(fresh, "--build-local")
+        self.assertEqual(list((self.root / "system/var/backups/porta").glob("*.tar.gz")), [])
 
     def test_deploy_runs_the_daemon_as_an_unprivileged_user(self):
         deploy = self.prepare_deploy(timer=False)
@@ -1664,6 +1693,79 @@ class AutomationTests(unittest.TestCase):
         command.unlink(missing_ok=True)
         command.write_text("#!/bin/sh\nset -eu\n" + script)
         command.chmod(0o755)
+
+    def test_backups_round_trip_verify_prune_and_restore_with_an_undo_copy(self):
+        root = self.root / "backup"
+        config, state, archives, tools = (root / name for name in ("etc", "state", "archives", "bin"))
+        for directory in (config / "tls", state / "acme", state / "downloads", tools):
+            directory.mkdir(parents=True)
+        (config / "porta.env").write_text("PORTA_ADMIN_TOKEN=secret\n")
+        (config / "tls/server.key").write_text("key")
+        for name, text in {"clients.json": "clients-v1", "leases.json": "leases-v1",
+                           "usage.json": "{}", "admins.json": "[]", "audit.log": "line\n",
+                           "audit.log.1": "older\n", "acme/cert": "acme",
+                           "downloads/porta-client": "binary", "clients.json.lock": ""}.items():
+            (state / name).write_text(text)
+        log = root / "systemctl.log"
+        (tools / "systemctl").write_text(f"#!/bin/sh\necho \"$*\" >> {log}\n")
+        (tools / "curl").write_text("#!/bin/sh\nexit 0\n")
+        for tool in ("systemctl", "curl"):
+            (tools / tool).chmod(0o755)
+        env = {**os.environ, "PATH": f"{tools}:/usr/bin:/bin", "PORTA_BACKUP_ALLOW_NONROOT": "1",
+               "PORTA_CONFIG_DIR": str(config), "PORTA_STATE_DIR": str(state),
+               "PORTA_BACKUP_DIR": str(archives), "PORTA_READY_URL": "http://127.0.0.1:1/readyz",
+               "TMPDIR": str(self.root / "scratch")}
+
+        def backup(*args, success=True):
+            result = subprocess.run(["bash", str(ROOT / "scripts/porta-backup.sh"), *args],
+                                    env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+            return result
+
+        first = pathlib.Path(backup("create").stdout.strip())
+        self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+        listing = subprocess.run(["tar", "-tzf", str(first)], text=True, capture_output=True).stdout
+        for member in ("config/porta.env", "config/tls/server.key", "state/clients.json",
+                       "state/audit.log.1", "state/acme/cert", "MANIFEST", "SHA256SUMS"):
+            self.assertIn(member, listing)
+        self.assertNotIn("downloads", listing)
+        self.assertNotIn("clients.json.lock", listing)
+        self.assertIn("files verified", backup("verify", first).stdout)
+
+        # Archives are named by second; retention keeps the newest.
+        import time as clock
+        for _ in range(2):
+            clock.sleep(1.1)
+            backup("create", "--keep", "2")
+        self.assertEqual(len(backup("list").stdout.split()), 2)
+        self.assertFalse(first.exists())
+        newest = pathlib.Path(backup("list").stdout.split()[0])
+
+        tampered = archives / "porta-tampered.tar.gz"
+        work = self.root / "scratch/tamper"
+        work.mkdir()
+        subprocess.run(["tar", "-C", str(work), "-xzf", str(newest)], check=True)
+        (work / "state/clients.json").write_text("forged")
+        subprocess.run(["tar", "-C", str(work), "-czf", str(tampered), "."], check=True)
+        self.assertIn("checksums", backup("verify", tampered, success=False).stderr)
+        self.assertIn("no archive",
+                      backup("verify", archives / "missing.tar.gz", success=False).stderr)
+        foreign = archives / "foreign.tar.gz"
+        subprocess.run(["tar", "-C", str(config), "-czf", str(foreign), "porta.env"], check=True)
+        self.assertIn("not a Porta backup", backup("verify", foreign, success=False).stderr)
+        foreign.unlink()
+        tampered.unlink()
+
+        (state / "clients.json").write_text("clients-v2")
+        (state / "leases.json").unlink()
+        restored = backup("restore", newest).stdout
+        self.assertEqual((state / "clients.json").read_text(), "clients-v1")
+        self.assertEqual((state / "leases.json").read_text(), "leases-v1")
+        self.assertEqual((state / "downloads/porta-client").read_text(), "binary")
+        undo = next(state.glob("restore-replaced-*"))
+        self.assertEqual((undo / "state/clients.json").read_text(), "clients-v2")
+        self.assertIn("previous state kept in", restored)
+        self.assertEqual(log.read_text().split("\n")[:2], ["stop porta.service", "start porta.service"])
 
     def test_alert_rules_only_use_metrics_the_gateway_exports(self):
         import yaml
