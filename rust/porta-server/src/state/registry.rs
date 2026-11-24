@@ -2747,6 +2747,7 @@ mod tests {
                         path: "/v1/tunnel".into(),
                         peer: "127.0.0.1:1234".parse().unwrap(),
                         standard: false,
+                        client_version: None,
                     })
                     .await
                     .unwrap();

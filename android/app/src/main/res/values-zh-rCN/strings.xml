@@ -63,6 +63,7 @@
     <string name="device_pending_denied">此设备正在等待管理员批准。批准后请重新连接。</string>
     <string name="enrollment_closed_denied">此账户不再接受新设备，请联系管理员开放注册。</string>
     <string name="device_denied_denied">管理员未允许此设备连接。</string>
+    <string name="client_outdated_denied">此版本的 Porta 过旧，网关不再允许连接。请从下载页面安装最新版本。</string>
     <string name="routing_full_tunnel">所有流量均经由网关</string>
     <plurals name="routing_split_tunnel">
         <item quantity="other">分流模式 · %1$d 个网络经由网关</item>

@@ -471,6 +471,10 @@ fn apply_headers(request: &mut Request<()>, config: &ClientConfig) -> Result<(),
         HeaderName::from_static("x-porta-version"),
         HeaderValue::from_static(frame::VERSION),
     );
+    headers.insert(
+        HeaderName::from_static(super::HEADER_CLIENT_VERSION),
+        HeaderValue::from_static(crate::VERSION.trim_ascii()),
+    );
     for (name, value) in [
         ("x-porta-client-id", proof.device_id),
         ("x-porta-device-name", proof.name),

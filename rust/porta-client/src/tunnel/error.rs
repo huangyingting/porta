@@ -11,6 +11,8 @@ pub enum AccountDenial {
     EnrollmentClosed,
     /// An administrator refused this device.
     DeviceDenied,
+    /// The gateway requires a newer version of the app.
+    ClientOutdated,
 }
 
 impl AccountDenial {
@@ -22,6 +24,7 @@ impl AccountDenial {
             "device-pending" => Some(Self::DevicePending),
             "enrollment-closed" => Some(Self::EnrollmentClosed),
             "device-denied" => Some(Self::DeviceDenied),
+            "client-outdated" => Some(Self::ClientOutdated),
             _ => None,
         }
     }
@@ -34,6 +37,7 @@ impl AccountDenial {
             Self::DevicePending => "device-pending",
             Self::EnrollmentClosed => "enrollment-closed",
             Self::DeviceDenied => "device-denied",
+            Self::ClientOutdated => "client-outdated",
         }
     }
 
@@ -50,6 +54,9 @@ impl AccountDenial {
                 "this account accepts no new devices; ask the administrator to allow enrollment"
             }
             Self::DeviceDenied => "the administrator has not allowed this device to connect",
+            Self::ClientOutdated => {
+                "this version of Porta is too old for the gateway; install the latest version from the downloads page"
+            }
         }
     }
 }

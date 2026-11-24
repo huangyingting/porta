@@ -524,6 +524,17 @@ send to the other, since direct traffic bypasses the gateway. Changing an
 account's policy reconnects its devices, which pick up the new rules
 automatically.
 
+## Requiring up-to-date clients
+
+Porta apps report their version when they connect. Start the gateway with
+`--min-client-version 0.1.41` (`deploy.sh --min-client-version 0.1.41`) to
+refuse older apps, for example after a security fix. They are refused before
+authenticating, so they enrol no device, and they show a message asking the
+user to install the latest version from the downloads page. Apps from
+before this setting existed report no version and are refused whenever a
+minimum is set. Standard CONNECT-IP clients are not Porta apps and are not
+affected. `deploy.sh --min-client-version=` removes the requirement.
+
 ## Subnet routing (site-to-site)
 
 A device can publish the network behind it, like a WireGuard peer with

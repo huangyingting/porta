@@ -8,16 +8,19 @@
 # Standard clients are refused until the account allows them; then the
 # probe receives an address and routes, with or without asking, and pings
 # the gateway and the web host through the tunnel. Turning the setting off
-# refuses them again.
+# refuses them again. The gateway also requires a client version from the
+# future: native Porta clients are told to update, standard clients are not
+# affected.
 #
-# Usage: sudo scripts/test-standard-masque.sh [path-to-porta-server] [path-to-masque-probe]
+# Usage: sudo scripts/test-standard-masque.sh [path-to-porta-server] [path-to-masque-probe] [path-to-porta-client]
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 2; }
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 server_binary=$(realpath "${1:-$repository_root/rust/target/debug/porta-server}")
 probe_binary=$(realpath "${2:-$repository_root/bin/masque-probe}")
-for binary in "$server_binary" "$probe_binary"; do
+client_binary=$(realpath "${3:-$repository_root/rust/target/debug/porta-client}")
+for binary in "$server_binary" "$probe_binary" "$client_binary"; do
   [[ -x $binary ]] || { echo "missing executable: $binary (make build-masque-probe builds the probe)" >&2; exit 2; }
 done
 for command in curl ip nft openssl python3; do
@@ -97,6 +100,7 @@ ip netns exec "$(ns gateway)" env PORTA_TOKEN="$(<"$work/token")" PORTA_ADMIN_TO
   --tls-cert "$work/gateway.crt" --tls-key "$work/gateway.key" \
   --client-registry "$work/gateway/clients.json" --lease-state "$work/gateway/leases.json" \
   --interface porta0 --egress-interface egress --pool 10.66.0.0/24 --dns 192.0.2.53 \
+  --min-client-version 99.0.0 \
   >"$work/gateway.log" 2>&1 &
 gateway_pid=$!
 for _ in $(seq 1 100); do
@@ -121,6 +125,27 @@ probe() {
   in_ns probe env PORTA_TOKEN="$token" "$probe_binary" -proxy "https://172.31.0.2:$port" \
     -ca "$work/ca.pem" -timeout 10s "$@"
 }
+
+# A native client older than --min-client-version is told to update.
+install -d -m 0700 "$work/native" "$work/bin"
+cat >"$work/bin/resolvectl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "$work/bin/resolvectl"
+if in_ns probe env PORTA_TOKEN="$(<"$work/token")" PATH="$work/bin:$PATH" timeout 30 \
+  "$client_binary" --server "https://172.31.0.2:$port" --ca "$work/ca.pem" \
+  --identity "$work/native/identity.json" --network-state "$work/native/network-state.json" \
+  --interface porta-ci0 >"$work/native.log" 2>&1; then
+  echo "an outdated native client connected" >&2
+  exit 1
+fi
+grep -q "too old for the gateway" "$work/native.log" || {
+  echo "the outdated client was not told to update" >&2
+  cat "$work/native.log" >&2
+  exit 1
+}
+echo "native clients older than the minimum version are told to update"
 
 if probe "$(<"$work/token")" >"$work/refused.log" 2>&1; then
   echo "a standard client connected before the account allowed it" >&2

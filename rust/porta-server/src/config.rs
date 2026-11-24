@@ -124,6 +124,10 @@ pub struct Config {
     /// split tunnels only.
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub peer_to_peer: bool,
+    /// Refuse native clients older than this version (MAJOR.MINOR.PATCH);
+    /// they are told to update. Standard CONNECT-IP clients are unaffected.
+    #[arg(long, value_name = "VERSION", value_parser = parse_min_client_version)]
+    pub min_client_version: Option<String>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub auto_mtu: bool,
     #[arg(long, default_value = "")]
@@ -881,6 +885,12 @@ impl Config {
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
     crate::wire::duration::parse_duration(value).map_err(|error| error.to_string())
+}
+
+fn parse_min_client_version(value: &str) -> Result<String, String> {
+    crate::transport::session::parse_version(value)
+        .map(|_| value.trim().to_owned())
+        .ok_or_else(|| format!("{value:?} is not a MAJOR.MINOR.PATCH version"))
 }
 
 fn parse_path(value: &str) -> Result<PathBuf, String> {

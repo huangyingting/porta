@@ -317,6 +317,10 @@ async fn run() -> Result<Stop> {
             registry.clone(),
             abuse.clone(),
             usage.clone(),
+            config
+                .min_client_version
+                .as_deref()
+                .and_then(porta_server_rust::transport::session::parse_version),
         ),
         leases: leases.clone(),
         router: packet_router,

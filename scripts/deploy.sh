@@ -55,6 +55,8 @@ Options:
   --client-to-client[=BOOL] Let connected clients reach each other's addresses
   --peer-to-peer[=BOOL]     Let devices that may reach each other connect
                             directly over UDP (HTTP/3 split-tunnel clients)
+  --min-client-version V    Refuse Porta apps older than V (such as 0.1.41) and
+                            tell users to update; --min-client-version= removes it
   --client-host-access[=BOOL]
                             Let clients reach all services on this host; by
                             default they may only ping it and use DNS port 53
@@ -143,6 +145,7 @@ exits=
 local_exit=false
 dns_resolver=false
 oidc_issuer=
+min_client_version=
 oidc_client_id=
 federation_primary=
 disable_federation=false
@@ -161,6 +164,7 @@ saved_option_names=(
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
   upstream_ca upstream_interface client_to_client peer_to_peer client_host_access routes
   dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist oidc_issuer
+  min_client_version
   oidc_client_id federation_primary ipv6_pool ipv6_routed
 )
 declare -A saved_options=()
@@ -226,6 +230,8 @@ while [[ $# -gt 0 ]]; do
     --federation-primary=*) federation_primary=${1#*=}; shift ;;
     --disable-federation) disable_federation=true; shift ;;
     --oidc-issuer) require_value "$@"; oidc_issuer=$2; shift 2 ;;
+    --min-client-version) require_value "$@"; min_client_version=$2; shift 2 ;;
+    --min-client-version=*) min_client_version=${1#*=}; shift ;;
     --oidc-issuer=*) oidc_issuer=${1#*=}; shift ;;
     --oidc-client-id) require_value "$@"; oidc_client_id=$2; shift 2 ;;
     --oidc-client-id=*) oidc_client_id=${1#*=}; shift ;;
@@ -295,6 +301,8 @@ mtu=$((10#$mtu))
 [[ $tun_interface =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid --tun-interface"
 [[ $pool =~ ^[0-9.]+/[0-9]+$ ]] || die "invalid --pool"
 [[ $dns =~ ^[0-9.]+$ ]] || die "invalid --dns"
+[[ -z $min_client_version || $min_client_version =~ ^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$ ]] ||
+  die "invalid --min-client-version; use MAJOR.MINOR.PATCH"
 if $generate_ipv6 && [[ -z $ipv6_pool ]]; then
   # A random unique local prefix (RFC 4193), kept across upgrades.
   ipv6_pool=$(python3 -c 'import ipaddress, secrets; print(ipaddress.IPv6Network((b"\xfd" + secrets.token_bytes(5) + bytes(10), 64)))')
@@ -1158,6 +1166,9 @@ fi
 if $peer_to_peer; then
   client_to_client_argument+=" --peer-to-peer"
 fi
+if [[ -n $min_client_version ]]; then
+  client_to_client_argument+=" --min-client-version $min_client_version"
+fi
 if $client_host_access; then
   network_up_options+=" --client-host-access"
 fi
@@ -1335,6 +1346,7 @@ Selectable exits: ${selectable_exits:-none}
 Client-to-client: $([[ $client_to_client == true ]] && echo "allowed within $pool" || echo "blocked")
 Backups:         daily to /var/backups/porta (porta-backup.timer); restore with sudo porta-backup restore
 Direct paths:    $([[ $peer_to_peer == true ]] && echo "offered to HTTP/3 split-tunnel clients" || echo "off (client traffic goes through this gateway)")
+Client versions: $([[ -n $min_client_version ]] && echo "$min_client_version or newer" || echo "any")
 Client IPv6:     $([[ -n $ipv6_pool ]] && echo "$ipv6_pool, $([[ $ipv6_routed == true ]] && echo "routed" || echo "masqueraded") through $external_interface" || echo "off (clients keep IPv6 off the tunnel)")
 Host services:   $([[ $client_host_access == true ]] && echo "reachable from clients" || echo "ping and DNS only from clients")
 Client DNS:      $([[ $dns_resolver == true ]] && echo "built-in resolver on ${gateway_cidr%/*} with names under porta.internal" || echo "$dns")

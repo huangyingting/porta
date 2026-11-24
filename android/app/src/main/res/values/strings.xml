@@ -63,6 +63,7 @@
     <string name="device_pending_denied">This device is waiting for administrator approval. Connect again once it is approved.</string>
     <string name="enrollment_closed_denied">This account accepts no new devices. Ask your administrator to allow enrollment.</string>
     <string name="device_denied_denied">Your administrator has not allowed this device to connect.</string>
+    <string name="client_outdated_denied">This version of Porta is too old for the gateway. Install the latest version from the downloads page.</string>
     <string name="routing_full_tunnel">All traffic goes through the gateway</string>
     <plurals name="routing_split_tunnel">
         <item quantity="one">Split tunnel · %1$d network via the gateway</item>

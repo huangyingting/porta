@@ -21,6 +21,8 @@ pub use error::{AccountDenial, ClientError};
 pub use peer::{direct_summary, DirectPeer};
 
 pub const TUNNEL_PATH: &str = "/v1/tunnel";
+/// The app version clients report, so gateways can require a minimum.
+pub const HEADER_CLIENT_VERSION: &str = "x-porta-client-version";
 pub const MASQUE_PATH: &str = "/.well-known/masque/ip/%2A/%2A/";
 pub const MASQUE_AUTH_PATH: &str = "/.well-known/masque/ip/*/*/";
 

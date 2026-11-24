@@ -18,11 +18,11 @@ use tracing::Instrument;
 
 use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryController};
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, is_masque_path, is_standard_request,
-    set_account_headers, AuthenticationRequest, DenialReason, DeviceProof, Lease, LeaseError,
-    MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session,
-    HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, PROTOCOL_VERSION,
-    REASON_HEADER,
+    bearer_token, client_version, fragment_ipv4, icmp_fragmentation_needed, is_masque_path,
+    is_standard_request, set_account_headers, AuthenticationRequest, DenialReason, DeviceProof,
+    Lease, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind,
+    Services, Session, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH,
+    PROTOCOL_VERSION, REASON_HEADER,
 };
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
@@ -543,6 +543,7 @@ where
                 path: MASQUE_AUTH_PATH.to_owned(),
                 peer,
                 standard,
+                client_version: client_version(request.headers()),
             },
             group_id: None,
             route: RouteKind::ConnectIp,
@@ -2212,6 +2213,7 @@ mod tests {
                     path: MASQUE_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
                     standard: false,
+                    client_version: None,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,
@@ -3647,6 +3649,7 @@ mod tests {
                     path: MASQUE_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
                     standard: false,
+                    client_version: None,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,

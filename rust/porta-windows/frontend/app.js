@@ -80,6 +80,7 @@ const messages = {
     devicePendingDenied: "This device is waiting for administrator approval. Connect again once it is approved.",
     enrollmentClosedDenied: "This account accepts no new devices. Ask your administrator to allow enrollment.",
     deviceDeniedDenied: "Your administrator has not allowed this device to connect.",
+    clientOutdatedDenied: "This version of Porta is too old for the gateway. Install the latest version from the downloads page.",
     accountExpires: "Access until {date}",
     fullTunnel: "All traffic goes through the gateway",
     splitTunnel: "Split tunnel · {count} networks via the gateway",
@@ -183,6 +184,7 @@ const messages = {
     devicePendingDenied: "此设备正在等待管理员批准。批准后请重新连接。",
     enrollmentClosedDenied: "此账户不再接受新设备，请联系管理员开放注册。",
     deviceDeniedDenied: "管理员未允许此设备连接。",
+    clientOutdatedDenied: "此版本的 Porta 过旧，网关不再允许连接。请从下载页面安装最新版本。",
     accountExpires: "可使用至 {date}",
     fullTunnel: "所有流量均经由网关",
     splitTunnel: "分流模式 · {count} 个网络经由网关",
@@ -543,6 +545,7 @@ function localizedDetail(snapshot) {
       if (snapshot.accountDenial === "device-pending") return t("devicePendingDenied");
       if (snapshot.accountDenial === "enrollment-closed") return t("enrollmentClosedDenied");
       if (snapshot.accountDenial === "device-denied") return t("deviceDeniedDenied");
+      if (snapshot.accountDenial === "client-outdated") return t("clientOutdatedDenied");
       if (snapshot.detail === "Normal network access has been restored.") return t("networkRestored");
       if (snapshot.detail === "Network recovery remains pending.") return t("recoveryPending");
       return snapshot.detail;

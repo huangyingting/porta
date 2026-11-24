@@ -512,6 +512,7 @@ fn lane_request(group: &Group, index: usize) -> Result<Request<()>, ClientError>
             format!("Bearer {}", group.config.token),
         )
         .header(frame::HEADER_VERSION, frame::VERSION)
+        .header(super::HEADER_CLIENT_VERSION, crate::VERSION.trim_ascii())
         .header("X-Porta-Lane-Session", &group.session)
         .header("X-Porta-Lane", index)
         .header("X-Porta-Lanes", LANE_COUNT)

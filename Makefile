@@ -148,8 +148,10 @@ test-peer-to-peer:
 	sudo -n ./scripts/test-peer-to-peer.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
 
 test-standard-masque: build-masque-probe
-	$(CARGO) build --manifest-path $(RUST_MANIFEST) --package porta-server-rust --locked
-	sudo -n ./scripts/test-standard-masque.sh $(RUST_TARGET)/debug/porta-server bin/masque-probe
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-server-rust --package porta-client-rust --locked
+	sudo -n ./scripts/test-standard-masque.sh $(RUST_TARGET)/debug/porta-server bin/masque-probe \
+		$(RUST_TARGET)/debug/porta-client
 
 # The C interface of the macOS and iOS apps, exercised from C on Linux.
 test-apple-ffi:

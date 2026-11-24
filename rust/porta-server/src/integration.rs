@@ -45,6 +45,8 @@ pub struct NativeAuthenticator {
     registry: Arc<StateRegistry>,
     abuse: Arc<AbuseGuard>,
     usage: Option<Arc<usage::Store>>,
+    /// Native clients older than this are refused (`--min-client-version`).
+    min_client_version: Option<(u64, u64, u64)>,
 }
 
 impl NativeAuthenticator {
@@ -53,6 +55,7 @@ impl NativeAuthenticator {
             registry,
             abuse,
             usage: None,
+            min_client_version: None,
         })
     }
 
@@ -61,11 +64,24 @@ impl NativeAuthenticator {
         registry: Arc<StateRegistry>,
         abuse: Arc<AbuseGuard>,
         usage: Arc<usage::Store>,
+        min_client_version: Option<(u64, u64, u64)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             abuse,
             usage: Some(usage),
+            min_client_version,
+        })
+    }
+
+    /// Whether a native client reporting `version` is too old to admit.
+    /// Clients that report no version predate the header and are too old
+    /// whenever a minimum is set.
+    fn outdated(&self, version: Option<&str>) -> bool {
+        self.min_client_version.is_some_and(|minimum| {
+            version
+                .and_then(crate::transport::session::parse_version)
+                .is_none_or(|version| version < minimum)
         })
     }
 }
@@ -106,7 +122,14 @@ impl Authenticator for NativeAuthenticator {
         let registry = self.registry.clone();
         let abuse = self.abuse.clone();
         let usage = self.usage.clone();
+        // Standard CONNECT-IP clients are not Porta apps and have no version.
+        let outdated = !request.standard && self.outdated(request.client_version.as_deref());
         Box::pin(async move {
+            // Refused before authenticating, so an outdated app enrolls no
+            // device; the minimum version is not a secret.
+            if outdated {
+                return Err(AuthenticationError::Forbidden(DenialReason::ClientOutdated));
+            }
             let Some(reservation) = abuse.reserve(Surface::Native, request.peer.ip()) else {
                 return Err(AuthenticationError::RateLimited {
                     retry_after_seconds: 5,
@@ -2379,6 +2402,36 @@ mod tests {
         packet[33] = flags;
         porta_wire::ip::set_ipv4_header_checksum(&mut packet).unwrap();
         Bytes::from(packet)
+    }
+
+    #[tokio::test]
+    async fn clients_older_than_the_minimum_version_are_outdated() {
+        use crate::transport::session::parse_version;
+        assert_eq!(parse_version("0.1.41"), Some((0, 1, 41)));
+        assert_eq!(parse_version("v1.2.3-beta.1"), Some((1, 2, 3)));
+        for invalid in ["", "1.2", "a.b.c", "1..3"] {
+            assert_eq!(parse_version(invalid), None, "{invalid}");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            StateRegistry::open(
+                directory.path().join("clients.json"),
+                "token-0123456789abcdef",
+            )
+            .await
+            .unwrap(),
+        );
+        let abuse = Arc::new(AbuseGuard::default_with_metrics(Arc::new(
+            OperationalMetrics::default(),
+        )));
+        let usage = Arc::new(usage::Store::open("").unwrap());
+        let authenticator =
+            NativeAuthenticator::with_usage(registry, abuse, usage, parse_version("0.1.41"));
+        assert!(!authenticator.outdated(Some("0.1.41")));
+        assert!(!authenticator.outdated(Some("0.2.0")));
+        assert!(authenticator.outdated(Some("0.1.40")));
+        assert!(authenticator.outdated(None));
+        assert!(authenticator.outdated(Some("garbage")));
     }
 
     #[tokio::test]

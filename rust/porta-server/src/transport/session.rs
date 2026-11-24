@@ -96,6 +96,35 @@ pub struct AuthenticationRequest {
     pub method: http::Method,
     pub path: String,
     pub peer: std::net::SocketAddr,
+    /// The native client's application version, from [`HEADER_CLIENT_VERSION`].
+    pub client_version: Option<String>,
+}
+
+/// Native clients report their application version in this header.
+pub const HEADER_CLIENT_VERSION: &str = "x-porta-client-version";
+
+/// The application version a native client reports, if any.
+pub fn client_version(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(HEADER_CLIENT_VERSION)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .map(str::to_owned)
+}
+
+/// A `MAJOR.MINOR.PATCH` version; anything after the patch number, such as
+/// a pre-release suffix, is ignored.
+pub fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().trim_start_matches('v').splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?;
+    let digits = patch
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(patch.len());
+    Some((major, minor, patch[..digits].parse().ok()?))
 }
 
 pub trait Cleanup: Send + Sync {
@@ -292,6 +321,8 @@ pub enum DenialReason {
     EnrollmentClosed,
     DeviceDenied,
     StandardClientsDisabled,
+    /// The client is older than the gateway's `--min-client-version`.
+    ClientOutdated,
 }
 
 impl DenialReason {
@@ -304,6 +335,7 @@ impl DenialReason {
             Self::EnrollmentClosed => "enrollment-closed",
             Self::DeviceDenied => "device-denied",
             Self::StandardClientsDisabled => "standard-clients-disabled",
+            Self::ClientOutdated => "client-outdated",
         }
     }
 }

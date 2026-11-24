@@ -158,6 +158,8 @@ in the `restore-replaced-*` copy.
 - **Rotate a client token:** use **Rotate** on the account's token in the
   admin page. Its devices reconnect after their users import the new
   profile.
+- **Require an app update:** redeploy with `--min-client-version` set to the
+  fixed release; older apps tell their users to update.
 - **Revoke a device:** use **Forget** or **Deny** on the device. Its live
   tunnel ends at once, and with `--peer-to-peer` its peers drop their
   direct paths to it.

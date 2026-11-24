@@ -959,6 +959,7 @@ class MainActivity : Activity() {
         AccountDenial.DEVICE_PENDING -> getString(R.string.device_pending_denied)
         AccountDenial.ENROLLMENT_CLOSED -> getString(R.string.enrollment_closed_denied)
         AccountDenial.DEVICE_DENIED -> getString(R.string.device_denied_denied)
+        AccountDenial.CLIENT_OUTDATED -> getString(R.string.client_outdated_denied)
         null -> null
     }
 
