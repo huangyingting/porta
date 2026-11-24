@@ -55,6 +55,16 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y nftables iproute2
           fi
+      - name: Resolve through systemd-resolved's stub, like an Ubuntu host
+        # Clients configure DNS through systemd-resolved and require
+        # /etc/resolv.conf to be its stub; some runner images manage the
+        # file another way.
+        run: |
+          if [[ -f /run/systemd/resolve/stub-resolv.conf ]] &&
+             [[ $(readlink -f /etc/resolv.conf) != /run/systemd/resolve/stub-resolv.conf ]]; then
+            sudo ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          fi
+          ls -l /etc/resolv.conf
       - run: make test
       - name: Test native firewall and client networking
         run: make test-native-firewall
