@@ -1784,12 +1784,17 @@ class AutomationTests(unittest.TestCase):
 
         (state / "clients.json").write_text("clients-v2")
         (state / "leases.json").unlink()
+        (config / "added-later.conf").write_text("new")
+        (config / "porta.env").write_text("PORTA_ADMIN_TOKEN=rotated\n")
         restored = backup("restore", newest).stdout
+        self.assertFalse((config / "added-later.conf").exists())
+        self.assertEqual((config / "porta.env").read_text(), "PORTA_ADMIN_TOKEN=secret\n")
         self.assertEqual((state / "clients.json").read_text(), "clients-v1")
         self.assertEqual((state / "leases.json").read_text(), "leases-v1")
         self.assertEqual((state / "downloads/porta-client").read_text(), "binary")
         undo = next(state.glob("restore-replaced-*"))
         self.assertEqual((undo / "state/clients.json").read_text(), "clients-v2")
+        self.assertEqual((undo / "config/added-later.conf").read_text(), "new")
         self.assertIn("previous state kept in", restored)
         self.assertEqual(log.read_text().split("\n")[:2], ["stop porta.service", "start porta.service"])
 

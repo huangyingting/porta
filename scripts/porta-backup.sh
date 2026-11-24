@@ -156,6 +156,8 @@ restore() {
     mkdir -p "$aside/state/$(dirname "$entry")"
     mv "$state_directory/$entry" "$aside/state/$entry"
   done < <(state_entries)
+  # The configuration directory becomes exactly the backed-up one.
+  find "$config_directory" -mindepth 1 -delete
   cp -a "$directory/config/." "$config_directory/"
   cp -a "$directory/state/." "$state_directory/"
   if id porta >/dev/null 2>&1; then
