@@ -263,7 +263,8 @@ impl Daemon {
             };
             let mut encoded = serde_json::to_vec(&response).unwrap_or_default();
             encoded.push(b'\n');
-            let _ = writer.write_all(&encoded).await;
+            // A client that stops reading must not hold its slot forever.
+            let _ = tokio::time::timeout(Duration::from_secs(10), writer.write_all(&encoded)).await;
         }
     }
 
