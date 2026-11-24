@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
@@ -99,6 +100,9 @@ class TunnelService : VpnService() {
         currentProfileId = profileId.ifBlank { server }
         currentProfileName = profileLabel.ifBlank { profileName(server) }
         currentAllowLan = intent.getBooleanExtra(EXTRA_ALLOW_LAN, false)
+        currentAppMode = AppMode.fromCode(intent.getStringExtra(EXTRA_APP_MODE))
+        currentApps = intent.getStringArrayExtra(EXTRA_APPS)
+            ?.filter(::isPackageName)?.take(MAX_PROFILE_APPS).orEmpty()
         currentSessionId = runGeneration
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -567,6 +571,8 @@ class TunnelService : VpnService() {
             routing,
             localAccess = currentAllowLan && routing.isFullTunnel,
             localNetworks = local,
+            appMode = currentAppMode,
+            apps = currentApps,
         )
     }
 
@@ -608,8 +614,28 @@ class TunnelService : VpnService() {
             if (configuration.dns.isNotBlank()) builder.addRoute(configuration.dns, 32)
             if (sourceAddress6 == null) builder.allowFamily(OsConstants.AF_INET6)
         }
-        // Platform certificate checks create Java sockets outside the native socket protector.
-        builder.addDisallowedApplication(packageName)
+        // Platform certificate checks create Java sockets outside the native
+        // socket protector, so Porta itself always stays outside the tunnel.
+        val rules = appRules(configuration.appMode, configuration.apps, packageName)
+        var carried = 0
+        for (app in rules.allowed) {
+            try {
+                builder.addAllowedApplication(app)
+                carried++
+            } catch (_: PackageManager.NameNotFoundException) {
+                logEvent("Skipping $app: the app is not installed")
+            }
+        }
+        if (configuration.appMode == AppMode.ONLY && carried == 0) {
+            throw PermanentTunnelException(getString(R.string.no_selected_apps_installed))
+        }
+        for (app in rules.disallowed) {
+            try {
+                builder.addDisallowedApplication(app)
+            } catch (_: PackageManager.NameNotFoundException) {
+                logEvent("Skipping $app: the app is not installed")
+            }
+        }
         if (configuration.dns.isNotBlank()) builder.addDnsServer(configuration.dns)
         val vpn = builder.establish() ?: throw PermanentTunnelException("Android refused to establish the VPN")
         val previousReader = vpnReader
@@ -1092,6 +1118,8 @@ class TunnelService : VpnService() {
         const val EXTRA_SERVER = "server"
         const val EXTRA_BACKUP_SERVERS = "backupServers"
         const val EXTRA_ALLOW_LAN = "allowLan"
+        const val EXTRA_APP_MODE = "appMode"
+        const val EXTRA_APPS = "apps"
 
         /** Multicast and broadcast that local discovery (mDNS, SSDP) uses. */
         private val LOCAL_DISCOVERY = listOf(
@@ -1111,6 +1139,8 @@ class TunnelService : VpnService() {
                 .putExtra(EXTRA_BACKUP_SERVERS, profile.backupServers.toTypedArray())
                 .putExtra(EXTRA_TOKEN, profile.token)
                 .putExtra(EXTRA_ALLOW_LAN, profile.allowLan)
+                .putExtra(EXTRA_APP_MODE, profile.appMode.code)
+                .putExtra(EXTRA_APPS, profile.apps.toTypedArray())
         const val EXTRA_TOKEN = "token"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
@@ -1124,6 +1154,8 @@ class TunnelService : VpnService() {
         @Volatile private var currentProfileId: String? = null
         @Volatile private var currentProfileName: String? = null
         @Volatile private var currentAllowLan = false
+        @Volatile private var currentAppMode = AppMode.ALL
+        @Volatile private var currentApps = emptyList<String>()
         @Volatile private var currentSessionId = NO_SESSION
         @Volatile private var currentSnapshot = TrafficSnapshot()
         private val nextSessionId = AtomicLong()
@@ -1159,6 +1191,8 @@ class TunnelService : VpnService() {
         val localAccess: Boolean = false,
         /** The local networks routed around the tunnel. */
         val localNetworks: List<RoutePrefix> = emptyList(),
+        val appMode: AppMode = AppMode.ALL,
+        val apps: List<String> = emptyList(),
     )
 
     /**

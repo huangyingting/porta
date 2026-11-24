@@ -116,4 +116,20 @@
     <string name="notification_connected">Secure tunnel connected</string>
     <string name="notification_connected_transport">Connected over %1$s</string>
     <string name="notification_permission_revoked">VPN permission revoked</string>
+    <string name="apps_label">Apps</string>
+    <string name="apps_all">All apps</string>
+    <string name="apps_mode_all">All apps use the tunnel</string>
+    <string name="apps_mode_only">Only chosen apps use the tunnel</string>
+    <string name="apps_mode_except">Chosen apps bypass the tunnel</string>
+    <string name="apps_choose_one">Choose at least one app</string>
+    <string name="apps_too_many">Choose at most %1$d apps</string>
+    <string name="no_selected_apps_installed">None of the apps chosen for this profile are installed</string>
+    <plurals name="apps_only">
+        <item quantity="one">Only %1$d app</item>
+        <item quantity="other">Only %1$d apps</item>
+    </plurals>
+    <plurals name="apps_except">
+        <item quantity="one">All except %1$d app</item>
+        <item quantity="other">All except %1$d apps</item>
+    </plurals>
 </resources>

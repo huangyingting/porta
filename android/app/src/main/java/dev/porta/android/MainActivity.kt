@@ -742,6 +742,26 @@ class MainActivity : Activity() {
             setTextColor(COLOR_MUTED)
             setPadding(dp(34), 0, dp(2), dp(4))
         }
+        // Which apps use the tunnel is a choice for this device, so an
+        // imported profile starts with every app.
+        var appMode = existing?.appMode ?: AppMode.ALL
+        var apps = existing?.apps.orEmpty()
+        val appChoice = TextView(this).apply {
+            text = appSummary(appMode, apps)
+            textSize = 15f
+            setTextColor(COLOR_TEXT)
+            background = rounded(COLOR_FIELD, 12f, COLOR_BORDER)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(13), 0, dp(13), 0)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50))
+            setOnClickListener {
+                chooseApps(appMode, apps) { mode, selected ->
+                    appMode = mode
+                    apps = selected
+                    text = appSummary(mode, selected)
+                }
+            }
+        }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(4), dp(4), dp(4), 0)
@@ -759,6 +779,8 @@ class MainActivity : Activity() {
                 setTextColor(COLOR_MUTED)
                 setPadding(dp(2), dp(14), dp(2), dp(4))
             })
+            addView(dialogLabel(R.string.apps_label))
+            addView(appChoice)
             addView(autoConnect)
             addView(allowLan)
             addView(allowLanHelp)
@@ -782,6 +804,8 @@ class MainActivity : Activity() {
                     token = token.text.toString().ifBlank { existing?.token.orEmpty() },
                     autoConnect = autoConnect.isChecked,
                     allowLan = allowLan.isChecked,
+                    appMode = appMode,
+                    apps = if (appMode == AppMode.ALL) emptyList() else apps,
                     backupServers = parseBackupServers(backups.text.toString()) ?: run {
                         backups.error = getString(R.string.https_required)
                         return@setOnClickListener
@@ -802,6 +826,76 @@ class MainActivity : Activity() {
             }
         }
         dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        dialog.show()
+    }
+
+    private fun appSummary(mode: AppMode, apps: List<String>): String = when (mode) {
+        AppMode.ALL -> getString(R.string.apps_all)
+        AppMode.ONLY -> resources.getQuantityString(R.plurals.apps_only, apps.size, apps.size)
+        AppMode.EXCEPT -> resources.getQuantityString(R.plurals.apps_except, apps.size, apps.size)
+    }
+
+    /** Asks which apps use the tunnel, then which apps the choice names. */
+    private fun chooseApps(
+        mode: AppMode,
+        apps: List<String>,
+        chosen: (AppMode, List<String>) -> Unit,
+    ) {
+        val modes = AppMode.entries
+        val labels = arrayOf(
+            getString(R.string.apps_mode_all),
+            getString(R.string.apps_mode_only),
+            getString(R.string.apps_mode_except),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(R.string.apps_label)
+            .setSingleChoiceItems(labels, modes.indexOf(mode)) { dialog, which ->
+                dialog.dismiss()
+                val next = modes[which]
+                if (next == AppMode.ALL) {
+                    chosen(next, emptyList())
+                } else {
+                    pickApps(next, if (next == mode) apps else emptyList()) { selected -> chosen(next, selected) }
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun pickApps(mode: AppMode, apps: List<String>, picked: (List<String>) -> Unit) {
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val installed = packageManager.queryIntentActivities(launcher, 0)
+            .map { it.activityInfo.applicationInfo }
+            .filter { it.packageName != packageName }
+            .distinctBy { it.packageName }
+            .associate { it.packageName to it.loadLabel(packageManager).toString() }
+        // Keep choices for apps that are no longer installed so they can be removed.
+        val entries = (installed + apps.filter { it !in installed }.associateWith { it })
+            .entries.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.value })
+        val checked = BooleanArray(entries.size) { entries[it].key in apps }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (mode == AppMode.ONLY) R.string.apps_mode_only else R.string.apps_mode_except)
+            .setMultiChoiceItems(entries.map { it.value }.toTypedArray(), checked) { _, which, isChecked ->
+                checked[which] = isChecked
+            }
+            .setPositiveButton(R.string.save, null)
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val selected = entries.indices.filter { checked[it] }.map { entries[it].key }
+                when {
+                    selected.isEmpty() ->
+                        Toast.makeText(this, R.string.apps_choose_one, Toast.LENGTH_SHORT).show()
+                    selected.size > MAX_PROFILE_APPS ->
+                        Toast.makeText(this, getString(R.string.apps_too_many, MAX_PROFILE_APPS), Toast.LENGTH_SHORT).show()
+                    else -> {
+                        picked(selected)
+                        dialog.dismiss()
+                    }
+                }
+            }
+        }
         dialog.show()
     }
 

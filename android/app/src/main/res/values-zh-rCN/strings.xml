@@ -114,4 +114,18 @@
     <string name="notification_connected">安全隧道已连接</string>
     <string name="notification_connected_transport">已通过 %1$s 连接</string>
     <string name="notification_permission_revoked">VPN 权限已撤销</string>
+    <string name="apps_label">应用</string>
+    <string name="apps_all">所有应用</string>
+    <string name="apps_mode_all">所有应用使用隧道</string>
+    <string name="apps_mode_only">仅所选应用使用隧道</string>
+    <string name="apps_mode_except">所选应用不使用隧道</string>
+    <string name="apps_choose_one">请至少选择一个应用</string>
+    <string name="apps_too_many">最多选择 %1$d 个应用</string>
+    <string name="no_selected_apps_installed">此配置所选的应用均未安装</string>
+    <plurals name="apps_only">
+        <item quantity="other">仅 %1$d 个应用</item>
+    </plurals>
+    <plurals name="apps_except">
+        <item quantity="other">除 %1$d 个应用外的所有应用</item>
+    </plurals>
 </resources>

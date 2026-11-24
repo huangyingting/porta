@@ -165,6 +165,8 @@ not conceal transport fingerprints from network inspection.
   network, such as public Wi-Fi, that traffic is visible to the network and
   local hosts can reach the device, as without a VPN. Leave the option off
   on profiles used on networks you do not trust.
+- On Android, apps a profile keeps outside the tunnel use the device's
+  network directly, unprotected and visible to that network.
 - With `--peer-to-peer`, peers learn each other's public IP addresses and
   traffic between them bypasses the gateway: it is not logged, counted
   toward usage or quotas, or rate limited there. Peers authenticate each

@@ -133,6 +133,25 @@ around those networks, and on macOS and iOS the app sets the system's
 through the tunnel, so the option only matters for full tunnels. Devices on
 the local network can reach this device, as they could before connecting.
 
+## Choosing which apps use the tunnel
+
+On Android, the profile dialog's **Apps** setting chooses which apps the
+tunnel carries:
+- **All apps use the tunnel** (the default);
+- **Only chosen apps use the tunnel**: every other app keeps using the
+  device's network directly;
+- **Chosen apps bypass the tunnel**: those apps use the device's network
+  directly, for example a banking app that refuses VPN addresses.
+
+The picker lists launchable apps; up to 256 can be chosen. The choice stays on
+the device: imported profiles start with all apps. Apps chosen but since
+uninstalled are skipped, and a profile limited to chosen apps refuses to
+connect when none of them is installed rather than tunnelling every app.
+Traffic from apps outside the tunnel is not protected by it. Android's
+**Block connections without VPN** setting also blocks the apps kept outside
+the tunnel, so leave it off to use this option. Porta's own control traffic
+always stays outside the tunnel. Desktop clients tunnel the whole device.
+
 ## Split tunnels
 
 When the gateway advertises split-tunnel routes, clients route only those
