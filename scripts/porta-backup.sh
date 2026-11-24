@@ -28,6 +28,13 @@ die() { echo "porta-backup: $*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
 [[ ${PORTA_BACKUP_ALLOW_NONROOT:-} == 1 || $EUID -eq 0 ]] || die "run with sudo"
+require() {
+  local command
+  for command in "$@"; do
+    command -v "$command" >/dev/null || die "missing required command: $command"
+  done
+}
+require tar gzip sha256sum find sort xargs
 umask 077
 
 # State that is worth restoring; everything else under the state directory
@@ -85,7 +92,7 @@ create() {
   {
     echo "format=1"
     echo "created=$stamp"
-    echo "host=$(hostname)"
+    echo "host=$(hostname 2>/dev/null || uname -n)"
     if [[ -x /usr/local/bin/porta-server ]]; then
       echo "server=$(/usr/local/bin/porta-server --version 2>/dev/null | head -n 1)"
     fi
@@ -141,6 +148,7 @@ verify() {
 
 restore() {
   [[ $# -eq 1 ]] || usage 2
+  require systemctl curl
   local directory stamp aside
   directory=$(unpack "$1")
   cleanup+=("$directory")
