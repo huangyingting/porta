@@ -211,7 +211,13 @@ curl http://127.0.0.1:9090/readyz
 
 Re-run `sudo ./scripts/deploy.sh` with no options to upgrade. It reuses the
 options saved in `/etc/porta/deploy.conf` and preserves credentials, client
-records, usage, and leases; options you pass override the saved ones.
+records, usage, and leases; options you pass override the saved ones. It
+backs up the gateway first, and a daily `porta-backup.timer` keeps two
+weeks of backups in `/var/backups/porta` (`sudo porta-backup restore ARCHIVE`).
+Scrape `/metrics` with `PORTA_METRICS_TOKEN` and load
+[`deploy/prometheus/porta-alerts.yml`](deploy/prometheus/porta-alerts.yml);
+the [operations guide](docs/operations.md) covers alerts, backups, upgrades
+and rollbacks.
 
 Automatic HTTP/3 tunnel MTU selection is enabled by default, with a 1400
 ceiling and a conservative 1100 baseline. Datagram packet budgets also adapt
@@ -224,6 +230,7 @@ for fallback, IPv4 handling, and nested-VPN limits.
 ## Documentation
 
 - [Production deployment](docs/deployment.md)
+- [Operations: monitoring, backups, upgrades](docs/operations.md)
 - [Client guide](docs/clients.md)
 - [Architecture and protocol compatibility](docs/architecture.md)
 - [Endpoint reference](docs/endpoints.md)
