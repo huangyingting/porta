@@ -49,6 +49,9 @@ pub struct Config {
     /// In a full tunnel, keep the directly connected private networks
     /// reachable outside the tunnel.
     pub allow_lan: bool,
+    /// Dial this `IP[:PORT]`, a relay that forwards to the only gateway,
+    /// instead of the gateway's own address.
+    pub relay: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +345,15 @@ pub async fn run(
         .iter()
         .map(|url| parse_origin(url))
         .collect::<Result<Vec<_>, _>>()?;
+    let relay =
+        failover::relay_candidate(&gateways, config.relay.as_deref()).map_err(RunError::Invalid)?;
+    if let Some(relay) = relay {
+        if !config.manual_network && !usable_endpoint(relay.address.ip()) {
+            return Err(RunError::Invalid(
+                "automatic networking requires an unscoped unicast relay address".to_owned(),
+            ));
+        }
+    }
     let tls = tls::config(
         config.ca_path.as_deref(),
         config.thumbprint.as_deref(),
@@ -394,11 +406,21 @@ pub async fn run(
             Vec::new()
         } else {
             runtime.network_started = true;
-            restored_candidates(&gateways, recovered)?
+            match relay {
+                Some(relay) => vec![relay],
+                None => restored_candidates(&gateways, recovered)?,
+            }
         }
     } else {
         Vec::new()
     };
+    if let Some(relay) = relay {
+        candidates = vec![relay];
+        observer(runtime.event(
+            State::Connecting,
+            format!("relay {} forwards to {}", relay.address, gateways[0]),
+        ));
+    }
 
     let token = Arc::new(config.token.clone());
     let proof_identity = identity.clone();
@@ -421,6 +443,7 @@ pub async fn run(
 
     let result = run_loop(
         &config,
+        relay,
         &gateways,
         &base_tunnel_config,
         &mut runtime,
@@ -481,8 +504,10 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     config: &Config,
+    relay: Option<failover::Candidate>,
     gateways: &[Url],
     base_tunnel_config: &ClientConfig,
     runtime: &mut Runtime,
@@ -562,7 +587,7 @@ async fn run_loop(
             let candidate = candidates[attempts % candidates.len()];
             (candidate.gateway, Some(candidate.address))
         } else {
-            (attempts % gateways.len(), None)
+            (attempts % gateways.len(), relay.map(|relay| relay.address))
         };
 
         if runtime.network_started {

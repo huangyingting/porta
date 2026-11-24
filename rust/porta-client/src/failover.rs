@@ -19,6 +19,30 @@ pub struct Candidate {
     pub address: SocketAddr,
 }
 
+/// The one candidate of a profile that dials `relay`, a host forwarding TCP
+/// and UDP unchanged to its only gateway. Every attempt and reconnect goes
+/// through the relay, never directly to the gateway.
+pub fn relay_candidate(
+    gateways: &[url::Url],
+    relay: Option<&str>,
+) -> Result<Option<Candidate>, String> {
+    let Some(relay) = relay.map(str::trim).filter(|relay| !relay.is_empty()) else {
+        return Ok(None);
+    };
+    if gateways.len() != 1 {
+        return Err(
+            "a relay forwards to one gateway; remove the backup gateways or the relay".to_owned(),
+        );
+    }
+    let port = gateways[0].port_or_known_default().unwrap_or(443);
+    let address = crate::tunnel::parse_dial_address(relay, port)
+        .map_err(|error| format!("invalid relay address: {error}"))?;
+    Ok(Some(Candidate {
+        gateway: 0,
+        address,
+    }))
+}
+
 /// Measures the TCP connect time of every address concurrently; `None`
 /// marks an endpoint that did not answer in time.
 pub async fn probe(

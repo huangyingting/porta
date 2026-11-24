@@ -332,6 +332,45 @@ limit on the next hop's account, or an unreachable next hop. Monitor
 Avoid loops: a chain that eventually points back to an earlier hop forwards
 packets until their TTL expires.
 
+## Transport relays
+
+Some clients have a poor route to the gateway even though another host has
+good routes to both, because of peering, congestion or loss:
+
+```text
+client -> relay host -> gateway
+```
+
+A transport relay forwards the client's TCP and UDP connections to the
+gateway unchanged. It is not a Porta gateway: it never holds tokens or TLS
+keys and cannot read tunnel traffic, and the gateway stays the exit. Unlike a
+[cascade relay](#cascade-relays-multi-hop), nothing changes on the gateway.
+It cannot help when the bottleneck is the client's own link or the gateway's
+uplink, and throughput is bounded by the slower of the two legs.
+
+On the relay host, a Linux machine with nftables, run:
+
+```sh
+sudo ./scripts/relay.sh up 203.0.113.10:8443 --port 8443 --allow 198.51.100.0/24 --persist
+```
+
+- The first argument is the gateway's IP and port.
+- `--port` is the port clients dial on the relay (default: the gateway's).
+- `--allow` limits which client networks may use it (default: any).
+- `--persist` restores the relay at boot through a `porta-relay` systemd
+  service. Without it the rules last until the next reboot.
+
+The relay redirects TCP and UDP on that port to the gateway, masquerades the
+connections so replies return through it, enables IP forwarding and rate
+limits new flows. `sudo ./scripts/relay.sh status` shows the rules and
+`sudo ./scripts/relay.sh down` removes them. Open the relay port in any
+other firewall on the host and in the cloud provider's security rules. The
+gateway sees the relay's address for these clients, so its per-address
+limits apply to the relay as a whole.
+
+Clients keep the gateway's URL and set the relay's `IP:PORT` as their relay
+address; see [Relays](clients.md#relays).
+
 ## Built-in DNS resolver
 
 `--dns-resolver` (`deploy.sh --dns-resolver`) serves DNS on the gateway's

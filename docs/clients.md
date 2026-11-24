@@ -97,6 +97,23 @@ reachable outside the tunnel. While protection is active the order is not
 re-measured and DNS is unavailable, so failover uses the endpoints resolved
 when the client started.
 
+## Relays
+
+When a [transport relay](deployment.md#transport-relays) forwards to the
+gateway, keep the gateway's URL in the profile and set the relay as the
+**Relay address** (Linux and Windows apps, Android), `--relay-address
+IP:PORT` (Linux and Windows CLIs) or the `relayAddress` provider option
+(macOS and iOS). The address is an IP with an optional port, such as
+`203.0.113.7:8443` or `[2001:db8::7]:443`; without a port, the gateway's
+port is used.
+
+The client then dials the relay for every connection and reconnect, over
+HTTP/3 and HTTP/2, and never falls back to dialing the gateway directly. It
+still checks the gateway's name and certificate and authenticates to the
+gateway, so a relay cannot impersonate it. Leak protection lets only the
+relay through outside the tunnel. A relay forwards to one gateway, so a
+profile with a relay has no backup gateways.
+
 ## Connecting automatically
 
 Mark one profile **Connect automatically** to connect it without opening the

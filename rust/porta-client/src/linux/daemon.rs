@@ -62,6 +62,9 @@ struct StoredProfile {
     /// Connected when the service starts; at most one profile has it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     connect_at_login: bool,
+    /// `IP[:PORT]` of a relay that forwards to the gateway.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    relay: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -91,6 +94,8 @@ struct ProfileInput {
     allow_lan: bool,
     #[serde(default)]
     connect_at_login: bool,
+    #[serde(default)]
+    relay: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +139,7 @@ struct SnapshotProfile {
     transport: String,
     allow_lan: bool,
     connect_at_login: bool,
+    relay: String,
     selected: bool,
     active: bool,
     status: String,
@@ -361,6 +367,7 @@ impl Daemon {
                 transport: profile.transport.clone(),
                 allow_lan: profile.allow_lan,
                 connect_at_login: profile.connect_at_login,
+                relay: profile.relay.clone(),
                 selected: profile.id == store.selected,
                 active: profile.id == status.active_id && status.running,
                 status: if profile.id == status.active_id {
@@ -461,6 +468,18 @@ impl Daemon {
         if backup_servers.len() > 7 {
             return Err("a profile lists at most 7 backup gateways".to_owned());
         }
+        let relay = input.relay.trim().to_owned();
+        crate::failover::relay_candidate(
+            &std::iter::once(parse_origin(&server_url)?)
+                .chain(
+                    backup_servers
+                        .iter()
+                        .map(|server| parse_origin(server))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .collect::<Vec<_>>(),
+            Some(&relay),
+        )?;
         let transport = match input.transport.trim() {
             "" | "auto" => "auto",
             "h3" => "h3",
@@ -502,6 +521,7 @@ impl Daemon {
             token,
             allow_lan: input.allow_lan,
             connect_at_login: input.connect_at_login,
+            relay,
         };
         let previous_profiles = store.profiles.clone();
         if profile.connect_at_login {
@@ -637,6 +657,7 @@ impl Daemon {
                 network_state: self.config.network_state.clone(),
                 subnet_router: false,
                 allow_lan: profile.allow_lan,
+                relay: (!profile.relay.is_empty()).then(|| profile.relay.clone()),
             },
             &cancellation,
             observer,
@@ -1310,7 +1331,26 @@ mod tests {
         assert!(fs::read_to_string(&profiles)
             .unwrap()
             .contains("token-0123456789abcdef"));
+        // A relay forwards to one gateway and is an IP address.
+        let snapshot = request(
+            &socket,
+            &json!({"command": "save_profile", "input": {"id": id, "name": "Work",
+                "serverUrl": "https://vpn.example.com", "relay": " 203.0.113.7:9443 "}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot["profiles"][0]["relay"], "203.0.113.7:9443");
+        let error = request(
+            &socket,
+            &json!({"command": "save_profile", "input": {"id": id, "name": "Work",
+                "serverUrl": "https://vpn.example.com",
+                "backupServers": ["https://backup.example.com"], "relay": "203.0.113.7"}}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("a relay forwards to one gateway"), "{error}");
         for input in [
+            json!({"name": "x", "serverUrl": "https://vpn.example.com", "relay": "relay.example.com:443", "token": "t"}),
             json!({"name": "x", "serverUrl": "http://vpn.example.com", "token": "t"}),
             json!({"name": "", "serverUrl": "https://vpn.example.com", "token": "t"}),
             json!({"name": "x", "serverUrl": "https://vpn.example.com", "transport": "udp", "token": "t"}),

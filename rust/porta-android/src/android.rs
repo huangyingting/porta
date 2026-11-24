@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -272,16 +272,11 @@ fn parse_server(server: &str) -> Result<(String, u16), BridgeError> {
     Ok((host, port))
 }
 
-fn parse_remote(remote_ip: &str, port: u16) -> Result<SocketAddr, BridgeError> {
-    let ip = remote_ip
-        .parse::<IpAddr>()
-        .map_err(|error| BridgeError::Message(format!("invalid remote IP address: {error}")))?;
-    if ip.is_unspecified() || ip.is_multicast() {
-        return Err(BridgeError::Message(
-            "remote IP address must be unicast".to_string(),
-        ));
-    }
-    Ok(SocketAddr::new(ip, port))
+/// The address to dial: the gateway's resolved IP, or a relay's
+/// `IP[:PORT]` that forwards to it.
+fn parse_remote(remote: &str, port: u16) -> Result<SocketAddr, BridgeError> {
+    porta_client::tunnel::parse_dial_address(remote, port)
+        .map_err(|error| BridgeError::Message(format!("invalid remote address: {error}")))
 }
 
 fn get_dialer(id: jlong) -> Result<Arc<DialerHandle>, BridgeError> {

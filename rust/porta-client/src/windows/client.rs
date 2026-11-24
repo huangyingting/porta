@@ -38,6 +38,9 @@ pub struct Config {
     /// In a full tunnel, keep the directly connected private networks
     /// reachable outside the tunnel.
     pub allow_lan: bool,
+    /// Dial this `IP[:PORT]`, a relay that forwards to the only gateway,
+    /// instead of the gateway's own address.
+    pub relay: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +161,14 @@ pub async fn run(
         Some(manager)
     };
     let mut network_active = network.as_ref().is_some_and(NetworkManager::needs_cleanup);
-    let endpoints = if let Some(manager) = network.as_ref() {
+    let relay = crate::failover::relay_candidate(&config.servers, config.relay.as_deref())
+        .map_err(RunError::Invalid)?;
+    let endpoints = if let Some(relay) = relay {
+        if network.as_ref().is_some_and(NetworkManager::needs_cleanup) {
+            observer.event(Event::RecoveringNetwork);
+        }
+        vec![relay]
+    } else if let Some(manager) = network.as_ref() {
         let saved = manager.recovery_endpoints()?;
         if saved.is_empty() {
             if network_active {

@@ -103,6 +103,7 @@ class TunnelService : VpnService() {
         currentAppMode = AppMode.fromCode(intent.getStringExtra(EXTRA_APP_MODE))
         currentApps = intent.getStringArrayExtra(EXTRA_APPS)
             ?.filter(::isPackageName)?.take(MAX_PROFILE_APPS).orEmpty()
+        currentRelay = intent.getStringExtra(EXTRA_RELAY)?.trim()?.takeIf(::isRelayAddress).orEmpty()
         currentSessionId = runGeneration
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -257,7 +258,13 @@ class TunnelService : VpnService() {
         val attemptStartedAt = System.nanoTime()
         if (!attemptActive.get()) throw IOException("Underlying network changed before connection")
         var resolveFailure: Exception? = null
-        val resolved = servers.flatMap { server ->
+        val relay = currentRelay
+        // A relay forwards to the profile's only gateway; every attempt
+        // dials it, never the gateway directly.
+        val resolved = if (relay.isNotEmpty()) {
+            logEvent("Dialing relay $relay for ${gatewayHost(servers.first())}")
+            listOf(GatewayCandidate(servers.first(), relay))
+        } else servers.flatMap { server ->
             val host = gatewayHost(server)
                 ?: throw PermanentTunnelException("Gateway URL has no hostname")
             try {
@@ -1120,6 +1127,7 @@ class TunnelService : VpnService() {
         const val EXTRA_ALLOW_LAN = "allowLan"
         const val EXTRA_APP_MODE = "appMode"
         const val EXTRA_APPS = "apps"
+        const val EXTRA_RELAY = "relay"
 
         /** Multicast and broadcast that local discovery (mDNS, SSDP) uses. */
         private val LOCAL_DISCOVERY = listOf(
@@ -1141,6 +1149,7 @@ class TunnelService : VpnService() {
                 .putExtra(EXTRA_ALLOW_LAN, profile.allowLan)
                 .putExtra(EXTRA_APP_MODE, profile.appMode.code)
                 .putExtra(EXTRA_APPS, profile.apps.toTypedArray())
+                .putExtra(EXTRA_RELAY, profile.relay)
         const val EXTRA_TOKEN = "token"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
@@ -1156,6 +1165,7 @@ class TunnelService : VpnService() {
         @Volatile private var currentAllowLan = false
         @Volatile private var currentAppMode = AppMode.ALL
         @Volatile private var currentApps = emptyList<String>()
+        @Volatile private var currentRelay = ""
         @Volatile private var currentSessionId = NO_SESSION
         @Volatile private var currentSnapshot = TrafficSnapshot()
         private val nextSessionId = AtomicLong()

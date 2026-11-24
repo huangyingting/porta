@@ -74,6 +74,8 @@ jobs:
         run: make test-native-firewall
       - name: Test cascade relay chain end to end
         run: make test-cascade
+      - name: Test the transport relay end to end
+        run: make test-transport-relay
       - name: Test split tunneling end to end
         run: make test-split-tunnel
       - name: Test subnet routing and access policy end to end

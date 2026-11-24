@@ -128,4 +128,8 @@
     <plurals name="apps_except">
         <item quantity="other">除 %1$d 个应用外的所有应用</item>
     </plurals>
+    <string name="relay_label">中继地址</string>
+    <string name="relay_hint">可选：转发到网关的中继 IP:端口</string>
+    <string name="relay_invalid">请输入中继的 IP 地址和端口，例如 203.0.113.7:8443</string>
+    <string name="relay_one_gateway">中继只能转发到一个网关。请移除备用网关或中继。</string>
 </resources>

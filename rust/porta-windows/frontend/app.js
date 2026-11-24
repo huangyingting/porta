@@ -35,6 +35,10 @@ const messages = {
     gateway: "Gateway URL",
     backupGateways: "Backup gateways",
     backupGatewaysPlaceholder: "Optional, one per line: gateways that share this account",
+    relayAddress: "Relay address",
+    relayAddressPlaceholder: "Optional IP:port of a relay to the gateway",
+    relayNeedsOneGateway: "A relay forwards to one gateway. Remove the backup gateways or the relay.",
+    invalidRelay: "Enter the relay as an IP address and port, such as 203.0.113.7:8443.",
     allowLan: "Allow local network",
     allowLanHelp: "Keep printers, file shares and media players on this network reachable while everything else uses the tunnel. DNS still uses the tunnel.",
     connectAtLogin: "Connect automatically",
@@ -152,6 +156,10 @@ const messages = {
     gateway: "网关地址",
     backupGateways: "备用网关",
     backupGatewaysPlaceholder: "可选，每行一个：共享此账户的网关",
+    relayAddress: "中继地址",
+    relayAddressPlaceholder: "可选：转发到网关的中继 IP:端口",
+    relayNeedsOneGateway: "中继只能转发到一个网关。请移除备用网关或中继。",
+    invalidRelay: "请输入中继的 IP 地址和端口，例如 203.0.113.7:8443。",
     allowLan: "允许访问本地网络",
     allowLanHelp: "其他流量经由隧道时，仍可访问此网络上的打印机、文件共享和媒体设备。DNS 仍经由隧道。",
     connectAtLogin: "自动连接",
@@ -743,6 +751,7 @@ function openEditor(profile = null) {
   $("profile-name").value = profile?.name || "";
   $("profile-server").value = profile?.serverUrl || "https://";
   $("profile-backups").value = (profile?.backupServers || []).join("\n");
+  $("profile-relay").value = profile?.relay || "";
   $("profile-allow-lan").checked = Boolean(profile?.allowLan);
   $("profile-connect-at-login").checked = Boolean(profile?.connectAtLogin);
   $("profile-token").value = "";
@@ -824,6 +833,7 @@ async function saveProfile(event) {
     token: $("profile-token").value,
     allowLan: $("profile-allow-lan").checked,
     connectAtLogin: $("profile-connect-at-login").checked,
+    relay: $("profile-relay").value.trim(),
   };
   const invalid = validateProfileInput(input);
   if (invalid) {
@@ -868,6 +878,14 @@ function validateProfileInput(input) {
       }
     } catch (_) {
       return { field: "profile-backups", message: t("invalidServer") };
+    }
+  }
+  if (input.relay) {
+    if (input.backupServers.length) return { field: "profile-relay", message: t("relayNeedsOneGateway") };
+    // An IPv4 or bracketed IPv6 address with an optional port; the service
+    // checks the address itself.
+    if (!/^(\d{1,3}(\.\d{1,3}){3}|\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)(:\d{1,5})?$/.test(input.relay)) {
+      return { field: "profile-relay", message: t("invalidRelay") };
     }
   }
   if (!state.editorProfile && !input.token.trim()) {

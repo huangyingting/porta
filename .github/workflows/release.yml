@@ -181,7 +181,7 @@ jobs:
         run: |
           mkdir -p dist/deploy-bundle/porta/scripts dist/deploy-bundle/porta/deploy
           cp scripts/deploy.sh scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh \
-            scripts/porta-backup.sh dist/deploy-bundle/porta/scripts/
+            scripts/porta-backup.sh scripts/relay.sh dist/deploy-bundle/porta/scripts/
           cp deploy/99-porta-quic.conf deploy/porta-cert-sync.timer deploy/porta-tmpfiles.conf \
             deploy/porta-backup.service deploy/porta-backup.timer \
             deploy/prometheus/porta-alerts.yml dist/deploy-bundle/porta/deploy/
