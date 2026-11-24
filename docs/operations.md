@@ -124,7 +124,7 @@ Clients keep their device approval, and devices keep their addresses.
 
 ```sh
 sudo ./scripts/deploy.sh                 # latest release, saved options
-sudo ./scripts/deploy.sh --release v0.1.41
+sudo ./scripts/deploy.sh --release v0.1.40
 ```
 
 `deploy.sh` reuses the options in `/etc/porta/deploy.conf`.

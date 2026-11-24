@@ -527,7 +527,7 @@ automatically.
 ## Requiring up-to-date clients
 
 Porta apps report their version when they connect. Start the gateway with
-`--min-client-version 0.1.41` (`deploy.sh --min-client-version 0.1.41`) to
+`--min-client-version 0.1.40` (`deploy.sh --min-client-version 0.1.40`) to
 refuse older apps, for example after a security fix. They are refused before
 authenticating, so they enrol no device, and they show a message asking the
 user to install the latest version from the downloads page. Apps from

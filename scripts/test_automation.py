@@ -1080,10 +1080,10 @@ class AutomationTests(unittest.TestCase):
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
         self.assertNotIn("--peer-to-peer", unit)
 
-        result = self.run_deploy(deploy, "--build-local", "--min-client-version", "0.1.41")
+        result = self.run_deploy(deploy, "--build-local", "--min-client-version", "0.1.40")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
-        self.assertIn("--min-client-version 0.1.41", unit)
-        self.assertIn("Client versions: 0.1.41 or newer", result.stdout)
+        self.assertIn("--min-client-version 0.1.40", unit)
+        self.assertIn("Client versions: 0.1.40 or newer", result.stdout)
         self.run_deploy(deploy, "--build-local", "--min-client-version", "latest", success=False)
         self.run_deploy(deploy, "--build-local", "--min-client-version=")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()

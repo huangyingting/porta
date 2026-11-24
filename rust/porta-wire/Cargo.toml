@@ -1,6 +1,6 @@
 [package]
 name = "porta-wire"
-version = "0.1.41"
+version = "0.1.40"
 edition = "2021"
 publish = false
 

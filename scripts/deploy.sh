@@ -55,7 +55,7 @@ Options:
   --client-to-client[=BOOL] Let connected clients reach each other's addresses
   --peer-to-peer[=BOOL]     Let devices that may reach each other connect
                             directly over UDP (HTTP/3 split-tunnel clients)
-  --min-client-version V    Refuse Porta apps older than V (such as 0.1.41) and
+  --min-client-version V    Refuse Porta apps older than V (such as 0.1.40) and
                             tell users to update; --min-client-version= removes it
   --client-host-access[=BOOL]
                             Let clients reach all services on this host; by
