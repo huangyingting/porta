@@ -1966,8 +1966,10 @@ class AutomationTests(unittest.TestCase):
             self.assertNotIn("networkSecurityConfig", manifest_path.read_text())
 
         service = (ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt").read_text()
+        # Porta itself stays outside the tunnel in every app mode; AppRulesTest
+        # covers the rules.
         self.assertLess(
-            service.index("builder.addDisallowedApplication(packageName)"),
+            service.index("appRules(configuration.appMode, configuration.apps, packageName)"),
             service.index("builder.establish()"),
         )
 
