@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "porta-fuzz"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "http",
  "libfuzzer-sys",
@@ -426,13 +426,14 @@ dependencies = [
 
 [[package]]
 name = "porta-wire"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "base64",
  "hex",
  "http",
  "ipnet",
  "p256",
+ "serde",
  "sha2 0.10.9",
  "thiserror",
  "time",
