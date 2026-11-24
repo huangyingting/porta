@@ -1189,6 +1189,8 @@ struct PeerState {
     announced: std::collections::BTreeMap<Ipv4Addr, Announced>,
     by_account: HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
     by_group: HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+    /// Which session published each certificate fingerprint.
+    fingerprints: HashMap<Fingerprint, Ipv4Addr>,
     /// Sessions whose lists may be stale; `all_dirty` covers every one.
     dirty: std::collections::HashSet<Ipv4Addr>,
     all_dirty: bool,
@@ -1211,14 +1213,25 @@ impl PeerDirectory {
         context: Arc<RouteContext>,
         endpoint: SocketAddr,
         fingerprint: Fingerprint,
-    ) -> tokio::sync::watch::Receiver<Vec<Peer>> {
+    ) -> Option<tokio::sync::watch::Receiver<Vec<Peer>>> {
         let mut state = self.state.lock();
+        // Fingerprints are visible to peers; a device offering another's
+        // would displace that device in its peers' lists.
+        if state
+            .fingerprints
+            .get(&fingerprint)
+            .is_some_and(|owner| *owner != lease)
+        {
+            return None;
+        }
         // A reconnect may change the account or group, and with it the
         // devices whose lists hold this one.
         if let Some(previous) = state.announced.remove(&lease) {
             self.mark_peers_of(&mut state, lease, &previous.context);
             state.unindex(lease, &previous.context);
+            state.fingerprints.remove(&previous.fingerprint);
         }
+        state.fingerprints.insert(fingerprint, lease);
         state.index(lease, &context);
         // The new session gets its list at once; its peers' lists follow.
         let entry = Announced {
@@ -1236,7 +1249,7 @@ impl PeerDirectory {
         state.dirty.remove(&lease);
         drop(state);
         self.schedule();
-        receiver
+        Some(receiver)
     }
 
     /// Removes the session at `lease` if `context` is still its session.
@@ -1249,7 +1262,9 @@ impl PeerDirectory {
         {
             return;
         }
-        state.announced.remove(&lease);
+        if let Some(entry) = state.announced.remove(&lease) {
+            state.fingerprints.remove(&entry.fingerprint);
+        }
         state.unindex(lease, context);
         self.mark_peers_of(&mut state, lease, context);
         state.dirty.remove(&lease);
@@ -1784,7 +1799,11 @@ impl PacketRouter for RouterAdapter {
         // published after its withdrawal.
         let contexts = self.contexts.read();
         let context = contexts.get(&lease)?.clone();
-        Some(self.peers.announce(lease, context, endpoint, fingerprint))
+        let announced = self.peers.announce(lease, context, endpoint, fingerprint);
+        if announced.is_none() {
+            tracing::warn!(%lease, "refusing a direct-path offer with another device's certificate");
+        }
+        announced
     }
 }
 
@@ -2182,16 +2201,24 @@ mod tests {
             },
         );
         let endpoint = |port| SocketAddr::new("198.51.100.7".parse().unwrap(), port);
-        let mut first = directory.announce(a, alpha.clone(), endpoint(1000), [1; 32]);
+        let mut first = directory
+            .announce(a, alpha.clone(), endpoint(1000), [1; 32])
+            .unwrap();
         assert!(first.borrow_and_update().is_empty());
-        let mut second = directory.announce(b, dual.clone(), endpoint(2000), [2; 32]);
-        directory.announce(c, fenced.clone(), endpoint(3000), [3; 32]);
-        let other = directory.announce(
-            d,
-            context("beta", NetworkPolicy::default()),
-            "[::ffff:203.0.113.9]:4000".parse().unwrap(),
-            [4; 32],
-        );
+        let mut second = directory
+            .announce(b, dual.clone(), endpoint(2000), [2; 32])
+            .unwrap();
+        directory
+            .announce(c, fenced.clone(), endpoint(3000), [3; 32])
+            .unwrap();
+        let other = directory
+            .announce(
+                d,
+                context("beta", NetworkPolicy::default()),
+                "[::ffff:203.0.113.9]:4000".parse().unwrap(),
+                [4; 32],
+            )
+            .unwrap();
         assert!(first.has_changed().unwrap());
         let peers = first.borrow_and_update().clone();
         assert_eq!(
@@ -2218,9 +2245,13 @@ mod tests {
         // and moving back returns to them.
         drop(second);
         let moved = context("gamma", NetworkPolicy::default());
-        directory.announce(b, moved.clone(), endpoint(2000), [2; 32]);
+        directory
+            .announce(b, moved.clone(), endpoint(2000), [2; 32])
+            .unwrap();
         assert!(first.borrow_and_update().is_empty());
-        directory.announce(b, dual.clone(), endpoint(2000), [2; 32]);
+        directory
+            .announce(b, dual.clone(), endpoint(2000), [2; 32])
+            .unwrap();
         assert_eq!(first.borrow_and_update().len(), 1);
 
         // A stale session's withdrawal does not remove its successor.
@@ -2230,17 +2261,35 @@ mod tests {
         directory.withdraw(b, &dual);
         assert!(first.borrow_and_update().is_empty());
 
+        // Another device's fingerprint is refused; a reconnect may reuse its own.
+        let beta = context("beta", NetworkPolicy::default());
+        assert!(directory
+            .announce(d, beta.clone(), endpoint(4000), [1; 32])
+            .is_none());
+        assert!(directory
+            .announce(a, alpha.clone(), endpoint(1000), [1; 32])
+            .is_some());
+        // Withdrawing releases the fingerprint.
+        directory.withdraw(a, &alpha);
+        assert!(directory
+            .announce(d, beta, endpoint(4000), [1; 32])
+            .is_some());
+
         let switching = Arc::new(PeerDirectory {
             client_to_client: true,
             ..PeerDirectory::default()
         });
-        let first = switching.announce(a, alpha, endpoint(1000), [1; 32]);
-        switching.announce(
-            d,
-            context("beta", NetworkPolicy::default()),
-            "[::ffff:203.0.113.9]:4000".parse().unwrap(),
-            [4; 32],
-        );
+        let first = switching
+            .announce(a, alpha, endpoint(1000), [1; 32])
+            .unwrap();
+        switching
+            .announce(
+                d,
+                context("beta", NetworkPolicy::default()),
+                "[::ffff:203.0.113.9]:4000".parse().unwrap(),
+                [4; 32],
+            )
+            .unwrap();
         assert_eq!(
             first.borrow()[0].endpoint,
             "203.0.113.9:4000".parse::<SocketAddr>().unwrap()
@@ -2252,6 +2301,11 @@ mod tests {
         let address = |index: u32| Ipv4Addr::from(0x0a40_0000 + index);
         let endpoint =
             |index: u32| SocketAddr::new("198.51.100.7".parse().unwrap(), 1024 + index as u16);
+        let fingerprint = |index: u32| {
+            let mut fingerprint = [0_u8; 32];
+            fingerprint[..4].copy_from_slice(&index.to_be_bytes());
+            fingerprint
+        };
         for client_to_client in [true, false] {
             let directory = Arc::new(PeerDirectory {
                 client_to_client,
@@ -2266,12 +2320,14 @@ mod tests {
                     } else {
                         format!("a{}", index / 2)
                     };
-                    directory.announce(
-                        address(index),
-                        context(&account, NetworkPolicy::default()),
-                        endpoint(index),
-                        [index as u8; 32],
-                    )
+                    directory
+                        .announce(
+                            address(index),
+                            context(&account, NetworkPolicy::default()),
+                            endpoint(index),
+                            fingerprint(index),
+                        )
+                        .unwrap()
                 })
                 .collect::<Vec<_>>();
             assert!(

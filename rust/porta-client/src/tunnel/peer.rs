@@ -82,9 +82,9 @@ impl Identity {
 pub(super) struct Peers {
     /// Live paths by the peer's tunnel addresses.
     links: RwLock<HashMap<IpAddr, quinn::Connection>>,
-    /// Devices the gateway listed, by fingerprint, with the token that
+    /// Devices the gateway listed, by tunnel address, with the token that
     /// ends their path.
-    known: RwLock<HashMap<Fingerprint, (Peer, CancellationToken)>>,
+    known: RwLock<HashMap<Ipv4Addr, (Peer, CancellationToken)>>,
     updates: watch::Sender<Vec<Peer>>,
     status: watch::Sender<Vec<DirectPeer>>,
     lease: Lease,
@@ -198,22 +198,22 @@ impl Peers {
         let wanted = listed
             .into_iter()
             .filter(|peer| reachable(&self.lease, &self.routing, peer, family_v6))
-            .map(|peer| (peer.fingerprint, peer))
+            .map(|peer| (peer.address, peer))
             .collect::<HashMap<_, _>>();
         let mut known = self.known.write().expect("peer list lock poisoned");
-        known.retain(|fingerprint, (peer, token)| {
-            let keep = wanted.get(fingerprint) == Some(peer);
+        known.retain(|address, (peer, token)| {
+            let keep = wanted.get(address) == Some(peer);
             if !keep {
                 token.cancel();
             }
             keep
         });
-        for (fingerprint, peer) in wanted {
-            if known.contains_key(&fingerprint) {
+        for (address, peer) in wanted {
+            if known.contains_key(&address) {
                 continue;
             }
             let token = cancellation.child_token();
-            known.insert(fingerprint, (peer, token.clone()));
+            known.insert(address, (peer, token.clone()));
             tasks.spawn(self.clone().connect(endpoint.clone(), peer, token));
         }
     }
