@@ -401,6 +401,28 @@ bundling the Android verifier AAR that the Android build loads from the
 crate. Moving past it means fetching that AAR from a pinned, checksummed
 source in `android/app/build.gradle.kts`.
 
+## Fuzzing
+
+`rust/fuzz` holds coverage-guided fuzz targets for every parser that reads
+network input: MASQUE capsules (`capsules`), IP packets with fragmentation,
+ICMP errors and NAT (`ip_packets`), device proof headers (`device_proof`),
+direct-path messages (`peer_messages`), the HTTP/2 packet stream
+(`packet_frames`) and durations (`durations`). Targets assert that what
+decodes re-encodes to the same value. It is a separate workspace because
+fuzzing needs nightly:
+
+```sh
+rustup toolchain install nightly --profile minimal
+cargo +nightly install cargo-fuzz --locked
+make fuzz FUZZ_SECONDS=300          # every target, 5 minutes each
+cd rust/fuzz && cargo +nightly fuzz run ip_packets   # one target, until stopped
+```
+
+The required **fuzz** CI job runs every target for 30 seconds and uploads
+any crashing input as the `fuzz-crashes` artifact. Reproduce one with
+`cargo +nightly fuzz run <target> <file>`, fix the bug and add the input as
+a unit test next to the parser.
+
 ## Version policy
 
 The application version is stored in `internal/buildinfo/VERSION` and currently
@@ -434,9 +456,9 @@ workflows. `golang` is a separate implementation branch; do not merge its Go
 build/release workflows into `main`.
 
 **CI** builds and tests branch pushes, PRs targeting `main`, and manual runs.
-Linux/Rust, the dependency policy, the standard CONNECT-IP interop job, the
-macOS job that builds and tests PortaKit, native Windows, and Android must
-all pass. The stable
+Linux/Rust, the dependency policy, fuzzing, the standard CONNECT-IP interop
+job, the macOS job that builds and tests PortaKit, native Windows, and
+Android must all pass. The stable
 **Rust PR required** check rejects failed, cancelled or skipped jobs and rejects
 promotion PRs whose source is not this repository's `rust` branch. Branch/main
 and manual runs use **Rust CI required**, so they cannot substitute for the

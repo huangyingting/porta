@@ -105,6 +105,25 @@ jobs:
           command: check
           arguments: --all-features
 
+  fuzz:
+    # Coverage-guided fuzzing of every parser that reads network input
+    # (rust/fuzz). A crash uploads the input that reproduces it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz the wire parsers
+        run: make fuzz FUZZ_SECONDS=30
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crashes
+          path: rust/fuzz/artifacts
+          if-no-files-found: ignore
+
   masque-interop:
     # An independent RFC 9484 client (quic-go/connect-ip-go) against the
     # gateway's standard CONNECT-IP mode. Test tooling only.
@@ -286,7 +305,7 @@ jobs:
   required:
     name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}
     if: ${{ always() }}
-    needs: [rust, dependencies, masque-interop, apple, windows, android]
+    needs: [rust, dependencies, fuzz, masque-interop, apple, windows, android]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -302,12 +321,13 @@ jobs:
           INTEROP_RESULT: ${{ needs.masque-interop.result }}
           APPLE_RESULT: ${{ needs.apple.result }}
           DEPENDENCIES_RESULT: ${{ needs.dependencies.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
         run: |
           if [[ "$EVENT_NAME" == pull_request && ( "$HEAD_BRANCH" != rust || "$HEAD_REPOSITORY" != "$REPOSITORY" ) ]]; then
             echo "main only accepts promotion PRs from this repository's rust branch" >&2
             exit 1
           fi
-          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT" "$APPLE_RESULT" "$DEPENDENCIES_RESULT"; do
+          for result in "$RUST_RESULT" "$WINDOWS_RESULT" "$ANDROID_RESULT" "$INTEROP_RESULT" "$APPLE_RESULT" "$DEPENDENCIES_RESULT" "$FUZZ_RESULT"; do
             if [[ "$result" != success ]]; then
               echo "A required Rust build/test job failed, was cancelled, or was skipped: $result" >&2
               exit 1

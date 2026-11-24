@@ -10,7 +10,7 @@ WINTUN_ZIP := bin/wintun-$(WINTUN_VERSION).zip
 WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
 
 .PHONY: all build build-rust-server build-rust-clients build-windows build-linux-desktop build-masque-probe build-apple android android-debug \
-	check-version check-dependencies clean test test-automation test-rust test-rust-server test-rust-client \
+	check-version check-dependencies fuzz clean test test-automation test-rust test-rust-server test-rust-client \
 	test-rust-interop test-live-vpn test-cascade test-split-tunnel test-subnet-router test-exit-selection test-dns-resolver test-admin-identity test-gateway-failover test-ipv6 test-graceful-restart test-client-daemon test-peer-to-peer test-standard-masque test-apple-ffi test-apple test-service-user test-windows-cross test-native-firewall test-server-web \
 	verify-wintun vet
 
@@ -43,6 +43,16 @@ test-windows-cross:
 		--package porta-windows \
 		--target $(WINDOWS_TARGET) \
 		--all-targets --locked
+
+# Coverage-guided fuzzing of the wire parsers; needs nightly and cargo-fuzz.
+FUZZ_SECONDS ?= 30
+FUZZ_TARGETS := capsules ip_packets device_proof peer_messages packet_frames durations
+fuzz:
+	cd rust/fuzz && $(CARGO) +nightly metadata --locked --format-version 1 >/dev/null && \
+	for target in $(FUZZ_TARGETS); do \
+		$(CARGO) +nightly fuzz run $$target -- \
+			-max_total_time=$(FUZZ_SECONDS) -rss_limit_mb=2048 || exit 1; \
+	done
 
 # Needs cargo-deny (cargo install cargo-deny --locked).
 check-dependencies:

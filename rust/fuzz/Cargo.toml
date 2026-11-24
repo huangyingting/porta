@@ -1,0 +1,60 @@
+[package]
+name = "porta-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A separate workspace: fuzzing needs nightly, and porta-wire is the only
+# crate it builds. `make fuzz` runs every target briefly.
+[workspace]
+
+[dependencies]
+http = "1.3.1"
+libfuzzer-sys = "0.4.10"
+porta-wire = { path = "../porta-wire" }
+time = "0.3.44"
+
+[[bin]]
+name = "capsules"
+path = "fuzz_targets/capsules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_packets"
+path = "fuzz_targets/ip_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_proof"
+path = "fuzz_targets/device_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_messages"
+path = "fuzz_targets/peer_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet_frames"
+path = "fuzz_targets/packet_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durations"
+path = "fuzz_targets/durations.rs"
+test = false
+doc = false
+bench = false

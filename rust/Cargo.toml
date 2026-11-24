@@ -11,6 +11,8 @@ members = [
     "porta-windows-package",
     "porta-wire",
 ]
+# Fuzzing builds on nightly in its own workspace.
+exclude = ["fuzz"]
 resolver = "2"
 
 [patch."https://github.com/hyperium/h3.git"]

@@ -378,14 +378,18 @@ fn ipv4_header_length(packet: &[u8]) -> Result<usize, Ipv4Error> {
 
 /// Decrements the IPv4 TTL or IPv6 hop limit as a router forwarding the
 /// packet does, keeping the IPv4 header checksum valid. Returns false, and
-/// leaves the packet unchanged, once the limit is exhausted.
+/// leaves the packet unchanged, once the limit is exhausted or when the
+/// packet is malformed.
 pub fn decrement_hop_limit(packet: &mut [u8]) -> bool {
+    if parse_ip(packet).is_err() {
+        return false;
+    }
     match ip_version(packet) {
-        Some(4) if packet.len() >= 20 && packet[8] > 1 => {
+        Some(4) if packet[8] > 1 => {
             packet[8] -= 1;
             set_ipv4_header_checksum(packet).is_ok()
         }
-        Some(6) if packet.len() >= IPV6_HEADER_LENGTH && packet[7] > 1 => {
+        Some(6) if packet[7] > 1 => {
             packet[7] -= 1;
             true
         }
@@ -396,6 +400,18 @@ pub fn decrement_hop_limit(packet: &mut [u8]) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_packets_keep_their_hop_limit() {
+        // Found by fuzzing: a header whose total length exceeds the packet.
+        let mut packet = [
+            0x46, 0x26, 0xa9, 0xbc, 0xbc, 0xbc, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26,
+            0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x40,
+        ];
+        let original = packet;
+        assert!(!decrement_hop_limit(&mut packet));
+        assert_eq!(packet, original);
+    }
 
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4], payload_len: usize) -> Vec<u8> {
         let mut packet = vec![0; 20 + payload_len];
