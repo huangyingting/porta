@@ -73,6 +73,10 @@ pub enum ClientError {
     Refused(String),
     #[error("{0}")]
     Permanent(String),
+    /// The TLS handshake with the gateway failed, as when a captive network
+    /// answers in its place until the user signs in.
+    #[error("TLS handshake failed: {0}; if this network has a sign-in page, sign in to it first")]
+    Intercepted(String),
     /// Permanent refusal of a valid account; see [`AccountDenial`].
     #[error("{}", .0.message())]
     Denied(AccountDenial),
@@ -99,7 +103,16 @@ impl ClientError {
 
     /// Failures that retrying cannot fix without operator action.
     pub fn is_permanent(&self) -> bool {
-        matches!(self, Self::Permanent(_) | Self::Denied(_))
+        matches!(
+            self,
+            Self::Permanent(_) | Self::Denied(_) | Self::Intercepted(_)
+        )
+    }
+
+    /// The network may be holding the connection for sign-in. Clients whose
+    /// leak protection would block the sign-in page retry these.
+    pub fn is_intercepted(&self) -> bool {
+        matches!(self, Self::Intercepted(_))
     }
 
     pub fn denial(&self) -> Option<AccountDenial> {

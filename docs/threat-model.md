@@ -167,6 +167,11 @@ not conceal transport fingerprints from network inspection.
   on profiles used on networks you do not trust.
 - On Android, apps a profile keeps outside the tunnel use the device's
   network directly, unprotected and visible to that network.
+- **Sign in to network** removes leak protection for up to five minutes, so
+  traffic in that time uses the local network directly. Porta reconnects as
+  soon as the gateway answers with a certificate the profile trusts; a
+  network that fakes the gateway cannot end the pause early or capture the
+  tunnel, because the probe verifies the certificate as the tunnel does.
 - With `--peer-to-peer`, peers learn each other's public IP addresses and
   traffic between them bypasses the gateway: it is not logged, counted
   toward usage or quotas, or rate limited there. Peers authenticate each

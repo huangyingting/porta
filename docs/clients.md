@@ -133,6 +133,32 @@ around those networks, and on macOS and iOS the app sets the system's
 through the tunnel, so the option only matters for full tunnels. Devices on
 the local network can reach this device, as they could before connecting.
 
+## Signing in to captive networks
+
+Hotel, airport and café networks often hold every connection until you sign
+in on a web page. Leak protection blocks that page while the tunnel
+reconnects, so the desktop clients detect such networks and let you lift
+protection briefly:
+- When the gateway's TLS handshake fails while protection is active (the
+  network answers in the gateway's place with its own certificate), the
+  Linux and Windows apps show **Network sign-in required** and keep retrying
+  instead of giving up.
+- While the tunnel is connecting or reconnecting, or protection is retained
+  after an error, the status card offers **Sign in to network**. It removes
+  leak protection, routes and DNS for up to five minutes. Open any web page
+  to reach the network's sign-in page.
+- Porta checks the gateway every five seconds and reconnects as soon as it
+  answers with its own certificate, or when the five minutes end.
+  **Reconnect now** ends the pause early, and **Disconnect** ends it without
+  reconnecting.
+
+Traffic during the pause is not protected by the tunnel, as without a VPN.
+On Linux the desktop app sends the service's `sign_in_network` control
+command. The command-line clients log the failure and keep retrying; stop them with
+Ctrl+C, which removes protection, sign in, and start them again. Android and
+Apple devices detect captive networks themselves and show the sign-in page
+outside the tunnel.
+
 ## Choosing which apps use the tunnel
 
 On Android, the profile dialog's **Apps** setting chooses which apps the

@@ -25,6 +25,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::client::{self, Event, RunError, State};
+use crate::captive;
 use crate::tunnel::{AccountStatus, Routing, Transport};
 
 const STORE_VERSION: u8 = 1;
@@ -96,12 +97,22 @@ struct ProfileInput {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum Request {
     Snapshot,
-    SelectProfile { id: String },
-    SaveProfile { input: ProfileInput },
-    DeleteProfile { id: String },
-    Connect { id: String },
+    SelectProfile {
+        id: String,
+    },
+    SaveProfile {
+        input: ProfileInput,
+    },
+    DeleteProfile {
+        id: String,
+    },
+    Connect {
+        id: String,
+    },
     Disconnect,
     RestoreNetwork,
+    /// Lift protection for a while so the user can sign in to the network.
+    SignInNetwork,
     ClearActivity,
 }
 
@@ -162,7 +173,17 @@ pub struct Snapshot {
     split_routes: Vec<String>,
     split_dns_domains: Vec<String>,
     direct_peers: Vec<String>,
+    /// RFC 3339 end of a network sign-in pause; empty when not paused.
+    sign_in_until: String,
+    /// The network appears to hold the gateway until the user signs in.
+    sign_in_suggested: bool,
     activity: Vec<String>,
+}
+
+/// Protection lifted so the user can sign in to a captive network.
+struct SignIn {
+    until: SystemTime,
+    cancellation: CancellationToken,
 }
 
 #[derive(Default)]
@@ -190,6 +211,10 @@ struct Status {
     account_denial: String,
     routing: Routing,
     direct_peers: Vec<crate::tunnel::DirectPeer>,
+    sign_in: Option<SignIn>,
+    /// The profile to pause for sign-in once the running session stops.
+    sign_in_after_stop: Option<String>,
+    sign_in_suggested: bool,
     activity: Vec<String>,
 }
 
@@ -300,6 +325,7 @@ impl Daemon {
             Request::Connect { id } => self.connect(&id)?,
             Request::Disconnect => self.disconnect(),
             Request::RestoreNetwork => self.restore_network()?,
+            Request::SignInNetwork => self.sign_in_network()?,
             Request::ClearActivity => self.lock_status().activity.clear(),
         }
         Ok(self.snapshot())
@@ -388,6 +414,12 @@ impl Daemon {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            sign_in_until: status
+                .sign_in
+                .as_ref()
+                .map(|sign_in| rfc3339(sign_in.until))
+                .unwrap_or_default(),
+            sign_in_suggested: status.sign_in_suggested,
             activity: status.activity.clone(),
         }
     }
@@ -550,6 +582,10 @@ impl Daemon {
             if status.running || status.restoring {
                 return Err("Porta is already connecting or restoring the network".to_owned());
             }
+            if let Some(sign_in) = status.sign_in.take() {
+                sign_in.cancellation.cancel();
+            }
+            status.sign_in_suggested = false;
             status.active_id = profile.id.clone();
             status.cancellation = Some(cancellation.clone());
             status.running = true;
@@ -614,13 +650,19 @@ impl Daemon {
         status.cancellation = None;
         status.active_id.clear();
         status.recovery = recovery;
+        status.sign_in_suggested = false;
         reset_connection(&mut status);
+        let sign_in = status.sign_in_after_stop.take();
         match result {
             Ok(()) | Err(RunError::Cancelled) => {
                 status.status = "Disconnected".to_owned();
                 status.detail = "Choose a profile to reconnect securely.".to_owned();
                 status.tone = "offline".to_owned();
                 add_activity(&mut status.activity, "Disconnected");
+                if let Some(id) = sign_in.filter(|_| !recovery) {
+                    drop(status);
+                    self.start_sign_in(&id);
+                }
             }
             Err(error) => {
                 status.status = "Connection error".to_owned();
@@ -652,6 +694,7 @@ impl Daemon {
                     add_activity(&mut status.activity, &format!("Connected over {transport}"));
                 }
                 status.connected = true;
+                status.sign_in_suggested = false;
                 status.status = "Connected".to_owned();
                 if let Some(lease) = event.lease {
                     status.detail = match event.transport {
@@ -683,7 +726,10 @@ impl Daemon {
                 status.connected_at = event.connected_at.map(rfc3339).unwrap_or_default();
                 update_rates(&mut status, event.bytes_uploaded, event.bytes_downloaded);
             }
-            State::Connecting | State::Configuring | State::Reconnecting => {
+            State::Connecting
+            | State::Configuring
+            | State::Reconnecting
+            | State::SignInRequired => {
                 if status.disconnecting {
                     return;
                 }
@@ -691,9 +737,13 @@ impl Daemon {
                 status.status = match event.state {
                     State::Configuring => "Configuring network",
                     State::Reconnecting => "Reconnecting",
+                    State::SignInRequired => "Network sign-in required",
                     _ => "Connecting",
                 }
                 .to_owned();
+                if event.state == State::SignInRequired {
+                    status.sign_in_suggested = true;
+                }
                 status.detail = event.message.clone();
                 status.tone = "warning".to_owned();
                 add_activity(&mut status.activity, &event.message);
@@ -706,6 +756,14 @@ impl Daemon {
 
     fn disconnect(&self) {
         let mut status = self.lock_status();
+        if let Some(sign_in) = status.sign_in.take() {
+            sign_in.cancellation.cancel();
+            status.status = "Disconnected".to_owned();
+            status.detail = "Choose a profile to reconnect securely.".to_owned();
+            status.tone = "offline".to_owned();
+            add_activity(&mut status.activity, "Network sign-in pause ended");
+            return;
+        }
         let Some(cancellation) = status.cancellation.clone() else {
             return;
         };
@@ -715,6 +773,137 @@ impl Daemon {
         status.tone = "warning".to_owned();
         drop(status);
         cancellation.cancel();
+    }
+
+    /// Lifts leak protection for [`captive::SIGN_IN_PAUSE`] so the user can
+    /// sign in to a captive network, then reconnects the profile.
+    fn sign_in_network(self: &Arc<Self>) -> Result<(), String> {
+        let selected = self.lock_store().selected.clone();
+        let mut status = self.lock_status();
+        if status.sign_in.is_some() {
+            return Err("protection is already paused for network sign-in".to_owned());
+        }
+        if status.restoring || status.disconnecting {
+            return Err("Porta is busy; try again in a moment".to_owned());
+        }
+        if status.running {
+            if status.connected {
+                return Err("the tunnel is connected, so the network needs no sign-in".to_owned());
+            }
+            let Some(cancellation) = status.cancellation.clone() else {
+                return Err("Porta is busy; try again in a moment".to_owned());
+            };
+            status.sign_in_after_stop = Some(status.active_id.clone());
+            status.disconnecting = true;
+            status.status = "Pausing protection".to_owned();
+            status.detail = "Lifting leak protection for network sign-in...".to_owned();
+            status.tone = "warning".to_owned();
+            drop(status);
+            cancellation.cancel();
+            return Ok(());
+        }
+        if !status.recovery || selected.is_empty() {
+            return Err(
+                "Porta is not connecting, so nothing blocks the network's sign-in page".to_owned(),
+            );
+        }
+        // Protection was retained after an error: remove it, then pause.
+        status.restoring = true;
+        status.status = "Pausing protection".to_owned();
+        status.detail = "Lifting leak protection for network sign-in...".to_owned();
+        status.tone = "warning".to_owned();
+        drop(status);
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = client::cleanup_network(
+                daemon.config.network_state.clone(),
+                &CancellationToken::new(),
+            )
+            .await;
+            let recovery = network_recovery(&daemon.config.network_state);
+            let mut status = daemon.lock_status();
+            status.restoring = false;
+            status.recovery = recovery;
+            match result {
+                Ok(()) if !recovery => {
+                    drop(status);
+                    daemon.start_sign_in(&selected);
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    status.status = "Restore failed".to_owned();
+                    status.detail = error.to_string();
+                    status.tone = "danger".to_owned();
+                    let line = format!("Network restore failed: {error}");
+                    add_activity(&mut status.activity, &line);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Starts a sign-in pause for the profile, whose end reconnects it.
+    fn start_sign_in(self: &Arc<Self>, id: &str) {
+        let profile = self
+            .lock_store()
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned();
+        let Some(profile) = profile else { return };
+        let tls = match crate::tls::config(
+            self.config.ca_path.as_deref(),
+            self.config.thumbprint.as_deref(),
+            false,
+        ) {
+            Ok(tls) => tls,
+            Err(error) => {
+                self.log(&format!("Could not pause for network sign-in: {error}"));
+                return;
+            }
+        };
+        let cancellation = CancellationToken::new();
+        {
+            let mut status = self.lock_status();
+            status.sign_in = Some(SignIn {
+                until: SystemTime::now() + captive::SIGN_IN_PAUSE,
+                cancellation: cancellation.clone(),
+            });
+            status.status = "Paused for network sign-in".to_owned();
+            status.detail =
+                "Sign in to the network in your browser; Porta reconnects automatically."
+                    .to_owned();
+            status.tone = "warning".to_owned();
+            add_activity(
+                &mut status.activity,
+                "Leak protection paused for network sign-in",
+            );
+        }
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            let gateways = std::iter::once(profile.server_url.clone())
+                .chain(profile.backup_servers.iter().cloned())
+                .collect::<Vec<_>>();
+            if !captive::wait_for_sign_in(&gateways, &tls, captive::SIGN_IN_PAUSE, &cancellation)
+                .await
+            {
+                return;
+            }
+            {
+                let mut status = daemon.lock_status();
+                // A connect or disconnect ended the pause first.
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                status.sign_in = None;
+                add_activity(&mut status.activity, "Network sign-in pause ended");
+            }
+            if let Err(error) = daemon.connect(&profile.id) {
+                daemon.log(&format!(
+                    "Could not reconnect after network sign-in: {error}"
+                ));
+            }
+        });
     }
 
     fn restore_network(self: &Arc<Self>) -> Result<(), String> {

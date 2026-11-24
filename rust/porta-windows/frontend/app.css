@@ -975,6 +975,13 @@ textarea::placeholder {
   font-size: 12px;
 }
 
+.status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 .account-detail.warning {
   color: #f0b45a;
   font-weight: 600;

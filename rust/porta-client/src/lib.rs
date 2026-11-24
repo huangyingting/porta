@@ -1,3 +1,4 @@
+pub mod captive;
 pub mod device;
 pub mod failover;
 pub mod identity;

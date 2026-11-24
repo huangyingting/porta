@@ -131,6 +131,13 @@ fn restore_network(app: AppHandle, desktop: State<'_, Arc<Desktop>>) -> Result<(
 }
 
 #[tauri::command(async)]
+fn sign_in_network(app: AppHandle, desktop: State<'_, Arc<Desktop>>) -> Result<(), String> {
+    desktop
+        .call(&app, json!({"command": "sign_in_network"}))
+        .map(|_| ())
+}
+
+#[tauri::command(async)]
 fn clear_activity(app: AppHandle, desktop: State<'_, Arc<Desktop>>) -> Result<(), String> {
     desktop
         .call(&app, json!({"command": "clear_activity"}))
@@ -199,6 +206,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             connect,
             disconnect,
             restore_network,
+            sign_in_network,
             clear_activity,
             save_activity_log
         ])

@@ -57,6 +57,9 @@ pub enum State {
     Configuring,
     Connected,
     Reconnecting,
+    /// Reconnecting while the network intercepts the gateway, as a captive
+    /// network does until the user signs in; see [`crate::captive`].
+    SignInRequired,
     Disconnected,
     Error,
 }
@@ -496,14 +499,21 @@ async fn run_loop(
             return Err(RunError::Cancelled);
         }
         if let Some(error) = retry_error.take() {
-            if !config.reconnect || !error.is_retryable() {
+            // With protection active, an intercepting network blocks its own
+            // sign-in page, so keep trying until the user signs in.
+            let intercepted = error.is_intercepted() && runtime.network_started;
+            if !config.reconnect || !(error.is_retryable() || intercepted) {
                 return Err(RunError::Tunnel(error));
             }
             let delay = reconnect_delay(failures, config.reconnect_max_delay);
             failures = failures.saturating_add(1);
             attempts = attempts.wrapping_add(1);
             observer(runtime.event(
-                State::Reconnecting,
+                if intercepted {
+                    State::SignInRequired
+                } else {
+                    State::Reconnecting
+                },
                 format!("Reconnecting in {delay:?} after: {error}"),
             ));
             tokio::select! {

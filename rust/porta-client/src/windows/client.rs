@@ -75,6 +75,9 @@ pub enum Event {
     Reconnecting {
         reason: String,
         delay: Duration,
+        /// The network intercepts the gateway, as a captive network does
+        /// until the user signs in; see [`crate::captive`].
+        sign_in_required: bool,
     },
     Stopping,
 }
@@ -247,12 +250,18 @@ pub async fn run(
                 )
                 .await;
             }
-            Err(error) if error.is_retryable() && config.reconnect => {
+            // With protection active, an intercepting network blocks its own
+            // sign-in page, so keep trying until the user signs in.
+            Err(error)
+                if config.reconnect
+                    && (error.is_retryable() || error.is_intercepted() && network_active) =>
+            {
                 let delay = reconnect_delay(failures, config.reconnect_max_delay);
                 failures = failures.saturating_add(1);
                 observer.event(Event::Reconnecting {
                     reason: error.to_string(),
                     delay,
+                    sign_in_required: error.is_intercepted(),
                 });
                 if wait_or_cancel(delay, &cancellation).await {
                     continue;
@@ -383,6 +392,7 @@ pub async fn run(
                 observer.event(Event::Reconnecting {
                     reason: error,
                     delay,
+                    sign_in_required: false,
                 });
                 if !wait_or_cancel(delay, &cancellation).await {
                     return stop(

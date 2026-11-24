@@ -9,7 +9,9 @@
 # it saves a profile, connects, checks that traffic uses the tunnel and that
 # the snapshot reports it, disconnects, and checks that networking is
 # restored. The full tunnel blocks the local printer until the profile allows
-# the local network. A wrong token surfaces as a connection error, and only
+# the local network. A captive network that answers for the gateway is
+# reported, and pausing for sign-in lifts protection until the gateway is
+# reachable again. A wrong token surfaces as a connection error, and only
 # root and members of the control group may open the socket.
 #
 # Usage: sudo scripts/test-client-daemon.sh [path-to-porta-server] [path-to-porta-client]
@@ -281,6 +283,72 @@ wait_for 's["connected"] and s["profiles"][0]["connectAtLogin"]' "an automatic c
 control '{"command":"disconnect"}' >/dev/null
 wait_for 'not s["running"] and s["status"] == "Disconnected"' "a disconnection"
 echo "a profile marked to connect automatically connects when the service starts"
+
+# A captive network: the gateway's TCP port answers with another certificate
+# and existing connections drop, until the user signs in.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Hotel Wi-Fi" \
+  -addext 'subjectAltName=IP:172.31.0.2' \
+  -keyout "$work/portal.key" -out "$work/portal.crt" >/dev/null 2>&1
+cat >"$work/portal.py" <<'PY'
+import socket, ssl, sys, threading
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(sys.argv[1], sys.argv[2])
+listener = socket.create_server(("0.0.0.0", 8444))
+
+def handshake(connection):
+    try:
+        with context.wrap_socket(connection, server_side=True):
+            pass
+    except (OSError, ssl.SSLError):
+        connection.close()
+
+while True:
+    connection, _ = listener.accept()
+    threading.Thread(target=handshake, args=(connection,), daemon=True).start()
+PY
+cat >"$work/captive.nft" <<NFT
+table ip captive {
+  chain prerouting {
+    type nat hook prerouting priority dstnat;
+    iifname "east" tcp dport $port redirect to :8444
+  }
+  chain input {
+    type filter hook input priority -10;
+    iifname "east" tcp dport $port ct state established reject with tcp reset
+  }
+}
+NFT
+ip netns exec "$(ns gateway)" python3 "$work/portal.py" "$work/portal.crt" "$work/portal.key" >"$work/portal.log" 2>&1 &
+pids+=($!)
+if control '{"command":"sign_in_network"}' 2>/dev/null; then
+  echo "an idle service paused protection for sign-in" >&2
+  exit 1
+fi
+control "{\"command\":\"save_profile\",\"input\":{\"id\":\"$id\",\"name\":\"Office\",\"serverUrl\":\"https://172.31.0.2:$port\",\"transport\":\"h2\"}}" >/dev/null
+control "{\"command\":\"connect\",\"id\":\"$id\"}" >/dev/null
+wait_for 's["connected"] and s["transport"] == "h2"' "an HTTP/2 connection"
+in_ns gateway nft -f "$work/captive.nft"
+wait_for 's["status"] == "Network sign-in required" and s["signInSuggested"] and s["running"]' "the captive network"
+[[ -e $work/client/network-state.json ]] || { echo "protection lapsed on the captive network" >&2; exit 1; }
+control '{"command":"sign_in_network"}' >/dev/null
+wait_for 's["status"] == "Paused for network sign-in" and s["signInUntil"] and not s["running"]' "the sign-in pause"
+[[ ! -e $work/client/network-state.json ]] || { echo "the sign-in pause kept protection" >&2; exit 1; }
+if in_ns client nft list tables | grep -q porta; then
+  echo "the sign-in pause left the leak protection rules" >&2
+  exit 1
+fi
+sleep 6
+[[ $(control '{"command":"snapshot"}' | field '["status"]') == "Paused for network sign-in" ]] || {
+  echo "the pause ended while the network still intercepted the gateway" >&2
+  exit 1
+}
+in_ns gateway nft delete table ip captive
+wait_for 's["connected"] and not s["signInUntil"]' "a reconnection after sign-in"
+[[ $(seen) == 172.31.9.1 ]] || { echo "the connection after sign-in does not carry traffic" >&2; exit 1; }
+control '{"command":"disconnect"}' >/dev/null
+wait_for 'not s["running"] and s["status"] == "Disconnected"' "a disconnection"
+echo "a captive network is reported, and pausing for sign-in reconnects once it lets the gateway through"
 
 wrong=$(control "{\"command\":\"save_profile\",\"input\":{\"name\":\"Wrong\",\"serverUrl\":\"https://172.31.0.2:$port\",\"token\":\"wrong-token-0123456789abcdef\"}}")
 wrong_id=$(python3 -c 'import json, sys; print(next(p["id"] for p in json.load(sys.stdin)["profiles"] if p["name"] == "Wrong"))' <<<"$wrong")

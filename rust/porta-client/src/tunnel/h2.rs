@@ -593,13 +593,40 @@ async fn dial_tcp(
     ))
 }
 
+/// Completes a TLS handshake with the gateway, verifying its certificate,
+/// without opening a tunnel.
+pub(super) async fn probe(
+    url: &Url,
+    tls: &Arc<rustls::ClientConfig>,
+    cancellation: &CancellationToken,
+) -> Result<(), ClientError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ClientError::permanent("gateway URL has no hostname"))?
+        .trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ClientError::permanent("gateway URL has no port"))?;
+    let (tcp, _) = dial_tcp(host, port, None, None, cancellation).await?;
+    let mut tls = (**tls).clone();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|_| ClientError::permanent("gateway hostname is invalid for TLS"))?;
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(ClientError::Closed),
+        result = TlsConnector::from(Arc::new(tls)).connect(server_name, tcp) => {
+            result.map(drop).map_err(classify_tls_error)
+        }
+    }
+}
+
 fn classify_tls_error(error: std::io::Error) -> ClientError {
     if error
         .get_ref()
         .and_then(|cause| cause.downcast_ref::<rustls::Error>())
         .is_some()
     {
-        ClientError::permanent(format!("TLS handshake failed: {error}"))
+        ClientError::Intercepted(error.to_string())
     } else {
         ClientError::unavailable(error)
     }

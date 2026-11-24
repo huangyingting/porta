@@ -519,7 +519,7 @@ mod windows {
                 downloaded_bytes,
                 ..
             } => eprintln!("porta-client: uploaded={uploaded_bytes} downloaded={downloaded_bytes}"),
-            Event::Reconnecting { reason, delay } => eprintln!(
+            Event::Reconnecting { reason, delay, .. } => eprintln!(
                 "porta-client: reconnecting in {}: {reason}",
                 porta_wire::duration::format_duration(delay)
             ),

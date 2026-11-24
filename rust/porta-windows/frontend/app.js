@@ -101,6 +101,14 @@ const messages = {
     connectedH2: "4-lane HTTP/2 fallback · encrypted · MTU {mtu}",
     connectedAuto: "Encrypted tunnel active · MTU {mtu}",
     reconnectingDetail: "The network changed; restoring the secure tunnel…",
+    signInRequired: "Network sign-in required",
+    signInRequiredDetail: "This network is holding the connection to the gateway. If it has a sign-in page, choose Sign in to network.",
+    pausingProtection: "Pausing protection",
+    pausingProtectionDetail: "Lifting leak protection for network sign-in…",
+    pausedForSignIn: "Paused for network sign-in",
+    pausedForSignInDetail: "Sign in to the network in your browser. Porta reconnects once the gateway is reachable, or in {time}.",
+    signInNetwork: "Sign in to network",
+    reconnectNow: "Reconnect now",
     disconnectingDetail: "Restoring normal network access…",
     recoveryDetail: "Reconnect to resume protection, or restore normal connectivity.",
     recoveryActive: "Resuming retained fail-closed protection…",
@@ -210,6 +218,14 @@ const messages = {
     connectedH2: "4 通道 HTTP/2 备用连接 · 已加密 · MTU {mtu}",
     connectedAuto: "加密隧道已启用 · MTU {mtu}",
     reconnectingDetail: "网络已变化，正在恢复安全隧道…",
+    signInRequired: "需要登录网络",
+    signInRequiredDetail: "此网络拦截了与网关的连接。如果它有登录页面，请选择“登录网络”。",
+    pausingProtection: "正在暂停保护",
+    pausingProtectionDetail: "正在暂时解除防泄漏保护以登录网络…",
+    pausedForSignIn: "已暂停以登录网络",
+    pausedForSignInDetail: "请在浏览器中登录此网络。网关可访问后 Porta 会立即重新连接，最迟在 {time} 后。",
+    signInNetwork: "登录网络",
+    reconnectNow: "立即重新连接",
     disconnectingDetail: "正在恢复正常网络访问…",
     recoveryDetail: "重新连接可恢复保护，也可以直接恢复正常网络。",
     recoveryActive: "正在恢复保留的防泄漏保护…",
@@ -234,6 +250,9 @@ const statusKeys = {
   "Network recovery failed": "recoveryFailed",
   Ready: "ready",
   Reconnecting: "reconnecting",
+  "Network sign-in required": "signInRequired",
+  "Pausing protection": "pausingProtection",
+  "Paused for network sign-in": "pausedForSignIn",
   "Recovering network": "recoveringNetwork",
   "Restoring network": "restoringNetwork",
 };
@@ -348,6 +367,7 @@ async function call(name, ...args) {
     Connect: ["connect", { id: args[0] }],
     Disconnect: ["disconnect", {}],
     RestoreNetwork: ["restore_network", {}],
+    SignInNetwork: ["sign_in_network", {}],
     ClearActivity: ["clear_activity", {}],
     SaveActivityLog: ["save_activity_log", {}],
   };
@@ -396,6 +416,7 @@ function updatePendingState() {
     element.disabled = busy;
   });
   $("language-action").disabled = busy;
+  updateSignInActions();
   $("restore-action").disabled =
     busy || !state.snapshot?.recoveryAvailable || state.snapshot?.running ||
     state.snapshot?.restoring;
@@ -462,6 +483,7 @@ function applySnapshot(snapshot, recordTraffic) {
   renderProfilesIfNeeded();
   renderActivityIfNeeded();
   updateRecoveryAction();
+  updateSignInActions();
   updateDuration();
 }
 
@@ -542,6 +564,12 @@ function localizedDetail(snapshot) {
       return t("connectedAuto", { mtu: snapshot.mtu });
     case "Reconnecting":
       return t("reconnectingDetail");
+    case "Network sign-in required":
+      return t("signInRequiredDetail");
+    case "Pausing protection":
+      return t("pausingProtectionDetail");
+    case "Paused for network sign-in":
+      return t("pausedForSignInDetail", { time: signInRemaining(snapshot) });
     case "Disconnecting":
     case "Restoring network":
       return t("disconnectingDetail");
@@ -878,6 +906,27 @@ function renderActivityIfNeeded() {
   $("clear-action").disabled = activity.length === 0 || Boolean(state.pendingAction);
 }
 
+// The time left in a network sign-in pause, as m:ss.
+function signInRemaining(snapshot) {
+  const seconds = Math.max(0, Math.ceil((Date.parse(snapshot.signInUntil) - Date.now()) / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+// Leak protection blocks a captive network's sign-in page, so offer a short
+// pause while the tunnel cannot connect, and an early end to the pause.
+function updateSignInActions() {
+  const snapshot = state.snapshot;
+  const paused = Boolean(snapshot?.signInUntil);
+  const blocked = Boolean(snapshot) && !snapshot.startupBlocked && !snapshot.disconnecting &&
+    !snapshot.restoring &&
+    ((snapshot.running && !snapshot.connected) || (!snapshot.running && snapshot.recoveryAvailable));
+  $("sign-in-actions").classList.toggle("hidden", !paused && !blocked);
+  $("sign-in-action").classList.toggle("hidden", paused || !blocked);
+  $("reconnect-action").classList.toggle("hidden", !paused);
+  $("sign-in-action").disabled = Boolean(state.pendingAction);
+  $("reconnect-action").disabled = Boolean(state.pendingAction);
+}
+
 function updateRecoveryAction() {
   const available = Boolean(state.snapshot?.recoveryAvailable);
   $("restore-action").classList.toggle("hidden", !available);
@@ -918,6 +967,7 @@ function firstLetter(value = "") {
 }
 
 function updateDuration() {
+  if (state.snapshot?.signInUntil) setText("status-detail", localizedDetail(state.snapshot));
   const connectedAt = state.snapshot?.connectedAt;
   if (!connectedAt) {
     setText("session-duration", "00:00");
@@ -1040,6 +1090,13 @@ $("delete-profile").addEventListener("click", deleteProfile);
 $("error-dismiss").addEventListener("click", hideError);
 $("restore-action").addEventListener("click", async () => {
   await performAction("restore", "", () => call("RestoreNetwork"));
+});
+$("sign-in-action").addEventListener("click", async () => {
+  await performAction("sign-in", "", () => call("SignInNetwork"));
+});
+$("reconnect-action").addEventListener("click", async () => {
+  const id = state.snapshot?.selectedProfileId || "";
+  await performAction("connect", id, () => call("Connect", id));
 });
 $("clear-action").addEventListener("click", clearActivity);
 $("export-action").addEventListener("click", saveActivity);

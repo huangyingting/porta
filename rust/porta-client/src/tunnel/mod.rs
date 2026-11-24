@@ -499,6 +499,28 @@ impl Drop for ConnectionInner {
     }
 }
 
+/// Checks that the gateway at `url` answers with a certificate `tls`
+/// trusts, as it does once a captive network lets it through. It neither
+/// authenticates nor opens a tunnel.
+pub async fn probe(
+    url: &str,
+    tls: &Arc<RustlsClientConfig>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<(), ClientError> {
+    let url = url::Url::parse(url).map_err(ClientError::permanent)?;
+    if url.scheme() != "https" {
+        return Err(ClientError::permanent("gateway URL must use https"));
+    }
+    tokio::time::timeout(timeout, h2::probe(&url, tls, cancellation))
+        .await
+        .unwrap_or_else(|_| {
+            Err(ClientError::unavailable(
+                "the gateway did not answer in time",
+            ))
+        })
+}
+
 pub async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
     if config.url.is_empty() || config.token.is_empty() {
         return Err(ClientError::permanent("gateway URL and token are required"));
