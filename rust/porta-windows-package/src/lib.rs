@@ -101,7 +101,11 @@ mod tests {
         for (index, expected_name) in REQUIRED_FILES.into_iter().enumerate() {
             let mut entry = archive.by_index(index).unwrap();
             assert_eq!(entry.name().unwrap(), expected_name);
-            assert_eq!(entry.unix_mode(), Some(0o100755));
+            // zip records the system that wrote the archive. Written on
+            // Windows, entries carry DOS attributes, which have no Unix mode.
+            if cfg!(unix) {
+                assert_eq!(entry.unix_mode(), Some(0o100755));
+            }
             let mut contents = String::new();
             entry.read_to_string(&mut contents).unwrap();
             assert_eq!(contents, format!("file-{index}"));
