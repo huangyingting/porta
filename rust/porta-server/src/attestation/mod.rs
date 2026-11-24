@@ -5,6 +5,7 @@
 pub mod android;
 pub mod der;
 pub mod service;
+pub mod tpm;
 pub mod x509;
 
 use thiserror::Error;

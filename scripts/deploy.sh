@@ -60,6 +60,9 @@ Options:
   --client-host-access[=BOOL]
                             Let clients reach all services on this host; by
                             default they may only ping it and use DNS port 53
+  --verify-tpm[=BOOL]       Verify TPM device keys against Microsoft's list of
+                            TPM vendor CAs, refreshed on every deployment
+                            (needs cabextract)
   --routes CIDR[,CIDR...]   Split tunnel: clients route only these prefixes
                             through Porta (IPv6 ones need IPv6); --routes=
                             restores a full tunnel
@@ -145,6 +148,7 @@ upstream_interface=porta-up0
 client_to_client=false
 peer_to_peer=false
 client_host_access=false
+verify_tpm=false
 routes=
 dns_domains=
 exits=
@@ -170,7 +174,7 @@ deploy_config=/etc/porta/deploy.conf
 saved_option_names=(
   domain certificate private_key acme_email port admin_port external_interface
   tun_interface pool dns mtu auto_mtu trust_proxy_headers forward_proxy upstream
-  upstream_ca upstream_interface client_to_client peer_to_peer client_host_access routes
+  upstream_ca upstream_interface client_to_client peer_to_peer client_host_access verify_tpm routes
   dns_domains exits local_exit dns_resolver dns_upstreams dns_forwards dns_blocklist oidc_issuer
   min_client_version sso_user_domains sso_max_devices
   oidc_client_id federation_primary ipv6_pool ipv6_routed
@@ -234,6 +238,8 @@ while [[ $# -gt 0 ]]; do
     --peer-to-peer=*) peer_to_peer=$(parse_bool --peer-to-peer "${1#*=}"); shift ;;
     --client-host-access) client_host_access=true; shift ;;
     --client-host-access=*) client_host_access=$(parse_bool --client-host-access "${1#*=}"); shift ;;
+    --verify-tpm) verify_tpm=true; shift ;;
+    --verify-tpm=*) verify_tpm=$(parse_bool --verify-tpm "${1#*=}"); shift ;;
     --federation-primary) require_value "$@"; federation_primary=$2; shift 2 ;;
     --federation-primary=*) federation_primary=${1#*=}; shift ;;
     --disable-federation) disable_federation=true; shift ;;
@@ -276,7 +282,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run this script with sudo"
-for option in auto_mtu trust_proxy_headers forward_proxy client_to_client peer_to_peer client_host_access local_exit dns_resolver ipv6_routed; do
+for option in auto_mtu trust_proxy_headers forward_proxy client_to_client peer_to_peer client_host_access verify_tpm local_exit dns_resolver ipv6_routed; do
   [[ ${!option} == true || ${!option} == false ]] || die "invalid saved value for $option"
 done
 [[ -n $domain ]] || die "--domain is required on the first deployment"
@@ -471,6 +477,9 @@ fi
 for command in install systemctl ip nft openssl curl sed awk sysctl python3 ss grep sha256sum uname flock; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
+if $verify_tpm; then
+  command -v cabextract >/dev/null || die "--verify-tpm needs cabextract (sudo apt-get install cabextract)"
+fi
 if $build_local; then
   for command in make getent; do
     command -v "$command" >/dev/null || die "required command not found: $command"
@@ -901,6 +910,7 @@ rollback() {
         rollback_run rm -f "$pre_upgrade_backup"
       fi
       rollback_run restore_file porta-backup /usr/local/sbin/porta-backup
+      rollback_run restore_file porta-tpm-cas /usr/local/sbin/porta-tpm-cas
       for unit in porta.service porta-cert-sync.service porta-cert-sync.timer \
         porta-backup.service porta-backup.timer; do
         rollback_run restore_file "$unit" "/etc/systemd/system/$unit"
@@ -942,6 +952,15 @@ rollback_directory=$(mktemp -d)
 trap rollback EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# TPM vendor CAs, fetched before anything changes; the set is replaced in
+# one step and needs no rollback.
+tpm_arguments=
+if $verify_tpm; then
+  install -d -m 0755 /var/lib/porta
+  scripts/porta-tpm-cas.sh /var/lib/porta/tpm-ca || die "could not install the TPM vendor CAs"
+  tpm_arguments=" --tpm-ca-dir /var/lib/porta/tpm-ca"
+fi
 
 # Report how this run differs from the saved configuration before any
 # service is stopped.
@@ -1001,6 +1020,7 @@ if [[ -f /var/lib/porta/clients.json ]]; then
 fi
 backup_file /usr/local/bin/porta-server porta-server
 backup_file /usr/local/sbin/porta-backup porta-backup
+backup_file /usr/local/sbin/porta-tpm-cas porta-tpm-cas
 backup_file /usr/local/libexec/porta/server-up.sh server-up.sh
 backup_file /usr/local/libexec/porta/server-down.sh server-down.sh
 backup_file /usr/local/libexec/porta/sync-cert.sh sync-cert.sh
@@ -1030,6 +1050,7 @@ install -m 0755 scripts/server-up.sh scripts/server-down.sh scripts/sync-cert.sh
   /usr/local/libexec/porta/
 install -d -m 0755 /usr/local/sbin
 install -m 0755 scripts/porta-backup.sh /usr/local/sbin/porta-backup
+install -m 0755 scripts/porta-tpm-cas.sh /usr/local/sbin/porta-tpm-cas
 install -d -m 0700 /var/backups/porta
 install -m 0644 deploy/porta-backup.service deploy/porta-backup.timer /etc/systemd/system/
 install -m 0644 deploy/99-porta-quic.conf /etc/sysctl.d/99-porta-quic.conf
@@ -1217,7 +1238,7 @@ User=$service_user
 Group=$service_user
 EnvironmentFile=/etc/porta/porta.env
 $tls_preflight
-ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments$federation_arguments$ipv6_arguments --mtu $mtu --json-logs
+ExecStart=/usr/local/bin/porta-server --listen :$port --admin-listen 127.0.0.1:$admin_port $tls_arguments $forward_proxy_argument $trust_proxy_argument $auto_mtu_argument $upstream_arguments --landing-template-dir /etc/porta/landing --client-downloads /var/lib/porta/downloads --client-registry /var/lib/porta/clients.json --interface $tun_interface --egress-interface $external_interface --pool $pool --lease-state /var/lib/porta/leases.json --dns $dns$route_arguments$resolver_arguments$client_to_client_argument$oidc_arguments$federation_arguments$ipv6_arguments$tpm_arguments --mtu $mtu --json-logs
 ExecStartPost=!/bin/bash -c 'for i in \$(seq 1 50); do /usr/sbin/ip link show dev $tun_interface >/dev/null 2>&1 && exec /usr/local/libexec/porta/server-up.sh $tun_interface $gateway_cidr $pool $external_interface $port$network_up_options; sleep 0.1; done; exit 1'
 ExecStopPost=!/usr/local/libexec/porta/server-down.sh $tun_interface $external_interface
 # Restarts in place for upgrades, keeping sockets, interfaces and leases.
@@ -1376,6 +1397,7 @@ Client routing:  $([[ -n $routes ]] && echo "split tunnel: ${routes//,/, }${dns_
 Accounts:        $([[ -n $federation_primary ]] && echo "mirrored from $federation_primary (read-only here)" || echo "managed here")
 Admin endpoint:  http://127.0.0.1:$admin_port
 Admin sign-in:   https://$domain$([[ $port == 443 ]] || printf ':%s' "$port")/admin/sign-in$([[ -n $oidc_arguments ]] && echo " (single sign-on through $oidc_issuer)")
+TPM device keys: $([[ $verify_tpm == true ]] && echo "verified against Microsoft's TPM vendor CAs in /var/lib/porta/tpm-ca" || echo "not verified (--verify-tpm)")
 User sign-in:    $([[ -n $sso_user_domains ]] && echo "single sign-on for ${sso_user_domains//,/, } (up to $sso_max_devices devices each)" || echo "access tokens from an administrator")
 Browser portal:  https://$domain:$port
 Admin token:     sudo sed -n 's/^PORTA_ADMIN_TOKEN=//p' /etc/porta/porta.env

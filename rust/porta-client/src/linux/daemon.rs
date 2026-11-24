@@ -36,6 +36,8 @@ const MAX_ACTIVITY_LINES: usize = 200;
 const MAX_CLIENTS: usize = 16;
 
 pub struct DaemonConfig {
+    /// Keep the device key in the computer's TPM.
+    pub hardware_key: bool,
     pub control_socket: PathBuf,
     pub profiles: PathBuf,
     pub network_state: PathBuf,
@@ -658,6 +660,7 @@ impl Daemon {
                 subnet_router: false,
                 allow_lan: profile.allow_lan,
                 relay: (!profile.relay.is_empty()).then(|| profile.relay.clone()),
+                hardware_key: self.config.hardware_key,
             },
             &cancellation,
             observer,
@@ -1258,6 +1261,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         let daemon = tokio::spawn({
             let config = DaemonConfig {
+                hardware_key: false,
                 control_socket: socket.clone(),
                 profiles: profiles.clone(),
                 network_state: directory.path().join("network.json"),

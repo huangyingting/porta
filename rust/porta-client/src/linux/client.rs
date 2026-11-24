@@ -52,6 +52,9 @@ pub struct Config {
     /// Dial this `IP[:PORT]`, a relay that forwards to the only gateway,
     /// instead of the gateway's own address.
     pub relay: Option<String>,
+    /// Keep the device key in the computer's TPM, so that the gateway can
+    /// verify it is hardware-protected.
+    pub hardware_key: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +307,17 @@ impl Runtime {
     }
 }
 
+fn hardware_summary(result: &porta_wire::attestation::AttestationResult) -> String {
+    if result.vendor.is_empty() {
+        "the gateway verified that the device key is in the TPM".to_owned()
+    } else {
+        format!(
+            "the gateway verified that the device key is in the {} TPM",
+            result.vendor
+        )
+    }
+}
+
 fn split_tunnel_summary(routing: &crate::tunnel::Routing) -> String {
     let routes = routing
         .routes
@@ -359,7 +373,11 @@ pub async fn run(
         config.thumbprint.as_deref(),
         config.insecure,
     )?;
-    let identity = Arc::new(identity::current_at(config.identity_path.as_deref())?);
+    let identity = Arc::new(if config.hardware_key {
+        identity::current_in_tpm_at(config.identity_path.as_deref())?
+    } else {
+        identity::current_at(config.identity_path.as_deref())?
+    });
     observer(Event {
         state: State::Connecting,
         message: format!("Device: {} ({})", identity.name, identity.id),
@@ -443,6 +461,7 @@ pub async fn run(
 
     let result = run_loop(
         &config,
+        &identity,
         relay,
         &gateways,
         &base_tunnel_config,
@@ -507,6 +526,7 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     config: &Config,
+    identity: &Arc<identity::Identity>,
     relay: Option<failover::Candidate>,
     gateways: &[Url],
     base_tunnel_config: &ClientConfig,
@@ -518,6 +538,8 @@ async fn run_loop(
     let mut failures = 0_u32;
     // Rotates through gateways and their endpoints on every failed attempt.
     let mut attempts = 0_usize;
+    // A TPM key is proven to the gateway once per run.
+    let mut attested = false;
     let mut retry_error: Option<ClientError> = None;
     loop {
         if cancellation.is_cancelled() {
@@ -602,11 +624,36 @@ async fn run_loop(
         let mut tunnel_config = base_tunnel_config.clone();
         tunnel_config.url = gateways[gateway].to_string();
         tunnel_config.dial_address = dial_address;
+        let attestation_config = tunnel_config.clone();
         let connection = tokio::select! {
             _ = cancellation.cancelled() => return Err(RunError::Cancelled),
             result = tunnel::connect(tunnel_config) => match result {
                 Ok(connection) => connection,
                 Err(error) => {
+                    let key = identity.tpm_key().filter(|_| !attested);
+                    if let (Some(crate::tunnel::AccountDenial::HardwareRequired), Some(key)) = (error.denial(), key) {
+                        // Prove the key, then connect again at once.
+                        attested = true;
+                        observer(runtime.event(
+                            State::Connecting,
+                            "proving to the gateway that the device key is in the TPM",
+                        ));
+                        let verdict = tokio::select! {
+                            _ = cancellation.cancelled() => return Err(RunError::Cancelled),
+                            verdict = crate::tpm::attest(&attestation_config, Arc::clone(key)) => verdict,
+                        };
+                        match verdict {
+                            Ok(result) => {
+                                observer(runtime.event(State::Connecting, hardware_summary(&result)));
+                                continue;
+                            }
+                            Err(reason) => {
+                                return Err(RunError::Tunnel(ClientError::permanent(format!(
+                                    "the account requires a hardware-protected device key, and the TPM could not prove this one: {reason}"
+                                ))));
+                            }
+                        }
+                    }
                     retry_error = Some(error);
                     continue;
                 }
@@ -706,6 +753,16 @@ async fn run_loop(
         runtime.ensure_reader(cancellation);
         runtime.connected_at.get_or_insert_with(SystemTime::now);
         observer(runtime.event(State::Connected, "Connected"));
+        if let Some(key) = identity.tpm_key().filter(|_| !attested) {
+            // Let the gateway record the key as hardware-protected; the
+            // tunnel does not wait for it.
+            attested = true;
+            let key = Arc::clone(key);
+            tokio::spawn(async move {
+                // A gateway that does not verify TPM keys refuses; that is fine.
+                let _ = crate::tpm::attest(&attestation_config, key).await;
+            });
+        }
 
         let started = Instant::now();
         let error = run_connection(connection, runtime, cancellation, observer).await;

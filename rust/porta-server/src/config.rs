@@ -73,6 +73,10 @@ pub struct Config {
     /// beside the client registry.
     #[arg(long, value_parser = parse_path)]
     pub sso_users: Option<PathBuf>,
+    /// TPM vendor CA certificates (such as Microsoft's TrustedTpm.cab,
+    /// extracted) for verifying that device keys live in a TPM.
+    #[arg(long, value_parser = parse_path)]
+    pub tpm_ca_dir: Option<PathBuf>,
     /// Mirror accounts from this primary gateway (HTTPS origin) instead of
     /// managing them here. Needs PORTA_FEDERATION_TOKEN.
     #[arg(long)]
@@ -298,6 +302,7 @@ impl fmt::Debug for Config {
             .field("sso_user_domains", &self.sso_user_domains)
             .field("sso_max_devices", &self.sso_max_devices)
             .field("sso_users", &self.sso_users)
+            .field("tpm_ca_dir", &self.tpm_ca_dir)
             .field("federation_primary", &self.federation_primary)
             .field("federation_ca", &self.federation_ca)
             .field("federation_token", &redacted(&self.federation_token))
@@ -420,6 +425,7 @@ impl Config {
         self.validate_resolver()?;
         self.validate_identity()?;
         self.validate_federation()?;
+        self.validate_tpm_ca_dir()?;
         if !self.dns.is_empty() {
             let dns = self.dns.parse::<Ipv4Addr>().context(
                 "advertised DNS must be a unicast IPv4 address, not loopback or link-local",
@@ -491,6 +497,15 @@ impl Config {
             .parent()
             .unwrap_or_else(|| std::path::Path::new(""))
             .join(name)
+    }
+
+    fn validate_tpm_ca_dir(&self) -> Result<()> {
+        if let Some(directory) = &self.tpm_ca_dir {
+            if !directory.is_absolute() || !directory.is_dir() {
+                bail!("--tpm-ca-dir must be an absolute path to a directory of TPM vendor CA certificates");
+            }
+        }
+        Ok(())
     }
 
     fn validate_user_sign_in(&mut self, oidc: bool) -> Result<()> {

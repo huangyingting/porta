@@ -994,6 +994,53 @@ and one address, and since the token is their only credential, use it only
 for accounts dedicated to such clients. See
 [Standard CONNECT-IP clients](endpoints.md#standard-connect-ip-clients).
 
+### Hardware-protected devices
+
+Device keys are generated on the device and never leave it, but a gateway
+cannot normally tell whether a key lives in secure hardware or in a file that
+could be copied. Devices can prove it, and **Require hardware-protected
+devices** in the client dialog (or `require_hardware` on
+`PUT /api/clients/{id}/enrollment`) makes an account accept only devices
+that have:
+
+- **Android**: the app's key is generated in the phone's TEE or StrongBox
+  with key attestation. The gateway verifies the attestation certificate
+  chain against Google's attestation roots, checks Google's revocation list
+  (fetched at startup and daily), and requires that the key was generated in
+  that hardware, for the Porta app.
+- **Windows**: new installs keep their key in the computer's TPM 2.0. The
+  gateway checks the TPM's endorsement key certificate against the TPM
+  vendors' CAs, then encrypts a secret to the endorsement key that only that
+  TPM, holding this exact key, can recover (credential activation). Deploy
+  with `--verify-tpm` to install Microsoft's list of TPM vendor CAs in
+  `/var/lib/porta/tpm-ca` (daemon option `--tpm-ca-dir`); without it, TPM
+  keys are not verified.
+- **Linux**: the CLI and service keep their key in the TPM with
+  `--hardware-key`, verified as on Windows.
+- macOS and iOS devices cannot prove their key yet, so they cannot use such
+  an account.
+
+Devices send their evidence when they first connect, so the device list
+shows **Hardware key** with the TPM vendor or the Android security level
+whatever the policy. On an account that requires it:
+
+- An enrolled device without evidence is refused with a message saying why.
+  A new device enrolls, proves its key and connects.
+- A device whose key predates this support (an Android install before key
+  attestation, a Windows install from before TPM keys) gets a new
+  hardware-protected key the first time it is refused, and enrolls again as a
+  new device, subject to the account's enrollment policy and device limit.
+  Forget the old entry afterwards.
+- Token-only access is refused: the forward proxy and standard MASQUE
+  clients.
+- Turning the option on disconnects every device without evidence.
+
+Each device records the platform, level (`strongbox`, `tee` or `tpm`), vendor
+and time of verification, under `hardware` in `GET /api/clients`. Federated
+replicas show the primary's verdicts; devices prove their key to the primary.
+Refresh the TPM vendor CAs with `sudo porta-tpm-cas` followed by
+`sudo systemctl reload porta`, or by deploying again.
+
 ### Account limits
 
 Each client account can have three optional limits, set in the client dialog

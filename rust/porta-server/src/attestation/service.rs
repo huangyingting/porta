@@ -6,13 +6,14 @@ use std::sync::Arc;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use porta_wire::attestation::{
-    AttestationRequest, AttestationResult, ATTESTATION_CHALLENGE_PATH, ATTESTATION_PATH,
-    MAX_CERTIFICATES, MAX_CERTIFICATE_SIZE,
+    AttestationRequest, AttestationResult, TpmChallengeRequest, ATTESTATION_CHALLENGE_PATH,
+    ATTESTATION_PATH, MAX_CERTIFICATES, MAX_CERTIFICATE_SIZE,
 };
 use porta_wire::device_auth::{self, Proof};
 use time::OffsetDateTime;
 
 use super::android::AndroidVerifier;
+use super::tpm::TpmVerifier;
 use super::AttestationError;
 use crate::state::registry::{ClientRegistry, HardwareAttestation, RegistryError};
 use crate::web::session::{RequestContext, Response};
@@ -20,11 +21,22 @@ use crate::web::session::{RequestContext, Response};
 pub struct AttestationService {
     registry: Arc<ClientRegistry>,
     android: Arc<AndroidVerifier>,
+    tpm: Option<Arc<TpmVerifier>>,
 }
 
 impl AttestationService {
     pub fn new(registry: Arc<ClientRegistry>, android: Arc<AndroidVerifier>) -> Self {
-        Self { registry, android }
+        Self {
+            registry,
+            android,
+            tpm: None,
+        }
+    }
+
+    /// Verifies TPM keys against these vendor CAs.
+    pub fn with_tpm(mut self, tpm: Arc<TpmVerifier>) -> Self {
+        self.tpm = Some(tpm);
+        self
     }
 
     /// Answers requests to the attestation endpoints, and nothing else.
@@ -68,7 +80,21 @@ impl AttestationService {
             }
         };
         if request.path == ATTESTATION_CHALLENGE_PATH {
-            return error(404, "this gateway does not verify TPM keys");
+            let Some(tpm) = &self.tpm else {
+                return error(404, "this gateway does not verify TPM keys");
+            };
+            let Ok(body) = serde_json::from_slice::<TpmChallengeRequest>(&request.body) else {
+                return error(400, "the TPM challenge request is malformed");
+            };
+            return match tpm.challenge(&account, &device, &key, &body, OffsetDateTime::now_utc()) {
+                Ok(challenge) => {
+                    Response::json(200, serde_json::to_vec(&challenge).unwrap_or_default())
+                }
+                Err(reason) => {
+                    tracing::info!(account_id = %account, device_id = %device, %reason, "TPM verification refused");
+                    error(422, &reason.to_string())
+                }
+            };
         }
         let body = match serde_json::from_slice::<AttestationRequest>(&request.body) {
             Ok(body) => body,
@@ -77,9 +103,10 @@ impl AttestationService {
         let result = match body {
             AttestationRequest::Android { certificates } => decode_certificates(&certificates)
                 .and_then(|chain| self.android.verify(&chain, &key, OffsetDateTime::now_utc())),
-            AttestationRequest::Tpm { .. } => {
-                return error(404, "this gateway does not verify TPM keys")
-            }
+            AttestationRequest::Tpm { challenge, secret } => match &self.tpm {
+                Some(tpm) => tpm.answer(&account, &device, &challenge, &secret),
+                None => return error(404, "this gateway does not verify TPM keys"),
+            },
         };
         match result {
             Ok(result) => self.record(&account, &device, result).await,

@@ -506,8 +506,7 @@ pub async fn attest(
     request: &porta_wire::attestation::AttestationRequest,
 ) -> Result<porta_wire::attestation::AttestationResult, ClientError> {
     let body = serde_json::to_vec(request).map_err(ClientError::permanent)?;
-    let answer =
-        h2::post_signed(config, porta_wire::attestation::ATTESTATION_PATH, body).await?;
+    let answer = h2::post_signed(config, porta_wire::attestation::ATTESTATION_PATH, body).await?;
     serde_json::from_slice(&answer)
         .map_err(|_| ClientError::permanent("the gateway's attestation answer is malformed"))
 }

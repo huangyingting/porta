@@ -595,7 +595,10 @@ pub(super) async fn post_signed(
             .method(Method::POST)
             .uri(endpoint.as_str())
             .header(http::header::CONTENT_TYPE, "application/json")
-            .header(http::header::AUTHORIZATION, format!("Bearer {}", config.token))
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", config.token),
+            )
             .header(super::HEADER_CLIENT_VERSION, crate::VERSION.trim_ascii())
             .body(())
             .map_err(ClientError::permanent)?;

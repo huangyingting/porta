@@ -112,6 +112,12 @@ mod linux {
         #[arg(
             long,
             action = ArgAction::SetTrue,
+            help = "Keep the device key in this computer's TPM, for accounts that require hardware-protected devices; an existing key is replaced and the device enrolls again"
+        )]
+        hardware_key: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
         cleanup_network: bool,
@@ -178,6 +184,7 @@ mod linux {
                     group: arguments.control_group,
                     ca_path: arguments.ca,
                     thumbprint: arguments.thumbprint,
+                    hardware_key: arguments.hardware_key,
                 },
                 &cancellation,
             )
@@ -202,6 +209,7 @@ mod linux {
                     subnet_router: arguments.subnet_router,
                     allow_lan: arguments.allow_lan,
                     relay: arguments.relay_address,
+                    hardware_key: arguments.hardware_key,
                 },
                 &cancellation,
                 print_event,
