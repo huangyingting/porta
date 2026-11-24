@@ -3609,7 +3609,7 @@ dependencies = [
  "p256",
  "porta-client-rust",
  "porta-wire",
- "rand 0.9.5",
+ "rand",
  "serde_json",
  "time",
  "tokio",
@@ -3639,7 +3639,7 @@ dependencies = [
  "p256",
  "porta-wire",
  "quinn",
- "rand 0.9.5",
+ "rand",
  "rcgen 0.14.10",
  "rustls",
  "rustls-platform-verifier",
@@ -3665,7 +3665,7 @@ version = "0.1.40"
 dependencies = [
  "clap",
  "porta-wire",
- "rand 0.9.5",
+ "rand",
  "rcgen 0.14.10",
  "tempfile",
  "thiserror 2.0.21",
@@ -3729,7 +3729,7 @@ dependencies = [
  "porta-client-rust",
  "porta-wire",
  "quinn",
- "rand 0.9.5",
+ "rand",
  "rcgen 0.14.10",
  "reqwest",
  "rustls",
@@ -3820,15 +3820,6 @@ name = "powerfmt"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
-
-[[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
 
 [[package]]
 name = "precomputed-hash"
@@ -3972,7 +3963,7 @@ dependencies = [
  "fastbloom",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.4",
+ "rand",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -4022,16 +4013,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
-dependencies = [
- "rand_chacha",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
@@ -4042,31 +4023,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_chacha"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
-dependencies = [
- "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -6704,26 +6666,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2da34e7164b75d803c3197b86e6cf61b874106fbd472c5082575a8bc5fbd0907"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "zerocopy"
-version = "0.8.64"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed43f3060383c64b000f3c630550aebdfa9d3b76d48de32390483dd2cc7e0865"
-dependencies = [
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.8.64"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cbd820fe3e35fb38c83b6dc7e6b1618bc46e0cd10073ae94e8d52dc468d8b9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
