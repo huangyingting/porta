@@ -27,6 +27,30 @@ pub struct SystemReadinessConfig {
     pub egress_url: Option<String>,
     pub dns_name: Option<String>,
     pub dns_address: Option<IpAddr>,
+    pub upstream: Option<UpstreamReadiness>,
+    /// Named exits; an exit that is down blackholes only its accounts, so
+    /// it does not make the gateway unready.
+    pub exits: Vec<(String, UpstreamReadiness)>,
+    /// The gateway's IPv6 address and the IPv6 client pool, when clients
+    /// get IPv6.
+    pub ipv6: Option<(std::net::Ipv6Addr, ipnet::Ipv6Net)>,
+}
+
+/// Cascade relay state: client traffic is forwarded through `interface`
+/// instead of the physical egress interface.
+#[derive(Clone)]
+pub struct UpstreamReadiness {
+    pub interface: String,
+    pub status: Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for UpstreamReadiness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamReadiness")
+            .field("interface", &self.interface)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
@@ -127,6 +151,39 @@ pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
             Ok(())
         }
     }));
+    if let Some((gateway, prefix)) = config.ipv6 {
+        checks.push(required_probe("tun_ipv6_address", {
+            let config = config.clone();
+            move |cancellation| {
+                let config = config.clone();
+                async move {
+                    let link = read_link_family(&config.interface, "-6", cancellation).await?;
+                    if link.addr_info.iter().any(|address| {
+                        address.family == "inet6"
+                            && address.local == IpAddr::V6(gateway)
+                            && address.prefix_len == prefix.prefix_len()
+                    }) {
+                        return Ok(());
+                    }
+                    bail!(
+                        "{} lacks IPv6 gateway address {gateway}/{}",
+                        config.interface,
+                        prefix.prefix_len()
+                    )
+                }
+            }
+        }));
+        checks.push(required_probe("ipv6_forwarding", {
+            move |cancellation| async move {
+                let value =
+                    read_file("/proc/sys/net/ipv6/conf/all/forwarding", cancellation).await?;
+                if value.trim() != "1" {
+                    bail!("net.ipv6.conf.all.forwarding is not enabled");
+                }
+                Ok(())
+            }
+        }));
+    }
     checks.push(required_probe("porta_forward_rules", {
         let config = config.clone();
         move |cancellation| {
@@ -179,6 +236,29 @@ pub fn system_readiness(config: SystemReadinessConfig) -> Result<Readiness> {
             }),
     ));
     checks.push(mtu_feedback_probe(config.interface.clone()));
+    if let Some(upstream) = config.upstream.clone() {
+        checks.push(required_probe("upstream_tunnel", move |_| {
+            let result = (upstream.status)().map_err(|error| anyhow!(error));
+            async move { result }
+        }));
+        checks.push(required_probe("upstream_route", {
+            let config = config.clone();
+            move |cancellation| {
+                let config = config.clone();
+                async move { check_upstream_route(&config, cancellation).await }
+            }
+        }));
+    }
+
+    for (name, exit) in config.exits.clone() {
+        checks.push(optional_probe(
+            &format!("exit_{name}"),
+            Some(move |_| {
+                let result = (exit.status)().map_err(|error| anyhow!(error));
+                async move { result }
+            }),
+        ));
+    }
 
     Ok(Readiness::new(checks, config.timeout))
 }
@@ -202,6 +282,11 @@ fn validate_config(config: &SystemReadinessConfig) -> Result<()> {
     }
     if config.require_input_guard && config.public_port == 0 {
         bail!("public listener port is invalid for input-guard readiness");
+    }
+    if config.upstream.as_ref().is_some_and(|upstream| {
+        upstream.interface.is_empty() || upstream.interface == config.interface
+    }) {
+        bail!("upstream readiness interface must differ from the client TUN");
     }
     if let Some(url) = config.egress_url.as_deref() {
         let parsed = reqwest::Url::parse(url)
@@ -277,13 +362,21 @@ struct Link {
 #[derive(Debug, Deserialize)]
 struct LinkAddress {
     family: String,
-    local: Ipv4Addr,
+    local: IpAddr,
     #[serde(rename = "prefixlen")]
     prefix_len: u8,
 }
 
 async fn read_link(interface: &str, cancellation: CancellationToken) -> Result<Link> {
-    let arguments = ["-j", "-4", "address", "show", "dev", interface];
+    read_link_family(interface, "-4", cancellation).await
+}
+
+async fn read_link_family(
+    interface: &str,
+    family: &str,
+    cancellation: CancellationToken,
+) -> Result<Link> {
+    let arguments = ["-j", family, "address", "show", "dev", interface];
     let data = run_command("ip", &arguments, cancellation).await?;
     let mut links: Vec<Link> = serde_json::from_slice(&data).context("decode interface state")?;
     if links.len() != 1 || links[0].ifname != interface {
@@ -361,6 +454,68 @@ async fn readiness_egress(
         bail!("egress interface {} is down", route.device);
     }
     Ok(route.device.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteDecision {
+    #[serde(default, rename = "dev")]
+    device: String,
+}
+
+/// Asks the kernel how it would forward a client packet: it must leave
+/// through the upstream interface, never the physical egress.
+async fn check_upstream_route(
+    config: &SystemReadinessConfig,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let upstream = config
+        .upstream
+        .as_ref()
+        .context("upstream readiness is not configured")?;
+    let client = Ipv4Addr::from(u32::from(config.gateway).wrapping_add(1));
+    let client = client.to_string();
+    let data = run_command(
+        "ip",
+        &[
+            "-j",
+            "-4",
+            "route",
+            "get",
+            "1.1.1.1",
+            "from",
+            &client,
+            "iif",
+            &config.interface,
+        ],
+        cancellation.clone(),
+    )
+    .await
+    .context("client traffic has no route through the next hop")?;
+    let decisions: Vec<RouteDecision> =
+        serde_json::from_slice(&data).context("decode route decision")?;
+    let device = decisions
+        .first()
+        .map(|decision| decision.device.as_str())
+        .unwrap_or_default();
+    if device != upstream.interface {
+        bail!(
+            "client traffic is routed through {device:?}, want {}",
+            upstream.interface
+        );
+    }
+    let mut effective_rpf = 0u8;
+    for name in ["all", upstream.interface.as_str()] {
+        let path = format!("/proc/sys/net/ipv4/conf/{name}/rp_filter");
+        let value = read_file(&path, cancellation.clone()).await?;
+        effective_rpf = effective_rpf.max(value.trim().parse::<u8>().unwrap_or(1));
+    }
+    if effective_rpf == 1 {
+        bail!(
+            "strict reverse-path filtering drops relayed replies; set net/ipv4/conf/{}/rp_filter=2",
+            upstream.interface
+        );
+    }
+    Ok(())
 }
 
 async fn check_mtu_feedback(interface: &str, cancellation: CancellationToken) -> Result<()> {
@@ -634,6 +789,19 @@ struct NftEntry {
     chain: Option<NftChain>,
     #[serde(default)]
     rule: Option<NftRule>,
+    #[serde(default)]
+    set: Option<NftSet>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NftSet {
+    name: String,
+    #[serde(default, rename = "type")]
+    kind: Value,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    flags: Vec<String>,
 }
 
 async fn check_porta_rules(
@@ -641,7 +809,10 @@ async fn check_porta_rules(
     nat: bool,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let egress = readiness_egress(config, cancellation.clone()).await?;
+    let egress = match &config.upstream {
+        Some(upstream) => upstream.interface.clone(),
+        None => readiness_egress(config, cancellation.clone()).await?,
+    };
     let data = run_command("nft", &["-j", "list", "table", "ip", "porta"], cancellation).await?;
     let table: NftDocument =
         serde_json::from_slice(&data).context("decode Porta nftables rules")?;
@@ -699,7 +870,11 @@ async fn check_porta_input_guard(
     let table: NftDocument = serde_json::from_slice(&data).context("decode Porta input guard")?;
     let mut found_chain = false;
     let mut rules = Vec::new();
+    let mut sets = Vec::new();
     for entry in table.nftables {
+        if let Some(set) = entry.set {
+            sets.push(set);
+        }
         if let Some(chain) = entry.chain {
             if chain.name == "input" {
                 found_chain = chain.kind == "filter"
@@ -731,7 +906,9 @@ async fn check_porta_input_guard(
         );
     }
     for (index, (rule, expected)) in rules.iter().zip(expected.iter()).enumerate() {
-        if !matches_input_guard_rule(rule, &egress, config.public_port, expected) {
+        if !matches_input_guard_rule(rule, &egress, config.public_port, expected)
+            || (uses_named_set(rule) && !valid_guard_set(&sets, expected))
+        {
             bail!(
                 "Porta input guard rule {} is missing or malformed",
                 index + 1
@@ -894,7 +1071,14 @@ fn matches_initial_syn(expression: &Map<String, Value>) -> bool {
         .as_object()
         .and_then(|value| value.get("payload"))
         .and_then(Value::as_object);
-    let flags = bitwise[1].as_array();
+    // nftables writes the flag mask either as a list or as an explicit
+    // `{"|": [...]}` expression depending on its version.
+    let flags = bitwise[1].as_array().or_else(|| {
+        bitwise[1]
+            .as_object()
+            .and_then(|mask| mask.get("|"))
+            .and_then(Value::as_array)
+    });
     payload
         .and_then(|payload| payload.get("protocol"))
         .and_then(Value::as_str)
@@ -911,17 +1095,66 @@ fn matches_initial_syn(expression: &Map<String, Value>) -> bool {
         })
 }
 
+/// Whether a guard rule tracks sources in a named set (`update @tcp4 {...}`)
+/// rather than an inline meter. nftables may list a meter in either form.
+fn uses_named_set(rule: &NftRule) -> bool {
+    rule.expr
+        .iter()
+        .any(|expression| expression.contains_key("set"))
+}
+
+fn valid_guard_set(sets: &[NftSet], expected: &InputGuardRule) -> bool {
+    let address_type = if expected.address_protocol == "ip" {
+        "ipv4_addr"
+    } else {
+        "ipv6_addr"
+    };
+    sets.iter().any(|set| {
+        set.name == expected.meter
+            && set.kind.as_str() == Some(address_type)
+            && set.size == 65535
+            && set.flags.iter().any(|flag| flag == "dynamic")
+            && set.flags.iter().any(|flag| flag == "timeout")
+    })
+}
+
 fn matches_input_meter(expression: &Map<String, Value>, expected: &InputGuardRule) -> bool {
-    let Some(meter) = expression.get("meter").and_then(Value::as_object) else {
+    // Inline form: {"meter": {"name", "size", "key": {"elem"}, "stmt": {"limit"}}}.
+    // Named-set form: {"set": {"op": "update", "set": "@name", "elem": {"elem"},
+    // "stmt": [{"limit"}]}}, whose set size is validated separately.
+    let (element, limit) = if let Some(meter) = expression.get("meter").and_then(Value::as_object) {
+        if meter.get("name").and_then(Value::as_str) != Some(expected.meter)
+            || meter.get("size").and_then(Value::as_u64) != Some(65535)
+        {
+            return false;
+        }
+        (
+            meter.get("key"),
+            meter
+                .get("stmt")
+                .and_then(Value::as_object)
+                .and_then(|statement| statement.get("limit")),
+        )
+    } else if let Some(update) = expression.get("set").and_then(Value::as_object) {
+        let statements = update.get("stmt").and_then(Value::as_array);
+        if update.get("op").and_then(Value::as_str) != Some("update")
+            || update.get("set").and_then(Value::as_str)
+                != Some(format!("@{}", expected.meter).as_str())
+            || statements.is_none_or(|statements| statements.len() != 1)
+        {
+            return false;
+        }
+        (
+            update.get("elem"),
+            statements
+                .and_then(|statements| statements.first())
+                .and_then(Value::as_object)
+                .and_then(|statement| statement.get("limit")),
+        )
+    } else {
         return false;
     };
-    if meter.get("name").and_then(Value::as_str) != Some(expected.meter)
-        || meter.get("size").and_then(Value::as_u64) != Some(65535)
-    {
-        return false;
-    }
-    let Some(element) = meter
-        .get("key")
+    let Some(element) = element
         .and_then(Value::as_object)
         .and_then(|key| key.get("elem"))
         .and_then(Value::as_object)
@@ -945,12 +1178,7 @@ fn matches_input_meter(expression: &Map<String, Value>, expected: &InputGuardRul
     {
         return false;
     }
-    let Some(limit) = meter
-        .get("stmt")
-        .and_then(Value::as_object)
-        .and_then(|statement| statement.get("limit"))
-        .and_then(Value::as_object)
-    else {
+    let Some(limit) = limit.and_then(Value::as_object) else {
         return false;
     };
     !limit.contains_key("rate_unit")
@@ -1103,6 +1331,9 @@ mod tests {
             egress_url: None,
             dns_name: None,
             dns_address: None,
+            upstream: None,
+            exits: Vec::new(),
+            ipv6: None,
         };
         assert!(validate_config(&base).is_ok());
         assert!(system_readiness(base.clone()).is_ok());
@@ -1113,9 +1344,45 @@ mod tests {
         invalid = base.clone();
         invalid.egress_url = Some("https://user@example.com/".to_string());
         assert!(validate_config(&invalid).is_err());
-        invalid = base;
+        invalid = base.clone();
         invalid.dns_name = Some("health.example".to_string());
         assert!(validate_config(&invalid).is_err());
+        invalid = base;
+        invalid.upstream = Some(UpstreamReadiness {
+            interface: "porta0".to_string(),
+            status: Arc::new(|| Ok(())),
+        });
+        assert!(validate_config(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_readiness_requires_the_next_hop_tunnel() {
+        let config = SystemReadinessConfig {
+            interface: "porta0".to_string(),
+            gateway: "10.66.0.1".parse().unwrap(),
+            pool: "10.66.0.0/24".parse().unwrap(),
+            mtu: 1400,
+            egress_interface: None,
+            require_nat: true,
+            require_input_guard: false,
+            public_port: 0,
+            timeout: Duration::from_secs(1),
+            egress_url: None,
+            dns_name: None,
+            dns_address: None,
+            upstream: Some(UpstreamReadiness {
+                interface: "porta-up0".to_string(),
+                status: Arc::new(|| Err("next-hop tunnel is down: 401".to_string())),
+            }),
+            exits: Vec::new(),
+            ipv6: None,
+        };
+        let report = system_readiness(config).unwrap().check().await;
+        assert_eq!(report.status, "not_ready");
+        let tunnel = &report.components["upstream_tunnel"];
+        assert!(tunnel.required);
+        assert!(tunnel.error.as_deref().unwrap().contains("401"));
+        assert!(report.components["upstream_route"].required);
     }
 
     #[test]
@@ -1216,6 +1483,77 @@ mod tests {
         byte_rate[4]["meter"]["stmt"]["limit"]["rate_unit"] = json!("mbytes");
         assert!(!matches_input_guard_rule(
             &rule(Value::Array(byte_rate)),
+            "eth0",
+            8443,
+            &expected
+        ));
+    }
+
+    #[test]
+    fn input_guard_accepts_the_named_set_form_with_a_valid_set() {
+        // As listed by `nft -j` for `update @tcp4 { ip saddr timeout 10s limit ... }`.
+        let expected = InputGuardRule::new("tcp", "ip", "tcp4", 200, 400, true);
+        let expressions = json!([
+            {"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},
+            {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8443}},
+            {"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"new"}},
+            {"match":{"op":"==","left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},
+                ["fin","syn","rst","ack"]]},"right":"syn"}},
+            {"set":{"op":"update","elem":{"elem":{"val":{"payload":{"protocol":"ip",
+                "field":"saddr"}},"timeout":10}},"set":"@tcp4",
+                "stmt":[{"limit":{"rate":200,"burst":400,"per":"second","inv":true}}]}},
+            {"counter":{"packets":0,"bytes":0}},
+            {"drop":null}
+        ]);
+        let valid = rule(expressions.clone());
+        assert!(uses_named_set(&valid));
+        assert!(matches_input_guard_rule(&valid, "eth0", 8443, &expected));
+        // Some nftables versions write the flag mask as an explicit OR.
+        let mut explicit_mask = expressions.as_array().unwrap().clone();
+        explicit_mask[3]["match"]["left"]["&"][1] = json!({"|": ["fin", "syn", "rst", "ack"]});
+        assert!(matches_input_guard_rule(
+            &rule(Value::Array(explicit_mask.clone())),
+            "eth0",
+            8443,
+            &expected
+        ));
+        explicit_mask[3]["match"]["left"]["&"][1] = json!({"|": ["fin", "syn"]});
+        assert!(!matches_input_guard_rule(
+            &rule(Value::Array(explicit_mask)),
+            "eth0",
+            8443,
+            &expected
+        ));
+
+        let set = |size, flags: &[&str]| NftSet {
+            name: "tcp4".into(),
+            kind: json!("ipv4_addr"),
+            size,
+            flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
+        };
+        assert!(valid_guard_set(
+            &[set(65535, &["timeout", "dynamic"])],
+            &expected
+        ));
+        assert!(!valid_guard_set(
+            &[set(1024, &["timeout", "dynamic"])],
+            &expected
+        ));
+        assert!(!valid_guard_set(&[set(65535, &["dynamic"])], &expected));
+        assert!(!valid_guard_set(&[], &expected));
+
+        let mut other_set = expressions.as_array().unwrap().clone();
+        other_set[4]["set"]["set"] = json!("@udp4");
+        assert!(!matches_input_guard_rule(
+            &rule(Value::Array(other_set)),
+            "eth0",
+            8443,
+            &expected
+        ));
+        let mut additive = expressions.as_array().unwrap().clone();
+        additive[4]["set"]["op"] = json!("add");
+        assert!(!matches_input_guard_rule(
+            &rule(Value::Array(additive)),
             "eth0",
             8443,
             &expected

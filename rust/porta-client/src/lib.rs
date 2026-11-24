@@ -1,4 +1,6 @@
+pub mod captive;
 pub mod device;
+pub mod failover;
 pub mod identity;
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub mod linux;

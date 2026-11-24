@@ -1,0 +1,14 @@
+[Unit]
+Description=Back up Porta gateway configuration and state
+After=porta.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/porta-backup create --keep 14
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# deploy.sh creates the archive directory.
+ReadWritePaths=/var/backups/porta

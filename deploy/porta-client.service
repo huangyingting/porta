@@ -1,0 +1,19 @@
+[Unit]
+Description=Porta VPN client service for the desktop app
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Members of the porta-client group control it through the desktop app.
+ExecStart=/usr/local/bin/porta-client --daemon --control-group porta-client --profiles /var/lib/porta-client/profiles.json --network-state /var/lib/porta-client/network-state.json --identity /var/lib/porta-client/identity.json
+RuntimeDirectory=porta-client
+RuntimeDirectoryMode=0755
+StateDirectory=porta-client
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

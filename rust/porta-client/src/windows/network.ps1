@@ -2,7 +2,10 @@ $ErrorActionPreference = "Stop"
 $Operation = [string]$env:PORTA_NETWORK_OPERATION
 $StatePath = [string]$env:PORTA_NETWORK_STATE_PATH
 $AddressCidr = [string]$env:PORTA_NETWORK_ADDRESS_CIDR
+$AddressCidr6 = [string]$env:PORTA_NETWORK_ADDRESS6_CIDR
 $DnsServer = [string]$env:PORTA_NETWORK_DNS_SERVER
+$SplitRoutes = @(([string]$env:PORTA_NETWORK_ROUTES).Split(",") | Where-Object { $_ })
+$DnsDomains = @(([string]$env:PORTA_NETWORK_DNS_DOMAINS).Split(",") | Where-Object { $_ })
 $Mtu = 0
 if ($Operation -notin @("prepare", "configure-interface", "up", "down", "retire-interface")) {
     throw "Invalid network helper operation."
@@ -12,6 +15,19 @@ if (-not $StatePath -or -not [IO.Path]::IsPathRooted($StatePath)) {
 }
 if (-not [int]::TryParse([string]$env:PORTA_NETWORK_MTU, [ref]$Mtu) -or $Mtu -lt 576 -or $Mtu -gt 9000) {
     throw "Invalid tunnel MTU."
+}
+foreach ($prefix in $SplitRoutes) {
+    if ($prefix -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$' -and
+        -not ($AddressCidr6 -and $prefix -match '^[0-9A-Fa-f:]+/\d{1,3}$')) { throw "Invalid split-tunnel route." }
+}
+if ($AddressCidr6 -and $AddressCidr6 -notmatch '^[0-9A-Fa-f:]+/128$') {
+    throw "Invalid IPv6 tunnel address."
+}
+foreach ($domain in $DnsDomains) {
+    if ($domain -notmatch '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$') { throw "Invalid split DNS domain." }
+}
+if ($DnsDomains.Count -gt 0 -and ($SplitRoutes.Count -eq 0 -or -not $DnsServer)) {
+    throw "Split DNS domains require split routes and a tunnel resolver."
 }
 $Icacls = Join-Path ([Environment]::SystemDirectory) "icacls.exe"
 $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -39,6 +55,16 @@ function Save-State {
     } finally { $file.Dispose() }
     Protect-StateFile "$StatePath.pending"
     [IO.File]::Replace("$StatePath.pending", $StatePath, [NullString]::Value)
+}
+function Get-AddressFamily($cidr) {
+    if ($cidr.Contains(":")) { return "IPv6" }
+    return "IPv4"
+}
+function Remove-OwnedAddress($owned, $interfaceIndex) {
+    $ownedParts = $owned.Split("/")
+    Get-NetIPAddress -AddressFamily (Get-AddressFamily $owned) -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $interfaceIndex -and $_.IPAddress -eq $ownedParts[0] -and $_.PrefixLength -eq [int]$ownedParts[1] } |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
 }
 function Get-Routes {
     @(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop)
@@ -75,6 +101,31 @@ function Retire-OwnedRoute($owned) {
     Set-StateField "routes" @($state.routes | Where-Object { $_ -ne $owned })
     Save-State
 }
+function Restore-InterfaceDns($restoreIndex) {
+    $interfaces = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $restoreIndex })
+    if ($interfaces.Count -gt 0) {
+        $current = @($interfaces[0].ServerAddresses)
+        if ($current.Count -eq 1 -and $current[0] -in @($state.dns.applied, $state.dns.pending)) {
+            if ($state.dns.automatic) {
+                $interfaces[0] | Set-DnsClientServerAddress -ResetServerAddresses -ErrorAction Stop
+            } else {
+                $interfaces[0] | Set-DnsClientServerAddress -ServerAddresses @($state.dns.original) -ErrorAction Stop
+            }
+        }
+    }
+}
+# NRPT rules carry an owner comment so a crash between adding a rule and
+# journaling it still leaves the rule discoverable for cleanup.
+function Get-NrptOwner { "Porta split DNS $($state.guard_key)" }
+function Remove-OwnedNrpt {
+    $owner = Get-NrptOwner
+    Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Comment -eq $owner } |
+        ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction Stop }
+    if (@($state.nrpt_domains | Where-Object { $_ }).Count -gt 0) {
+        Set-StateField "nrpt_domains" @()
+        Save-State
+    }
+}
 function Add-OwnedRoute($kind, $prefix, $index, $nextHop, $metric) {
     $owner = @($adapters | Where-Object { $_.InterfaceIndex -eq $index })
     if ($owner.Count -ne 1) { throw "Cannot determine escape/tunnel route interface ownership." }
@@ -107,11 +158,13 @@ if ($Operation -eq "retire-interface") {
     Set-StateField "addresses" @()
     Set-StateField "dns" $null
     Set-StateField "mtu" $null
+    Set-StateField "mtu6" $null
     Set-StateField "original_dhcp" ""
     Save-State
     return
 }
 if ($Operation -eq "down") {
+    Remove-OwnedNrpt
     foreach ($owned in @($state.routes | Where-Object { $_ })) {
         $owner = @($adapters | Where-Object { ([guid]$_.InterfaceGuid).ToString("B") -eq $owned.interface_guid })
         if ($owner.Count -eq 1) {
@@ -131,17 +184,7 @@ if ($Operation -eq "down") {
     $restoreIndex = 0
     if ($sameInterface) { $restoreIndex = [int]$restoreAdapters[0].InterfaceIndex }
     if ($state.dns -and $sameInterface) {
-        $interfaces = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $restoreIndex })
-        if ($interfaces.Count -gt 0) {
-            $current = @($interfaces[0].ServerAddresses)
-            if ($current.Count -eq 1 -and $current[0] -in @($state.dns.applied, $state.dns.pending)) {
-                if ($state.dns.automatic) {
-                    $interfaces[0] | Set-DnsClientServerAddress -ResetServerAddresses -ErrorAction Stop
-                } else {
-                    $interfaces[0] | Set-DnsClientServerAddress -ServerAddresses @($state.dns.original) -ErrorAction Stop
-                }
-            }
-        }
+        Restore-InterfaceDns $restoreIndex
     }
     if ($state.mtu -and $sameInterface) {
         $current = Get-NetIPInterface -InterfaceIndex $restoreIndex -AddressFamily IPv4 -ErrorAction Stop
@@ -153,10 +196,7 @@ if ($Operation -eq "down") {
     Set-StateField "dns" $null
     Save-State
     foreach ($owned in @($state.addresses | Where-Object { $_ -and $sameInterface })) {
-        $parts = $owned.Split("/")
-        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-            Where-Object { $_.InterfaceIndex -eq $restoreIndex -and $_.IPAddress -eq $parts[0] -and $_.PrefixLength -eq [int]$parts[1] } |
-            Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+        Remove-OwnedAddress $owned $restoreIndex
         Set-StateField "addresses" @($state.addresses | Where-Object { $_ -ne $owned })
         Save-State
     }
@@ -225,6 +265,21 @@ if ($existing.Count -eq 0) {
     Save-State
     New-NetIPAddress -InterfaceIndex $index -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) -ErrorAction Stop | Out-Null
 }
+if ($AddressCidr6) {
+    # Porta's own adapter has no neighbors: skip duplicate address detection
+    # and router discovery so the address is usable at once.
+    Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv6 -DadTransmits 0 -RouterDiscovery Disabled -ErrorAction Stop
+    $parts6 = $AddressCidr6.Split("/")
+    $existing6 = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $index -and $_.IPAddress -eq $parts6[0] -and $_.PrefixLength -eq 128 })
+    if ($existing6.Count -eq 0) {
+        if ($AddressCidr6 -notin @($state.addresses)) {
+            Set-StateField "addresses" (@($state.addresses | Where-Object { $_ }) + @($AddressCidr6))
+            Save-State
+        }
+        New-NetIPAddress -InterfaceIndex $index -IPAddress $parts6[0] -PrefixLength 128 -ErrorAction Stop | Out-Null
+    }
+}
 if ($Operation -eq "configure-interface") { return }
 if (-not ($state.mtu -and $state.mtu.applied -eq $Mtu -and -not $state.mtu.pending)) {
     if (-not $state.mtu) {
@@ -242,39 +297,69 @@ if (-not ($state.mtu -and $state.mtu.applied -eq $Mtu -and -not $state.mtu.pendi
     $state.mtu.pending = 0
     Save-State
 }
-Add-OwnedRoute "dns" "$DnsServer/32" $index "0.0.0.0" 1
-if (-not $state.dns) {
-    $current = @(Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)
-    $adapterGuid = ([guid]$tun[0].InterfaceGuid).ToString("B")
-    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$adapterGuid")
-    if (-not $key) { throw "Cannot snapshot the tunnel interface DNS configuration." }
-    try { $static = [string]$key.GetValue("NameServer", "") } finally { $key.Dispose() }
-    Set-StateField "dns" ([PSCustomObject]@{
-        interface_index=$index; automatic=[string]::IsNullOrWhiteSpace($static)
-        original=@($current[0].ServerAddresses); applied=""; pending=$DnsServer
-    })
+$split = $SplitRoutes.Count -gt 0
+if (-not $split -and -not $DnsServer) { throw "A full tunnel requires a tunnel resolver." }
+$tunnelPrefixes = @("0.0.0.0/1", "128.0.0.0/1")
+if ($AddressCidr6) { $tunnelPrefixes += @("::/1", "8000::/1") }
+if ($split) { $tunnelPrefixes = $SplitRoutes }
+if ($DnsServer) { Add-OwnedRoute "dns" "$DnsServer/32" $index "0.0.0.0" 1 }
+if ($split) {
+    # A split tunnel never takes over the host resolver: names under the
+    # advertised domains reach the tunnel resolver through NRPT only.
+    if ($state.dns) {
+        Restore-InterfaceDns $index
+        Set-StateField "dns" $null
+        Save-State
+    }
+    Remove-OwnedNrpt
+    if ($DnsDomains.Count -gt 0) {
+        Set-StateField "nrpt_domains" @($DnsDomains)
+        Save-State
+        foreach ($domain in $DnsDomains) {
+            Add-DnsClientNrptRule -Namespace ".$domain" -NameServers $DnsServer -Comment (Get-NrptOwner) -ErrorAction Stop | Out-Null
+        }
+    }
 } else {
-    $state.dns.pending = $DnsServer
+    Remove-OwnedNrpt
+    if (-not $state.dns) {
+        $current = @(Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop)
+        $adapterGuid = ([guid]$tun[0].InterfaceGuid).ToString("B")
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$adapterGuid")
+        if (-not $key) { throw "Cannot snapshot the tunnel interface DNS configuration." }
+        try { $static = [string]$key.GetValue("NameServer", "") } finally { $key.Dispose() }
+        Set-StateField "dns" ([PSCustomObject]@{
+            interface_index=$index; automatic=[string]::IsNullOrWhiteSpace($static)
+            original=@($current[0].ServerAddresses); applied=""; pending=$DnsServer
+        })
+    } else {
+        $state.dns.pending = $DnsServer
+    }
+    Save-State
+    Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop |
+        Set-DnsClientServerAddress -ServerAddresses @($DnsServer) -ErrorAction Stop
+    $state.dns.applied = $DnsServer
+    $state.dns.pending = ""
+    Save-State
 }
-Save-State
-Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop |
-    Set-DnsClientServerAddress -ServerAddresses @($DnsServer) -ErrorAction Stop
-$state.dns.applied = $DnsServer
-$state.dns.pending = ""
-Save-State
-Add-OwnedRoute "tunnel" "0.0.0.0/1" $index "0.0.0.0" 5
-Add-OwnedRoute "tunnel" "128.0.0.0/1" $index "0.0.0.0" 5
+foreach ($prefix in $tunnelPrefixes) {
+    $nextHop = "0.0.0.0"
+    if ($prefix.Contains(":")) { $nextHop = "::" }
+    Add-OwnedRoute "tunnel" $prefix $index $nextHop 5
+}
 foreach ($owned in @($state.routes | Where-Object {
-    $_ -and $_.kind -eq "dns" -and
-    ($_.prefix -ne "$DnsServer/32" -or $_.interface_index -ne $index -or $_.interface_guid -ne $state.interface_guid)
+    $_ -and $_.kind -eq "tunnel" -and
+    ($_.prefix -notin $tunnelPrefixes -or $_.interface_index -ne $index -or $_.interface_guid -ne $state.interface_guid)
 })) {
     Retire-OwnedRoute $owned
 }
-foreach ($old in @($state.addresses | Where-Object { $_ -and $_ -ne $AddressCidr })) {
-    $oldParts = $old.Split("/")
-    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.InterfaceIndex -eq $index -and $_.IPAddress -eq $oldParts[0] -and $_.PrefixLength -eq [int]$oldParts[1] } |
-        Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+foreach ($owned in @($state.routes | Where-Object {
+    $_ -and $_.kind -eq "dns" -and
+    (-not $DnsServer -or $_.prefix -ne "$DnsServer/32" -or $_.interface_index -ne $index -or $_.interface_guid -ne $state.interface_guid)
+})) {
+    Retire-OwnedRoute $owned
+}
+foreach ($old in @($state.addresses | Where-Object { $_ -and $_ -ne $AddressCidr -and $_ -ne $AddressCidr6 })) {
+    Remove-OwnedAddress $old $index
     Set-StateField "addresses" @($state.addresses | Where-Object { $_ -ne $old })
     Save-State
 }

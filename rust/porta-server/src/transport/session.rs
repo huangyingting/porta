@@ -2,7 +2,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,12 +10,19 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::wire::ip::{classify_ipv4, FlowKey, PacketClass};
+use crate::wire::ip::{classify_packet, FlowKey, PacketClass};
 pub use porta_wire::mtu::MtuError;
 
 pub const TUNNEL_PATH: &str = "/v1/tunnel";
 pub const MASQUE_PATH: &str = "/.well-known/masque/ip/%2A/%2A/";
 pub const MASQUE_AUTH_PATH: &str = "/.well-known/masque/ip/*/*/";
+
+/// Whether `path` is the unrestricted CONNECT-IP target in its canonical
+/// form: `*` percent-encoded, as RFC 6570 expansion of the RFC 9484
+/// template produces.
+pub fn is_masque_path(path: &str) -> bool {
+    path.eq_ignore_ascii_case(MASQUE_PATH)
+}
 pub const PROTOCOL_VERSION: &str = "2";
 pub const HEADER_VERSION: &str = "X-Porta-Version";
 pub const HEADER_MIN_VERSION: &str = "X-Porta-Min-Version";
@@ -41,6 +48,19 @@ pub struct DeviceProof {
 }
 
 impl DeviceProof {
+    /// The logical device of a standard CONNECT-IP client.
+    pub fn standard() -> Self {
+        Self {
+            device_id: crate::state::registry::STANDARD_DEVICE_ID.to_owned(),
+            name: "Standard MASQUE client".to_owned(),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_standard(&self) -> bool {
+        self.device_id == crate::state::registry::STANDARD_DEVICE_ID
+    }
+
     pub fn from_headers(headers: &http::HeaderMap) -> Self {
         let value = |name: &'static str| {
             headers
@@ -70,9 +90,41 @@ pub struct ClientIdentity {
 pub struct AuthenticationRequest {
     pub bearer_token: String,
     pub proof: DeviceProof,
+    /// A standard CONNECT-IP client without a Porta device proof, admitted by
+    /// token for accounts that allow it.
+    pub standard: bool,
     pub method: http::Method,
     pub path: String,
     pub peer: std::net::SocketAddr,
+    /// The native client's application version, from [`HEADER_CLIENT_VERSION`].
+    pub client_version: Option<String>,
+}
+
+/// Native clients report their application version in this header.
+pub const HEADER_CLIENT_VERSION: &str = "x-porta-client-version";
+
+/// The application version a native client reports, if any.
+pub fn client_version(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(HEADER_CLIENT_VERSION)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .map(str::to_owned)
+}
+
+/// A `MAJOR.MINOR.PATCH` version; anything after the patch number, such as
+/// a pre-release suffix, is ignored.
+pub fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().trim_start_matches('v').splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?;
+    let digits = patch
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(patch.len());
+    Some((major, minor, patch[..digits].parse().ok()?))
 }
 
 pub trait Cleanup: Send + Sync {
@@ -115,15 +167,186 @@ pub struct Authenticated {
     pub identity: ClientIdentity,
     pub cancellation: Arc<dyn Cancellation>,
     pub cleanup: Arc<dyn Cleanup>,
+    pub account: AccountStatus,
+    pub network: NetworkPolicy,
+}
+
+/// Network rules for one device's tunnel, enforced by the packet router.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NetworkPolicy {
+    /// Destinations the device may reach; empty allows every destination.
+    pub allow: Vec<crate::policy::AccessRule>,
+    /// Destinations the device may never reach; takes precedence over `allow`.
+    pub deny: Vec<crate::policy::AccessRule>,
+    /// Devices of accounts in the same group reach each other.
+    pub group: Option<String>,
+    /// Named exit for the device's traffic; unset uses the gateway default.
+    pub exit: Option<String>,
+    /// Networks behind this device that it routes for other clients.
+    pub subnets: Vec<ipnet::Ipv4Net>,
+    /// Subnets behind other devices, added to split-tunnel routes.
+    pub published: Vec<ipnet::Ipv4Net>,
+}
+
+impl NetworkPolicy {
+    /// Whether the allow and deny lists let the device exchange some
+    /// traffic with `address`.
+    pub fn permits(&self, address: IpAddr) -> bool {
+        !self
+            .deny
+            .iter()
+            .any(|rule| rule.is_whole() && rule.prefix.contains(&address))
+            && (self.allow.is_empty()
+                || self.allow.iter().any(|rule| rule.prefix.contains(&address)))
+    }
+
+    /// Whether the lists let the device exchange every kind of traffic with
+    /// `address`: no rule narrows what it may send there.
+    pub fn permits_fully(&self, address: IpAddr) -> bool {
+        !self.deny.iter().any(|rule| rule.prefix.contains(&address))
+            && (self.allow.is_empty()
+                || self
+                    .allow
+                    .iter()
+                    .any(|rule| rule.is_whole() && rule.prefix.contains(&address)))
+    }
+
+    /// Whether the device may send a packet with `transport` fields to
+    /// `destination`. Port rules decide which connections it may open; see
+    /// [`crate::policy`].
+    pub fn permits_packet(
+        &self,
+        destination: IpAddr,
+        transport: &porta_wire::ip::Transport,
+    ) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|rule| rule.matches(destination, transport))
+        {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        // Later segments of TCP connections, ICMP errors and later fragments
+        // belong to traffic whose opening packet the rules already decided.
+        let follows_up = transport.later_fragment
+            || transport.is_icmp_error()
+            || (transport.protocol == 6
+                && transport.tcp_flags.is_some()
+                && !transport.opens_tcp_connection());
+        if follows_up {
+            return self.permits(destination);
+        }
+        self.allow
+            .iter()
+            .any(|rule| rule.matches(destination, transport))
+    }
+
+    /// Whether `address` lies in a network behind this device.
+    pub fn routes_subnet(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => self.subnets.iter().any(|subnet| subnet.contains(&address)),
+            IpAddr::V6(_) => false,
+        }
+    }
+}
+
+/// Account limits reported to the client when a tunnel is established.
+/// Usage is a snapshot; enforcement does not depend on the client.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccountStatus {
+    /// Unix time in seconds.
+    pub expires_at: Option<i64>,
+    pub quota_bytes: Option<u64>,
+    pub quota_used_bytes: Option<u64>,
+    pub rate_limit_kbps: Option<u32>,
+}
+
+pub const HEADER_ACCOUNT_EXPIRES: &str = "x-porta-account-expires";
+pub const HEADER_QUOTA_BYTES: &str = "x-porta-quota-bytes";
+pub const HEADER_QUOTA_USED_BYTES: &str = "x-porta-quota-used-bytes";
+pub const HEADER_RATE_LIMIT_KBPS: &str = "x-porta-rate-limit-kbps";
+
+pub fn set_account_headers(headers: &mut http::HeaderMap, account: &AccountStatus) {
+    let values = [
+        (
+            HEADER_ACCOUNT_EXPIRES,
+            account.expires_at.map(|value| value.to_string()),
+        ),
+        (
+            HEADER_QUOTA_BYTES,
+            account.quota_bytes.map(|value| value.to_string()),
+        ),
+        (
+            HEADER_QUOTA_USED_BYTES,
+            account
+                .quota_bytes
+                .and(account.quota_used_bytes)
+                .map(|value| value.to_string()),
+        ),
+        (
+            HEADER_RATE_LIMIT_KBPS,
+            account.rate_limit_kbps.map(|value| value.to_string()),
+        ),
+    ];
+    for (name, value) in values {
+        if let Some(value) = value.and_then(|value| http::HeaderValue::from_str(&value).ok()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum AuthenticationError {
     #[error("authentication failed")]
     Unauthorized,
+    /// Valid credentials whose account may not connect now; the reason is
+    /// reported to the client.
+    #[error("account access denied: {0}")]
+    Forbidden(DenialReason),
     #[error("too many authentication attempts")]
     RateLimited { retry_after_seconds: u64 },
+    /// This gateway cannot admit the client now; another gateway may.
+    #[error("{0}")]
+    Unavailable(&'static str),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenialReason {
+    AccountExpired,
+    QuotaExceeded,
+    DevicePending,
+    EnrollmentClosed,
+    DeviceDenied,
+    StandardClientsDisabled,
+    /// The client is older than the gateway's `--min-client-version`.
+    ClientOutdated,
+}
+
+impl DenialReason {
+    /// Value of the `X-Porta-Reason` response header.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountExpired => "account-expired",
+            Self::QuotaExceeded => "quota-exceeded",
+            Self::DevicePending => "device-pending",
+            Self::EnrollmentClosed => "enrollment-closed",
+            Self::DeviceDenied => "device-denied",
+            Self::StandardClientsDisabled => "standard-clients-disabled",
+            Self::ClientOutdated => "client-outdated",
+        }
+    }
+}
+
+impl std::fmt::Display for DenialReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+pub const REASON_HEADER: &str = "x-porta-reason";
 
 pub trait Authenticator: Send + Sync {
     fn authenticate(
@@ -151,11 +374,28 @@ pub struct Lease {
     pub prefix_len: u8,
     pub gateway: Ipv4Addr,
     pub opaque_id: u64,
+    /// The device's IPv6 address on a dual-stack gateway.
+    pub ipv6: Option<Ipv6Lease>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv6Lease {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+    pub gateway: Ipv6Addr,
 }
 
 impl Lease {
     pub fn prefix(&self) -> String {
         format!("{}/{}", self.address, self.prefix_len)
+    }
+
+    /// Whether `address` is one of this lease's own addresses.
+    pub fn owns(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => address == self.address,
+            IpAddr::V6(address) => self.ipv6.is_some_and(|lease| lease.address == address),
+        }
     }
 }
 
@@ -188,6 +428,10 @@ pub struct RouteRequest {
     pub lease: Lease,
     pub kind: RouteKind,
     pub parent: CancellationToken,
+    /// Account whose throughput limit applies to the route.
+    pub account_id: String,
+    pub device_id: String,
+    pub network: NetworkPolicy,
 }
 
 pub trait PacketSource: Send + Sync {
@@ -229,6 +473,24 @@ pub trait PacketRouter: Send + Sync {
         cancellation: CancellationToken,
         packet: Bytes,
     ) -> BoxFuture<'static, Result<(), RouteError>>;
+
+    /// Whether the gateway coordinates direct paths between devices.
+    fn offers_peers(&self) -> bool {
+        false
+    }
+
+    /// Publishes the session at `lease` for direct paths: `endpoint` is its
+    /// public UDP address and `fingerprint` identifies the certificate it
+    /// presents to other devices. The receiver yields the devices it may
+    /// connect to, updated as they come and go, until the session ends.
+    fn announce_peer(
+        &self,
+        _lease: Ipv4Addr,
+        _endpoint: std::net::SocketAddr,
+        _fingerprint: crate::wire::peer::Fingerprint,
+    ) -> Option<tokio::sync::watch::Receiver<Vec<crate::wire::peer::Peer>>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +499,7 @@ pub struct UsageMetadata {
     pub device_id: String,
     pub transport: String,
     pub address: Ipv4Addr,
+    pub address6: Option<Ipv6Addr>,
     pub session_id: String,
 }
 
@@ -269,6 +532,7 @@ impl UsageSession for NoopUsageSession {
 
 struct CountedUsage {
     inner: Arc<dyn UsageSession>,
+    metrics: Option<Arc<dyn Metrics>>,
     uploaded_bytes: AtomicU64,
     uploaded_packets: AtomicU64,
     downloaded_bytes: AtomicU64,
@@ -279,6 +543,7 @@ impl CountedUsage {
     fn new(inner: Arc<dyn UsageSession>) -> Self {
         Self {
             inner,
+            metrics: None,
             uploaded_bytes: AtomicU64::new(0),
             uploaded_packets: AtomicU64::new(0),
             downloaded_bytes: AtomicU64::new(0),
@@ -291,6 +556,9 @@ impl UsageSession for CountedUsage {
     fn uploaded(&self, bytes: u64, packets: u64) {
         self.uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.uploaded_packets.fetch_add(packets, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.traffic(bytes, 0);
+        }
         self.inner.uploaded(bytes, packets);
     }
 
@@ -298,6 +566,9 @@ impl UsageSession for CountedUsage {
         self.downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.downloaded_packets
             .fetch_add(packets, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.traffic(0, bytes);
+        }
         self.inner.downloaded(bytes, packets);
     }
 
@@ -321,6 +592,8 @@ pub trait Metrics: Send + Sync {
     fn disconnected(&self) {}
     fn received_from_client(&self) {}
     fn sent_to_client(&self) {}
+    /// IP bytes accounted to a client's usage, by direction.
+    fn traffic(&self, _from_client: u64, _to_client: u64) {}
     fn dropped_from_client(&self) {}
     fn datagram_oversize(&self) {}
     fn datagram_mtu_reduced(&self) {}
@@ -346,6 +619,131 @@ pub struct Services {
     pub router: Arc<dyn PacketRouter>,
     pub usage: Arc<dyn Usage>,
     pub metrics: Arc<dyn Metrics>,
+    /// Destinations clients route through the tunnel by default.
+    pub routing: TunnelRouting,
+    /// Ends every tunnel when the gateway stops, so that shutdown and
+    /// in-place restarts need not wait for clients to disconnect.
+    pub shutdown: CancellationToken,
+}
+
+/// Which destinations a client sends through the tunnel, and which DNS
+/// names it resolves through the tunnel's DNS server.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TunnelRouting {
+    /// Empty means a full tunnel.
+    pub routes: Vec<ipnet::IpNet>,
+    /// With split routes: domains resolved by the tunnel DNS server.
+    pub dns_domains: Vec<String>,
+    /// Networks behind this client that the gateway routes to it.
+    pub subnets: Vec<ipnet::Ipv4Net>,
+    /// The client has an IPv6 address: IPv6 routes apply, and a full
+    /// tunnel carries IPv6 as well.
+    pub ipv6: bool,
+}
+
+pub const HEADER_ROUTES: &str = "x-porta-routes";
+/// The client's IPv6 address on HTTP/2; HTTP/3 assigns it in a capsule.
+pub const HEADER_ADDRESS6: &str = "x-porta-address6";
+pub const HEADER_DNS_DOMAINS: &str = "x-porta-dns-domains";
+pub const HEADER_SUBNETS: &str = "x-porta-subnets";
+
+impl TunnelRouting {
+    pub fn is_full_tunnel(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Routes as RFC 9484 ROUTE_ADVERTISEMENT ranges; IPv6 ranges only
+    /// with an IPv6 address.
+    pub fn advertisement(&self) -> Vec<crate::wire::masque::Route> {
+        let ipv6 = self.ipv6;
+        let mut routes = if self.routes.is_empty() {
+            let mut routes = vec![crate::wire::masque::Route {
+                start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                end: IpAddr::V4(Ipv4Addr::BROADCAST),
+                protocol: 0,
+            }];
+            if ipv6 {
+                routes.push(crate::wire::masque::Route {
+                    start: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    end: IpAddr::V6(Ipv6Addr::from(u128::MAX)),
+                    protocol: 0,
+                });
+            }
+            routes
+        } else {
+            self.routes
+                .iter()
+                .filter(|route| ipv6 || matches!(route, ipnet::IpNet::V4(_)))
+                .map(|route| crate::wire::masque::Route {
+                    start: route.network(),
+                    end: route.broadcast(),
+                    protocol: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        // IPv4 ranges precede IPv6 ranges, each in address order.
+        routes.sort_by_key(|route| (route.start.is_ipv6(), route.start));
+        routes
+    }
+
+    pub fn set_headers(&self, headers: &mut http::HeaderMap) {
+        if !self.routes.is_empty() {
+            let routes = self
+                .routes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Ok(value) = http::HeaderValue::from_str(&routes) {
+                headers.insert(HEADER_ROUTES, value);
+            }
+        }
+        if !self.dns_domains.is_empty() {
+            if let Ok(value) = http::HeaderValue::from_str(&self.dns_domains.join(",")) {
+                headers.insert(HEADER_DNS_DOMAINS, value);
+            }
+        }
+        if !self.subnets.is_empty() {
+            let subnets = self
+                .subnets
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Ok(value) = http::HeaderValue::from_str(&subnets) {
+                headers.insert(HEADER_SUBNETS, value);
+            }
+        }
+    }
+
+    /// The routing one device receives: its own subnets, and in a split
+    /// tunnel also the subnets other devices publish. IPv6 routes, and in a
+    /// split tunnel the IPv6 client pool, apply only with an IPv6 address.
+    pub fn for_device(&self, network: &NetworkPolicy, ipv6: Option<ipnet::Ipv6Net>) -> Self {
+        let mut routing = self.clone();
+        routing.subnets.clone_from(&network.subnets);
+        routing.ipv6 = ipv6.is_some();
+        match ipv6 {
+            None => routing
+                .routes
+                .retain(|route| matches!(route, ipnet::IpNet::V4(_))),
+            Some(pool) => {
+                let pool = ipnet::IpNet::V6(pool.trunc());
+                if !routing.is_full_tunnel() && !routing.routes.contains(&pool) {
+                    routing.routes.push(pool);
+                }
+            }
+        }
+        if !routing.is_full_tunnel() {
+            for subnet in &network.published {
+                let subnet = ipnet::IpNet::V4(*subnet);
+                if !routing.routes.contains(&subnet) {
+                    routing.routes.push(subnet);
+                }
+            }
+        }
+        routing
+    }
 }
 
 pub struct OpenSessionRequest {
@@ -359,8 +757,12 @@ pub struct OpenSessionRequest {
 pub enum OpenSessionError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("account access denied: {0}")]
+    Forbidden(DenialReason),
     #[error("too many authentication attempts")]
     RateLimited { retry_after_seconds: u64 },
+    #[error("{0}")]
+    Unavailable(&'static str),
     #[error(transparent)]
     Lease(#[from] LeaseError),
     #[error(transparent)]
@@ -386,12 +788,18 @@ impl Services {
                 self.metrics.authentication_failed();
                 return Err(OpenSessionError::Unauthorized);
             }
+            Err(AuthenticationError::Forbidden(reason)) => {
+                return Err(OpenSessionError::Forbidden(reason));
+            }
             Err(AuthenticationError::RateLimited {
                 retry_after_seconds,
             }) => {
                 return Err(OpenSessionError::RateLimited {
                     retry_after_seconds,
                 });
+            }
+            Err(AuthenticationError::Unavailable(message)) => {
+                return Err(OpenSessionError::Unavailable(message));
             }
         };
         let lease_request = LeaseRequest {
@@ -403,7 +811,7 @@ impl Services {
                 LeaseMode::Exclusive
             },
         };
-        let lease = match self.leases.acquire(lease_request).await {
+        let mut lease = match self.leases.acquire(lease_request).await {
             Ok(lease) => lease,
             Err(error) => {
                 authenticated.cancellation.cancel();
@@ -411,12 +819,20 @@ impl Services {
                 return Err(error.into());
             }
         };
+        // Named exits carry IPv4 only; their devices get no IPv6 address so
+        // that IPv6 never leaves through the default exit instead.
+        if authenticated.network.exit.is_some() {
+            lease.ipv6 = None;
+        }
         let route = match self
             .router
             .register(RouteRequest {
                 lease: lease.clone(),
                 kind: request.route,
                 parent: authenticated.cancellation.token(),
+                account_id: authenticated.identity.account_id.clone(),
+                device_id: proof.device_id.clone(),
+                network: authenticated.network.clone(),
             })
             .await
         {
@@ -428,14 +844,26 @@ impl Services {
                 return Err(error.into());
             }
         };
-        let usage = Arc::new(CountedUsage::new(self.usage.begin(UsageMetadata {
-            account_id: authenticated.identity.account_id.clone(),
-            device_id: proof.device_id.clone(),
-            transport: transport.clone(),
-            address: lease.address,
-            session_id: session_id.clone(),
-        })));
+        let usage = Arc::new(CountedUsage {
+            metrics: Some(self.metrics.clone()),
+            ..CountedUsage::new(self.usage.begin(UsageMetadata {
+                account_id: authenticated.identity.account_id.clone(),
+                device_id: proof.device_id.clone(),
+                transport: transport.clone(),
+                address: lease.address,
+                address6: lease.ipv6.map(|ipv6| ipv6.address),
+                session_id: session_id.clone(),
+            }))
+        });
         let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
+        let shutdown = self.shutdown.clone();
+        let ended = route.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => ended.cancel(),
+                _ = ended.cancelled() => {}
+            }
+        });
         self.metrics.connected();
         tracing::info!(
             tunnel_id,
@@ -443,10 +871,18 @@ impl Services {
             device_id = %proof.device_id,
             device_name = %proof.name,
             address = %lease.address,
+            ipv6 = %lease.ipv6.map(|ipv6| ipv6.address.to_string()).unwrap_or_default(),
             transport,
             peer = %peer,
             session_id,
             "tunnel connected"
+        );
+        let routing = self.routing.for_device(
+            &authenticated.network,
+            lease.ipv6.map(|ipv6| {
+                ipnet::Ipv6Net::new(ipv6.address, ipv6.prefix_len)
+                    .expect("validated IPv6 lease prefix")
+            }),
         );
         Ok(Session {
             services: self.clone(),
@@ -466,6 +902,8 @@ impl Services {
             route_cleanup: route.cleanup,
             usage: usage.clone(),
             counted_usage: usage,
+            account: authenticated.account,
+            routing,
             closed: AtomicBool::new(false),
         })
     }
@@ -489,10 +927,26 @@ pub struct Session {
     route_cleanup: Arc<dyn Cleanup>,
     pub usage: Arc<dyn UsageSession>,
     counted_usage: Arc<CountedUsage>,
+    pub account: AccountStatus,
+    pub routing: TunnelRouting,
     closed: AtomicBool,
 }
 
 impl Session {
+    /// Whether the client may send packets from `source`: its lease or, on a
+    /// subnet router, a network behind it.
+    pub fn may_send_from(&self, source: IpAddr) -> bool {
+        self.lease.owns(source)
+            || match source {
+                IpAddr::V4(source) => self
+                    .routing
+                    .subnets
+                    .iter()
+                    .any(|subnet| subnet.contains(&source)),
+                IpAddr::V6(_) => false,
+            }
+    }
+
     pub fn close(&self) {
         self.close_with_reason(if self.cancellation.is_cancelled() {
             "cancelled"
@@ -540,6 +994,12 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Whether a CONNECT-IP request comes from a standard client, which sends
+/// neither a Porta protocol version nor a device proof.
+pub fn is_standard_request(headers: &http::HeaderMap) -> bool {
+    !headers.contains_key(HEADER_VERSION) && !headers.contains_key("x-porta-client-id")
 }
 
 pub fn bearer_token(headers: &http::HeaderMap) -> Result<String, AuthenticationError> {
@@ -673,7 +1133,7 @@ impl PacketQueue {
     }
 
     pub fn enqueue(&self, packet: Bytes) -> bool {
-        let class = classify_ipv4(&packet).class;
+        let class = classify_packet(&packet).class;
         let now = Instant::now();
         let mut state = self.state.lock();
         if state.closed {
@@ -821,13 +1281,14 @@ struct FlowLane {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FlowId {
-    source: [u8; 4],
-    destination: [u8; 4],
+    source: [u8; 16],
+    destination: [u8; 16],
     source_port: u16,
     destination_port: u16,
     fragment_id: u16,
     protocol: u8,
     fragmented: bool,
+    family: u8,
 }
 
 impl From<FlowKey> for FlowId {
@@ -840,6 +1301,7 @@ impl From<FlowKey> for FlowId {
             fragment_id: flow.fragment_id,
             protocol: flow.protocol,
             fragmented: flow.fragmented,
+            family: flow.family,
         }
     }
 }
@@ -971,7 +1433,7 @@ impl LaneTable {
     }
 
     pub fn dispatch(&self, address: Ipv4Addr, packet: Bytes) -> bool {
-        let metadata = classify_ipv4(&packet);
+        let metadata = classify_packet(&packet);
         let queue = {
             let mut state = self.inner.state.lock();
             let Some(group) = state.groups.get_mut(&address) else {
@@ -1100,17 +1562,36 @@ fn select_data_lane(group: &mut LaneGroup, flow: FlowKey, hash: u32) -> u8 {
     selected
 }
 
+/// Splits an oversized IPv4 packet for `mtu`. IPv6 packets are never
+/// fragmented on the way; oversized ones need a Packet Too Big message.
 pub fn fragment_ipv4(packet: &Bytes, mtu: usize) -> Result<Vec<Bytes>, MtuError> {
+    if crate::wire::ip::ip_version(packet) == Some(6) {
+        return if packet.len() <= mtu {
+            Ok(vec![packet.clone()])
+        } else {
+            Err(MtuError::FragmentationNeeded)
+        };
+    }
     porta_wire::mtu::fragment_ipv4(packet, mtu)
         .map(|fragments| fragments.into_iter().map(Bytes::from).collect())
 }
 
+/// The ICMP or ICMPv6 error that tells the sender of an oversized packet to
+/// use `mtu`. IPv6 senders cannot go below 1280 bytes, so smaller limits
+/// suppress the message; callers carry such packets another way.
 pub fn icmp_fragmentation_needed(
     packet: &Bytes,
     lease: &Lease,
     mtu: usize,
     identification: u16,
 ) -> Result<Bytes, MtuError> {
+    if crate::wire::ip::ip_version(packet) == Some(6) {
+        let lease = lease.ipv6.ok_or(MtuError::InvalidPacket)?;
+        if mtu < crate::wire::ip::IPV6_MIN_MTU {
+            return Err(MtuError::IcmpSuppressed);
+        }
+        return porta_wire::mtu::icmpv6_packet_too_big(packet, lease.gateway, mtu).map(Bytes::from);
+    }
     porta_wire::mtu::icmp_fragmentation_needed(
         packet,
         porta_wire::mtu::IcmpContext {
@@ -1336,12 +1817,91 @@ mod tests {
             prefix_len: 24,
             gateway: "10.66.0.1".parse().unwrap(),
             opaque_id: 1,
+            ipv6: None,
         };
         let reply = icmp_fragmentation_needed(&df, &lease, 1100, 7).unwrap();
         assert_eq!(parse_ipv4(&reply).unwrap().source, lease.gateway);
         assert_eq!(&reply[20..22], &[3, 4]);
         assert_eq!(u16::from_be_bytes([reply[26], reply[27]]), 1100);
         assert_eq!(internet_checksum(&reply[20..]), 0);
+    }
+
+    #[test]
+    fn ipv6_routing_and_packet_too_big_follow_the_lease() {
+        let policy = NetworkPolicy {
+            published: vec!["10.30.0.0/24".parse().unwrap()],
+            ..NetworkPolicy::default()
+        };
+        let split = TunnelRouting {
+            routes: vec![
+                "10.20.0.0/16".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap(),
+            ],
+            ..TunnelRouting::default()
+        };
+        let ipv4_only = split.for_device(&policy, None);
+        assert_eq!(
+            ipv4_only.routes,
+            vec![
+                "10.20.0.0/16".parse::<ipnet::IpNet>().unwrap(),
+                "10.30.0.0/24".parse().unwrap()
+            ]
+        );
+        assert!(ipv4_only
+            .advertisement()
+            .iter()
+            .all(|route| route.start.is_ipv4()));
+        let dual = split.for_device(&policy, Some("fd66::2/64".parse().unwrap()));
+        assert!(dual.routes.contains(&"fd66::/64".parse().unwrap()));
+        let advertised = dual.advertisement();
+        assert_eq!(advertised.len(), 4);
+        assert!(advertised[..2].iter().all(|route| route.start.is_ipv4()));
+        assert!(advertised[2..].iter().all(|route| route.start.is_ipv6()));
+        let full =
+            TunnelRouting::default().for_device(&policy, Some("fd66::2/64".parse().unwrap()));
+        assert_eq!(full.advertisement().len(), 2);
+        assert!(full.routes.is_empty());
+
+        let mut lease = Lease {
+            address: "10.66.0.2".parse().unwrap(),
+            prefix_len: 24,
+            gateway: "10.66.0.1".parse().unwrap(),
+            opaque_id: 1,
+            ipv6: Some(Ipv6Lease {
+                address: "fd66::2".parse().unwrap(),
+                prefix_len: 64,
+                gateway: "fd66::1".parse().unwrap(),
+            }),
+        };
+        assert!(lease.owns("fd66::2".parse().unwrap()));
+        assert!(!lease.owns("fd66::3".parse().unwrap()));
+        let mut packet = vec![0; 1400];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&1360_u16.to_be_bytes());
+        packet[6] = 17;
+        packet[8..24].copy_from_slice(&"2001:db8::80".parse::<Ipv6Addr>().unwrap().octets());
+        packet[24..40].copy_from_slice(&"fd66::2".parse::<Ipv6Addr>().unwrap().octets());
+        let packet = Bytes::from(packet);
+        assert_eq!(
+            fragment_ipv4(&packet, 1300),
+            Err(MtuError::FragmentationNeeded)
+        );
+        assert_eq!(fragment_ipv4(&packet, 1400).unwrap(), vec![packet.clone()]);
+        let reply = icmp_fragmentation_needed(&packet, &lease, 1300, 1).unwrap();
+        assert_eq!(reply[40], 2);
+        assert_eq!(
+            &reply[8..24],
+            &"fd66::1".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert_eq!(
+            icmp_fragmentation_needed(&packet, &lease, 1200, 1),
+            Err(MtuError::IcmpSuppressed)
+        );
+        lease.ipv6 = None;
+        assert_eq!(
+            icmp_fragmentation_needed(&packet, &lease, 1300, 1),
+            Err(MtuError::InvalidPacket)
+        );
     }
 
     #[test]
@@ -1365,6 +1925,7 @@ mod tests {
             prefix_len: 24,
             gateway: "10.66.0.1".parse().unwrap(),
             opaque_id: 1,
+            ipv6: None,
         };
         let expected = porta_wire::mtu::icmp_fragmentation_needed(
             &df,

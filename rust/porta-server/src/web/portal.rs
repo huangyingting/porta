@@ -1,12 +1,16 @@
-use super::admin::{json_response, AdminService, ClientRegistry, RegistryError};
+use super::admin::{json_response, AdminActor, AdminService, ClientRegistry, RegistryError};
 use super::downloads::{open_download_file, DownloadService, CLIENT_DOWNLOAD_PREFIX};
 use super::landing::set_crawler_policy;
+use super::oidc::{OidcClient, OidcIdentity, SignInPurpose};
 use super::session::{
     constant_time_eq, expired_session_cookie, form_urlencode, hash_token, html_escape, parse_form,
     unix_time_now, CredentialCipher, PortalRole, PortalSession, RequestContext, Response,
     SessionStore, PORTAL_COOKIE_NAME, PORTAL_SESSION_TTL_SECS,
 };
 use crate::ops::abuse::{AbuseGuard, Surface};
+use crate::ops::audit::{Actor, AuditEvent, AuditLog};
+use crate::state::admins::{AdminError, AdminStore};
+use crate::state::sso_users::{email_domain, SsoUser, SsoUsers};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -23,8 +27,11 @@ pub const CLIENT_ACCESS_ERROR: &str =
     "This access link is invalid or no longer authorized. Ask your administrator for a new link.";
 pub const PORTAL_JOIN_SCRIPT_PATH: &str = "/assets/portal-join.js";
 pub const PORTAL_CLIENT_SCRIPT_PATH: &str = "/assets/portal-client.js";
+const ACCESS_DENIED: &str = "Access could not be verified.";
+const SSO_TOKEN_PURPOSE: &str = "sso-user-token-v1";
 
 const PORTAL_ACCESS_HTML: &str = include_str!("../../assets/portal-access.html");
+const ADMIN_SIGN_IN_HTML: &str = include_str!("../../assets/admin-sign-in.html");
 const PORTAL_DOWNLOADS_HTML: &str = include_str!("../../assets/portal-downloads.html");
 const PORTAL_JOIN_HTML: &str = include_str!("../../assets/portal-join.html");
 const PORTAL_JOIN_SCRIPT: &str = include_str!("../../assets/portal-join.js");
@@ -74,6 +81,35 @@ pub struct Portal {
     token_cipher: CredentialCipher,
     sessions: SessionStore,
     abuse: Option<Arc<AbuseGuard>>,
+    admins: Option<Arc<AdminStore>>,
+    audit: Option<Arc<AuditLog>>,
+    oidc: Option<Arc<OidcClient>>,
+    user_sign_in: Option<UserSso>,
+    federation: Option<FederationSource>,
+}
+
+/// User single sign-on: a verified email in one of `domains` gets an
+/// account, created on first sign-in with `max_devices` devices.
+pub struct UserSignIn {
+    pub users: Arc<SsoUsers>,
+    pub domains: Vec<String>,
+    pub max_devices: usize,
+}
+
+struct UserSso {
+    users: Arc<SsoUsers>,
+    domains: Vec<String>,
+    max_devices: usize,
+    /// Seals account tokens in the store; derived from the admin token.
+    cipher: CredentialCipher,
+    /// Concurrent first sign-ins of one user must create one account.
+    provisioning: tokio::sync::Mutex<()>,
+}
+
+/// What a primary gateway serves to replicas that present its token.
+pub struct FederationSource {
+    pub token: Zeroizing<String>,
+    pub export: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
 
 impl Portal {
@@ -101,11 +137,153 @@ impl Portal {
             token_cipher,
             sessions: SessionStore::default(),
             abuse: None,
+            admins: None,
+            audit: None,
+            oidc: None,
+            user_sign_in: None,
+            federation: None,
+        })
+    }
+
+    /// Lets users sign in with the single sign-on provider; needs the admin
+    /// token, which keys the sealed account tokens.
+    pub fn set_user_sign_in(&mut self, sign_in: Option<UserSignIn>) -> Result<(), &'static str> {
+        let Some(sign_in) = sign_in else {
+            self.user_sign_in = None;
+            return Ok(());
+        };
+        if self.admin_token.is_empty() {
+            return Err("user single sign-on requires PORTA_ADMIN_TOKEN");
+        }
+        self.user_sign_in = Some(UserSso {
+            users: sign_in.users,
+            domains: sign_in
+                .domains
+                .iter()
+                .map(|domain| domain.trim().to_ascii_lowercase())
+                .collect(),
+            max_devices: sign_in.max_devices,
+            cipher: CredentialCipher::derive(self.admin_token.as_bytes(), SSO_TOKEN_PURPOSE),
+            provisioning: tokio::sync::Mutex::new(()),
+        });
+        Ok(())
+    }
+
+    fn user_sso_enabled(&self) -> bool {
+        self.oidc.is_some() && self.user_sign_in.is_some()
+    }
+
+    fn access_page(&self, request: &RequestContext, message: &str, status: u16) -> Response {
+        render_access_page(request, self.user_sso_enabled(), message, status)
+    }
+
+    /// Serves this primary gateway's accounts to replicas.
+    pub fn set_federation(&mut self, federation: Option<FederationSource>) {
+        self.federation = federation;
+    }
+
+    fn serve_federation(&self, request: &RequestContext) -> Response {
+        let Some(federation) = &self.federation else {
+            return Response::not_found();
+        };
+        let reservation = match self.reserve_authentication(request, Surface::Portal) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                return Response::text(
+                    429,
+                    "text/plain; charset=utf-8",
+                    b"too many attempts\n".to_vec(),
+                )
+            }
+        };
+        let presented = request
+            .header("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        if !constant_time_eq(presented.as_bytes(), federation.token.as_bytes()) {
+            self.record(
+                AuditEvent::new(
+                    Actor {
+                        kind: "replica",
+                        id: String::new(),
+                        name: String::new(),
+                    },
+                    "federation.sync",
+                    "",
+                )
+                .outcome("denied")
+                .address(request.client_ip.or(request.peer_ip)),
+            );
+            return Response::text(
+                401,
+                "text/plain; charset=utf-8",
+                b"invalid federation token\n".to_vec(),
+            );
+        }
+        if let Some(reservation) = reservation {
+            reservation.refund();
+        }
+        let mut response = Response::json(200, (federation.export)());
+        response.set_header("Cache-Control", "no-store");
+        response
+    }
+
+    /// Named administrators, the audit log, and single sign-on.
+    pub fn set_identity(
+        &mut self,
+        admins: Option<Arc<AdminStore>>,
+        audit: Option<Arc<AuditLog>>,
+        oidc: Option<Arc<OidcClient>>,
+    ) {
+        let admin = std::mem::replace(
+            &mut self.admin,
+            AdminService::new(Arc::clone(&self.registry), Vec::new()),
+        );
+        self.admin = admin.with_identity(admins.clone(), audit.clone());
+        self.admins = admins;
+        self.audit = audit;
+        self.oidc = oidc;
+    }
+
+    fn record(&self, event: AuditEvent) {
+        if let Some(audit) = &self.audit {
+            audit.record(event);
+        }
+    }
+
+    /// The administrator behind a portal session. Sessions of deleted or
+    /// disabled administrators no longer authorize anything.
+    fn admin_actor(&self, session: &PortalSession) -> Option<AdminActor> {
+        if session.role != PortalRole::Admin {
+            return None;
+        }
+        if session.client_id.is_empty() {
+            return Some(AdminActor::break_glass());
+        }
+        let identity = self.admins.as_ref()?.get(&session.client_id)?;
+        Some(AdminActor {
+            kind: if session.admin_kind.is_empty() {
+                "admin"
+            } else {
+                session.admin_kind
+            },
+            id: identity.id,
+            name: identity.username,
+            role: identity.role,
         })
     }
 
     pub fn set_abuse_guard(&mut self, abuse: Option<Arc<AbuseGuard>>) {
         self.abuse = abuse;
+    }
+
+    /// Reports gateway state, such as the cascade relay, on the admin page.
+    pub fn set_gateway_status(&mut self, provider: super::admin::GatewayStatusProvider) {
+        let admin = std::mem::replace(
+            &mut self.admin,
+            AdminService::new(Arc::clone(&self.registry), Vec::new()),
+        );
+        self.admin = admin.with_gateway_status(provider);
     }
 
     pub async fn handle(&self, request: &RequestContext) -> Option<Response> {
@@ -127,10 +305,26 @@ impl Portal {
                     Some(self.redeem_client_access(request, now))
                 }
             }
-            "/access" if request.is_get_or_head() => {
-                Some(access_page_response(request, false, 200))
-            }
+            "/access" if request.is_get_or_head() => Some(self.access_page(request, "", 200)),
             "/access" if request.method == "POST" => Some(self.sign_in(request, now)),
+            crate::ops::federation::REGISTRY_PATH if request.method == "GET" => {
+                Some(self.serve_federation(request))
+            }
+            "/admin/sign-in" if request.is_get_or_head() => Some(admin_sign_in_page(
+                request,
+                self.oidc.is_some(),
+                "",
+                "",
+                200,
+            )),
+            "/admin/sign-in" if request.method == "POST" => Some(self.admin_sign_in(request, now)),
+            "/auth/oidc/start" if request.method == "GET" => Some(self.oidc_start(request).await),
+            "/auth/sso/start" if request.method == "GET" => {
+                Some(self.user_sso_start(request).await)
+            }
+            "/auth/oidc/callback" if request.method == "GET" => {
+                Some(self.oidc_callback(request, now).await)
+            }
             "/portal/logout" if request.method == "POST" => Some(self.sign_out(request)),
             "/portal/admin" => Some(self.serve_admin_page(request, now).await),
             "/portal/downloads" => Some(self.serve_downloads_page(request, now)),
@@ -143,15 +337,20 @@ impl Portal {
     }
 
     fn sign_in(&self, request: &RequestContext, now: u64) -> Response {
+        // Without this, another site could sign a visitor in with the
+        // attacker's token and show them the attacker's VPN profile.
+        if !same_origin_portal_request(request, self.trust_proxy_headers) {
+            return self.access_page(request, ACCESS_DENIED, 403);
+        }
         let Some(form) = parse_form(&request.body, 4 << 10) else {
-            return access_page_response(request, true, 401);
+            return self.access_page(request, ACCESS_DENIED, 401);
         };
         let token = form
             .iter()
             .find_map(|(key, value)| (key == "token").then_some(value.trim()))
             .unwrap_or_default();
         if !(16..=512).contains(&token.len()) {
-            return access_page_response(request, true, 401);
+            return self.access_page(request, ACCESS_DENIED, 401);
         }
         let reservation = match self.reserve_authentication(request, Surface::Portal) {
             Ok(reservation) => reservation,
@@ -166,12 +365,16 @@ impl Portal {
             if let Some(reservation) = reservation {
                 reservation.refund();
             }
+            self.record(
+                AuditEvent::new(AdminActor::break_glass().audit_actor(), "admin.sign_in", "")
+                    .address(request.client_ip.or(request.peer_ip)),
+            );
             return self.start_session(PortalSession::admin(now), "/portal/admin", now);
         }
         let session = match self.client_session(token, now) {
             Ok(session) => session,
             Err(RegistryError::Unauthorized | RegistryError::Disabled) => {
-                return access_page_response(request, true, 401)
+                return self.access_page(request, ACCESS_DENIED, 401)
             }
             Err(_) => {
                 return Response::text(
@@ -185,6 +388,404 @@ impl Portal {
             reservation.refund();
         }
         self.start_session(session, "/portal/downloads", now)
+    }
+
+    fn admin_sign_in(&self, request: &RequestContext, now: u64) -> Response {
+        let sso = self.oidc.is_some();
+        if !same_origin_portal_request(request, self.trust_proxy_headers) {
+            return admin_sign_in_page(request, sso, "", "Access could not be verified.", 403);
+        }
+        let Some(store) = &self.admins else {
+            return admin_sign_in_page(
+                request,
+                sso,
+                "",
+                "Named administrators are not enabled.",
+                404,
+            );
+        };
+        let Some(form) = parse_form(&request.body, 4 << 10) else {
+            return admin_sign_in_page(request, sso, "", "Access could not be verified.", 400);
+        };
+        let field = |name: &str| {
+            form.iter()
+                .find_map(|(key, value)| (key == name).then(|| value.trim().to_owned()))
+                .unwrap_or_default()
+        };
+        let (username, password, code) = (field("username"), field("password"), field("code"));
+        let reservation = match self.reserve_authentication(request, Surface::Portal) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                let mut response = admin_sign_in_page(
+                    request,
+                    sso,
+                    &username,
+                    "Too many attempts. Wait a moment and try again.",
+                    429,
+                );
+                response.set_header("Retry-After", "5");
+                return response;
+            }
+        };
+        let attempted = Actor {
+            kind: "admin",
+            id: String::new(),
+            name: username.to_ascii_lowercase(),
+        };
+        let address = request.client_ip.or(request.peer_ip);
+        match store.authenticate(&username, &password, &code, time::OffsetDateTime::now_utc()) {
+            Ok(identity) => {
+                if let Some(reservation) = reservation {
+                    reservation.refund();
+                }
+                self.record(
+                    AuditEvent::new(
+                        Actor {
+                            kind: "admin",
+                            id: identity.id.clone(),
+                            name: identity.username.clone(),
+                        },
+                        "admin.sign_in",
+                        "",
+                    )
+                    .address(address),
+                );
+                self.start_session(
+                    PortalSession::named_admin(&identity.id, &identity.username, "admin", now),
+                    "/portal/admin",
+                    now,
+                )
+            }
+            Err(AdminError::CodeRequired) => {
+                // The password was right; ask for the second factor.
+                if let Some(reservation) = reservation {
+                    reservation.refund();
+                }
+                admin_sign_in_page(
+                    request,
+                    sso,
+                    &username,
+                    "Enter the code from your authenticator app.",
+                    401,
+                )
+            }
+            Err(_) => {
+                self.record(
+                    AuditEvent::new(attempted, "admin.sign_in", "")
+                        .outcome("denied")
+                        .address(address),
+                );
+                admin_sign_in_page(
+                    request,
+                    sso,
+                    &username,
+                    "Access could not be verified.",
+                    401,
+                )
+            }
+        }
+    }
+
+    async fn oidc_start(&self, request: &RequestContext) -> Response {
+        let Some(oidc) = &self.oidc else {
+            return Response::not_found();
+        };
+        match oidc.start(SignInPurpose::Admin).await {
+            Ok(location) => {
+                let mut response = Response::redirect(&location);
+                response.set_header("Cache-Control", "no-store");
+                response
+            }
+            Err(error) => {
+                tracing::warn!(%error, "single sign-on could not start");
+                admin_sign_in_page(
+                    request,
+                    true,
+                    "",
+                    "Single sign-on is unavailable right now.",
+                    503,
+                )
+            }
+        }
+    }
+
+    async fn user_sso_start(&self, request: &RequestContext) -> Response {
+        let Some(oidc) = self.oidc.as_ref().filter(|_| self.user_sign_in.is_some()) else {
+            return Response::not_found();
+        };
+        match oidc.start(SignInPurpose::User).await {
+            Ok(location) => {
+                let mut response = Response::redirect(&location);
+                response.set_header("Cache-Control", "no-store");
+                response
+            }
+            Err(error) => {
+                tracing::warn!(%error, "user single sign-on could not start");
+                self.access_page(request, "Single sign-on is unavailable right now.", 503)
+            }
+        }
+    }
+
+    async fn oidc_callback(&self, request: &RequestContext, now: u64) -> Response {
+        let Some(oidc) = &self.oidc else {
+            return Response::not_found();
+        };
+        let parameter = |name: &str| {
+            request
+                .query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                .and_then(form_value)
+                .unwrap_or_default()
+        };
+        let (code, state) = (parameter("code"), parameter("state"));
+        let address = request.client_ip.or(request.peer_ip);
+        if code.is_empty() || state.is_empty() {
+            return admin_sign_in_page(request, true, "", "Single sign-on was cancelled.", 400);
+        }
+        let identity = match oidc.finish(&code, &state).await {
+            Ok((identity, SignInPurpose::User)) => {
+                return self.user_sso_finish(request, identity, now).await
+            }
+            Ok((identity, SignInPurpose::Admin)) => identity,
+            Err(error) => {
+                tracing::warn!(%error, "single sign-on failed");
+                self.record(
+                    AuditEvent::new(
+                        Actor {
+                            kind: "sso",
+                            id: String::new(),
+                            name: String::new(),
+                        },
+                        "admin.sign_in",
+                        "",
+                    )
+                    .outcome("denied")
+                    .address(address)
+                    .detail(serde_json::json!({ "error": error.to_string() })),
+                );
+                return admin_sign_in_page(
+                    request,
+                    true,
+                    "",
+                    "Single sign-on could not be verified.",
+                    401,
+                );
+            }
+        };
+        let Some(store) = &self.admins else {
+            return Response::not_found();
+        };
+        let admin = identity
+            .email_verified
+            .then(|| store.sso_admin(&identity.email))
+            .flatten();
+        let Some(admin) = admin else {
+            self.record(
+                AuditEvent::new(
+                    Actor {
+                        kind: "sso",
+                        id: identity.subject.clone(),
+                        name: identity.email.clone(),
+                    },
+                    "admin.sign_in",
+                    "",
+                )
+                .outcome("denied")
+                .address(address)
+                .detail(serde_json::json!({ "error": "no administrator for this verified email" })),
+            );
+            return admin_sign_in_page(
+                request,
+                true,
+                "",
+                "This account is not an administrator of this gateway.",
+                403,
+            );
+        };
+        self.record(
+            AuditEvent::new(
+                Actor {
+                    kind: "sso",
+                    id: admin.id.clone(),
+                    name: admin.username.clone(),
+                },
+                "admin.sign_in",
+                "",
+            )
+            .address(address)
+            .detail(serde_json::json!({ "email": identity.email })),
+        );
+        self.start_session(
+            PortalSession::named_admin(&admin.id, &admin.username, "sso", now),
+            "/portal/admin",
+            now,
+        )
+    }
+
+    /// Signs a user in with their account, provisioned on first sign-in.
+    async fn user_sso_finish(
+        &self,
+        request: &RequestContext,
+        identity: OidcIdentity,
+        now: u64,
+    ) -> Response {
+        let Some(sign_in) = &self.user_sign_in else {
+            return Response::not_found();
+        };
+        let address = request.client_ip.or(request.peer_ip);
+        let actor = Actor {
+            kind: "sso",
+            id: identity.subject.clone(),
+            name: identity.email.clone(),
+        };
+        let refuse = |reason: &str, message: &str, status: u16| {
+            self.record(
+                AuditEvent::new(actor.clone(), "user.sign_in", "")
+                    .outcome("denied")
+                    .address(address)
+                    .detail(serde_json::json!({ "error": reason })),
+            );
+            self.access_page(request, message, status)
+        };
+        let domain = email_domain(&identity.email);
+        if !identity.email_verified
+            || !domain.is_some_and(|domain| sign_in.domains.contains(&domain))
+        {
+            return refuse(
+                "email not verified or outside the allowed domains",
+                "This account cannot use this gateway. Sign in with your organisation account.",
+                403,
+            );
+        }
+        let token = match self.sso_account_token(sign_in, &identity).await {
+            Ok(token) => token,
+            Err(RegistryError::Disabled) => {
+                return refuse(
+                    "account disabled",
+                    "Your account is disabled. Ask your administrator.",
+                    403,
+                )
+            }
+            Err(error) => {
+                tracing::warn!(?error, "user single sign-on could not provision an account");
+                return refuse(
+                    "account unavailable",
+                    "Your account could not be set up right now. Try again later.",
+                    503,
+                );
+            }
+        };
+        let session = match self.client_session(&token, now) {
+            Ok(session) => session,
+            Err(RegistryError::Disabled) => {
+                return refuse(
+                    "account disabled",
+                    "Your account is disabled. Ask your administrator.",
+                    403,
+                )
+            }
+            Err(_) => {
+                return refuse(
+                    "account unavailable",
+                    "Your account could not be set up right now. Try again later.",
+                    503,
+                )
+            }
+        };
+        self.record(AuditEvent::new(actor, "user.sign_in", &session.client_id).address(address));
+        self.start_session(session, "/portal/downloads", now)
+    }
+
+    /// The token of the user's account, creating the account on first
+    /// sign-in. A token rotated by an administrator is rotated again, as
+    /// the sealed copy no longer matches; the user sets up devices anew.
+    async fn sso_account_token(
+        &self,
+        sign_in: &UserSso,
+        identity: &OidcIdentity,
+    ) -> Result<Zeroizing<String>, RegistryError> {
+        let _provisioning = sign_in.provisioning.lock().await;
+        let binding = |client_id: &str| {
+            format!(
+                "{SSO_TOKEN_PURPOSE}
+{}
+{client_id}",
+                identity.subject
+            )
+        };
+        let email = identity.email.trim().to_ascii_lowercase();
+        let store = |client_id: &str, token: &str, created_at| {
+            let sealed_token = sign_in
+                .cipher
+                .seal(token.as_bytes(), &binding(client_id))
+                .map_err(|_| RegistryError::Internal)?;
+            sign_in
+                .users
+                .put(SsoUser {
+                    subject: identity.subject.clone(),
+                    email: email.clone(),
+                    client_id: client_id.to_owned(),
+                    sealed_token,
+                    created_at,
+                })
+                .map_err(|error| {
+                    tracing::warn!(%error, "could not save a single sign-on user");
+                    RegistryError::Internal
+                })
+        };
+        if let Some(user) = sign_in.users.get(&identity.subject) {
+            let account = self
+                .registry
+                .list_clients()?
+                .into_iter()
+                .find(|client| client.id == user.client_id);
+            if let Some(account) = account {
+                if !account.enabled {
+                    return Err(RegistryError::Disabled);
+                }
+                let sealed = sign_in
+                    .cipher
+                    .open(&user.sealed_token, &binding(&user.client_id), 4096)
+                    .ok()
+                    .and_then(|token| String::from_utf8(token).ok())
+                    .map(Zeroizing::new);
+                if let Some(token) = sealed.filter(|token| {
+                    self.registry
+                        .portal_client_active(&user.client_id, &hash_token(token))
+                }) {
+                    if user.email != email {
+                        store(&user.client_id, &token, user.created_at)?;
+                    }
+                    return Ok(token);
+                }
+                let token =
+                    Zeroizing::new(self.registry.rotate_client_token(&user.client_id).await?);
+                store(&user.client_id, &token, user.created_at)?;
+                return Ok(token);
+            }
+            // The administrator deleted the account: start afresh.
+        }
+        let name = email.chars().take(80).collect::<String>();
+        let (account, token) = self
+            .registry
+            .create_client(&name, sign_in.max_devices)
+            .await?;
+        let token = Zeroizing::new(token);
+        store(&account.id, &token, time::OffsetDateTime::now_utc())?;
+        self.record(
+            AuditEvent::new(
+                Actor {
+                    kind: "sso",
+                    id: identity.subject.clone(),
+                    name: email.clone(),
+                },
+                "client.create",
+                &account.id,
+            )
+            .detail(serde_json::json!({ "provisioned": "single sign-on" })),
+        );
+        Ok(token)
     }
 
     fn reserve_authentication(
@@ -203,7 +804,7 @@ impl Portal {
             .reserve(surface, address)
             .map(Some)
             .ok_or_else(|| match surface {
-                Surface::Portal => access_page_response(request, true, 429),
+                Surface::Portal => self.access_page(request, ACCESS_DENIED, 429),
                 Surface::Invitation => join_response(request, CLIENT_ACCESS_ERROR, 429),
                 _ => Response::not_found(),
             })
@@ -223,6 +824,7 @@ impl Portal {
             token_hash,
             encrypted_token,
             expires_at: now.saturating_add(PORTAL_SESSION_TTL_SECS),
+            admin_kind: "",
         })
     }
 
@@ -242,6 +844,13 @@ impl Portal {
     }
 
     fn sign_out(&self, request: &RequestContext) -> Response {
+        if !same_origin_portal_request(request, self.trust_proxy_headers) {
+            return Response::text(
+                403,
+                "text/plain; charset=utf-8",
+                b"invalid request origin\n".to_vec(),
+            );
+        }
         if let Some(id) = request.cookie(PORTAL_COOKIE_NAME) {
             self.sessions.remove(id);
         }
@@ -254,31 +863,31 @@ impl Portal {
         if !request.is_get_or_head() {
             return Response::not_found();
         }
-        if self
+        let Some(actor) = self
             .session(request, now)
-            .is_none_or(|session| session.role != PortalRole::Admin)
-        {
+            .and_then(|session| self.admin_actor(&session))
+        else {
             return Response::redirect("/");
-        }
+        };
         let mut admin_request = request.clone();
         admin_request.path = "/".into();
         self.admin
-            .handle(&admin_request, true)
+            .handle(&admin_request, Some(actor))
             .await
             .unwrap_or_else(Response::not_found)
     }
 
     async fn serve_admin_api(&self, request: &RequestContext, now: u64) -> Option<Response> {
-        if self
+        let Some(actor) = self
             .session(request, now)
-            .is_none_or(|session| session.role != PortalRole::Admin)
-        {
+            .and_then(|session| self.admin_actor(&session))
+        else {
             return if request.is_get_or_head() {
                 None
             } else {
                 Some(Response::not_found())
             };
-        }
+        };
         if !request.is_get_or_head()
             && !same_origin_portal_request(request, self.trust_proxy_headers)
         {
@@ -288,7 +897,7 @@ impl Portal {
                 b"invalid request origin\n".to_vec(),
             ));
         }
-        self.admin.handle(request, true).await
+        self.admin.handle(request, Some(actor)).await
     }
 
     fn serve_downloads_page(&self, request: &RequestContext, now: u64) -> Response {
@@ -385,6 +994,20 @@ impl Portal {
             certificate: self
                 .issue_download_ticket("release-signing-cert.der", now + DOWNLOAD_TICKET_TTL_SECS),
         };
+        let account = if session.role == PortalRole::Client {
+            self.registry
+                .list_clients()
+                .ok()
+                .and_then(|clients| {
+                    clients
+                        .into_iter()
+                        .find(|client| client.id == session.client_id)
+                })
+                .map(|client| account_status_html(&client, now))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let body = downloads_page_html(
             &name,
             &portal_request_host(request, self.trust_proxy_headers),
@@ -392,6 +1015,7 @@ impl Portal {
             &rows,
             &release_tickets,
             profile.as_ref(),
+            &account,
         );
         let mut response = Response::html(200, body.into_bytes());
         response.set_header("Cache-Control", "no-store");
@@ -731,9 +1355,19 @@ pub fn profile_qr_code(input: &ProfileQrInput) -> Result<String, &'static str> {
 }
 
 pub fn same_origin_portal_request(request: &RequestContext, trust_proxy_headers: bool) -> bool {
+    // Browsers mark where a request comes from; pages cannot forge this.
+    let fetch_site = request.header("sec-fetch-site");
+    if fetch_site.is_some_and(|site| !matches!(site, "same-origin" | "none")) {
+        return false;
+    }
     let Some(origin) = request.header("origin") else {
         return true;
     };
+    // Portal pages send no referrer, so browsers report a same-origin form
+    // post's origin as "null".
+    if origin == "null" {
+        return fetch_site == Some("same-origin");
+    }
     let Some(parsed) = parse_https_origin(origin) else {
         return false;
     };
@@ -803,6 +1437,13 @@ const DOWNLOAD_CATALOG: &[(&str, &str, &str, &str, bool)] = &[
         false,
     ),
     (
+        "porta-desktop-linux-amd64.tar.gz",
+        "Linux",
+        "x86-64",
+        "Desktop app with tray, and the client service it controls",
+        false,
+    ),
+    (
         "porta-client-linux-arm64",
         "Linux",
         "ARM64",
@@ -865,13 +1506,85 @@ pub fn format_download_size(size: u64) -> String {
     }
 }
 
-fn access_page_response(request: &RequestContext, invalid: bool, status: u16) -> Response {
-    let message = if invalid {
-        "<p class=\"error\" role=\"alert\">Access could not be verified.</p>"
+/// Formats data quotas, which commonly span gigabytes or terabytes.
+fn format_quota_size(size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Decodes one `application/x-www-form-urlencoded` value.
+fn form_value(value: &str) -> Option<String> {
+    parse_form(format!("v={value}").as_bytes(), 8 << 10)?
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+}
+
+fn admin_sign_in_page(
+    request: &RequestContext,
+    sso: bool,
+    username: &str,
+    message: &str,
+    status: u16,
+) -> Response {
+    let message = if message.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"error\" role=\"alert\">{}</p>",
+            html_escape(message)
+        )
+    };
+    let sso = if sso {
+        "<a class=\"sso\" href=\"/auth/oidc/start\">Sign in with single sign-on</a>"
     } else {
         ""
     };
-    let body = render_asset_template(PORTAL_ACCESS_HTML, &[("%%PORTA_ACCESS_MESSAGE%%", message)]);
+    let body = render_asset_template(
+        ADMIN_SIGN_IN_HTML,
+        &[
+            ("%%PORTA_ADMIN_MESSAGE%%", message.as_str()),
+            ("%%PORTA_ADMIN_USERNAME%%", html_escape(username).as_str()),
+            ("%%PORTA_ADMIN_SSO%%", sso),
+        ],
+    );
+    let mut response = Response::html(status, body.into_bytes());
+    response.set_header("Cache-Control", "no-store");
+    set_portal_security_headers(&mut response);
+    response.without_body_for_head(request)
+}
+
+fn render_access_page(request: &RequestContext, sso: bool, message: &str, status: u16) -> Response {
+    let message = if message.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"error\" role=\"alert\">{}</p>",
+            html_escape(message)
+        )
+    };
+    let sso = if sso {
+        "<a class=\"sso\" href=\"/auth/sso/start\">Sign in with your organisation</a>"
+    } else {
+        ""
+    };
+    let body = render_asset_template(
+        PORTAL_ACCESS_HTML,
+        &[
+            ("%%PORTA_ACCESS_MESSAGE%%", message.as_str()),
+            ("%%PORTA_ACCESS_SSO%%", sso),
+        ],
+    );
     let mut response = Response::html(status, body.into_bytes());
     response.set_header("Cache-Control", "no-store");
     set_portal_security_headers(&mut response);
@@ -984,6 +1697,53 @@ fn render_asset_template(template: &str, replacements: &[(&str, &str)]) -> Strin
     rendered
 }
 
+/// Describes the signed-in client's account limits, or nothing when the
+/// account is unrestricted.
+fn account_status_html(client: &super::admin::ClientSummary, now: u64) -> String {
+    let mut lines = Vec::new();
+    if let Some(expires) = client.expires_at.as_deref().and_then(|value| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+    }) {
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            expires.year(),
+            u8::from(expires.month()),
+            expires.day()
+        );
+        let soon = expires.unix_timestamp() - now as i64 <= 7 * 86_400;
+        lines.push((format!("Access until {date} (UTC)"), soon));
+    }
+    if let Some(quota) = client.monthly_quota_bytes {
+        let used = client.quota_used_bytes.unwrap_or(0);
+        lines.push((
+            format!(
+                "{} of {} used this month",
+                format_quota_size(used),
+                format_quota_size(quota)
+            ),
+            used >= quota / 10 * 9,
+        ));
+    }
+    if let Some(rate) = client.rate_limit_kbps {
+        let rate = rate as f64 / 1000.0;
+        lines.push((format!("Speed limited to {rate} Mbit/s"), false));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let lines = lines
+        .into_iter()
+        .map(|(text, warning)| {
+            format!(
+                "<span{}>{}</span>",
+                if warning { " class=\"warning\"" } else { "" },
+                html_escape(&text)
+            )
+        })
+        .collect::<String>();
+    format!("<div class=\"account-status\"><small>Your access</small>{lines}</div>")
+}
+
 fn downloads_page_html(
     client_name: &str,
     host: &str,
@@ -991,6 +1751,7 @@ fn downloads_page_html(
     rows: &str,
     release_tickets: &ReleaseDownloadTickets,
     profile: Option<&DownloadProfile>,
+    account: &str,
 ) -> String {
     let version = html_escape(version);
     let client_name = html_escape(client_name);
@@ -1010,6 +1771,7 @@ fn downloads_page_html(
             ("%%PORTA_CHECKSUMS_TICKET%%", &checksums),
             ("%%PORTA_SIGNATURE_TICKET%%", &signature),
             ("%%PORTA_CERTIFICATE_TICKET%%", &certificate),
+            ("%%PORTA_ACCOUNT_STATUS%%", account),
         ],
     )
 }
@@ -1042,7 +1804,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn qr_code_data_uri(payload: &str) -> Result<String, ()> {
+pub(crate) fn qr_code_data_uri(payload: &str) -> Result<String, ()> {
     let qr = QrCode::encode(payload.as_bytes())?;
     Ok(format!(
         "data:image/png;base64,{}",
@@ -1696,6 +2458,32 @@ mod tests {
         request.peer_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!same_origin_portal_request(&request, false));
         assert!(same_origin_portal_request(&request, true));
+
+        // Browsers send "Origin: null" for same-origin form posts from pages
+        // without a referrer; Sec-Fetch-Site tells them apart.
+        let form = |site: Option<&str>| {
+            let request = RequestContext::new("POST", "/access")
+                .with_host("vpn.example.com")
+                .with_header("Origin", "null");
+            match site {
+                Some(site) => request.with_header("Sec-Fetch-Site", site),
+                None => request,
+            }
+        };
+        assert!(same_origin_portal_request(
+            &form(Some("same-origin")),
+            false
+        ));
+        assert!(!same_origin_portal_request(
+            &form(Some("cross-site")),
+            false
+        ));
+        assert!(!same_origin_portal_request(&form(None), false));
+        let forged = RequestContext::new("POST", "/access")
+            .with_host("vpn.example.com")
+            .with_header("Origin", "https://vpn.example.com")
+            .with_header("Sec-Fetch-Site", "cross-site");
+        assert!(!same_origin_portal_request(&forged, false));
     }
 
     #[test]
@@ -1737,7 +2525,12 @@ mod tests {
     fn access_page_restores_go_layout_and_responsive_styles() {
         for (method, invalid, status) in [("GET", false, 200), ("POST", true, 401)] {
             let request = RequestContext::new(method, "/access");
-            let response = access_page_response(&request, invalid, status);
+            let response = render_access_page(
+                &request,
+                false,
+                if invalid { ACCESS_DENIED } else { "" },
+                status,
+            );
             assert_eq!(response.status, status);
             assert_private_portal_headers(&response);
             let page = String::from_utf8(response.body).unwrap();
@@ -1759,7 +2552,8 @@ mod tests {
                 "<form method=\"post\" action=\"/access\">",
                 "<div class=\"field\">",
                 "<input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"current-password\" autofocus required>",
-                "<p class=\"note\">Credentials are exchanged for a secure, temporary browser session.</p>",
+                "<p class=\"note\">Credentials are exchanged for a secure, temporary browser session.",
+                "<a href=\"/admin/sign-in\">sign in with an account</a>",
             ] {
                 assert!(page.contains(fragment), "missing access design: {fragment}");
             }
@@ -1772,7 +2566,7 @@ mod tests {
             assert!(!page.contains("%%PORTA_"));
             assert!(!page.contains("<script"));
         }
-        let head = access_page_response(&RequestContext::new("HEAD", "/access"), false, 200);
+        let head = render_access_page(&RequestContext::new("HEAD", "/access"), false, "", 200);
         assert_eq!(head.status, 200);
         assert_private_portal_headers(&head);
         assert!(head.body.is_empty());
@@ -1785,7 +2579,7 @@ mod tests {
             signature: "signature-ticket".into(),
             certificate: "certificate-ticket".into(),
         };
-        let page = downloads_page_html("Phone", "porta.test", "v1.2.3", "", &tickets, None);
+        let page = downloads_page_html("Phone", "porta.test", "v1.2.3", "", &tickets, None, "");
         for fragment in [
             "@font-face{font-family:\"Mona Sans\";src:url(\"/assets/mona-sans.woff2\") format(\"woff2-variations\");font-weight:200 900;font-display:swap}",
             ":root{font-family:\"Mona Sans\",sans-serif;color:#171923;background:#f5f6fa;--violet:#6558ed;--line:#e2e4ea}",
@@ -1855,7 +2649,7 @@ mod tests {
             qr_code: "javascript:alert(1)".into(),
         };
         let rows = "<article class=\"download-row\">trusted row</article>";
-        let page = downloads_page_html(name, host, version, rows, &tickets, Some(&profile));
+        let page = downloads_page_html(name, host, version, rows, &tickets, Some(&profile), "");
         for value in [
             name,
             host,
@@ -1937,9 +2731,13 @@ mod tests {
             assert_eq!(response.status, 200);
             assert_private_portal_headers(&response);
             let page = String::from_utf8(response.body).unwrap();
-            assert_eq!(page.matches("<article class=\"download-row\">").count(), 6);
+            let packages = DOWNLOAD_CATALOG.len();
+            assert_eq!(
+                page.matches("<article class=\"download-row\">").count(),
+                packages
+            );
             assert_eq!(page.matches("<span class=\"recommended\">").count(), 1);
-            assert_eq!(page.matches("<div class=\"meta\">").count(), 6);
+            assert_eq!(page.matches("<div class=\"meta\">").count(), packages);
             assert!(page.contains("<span class=\"version\">v1.2.3</span>"));
             for name in DOWNLOAD_CATALOG.iter().map(|artifact| artifact.0).chain([
                 "SHA256SUMS",
@@ -2004,6 +2802,76 @@ mod tests {
             .header("Set-Cookie")
             .unwrap()
             .contains("Secure; HttpOnly; SameSite=Strict"));
+    }
+
+    #[test]
+    fn client_portal_shows_account_limits_only_when_configured() {
+        let now = 1_900_000_000;
+        assert_eq!(
+            account_status_html(&crate::web::admin::ClientSummary::default(), now),
+            ""
+        );
+        let client = crate::web::admin::ClientSummary {
+            expires_at: Some("2030-03-15T23:59:59Z".into()),
+            monthly_quota_bytes: Some(2 << 30),
+            quota_used_bytes: Some(1_950_000_000),
+            rate_limit_kbps: Some(5_000),
+            ..Default::default()
+        };
+        let html = account_status_html(&client, now);
+        assert!(html.contains("Your access"));
+        assert!(html.contains("Access until 2030-03-15 (UTC)"));
+        assert!(html.contains("1.8 GB of 2.0 GB used this month"), "{html}");
+        assert_eq!(format_quota_size(5 << 40), "5.0 TB");
+        assert_eq!(format_quota_size(512), "512 B");
+        assert!(html.contains("<span class=\"warning\">"));
+        assert!(html.contains("Speed limited to 5 Mbit/s"));
+        let page = downloads_page_html(
+            "Phone",
+            "porta.test",
+            "v1",
+            "",
+            &ReleaseDownloadTickets {
+                checksums: String::new(),
+                signature: String::new(),
+                certificate: String::new(),
+            },
+            None,
+            &html,
+        );
+        assert!(page.contains("Your access"));
+        assert!(!page.contains("%%PORTA_ACCOUNT_STATUS%%"));
+    }
+
+    #[tokio::test]
+    async fn cross_site_sign_in_and_sign_out_are_rejected() {
+        let token = "client-token-0123456789";
+        let registry: Arc<dyn ClientRegistry> = Arc::new(Registry::new(token));
+        let portal = Portal::new(registry, "admin-token-0123456789", "", false).unwrap();
+        let body = format!("token={token}").into_bytes();
+
+        let forged = RequestContext::new("POST", "/access")
+            .with_host("porta.example.com")
+            .with_header("Origin", "https://attacker.example")
+            .with_body(body.clone());
+        let response = portal.handle(&forged).await.unwrap();
+        assert_eq!(response.status, 403);
+        assert!(response.header("Set-Cookie").is_none());
+
+        let same_site = RequestContext::new("POST", "/access")
+            .with_host("porta.example.com")
+            .with_header("Origin", "https://porta.example.com")
+            .with_body(body);
+        let response = portal.handle(&same_site).await.unwrap();
+        assert_eq!(response.status, 303);
+        assert!(response.header("Set-Cookie").is_some());
+
+        let forged = RequestContext::new("POST", "/portal/logout")
+            .with_host("porta.example.com")
+            .with_header("Origin", "https://attacker.example");
+        let response = portal.handle(&forged).await.unwrap();
+        assert_eq!(response.status, 403);
+        assert!(response.header("Set-Cookie").is_none());
     }
 
     #[tokio::test]

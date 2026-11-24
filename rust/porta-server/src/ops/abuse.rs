@@ -145,12 +145,23 @@ impl AbuseGuard {
                     .fetch_sub(previous_len - shard.entries.len(), Ordering::Relaxed);
                 shard.next_prune = now + self.idle_expiry.min(Duration::from_secs(60));
             }
-            let reserved = self
-                .entries
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
-                    (entries < self.max_entries).then_some(entries + 1)
-                })
-                .is_ok();
+            // Reserve a slot without exceeding the bound. An explicit loop keeps
+            // this portable across toolchains that renamed `fetch_update`.
+            let mut entries = self.entries.load(Ordering::Relaxed);
+            let reserved = loop {
+                if entries >= self.max_entries {
+                    break false;
+                }
+                match self.entries.compare_exchange_weak(
+                    entries,
+                    entries + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break true,
+                    Err(current) => entries = current,
+                }
+            };
             if reserved {
                 let policy = self.policies[surface as usize];
                 shard.entries.insert(

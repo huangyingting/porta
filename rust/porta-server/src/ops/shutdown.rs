@@ -4,6 +4,18 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+
+/// Marks the shutdown in progress as an in-place restart, which clients are
+/// told about so that they reconnect at once.
+pub fn mark_restarting() {
+    RESTARTING.store(true, Ordering::Release);
+}
+
+pub fn restarting() -> bool {
+    RESTARTING.load(Ordering::Acquire)
+}
+
 #[derive(Clone, Debug)]
 pub struct Drain {
     inner: Arc<DrainInner>,

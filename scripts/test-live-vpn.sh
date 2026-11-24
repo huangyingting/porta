@@ -144,7 +144,7 @@ EOF
     if ((df_payload > 1200)); then
       df_payload=1200
     fi
-    ping -n -c 1 -W 5 -M do -s "$df_payload" "$gateway" >/dev/null
+    ping -n -c 1 -W 5 -M "do" -s "$df_payload" "$gateway" >/dev/null
 
     stop_client
     if ip link show dev "$interface" >/dev/null 2>&1; then

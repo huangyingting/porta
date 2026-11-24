@@ -1,0 +1,90 @@
+# Prometheus alerting rules for Porta gateways. Set PORTA_METRICS_TOKEN in
+# /etc/porta/porta.env, scrape each gateway's private operations listener as
+# job "porta", and load this file with `rule_files`:
+#
+#   scrape_configs:
+#     - job_name: porta
+#       authorization:
+#         credentials_file: /etc/prometheus/porta-metrics-token
+#       static_configs:
+#         - targets: ["127.0.0.1:9090"]
+#
+# See docs/operations.md for what to do when an alert fires.
+groups:
+  - name: porta
+    rules:
+      - alert: PortaGatewayDown
+        expr: up{job="porta"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Porta gateway {{ $labels.instance }} is not answering metrics scrapes"
+
+      - alert: PortaCertificateExpiresSoon
+        expr: porta_tls_certificate_expiry_timestamp_seconds - time() < 14 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS certificate of {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+
+      - alert: PortaCertificateExpiresImminently
+        expr: porta_tls_certificate_expiry_timestamp_seconds - time() < 3 * 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TLS certificate of {{ $labels.instance }} expires in {{ $value | humanizeDuration }}; clients will stop connecting"
+
+      - alert: PortaUpstreamDisconnected
+        # Only relays have ever connected upstream.
+        expr: porta_upstream_connected == 0 and porta_upstream_connections_total > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Relay {{ $labels.instance }} lost its next-hop gateway; relayed traffic is dropped"
+
+      - alert: PortaFederationStale
+        expr: time() - porta_federation_last_sync_timestamp_seconds > 15 * 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replica {{ $labels.instance }} has not mirrored its primary for {{ $value | humanizeDuration }}"
+
+      - alert: PortaAuthenticationFailures
+        expr: rate(porta_auth_failures_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} rejects {{ $value | humanize }} tunnel authentications per second"
+
+      - alert: PortaAdmissionRejections
+        expr: sum by (instance) (rate(porta_public_connection_rejections_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} turns away {{ $value | humanize }} connections per second at its admission limits"
+
+      - alert: PortaQueueDrops
+        expr: sum by (instance) (rate(porta_router_dropped_packets_total{reason=~"queue_.*"}[5m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} drops {{ $value | humanize }} packets per second on full client queues"
+
+      - alert: PortaDnsUpstreamFailing
+        expr: |
+          rate(porta_dns_answers_total{outcome="failed"}[5m])
+            / (rate(porta_dns_answers_total{outcome="failed"}[5m]) + rate(porta_dns_answers_total{outcome="forwarded"}[5m]))
+            > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}'s DNS upstreams fail {{ $value | humanizePercentage }} of forwarded queries"

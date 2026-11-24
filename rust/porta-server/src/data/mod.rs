@@ -1,4 +1,5 @@
 pub mod queue;
+pub mod ratelimit;
 pub mod router;
 pub mod tun;
 
@@ -15,6 +16,8 @@ impl DataMetrics for Metrics {
             DropReason::SessionClosed => "session_closed",
             DropReason::InvalidTunPacket => "invalid_tun_packet",
             DropReason::NoSession => "no_session",
+            DropReason::PolicyDenied => "policy_denied",
+            DropReason::TtlExpired => "ttl_expired",
         });
     }
 

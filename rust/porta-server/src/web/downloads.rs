@@ -10,6 +10,7 @@ pub const CLIENT_DOWNLOAD_TYPES: &[(&str, &str)] = &[
     ("porta-client-linux-amd64", "application/octet-stream"),
     ("porta-client-linux-arm64", "application/octet-stream"),
     ("porta-client-windows-amd64.zip", "application/zip"),
+    ("porta-desktop-linux-amd64.tar.gz", "application/gzip"),
     (
         "porta-android-arm64-v8a.apk",
         "application/vnd.android.package-archive",

@@ -1,13 +1,15 @@
 use super::queue::{
-    classify_ipv4, DataMetrics, DropReason, EnqueueResult, FlowKey, PacketClass, PacketQueue,
+    classify_packet, DataMetrics, DropReason, EnqueueResult, FlowKey, PacketClass, PacketQueue,
     QueueConfig,
 };
+use crate::state::pool::Ipv6Pool;
 use bytes::Bytes;
+use ipnet::Ipv4Net;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -37,10 +39,10 @@ pub enum RouterError {
     InvalidLaneConfiguration,
     #[error("router lane count does not match existing group")]
     LaneCountMismatch,
-    #[error("invalid IPv4 packet: {0}")]
+    #[error("invalid IP packet: {0}")]
     InvalidPacket(&'static str),
     #[error("packet source does not match tunnel lease: got {got} want {expected}")]
-    SourceSpoofed { got: Ipv4Addr, expected: Ipv4Addr },
+    SourceSpoofed { got: IpAddr, expected: Ipv4Addr },
     #[error("packet device I/O: {0}")]
     Device(#[from] io::Error),
 }
@@ -250,7 +252,12 @@ impl FlowTable {
 struct RouterInner {
     device: Arc<dyn PacketDevice>,
     sessions: RwLock<HashMap<Ipv4Addr, SessionGroup>>,
+    /// Networks behind subnet-router sessions, most specific first, with
+    /// the lease address of the session that routes each.
+    subnets: RwLock<Vec<(Ipv4Net, Ipv4Addr)>>,
     metrics: Option<Arc<dyn DataMetrics>>,
+    /// IPv6 addresses of dual-stack leases; sessions stay keyed by IPv4.
+    ipv6: Option<Ipv6Pool>,
 }
 
 #[derive(Clone)]
@@ -280,12 +287,36 @@ pub struct GroupRegistration {
 
 impl Router {
     pub fn new(device: Arc<dyn PacketDevice>, metrics: Option<Arc<dyn DataMetrics>>) -> Self {
+        Self::with_ipv6(device, metrics, None)
+    }
+
+    /// A dual-stack router: IPv6 packets reach the session whose IPv4 lease
+    /// pairs with their address in `ipv6`.
+    pub fn with_ipv6(
+        device: Arc<dyn PacketDevice>,
+        metrics: Option<Arc<dyn DataMetrics>>,
+        ipv6: Option<Ipv6Pool>,
+    ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
                 device,
                 sessions: RwLock::new(HashMap::new()),
+                subnets: RwLock::new(Vec::new()),
                 metrics,
+                ipv6,
             }),
+        }
+    }
+
+    pub fn ipv6(&self) -> Option<Ipv6Pool> {
+        self.inner.ipv6
+    }
+
+    /// The lease key of a session's own address in either family.
+    fn lease_key(&self, address: IpAddr) -> Option<Ipv4Addr> {
+        match address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(address) => self.inner.ipv6?.ipv4_address(address),
         }
     }
 
@@ -374,14 +405,63 @@ impl Router {
         Ok(GroupRegistration { session, collapsed })
     }
 
+    /// Routes `subnets` to the session at `lease` until that session ends.
+    pub fn set_subnets(&self, lease: Ipv4Addr, subnets: &[Ipv4Net]) {
+        let mut routes = self.inner.subnets.write();
+        routes.retain(|(_, owner)| *owner != lease);
+        routes.extend(subnets.iter().map(|subnet| (subnet.trunc(), lease)));
+        routes.sort_by_key(|(subnet, _)| std::cmp::Reverse(subnet.prefix_len()));
+    }
+
+    /// The lease address of the live session that receives packets for
+    /// `destination`: one of its own addresses or a subnet it routes.
+    pub fn owner(&self, destination: IpAddr) -> Option<Ipv4Addr> {
+        let lease = self.lease_key(destination);
+        let sessions = self.inner.sessions.read();
+        if let Some(lease) = lease.filter(|lease| sessions.contains_key(lease)) {
+            return Some(lease);
+        }
+        let IpAddr::V4(destination) = destination else {
+            return None;
+        };
+        self.inner
+            .subnets
+            .read()
+            .iter()
+            .find(|(subnet, _)| subnet.contains(&destination))
+            .map(|(_, owner)| *owner)
+            .filter(|owner| sessions.contains_key(owner))
+    }
+
+    /// Queues a packet for the session at `lease`, as if it had arrived
+    /// from the TUN device.
+    pub fn deliver(&self, lease: Ipv4Addr, packet: Bytes) -> bool {
+        let session = {
+            let sessions = self.inner.sessions.read();
+            sessions
+                .get(&lease)
+                .and_then(|group| select_lane(group, &packet))
+        };
+        let Some(session) = session else {
+            self.record_drop(DropReason::NoSession);
+            return false;
+        };
+        session.enqueue(packet);
+        true
+    }
+
+    pub fn record_policy_drop(&self, reason: DropReason) {
+        self.record_drop(reason);
+    }
+
     pub async fn inject(
         &self,
         cancellation: &CancellationToken,
         lease: Ipv4Addr,
         packet: &[u8],
     ) -> Result<(), RouterError> {
-        let (source, _) = parse_ipv4(packet)?;
-        if source != lease {
+        let (source, _) = parse_ip(packet)?;
+        if self.lease_key(source) != Some(lease) {
             return Err(RouterError::SourceSpoofed {
                 got: source,
                 expected: lease,
@@ -417,19 +497,26 @@ impl Router {
                     Err(error) => return Err(error.into()),
                 },
             };
-            let (_, destination) = match parse_ipv4(&packet) {
+            let (_, destination) = match parse_ip(&packet) {
                 Ok(addresses) => addresses,
                 Err(_) => {
                     self.record_drop(DropReason::InvalidTunPacket);
                     continue;
                 }
             };
-            let session = {
+            let session = self.lease_key(destination).and_then(|lease| {
                 let sessions = self.inner.sessions.read();
                 sessions
-                    .get(&destination)
+                    .get(&lease)
                     .and_then(|group| select_lane(group, &packet))
-            };
+            });
+            let session = session.or_else(|| {
+                let owner = self.owner(destination)?;
+                let sessions = self.inner.sessions.read();
+                sessions
+                    .get(&owner)
+                    .and_then(|group| select_lane(group, &packet))
+            });
             let Some(session) = session else {
                 self.record_drop(DropReason::NoSession);
                 continue;
@@ -516,6 +603,10 @@ fn remove_session(
     };
     if remove_group {
         sessions.remove(&address);
+        router
+            .subnets
+            .write()
+            .retain(|(_, owner)| *owner != address);
     }
 }
 
@@ -533,7 +624,7 @@ fn select_lane(group: &SessionGroup, packet: &[u8]) -> Option<Session> {
     if group.lanes.is_empty() {
         return None;
     }
-    let metadata = classify_ipv4(packet);
+    let metadata = classify_packet(packet);
     let preferred = if metadata.class == PacketClass::Control {
         0
     } else {
@@ -613,7 +704,7 @@ pub fn packet_lane(packet: &[u8], lane_count: usize) -> usize {
     if lane_count <= 1 {
         return 0;
     }
-    let metadata = classify_ipv4(packet);
+    let metadata = classify_packet(packet);
     if metadata.class == PacketClass::Control {
         0
     } else {
@@ -621,27 +712,17 @@ pub fn packet_lane(packet: &[u8], lane_count: usize) -> usize {
     }
 }
 
-fn parse_ipv4(packet: &[u8]) -> Result<(Ipv4Addr, Ipv4Addr), RouterError> {
-    if packet.len() < 20 {
-        return Err(RouterError::InvalidPacket(
-            "header is shorter than 20 bytes",
-        ));
-    }
-    if packet[0] >> 4 != 4 {
-        return Err(RouterError::InvalidPacket("packet is not IPv4"));
-    }
-    let header_length = usize::from(packet[0] & 0x0f) * 4;
-    if header_length < 20 || header_length > packet.len() {
-        return Err(RouterError::InvalidPacket("invalid IPv4 header length"));
-    }
-    let total_length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if total_length < header_length || total_length != packet.len() {
-        return Err(RouterError::InvalidPacket("IPv4 total length mismatch"));
-    }
-    Ok((
-        Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
-        Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
-    ))
+fn parse_ip(packet: &[u8]) -> Result<(IpAddr, IpAddr), RouterError> {
+    use porta_wire::ip::IpError;
+    porta_wire::ip::parse_ip(packet)
+        .map(|info| (info.source, info.destination))
+        .map_err(|error| {
+            RouterError::InvalidPacket(match error {
+                IpError::Unsupported => "packet is neither IPv4 nor IPv6",
+                IpError::ShortHeader => "header is shorter than its minimum",
+                IpError::InvalidLength { .. } => "IP length mismatch",
+            })
+        })
 }
 
 #[cfg(test)]
@@ -733,7 +814,7 @@ mod tests {
     fn flow(marker: u16) -> FlowKey {
         let mut packet = udp([1, 1, 1, 1], [10, 66, 0, 2], 28);
         packet[20..22].copy_from_slice(&marker.to_be_bytes());
-        classify_ipv4(&packet).flow
+        classify_packet(&packet).flow
     }
 
     fn flow_order(table: &FlowTable) -> Vec<FlowKey> {
@@ -841,6 +922,54 @@ mod tests {
             async move { router.run(&cancellation).await }
         });
         assert_eq!(session.recv().await.unwrap().as_ref(), packet);
+        cancellation.cancel();
+        assert!(runner.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ipv6_downlink_reaches_the_paired_lease_and_uplink_is_validated() {
+        let device = Arc::new(FakeDevice::default());
+        let ipv6 = Ipv6Pool::new(
+            "10.66.0.0/24".parse().unwrap(),
+            "fd66::/64".parse().unwrap(),
+        )
+        .unwrap();
+        let router = Router::with_ipv6(device.clone(), None, Some(ipv6));
+        let cancellation = CancellationToken::new();
+        let lease = Ipv4Addr::new(10, 66, 0, 2);
+        let session = router.register(&cancellation, lease);
+        let address = ipv6.address(lease).unwrap();
+        let ipv6_udp = |source: std::net::Ipv6Addr, destination: std::net::Ipv6Addr| {
+            let mut packet = vec![0; 48];
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&8_u16.to_be_bytes());
+            packet[6] = 17;
+            packet[8..24].copy_from_slice(&source.octets());
+            packet[24..40].copy_from_slice(&destination.octets());
+            packet
+        };
+        let internet: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let unleased = ipv6.address(Ipv4Addr::new(10, 66, 0, 9)).unwrap();
+        device.push(Ok(ipv6_udp(internet, unleased))).await;
+        let packet = ipv6_udp(internet, address);
+        device.push(Ok(packet.clone())).await;
+        let runner = tokio::spawn({
+            let router = router.clone();
+            let cancellation = cancellation.clone();
+            async move { router.run(&cancellation).await }
+        });
+        assert_eq!(session.recv().await.unwrap().as_ref(), packet);
+        assert!(matches!(
+            router
+                .inject(&cancellation, lease, &ipv6_udp(unleased, internet))
+                .await,
+            Err(RouterError::SourceSpoofed { .. })
+        ));
+        router
+            .inject(&cancellation, lease, &ipv6_udp(address, internet))
+            .await
+            .unwrap();
+        assert_eq!(device.written.lock().await.len(), 1);
         cancellation.cancel();
         assert!(runner.await.unwrap().is_ok());
     }

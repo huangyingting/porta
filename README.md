@@ -1,8 +1,9 @@
 # Porta
 
-Porta is an IPv4 VPN and authenticated HTTPS forward proxy built on MASQUE
+Porta is a dual-stack VPN and authenticated HTTPS forward proxy built on MASQUE
 `CONNECT-IP`. One gateway serves HTTP/2 over TCP and HTTP/3 over QUIC/UDP on
-the same port, with clients for Linux, Windows, and Android.
+the same port, with clients for Linux, Windows, and Android, and the
+[PortaKit](apple/README.md) foundation for macOS and iOS apps.
 
 ## Deploy
 
@@ -80,6 +81,39 @@ synchronization, client downloads, and the loopback operations listener.
 
 The HTTPS forward proxy is enabled by default. Add
 `--disable-forward-proxy` only for a VPN-only deployment.
+
+VPN clients cannot reach the gateway VM's cloud metadata service or its host
+services other than ping and DNS; add `--client-host-access` to allow host
+services. See [client isolation](docs/deployment.md#client-isolation).
+
+### Cascade relays (multi-hop)
+
+Gateways chain like multi-hop WireGuard: clients connect to the first gateway
+and their traffic exits from the last one.
+
+```text
+clients -> relay.example.com -> exit.example.com -> Internet
+```
+
+Deploy `exit.example.com` as above, create a client token for the relay in its
+admin portal, then deploy the relay:
+
+```bash
+read -rsp "Exit client token: " PORTA_UPSTREAM_TOKEN && echo
+export PORTA_UPSTREAM_TOKEN
+sudo --preserve-env=GH_TOKEN,PORTA_UPSTREAM_TOKEN ./scripts/deploy.sh \
+  --domain relay.example.com \
+  --upstream https://exit.example.com
+unset PORTA_UPSTREAM_TOKEN
+```
+
+Repeat with `--upstream https://relay.example.com` for a longer chain. Every
+hop can keep the default pool, clients need no changes, and relays fail
+closed: if the next hop is down, relayed traffic is dropped instead of leaving
+through the relay's own connection. Add `--client-to-client` to let clients of
+one gateway reach each other (hub and spoke), and `--peer-to-peer` to let
+devices connect directly through NATs where they can (mesh). See
+[cascade relays](docs/deployment.md#cascade-relays-multi-hop).
 Forward-proxy CONNECT uses HTTP/1.1 or HTTP/2; HTTP/3 is reserved for the
 native MASQUE CONNECT-IP tunnel.
 
@@ -93,6 +127,9 @@ Open the deployed URL, such as `https://vpn.example.com:8443`.
   usage.
 - Enter an active client token to download the matching Linux, Windows, or
   Android client.
+- With [user single sign-on](docs/deployment.md#letting-users-sign-in-with-single-sign-on),
+  people choose **Sign in with your organisation** and get an account of
+  their own instead of a token.
 
 Retrieve the initial tokens on the server:
 
@@ -111,6 +148,13 @@ sudo --preserve-env=PORTA_TOKEN ./porta-client-linux-amd64 \
   --server https://vpn.example.com:8443
 unset PORTA_TOKEN
 ```
+
+For unattended use, store the token in an owner-only file and pass
+`--token-file /etc/porta/client.token` instead of `PORTA_TOKEN`; see the
+[client guide](docs/clients.md#linux-cli) for a systemd unit.
+
+For a window and tray instead of a terminal, install the
+[Linux desktop app](docs/clients.md#linux-desktop-app).
 
 Linux configures routes, DNS, and an owned fail-closed firewall automatically;
 root, iproute2, nftables, and systemd-resolved's local stub are required.
@@ -168,8 +212,15 @@ sudo journalctl -u porta -f
 curl http://127.0.0.1:9090/readyz
 ```
 
-Re-run `scripts/deploy.sh` to upgrade while preserving credentials, client
-records, usage, and leases.
+Re-run `sudo ./scripts/deploy.sh` with no options to upgrade. It reuses the
+options saved in `/etc/porta/deploy.conf` and preserves credentials, client
+records, usage, and leases; options you pass override the saved ones. It
+backs up the gateway first, and a daily `porta-backup.timer` keeps two
+weeks of backups in `/var/backups/porta` (`sudo porta-backup restore ARCHIVE`).
+Scrape `/metrics` with `PORTA_METRICS_TOKEN` and load
+[`deploy/prometheus/porta-alerts.yml`](deploy/prometheus/porta-alerts.yml);
+the [operations guide](docs/operations.md) covers alerts, backups, upgrades
+and rollbacks.
 
 Automatic HTTP/3 tunnel MTU selection is enabled by default, with a 1400
 ceiling and a conservative 1100 baseline. Datagram packet budgets also adapt
@@ -182,6 +233,7 @@ for fallback, IPv4 handling, and nested-VPN limits.
 ## Documentation
 
 - [Production deployment](docs/deployment.md)
+- [Operations: monitoring, backups, upgrades](docs/operations.md)
 - [Client guide](docs/clients.md)
 - [Architecture and protocol compatibility](docs/architecture.md)
 - [Endpoint reference](docs/endpoints.md)

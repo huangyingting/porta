@@ -716,7 +716,8 @@ h2 {
   font-weight: 650;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   min-height: 46px;
   padding: 0 13px;
@@ -724,19 +725,58 @@ input {
   border-radius: 13px;
   color: var(--text);
   background: var(--field);
+  font: inherit;
 }
 
-input:hover {
+textarea {
+  padding: 11px 13px;
+  resize: vertical;
+}
+
+input:hover,
+textarea:hover {
   border-color: var(--border-strong);
 }
 
-input:focus {
+input:focus,
+textarea:focus {
   border-color: var(--accent-strong);
   box-shadow: 0 0 0 3px rgba(110, 231, 183, 0.09);
 }
 
-input::placeholder {
+input::placeholder,
+textarea::placeholder {
   color: #60748b;
+}
+
+.editor-card label.option-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.option-row input[type="checkbox"] {
+  margin: 3px 0 0;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  accent-color: var(--accent, #2f6fed);
+}
+
+.option-title {
+  display: block;
+  color: var(--text, inherit);
+  font-size: 0.82rem;
+}
+
+.option-help {
+  display: block;
+  margin-top: 3px;
+  color: var(--subtle);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.45;
 }
 
 .field-help {
@@ -927,4 +967,22 @@ input::placeholder {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+.account-detail {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.account-detail.warning {
+  color: #f0b45a;
+  font-weight: 600;
 }

@@ -60,11 +60,26 @@
 ## Operator responsibilities
 
 - Keep the admin listener bound to loopback and access it through an SSH tunnel.
-  Use independent random admin and client tokens. The server can obtain its
+  Use independent random admin and client tokens. Keep `PORTA_ADMIN_TOKEN` as
+  a break-glass credential and give each administrator a named account with
+  the least role they need, two-factor authentication or single sign-on.
+- Protect `/var/lib/porta/admins.json` (password hashes and TOTP secrets) and
+  `/var/lib/porta/audit.log`; both are written `0600` for the service user.
+- User single sign-on trusts the identity provider to verify emails: anyone
+  it signs in with a verified address in an allowed domain gets an account.
+  Allow only domains the provider controls. Account tokens in
+  `/var/lib/porta/sso-users.json` are encrypted with a key derived from
+  `PORTA_ADMIN_TOKEN`, so reading the file alone does not reveal them, but
+  anyone with both can.
+  Ship the audit log off the host if it must survive a host compromise. The server can obtain its
   certificate from Let's Encrypt or load an externally managed certificate;
   clients validate either through their system trust store.
 - When using automatic Let's Encrypt certificates, protect and persist the ACME
   cache directory and expose the challenge listener only as required.
+- Keep the daemon unprivileged. It runs as the `porta` user with only network
+  capabilities; a compromise can read the TLS key, tokens held in memory, and
+  `/var/lib/porta`, and can change network configuration, but cannot write
+  configuration, binaries, or the root-only network helper journals.
 - Restrict gateway egress, rate-limit the public endpoint, rotate credentials,
   and retain only privacy-appropriate operational logs.
 - Apply cloud-edge allow rules and managed DDoS protection where available.
@@ -106,6 +121,10 @@ not conceal transport fingerprints from network inspection.
   request proof could be replayed until its five-minute timestamp window
   expires. TLS normally prevents network capture; a reverse proxy terminating
   TLS can observe both the bearer token and proof and must be fully trusted.
+- With the default `open` enrollment policy, anyone holding an account token
+  can enroll new devices up to the device limit. The `approval` and `closed`
+  policies make enrollment an administrator decision; approval is keyed by the
+  device's public key, not by attested hardware.
 - Forward-proxy Basic usernames are ignored, so every proxy client using an
   account token shares one token-only `forward-proxy` enrollment and cannot be
   managed or attributed individually.
@@ -130,6 +149,56 @@ not conceal transport fingerprints from network inspection.
   `rp_filter=2`. Incoming
   client packet sources must still match their authenticated lease. Physical
   interfaces and global reverse-path filtering are not weakened.
+- A cascade relay is not an anonymity network. Every hop terminates TLS and
+  sees the inner IPv4 packets it forwards, and each relay authenticates to its
+  next hop as one device with a stored token and software key. The exit sees
+  all relayed clients as that one device. Relay hops limit which public address
+  the Internet observes and where traffic exits, not which operators can
+  observe it. The upstream interface accepts only replies to relayed flows;
+  the next hop cannot use it to reach the relay's host or networks.
+- Gateways drop client traffic to link-local addresses, including cloud
+  instance metadata, and to gateway host services other than ICMP and DNS
+  unless `--client-host-access` is set. Other private networks routed from the
+  gateway, such as its cloud VPC, remain reachable by design for remote access;
+  restrict them with additional operator firewall rules when not intended.
+- Devices of one account reach each other, and accounts that share an access
+  group reach each other's devices and subnets. `--client-to-client` makes
+  every client of a gateway, across all accounts, a peer. Leave it off unless
+  all clients are mutually trusted; client hosts must protect their own
+  services from their peers.
+- **Allow local network** sends traffic for the attached private networks,
+  and their multicast and broadcast, outside the tunnel. On an untrusted
+  network, such as public Wi-Fi, that traffic is visible to the network and
+  local hosts can reach the device, as without a VPN. Leave the option off
+  on profiles used on networks you do not trust.
+- On Android, apps a profile keeps outside the tunnel use the device's
+  network directly, unprotected and visible to that network.
+- **Sign in to network** removes leak protection for up to five minutes, so
+  traffic in that time uses the local network directly. Porta reconnects as
+  soon as the gateway answers with a certificate the profile trusts; a
+  network that fakes the gateway cannot end the pause early or capture the
+  tunnel, because the probe verifies the certificate as the tunnel does.
+- With `--peer-to-peer`, peers learn each other's public IP addresses and
+  traffic between them bypasses the gateway: it is not logged, counted
+  toward usage or quotas, or rate limited there. Peers authenticate each
+  other only through fingerprints the gateway vouches for, so a compromised
+  gateway can impersonate peers either way. Each client drops direct
+  packets that are not from the peer's tunnel addresses to its own.
+- Backup archives (`porta-backup`, `/var/backups/porta`) hold every gateway
+  secret: tokens, TLS and ACME keys, administrator TOTP secrets and a relay's
+  device key. They are root-only on the host; encrypt them before they leave
+  it, and treat a leaked archive like a leaked admin token.
+- `PORTA_FEDERATION_TOKEN` lets its holder download every account's token
+  hash, devices and policies from a primary; token hashes are SHA-256 of
+  random tokens and cannot be reversed, but treat the federation token like
+  the admin token. Replicas trust what the primary serves.
+- The built-in resolver reveals device names and addresses only to a
+  device's peers, but every name a client looks up is visible to the gateway
+  and to the resolvers it forwards to.
+- A subnet router exposes its LAN to its peers. Its LAN hosts can initiate
+  connections to peers, as with WireGuard `AllowedIPs`; restrict them with
+  deny lists or host firewalls. Source validation is relaxed only for the
+  router's own assigned subnets.
 - Native clients mitigate fallback head-of-line blocking with independent
   HTTP/2 connections, a prioritized control lane, bounded queues, and
   flow-pinned data lanes. Loss can still stall every flow assigned to the
@@ -153,7 +222,15 @@ not conceal transport fingerprints from network inspection.
   traffic. Its exact endpoint TCP/UDP exceptions are not process-specific.
   Windows endpoint exceptions are application scoped and forwarding is blocked.
   Neither implementation overrides unrelated firewall blocks.
-- IPv6 payload is blocked, not tunneled. Loopback and narrowly required
+- Standard CONNECT-IP clients, allowed per account and off by default,
+  authenticate with the token alone. For those accounts a stolen token is
+  sufficient to connect (as for the forward proxy); device enrollment,
+  approval and per-device revocation do not apply to them.
+- IPv6 payload is tunneled only with an IPv6 lease and otherwise blocked in
+  full tunnels; split tunnels leave untunneled IPv6 on the device's network.
+  On the gateway IPv6 leaves only through the physical interface, never a
+  named exit or cascade next hop: those devices get no IPv6 address and a
+  cascade relay refuses an IPv6 pool. Loopback and narrowly required
   transport/control exceptions remain. Protected retries use cached literal
   endpoints and retain TLS hostname verification; arbitrary DNS changes,
   physical DHCP renewal, and unrestricted network handover are not guaranteed.
