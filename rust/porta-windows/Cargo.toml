@@ -15,6 +15,7 @@ tauri-build = "2.6.3"
 [target.'cfg(windows)'.dependencies]
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 porta-client = { package = "porta-client-rust", path = "../porta-client" }
+porta-wire = { path = "../porta-wire" }
 serde = { version = "1.0.228", features = ["derive"] }
 tauri = { version = "2.11.5", default-features = false, features = [
   "common-controls-v6",
