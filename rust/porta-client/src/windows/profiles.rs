@@ -8,7 +8,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore as _};
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -28,6 +28,9 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub server_url: String,
+    /// Further gateways sharing the account; the fastest one is used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<String>,
     #[serde(with = "transport_serde")]
     pub transport: Transport,
     #[serde(default)]
@@ -37,6 +40,12 @@ pub struct Profile {
     pub reconnect: bool,
     #[serde(with = "duration_nanos")]
     pub reconnect_max_delay: Duration,
+    /// Keep the local network reachable in a full tunnel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_lan: bool,
+    /// Connected when the user signs in; at most one profile has it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connect_at_login: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -51,11 +60,14 @@ impl Profile {
             id: String::new(),
             name: name.into(),
             server_url: server_url.into(),
+            backup_servers: Vec::new(),
             transport,
             ca_path: String::new(),
             thumbprint: String::new(),
             reconnect: true,
             reconnect_max_delay: Duration::from_secs(30),
+            allow_lan: false,
+            connect_at_login: false,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -168,6 +180,10 @@ impl Store {
         }
         profile.name = profile.name.trim().to_owned();
         profile.server_url = profile.server_url.trim().to_owned();
+        for server in &mut profile.backup_servers {
+            *server = server.trim().to_owned();
+        }
+        profile.backup_servers.retain(|server| !server.is_empty());
         validate(&profile)?;
 
         let mut state = self.state.lock().map_err(|_| ProfileError::Poisoned)?;
@@ -255,12 +271,17 @@ fn validate(profile: &Profile) -> Result<(), ProfileError> {
     if profile.server_url.is_empty() {
         return Err(ProfileError::Invalid("server URL is required".to_owned()));
     }
+    if profile.backup_servers.len() > 7 {
+        return Err(ProfileError::Invalid(
+            "a profile lists at most 7 backup gateways".to_owned(),
+        ));
+    }
     Ok(())
 }
 
 fn random_id() -> String {
     let mut bytes = [0_u8; 12];
-    OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -282,7 +303,7 @@ fn persist(path: &Path, state: &State) -> std::io::Result<()> {
     })?;
     fs::create_dir_all(directory)?;
     let mut random = [0_u8; 8];
-    OsRng.fill_bytes(&mut random);
+    rand::rng().fill_bytes(&mut random);
     let pending = directory.join(format!(".profiles-{}.tmp", hex::encode(random)));
     let result = (|| {
         let mut file = OpenOptions::new()

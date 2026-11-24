@@ -384,10 +384,10 @@ mod tests {
         let encoded = hex::decode(SPKI_HEX).unwrap();
         let key = parse_public_key_spki(&encoded).unwrap();
         assert_eq!(
-            key.to_encoded_point(false).as_bytes(),
+            key.to_sec1_point(false).as_bytes(),
             signing_key()
                 .verifying_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
         );
         assert_eq!(device_id_from_encoded(&encoded).unwrap(), DEVICE_ID);

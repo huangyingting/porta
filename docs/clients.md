@@ -1,13 +1,16 @@
 # Client guide
 
-Porta releases provide Linux clients, a Windows desktop and CLI package, and
-per-architecture Android APKs. The deployed browser portal mirrors the matching
-release artifacts so end users do not need GitHub access.
+Porta releases provide Linux CLI clients, a Linux desktop app, a Windows
+desktop and CLI package, and per-architecture Android APKs. The deployed
+browser portal mirrors the matching release artifacts so end users do not
+need GitHub access.
 
 ## Get a client
 
-Open the deployed Porta URL and enter an active client token. The protected
-downloads page shows the server address, client release version, package sizes,
+Open the deployed Porta URL and enter an active client token, or choose
+**Sign in with your organisation** when the gateway offers single sign-on
+(see [Letting users sign in with single sign-on](deployment.md#letting-users-sign-in-with-single-sign-on)).
+The protected downloads page shows the server address, client release version, package sizes,
 and SHA-256 checksums.
 
 Available packages:
@@ -15,6 +18,7 @@ Available packages:
 - `porta-client-linux-amd64`
 - `porta-client-linux-arm64`
 - `porta-client-windows-amd64.zip`
+- `porta-desktop-linux-amd64.tar.gz` (the Linux desktop app and its service)
 - `porta-android-arm64-v8a.apk`
 - `porta-android-armeabi-v7a.apk`
 - `porta-android-x86_64.apk`
@@ -79,6 +83,156 @@ same limits under **Your access**. Fail-closed protection behaves as for any
 other permanent rejection: disconnect, or run `--cleanup-network` on Linux, to
 use the network without the tunnel.
 
+## Multi-gateway profiles
+
+A profile can list several gateways that share accounts (see
+[federation](deployment.md#several-gateways-for-one-account-federation)).
+Linux and Windows CLIs take `--server` more than once; the Windows app and
+Android take **Backup gateways**, one per line. Before connecting, clients
+measure how quickly each gateway endpoint accepts a TCP connection and try
+the fastest first; on any retryable failure, including a replica that does
+not know the device yet, they move to the next endpoint. Fail-closed
+protection stays on while they fail over: only the profile's gateway endpoints are
+reachable outside the tunnel. While protection is active the order is not
+re-measured and DNS is unavailable, so failover uses the endpoints resolved
+when the client started.
+
+## Connecting automatically
+
+Mark one profile **Connect automatically** to connect it without opening the
+app:
+- **Linux desktop:** the `porta-client.service` connects it whenever the
+  service starts, which is at boot.
+- **Windows:** the app registers a **Porta** scheduled task that starts it
+  hidden in the tray at sign-in, with the elevation it needs, and connects
+  the profile. Turning the option off removes the task, as does deleting
+  the profile.
+- **Android:** **Reconnect after device restart** does the same after a
+  reboot, with the profile's backup gateways and options.
+
+A connection that fails at startup, for example with no network yet, is
+retried like any other and shows its error in the app.
+
+## Local network access
+
+A full tunnel sends everything through the gateway, so printers, file
+shares, casting and other devices on the network you are attached to become
+unreachable. Enable **Allow local network** on a profile (the Linux and
+Windows apps' profile editor, the Android profile dialog, or `--allow-lan`
+for the Linux and Windows CLIs). The option then lets through, outside the
+tunnel:
+- the private networks the device is directly attached to (RFC 1918,
+  link-local and IPv6 unique-local), except any that contain the tunnel's
+  own addresses or DNS server;
+- the multicast and broadcast that discovery protocols such as mDNS and
+  SSDP use.
+
+Everything else, including DNS, still uses the tunnel and stays fail-closed.
+Linux and Windows let only that local traffic past leak protection, and keep
+DNS (ports 53 and 853) to local hosts blocked. Android routes
+around those networks, and on macOS and iOS the app sets the system's
+`excludeLocalNetworks` option. Split tunnels never route the local network
+through the tunnel, so the option only matters for full tunnels. Devices on
+the local network can reach this device, as they could before connecting.
+
+## Signing in to captive networks
+
+Hotel, airport and café networks often hold every connection until you sign
+in on a web page. Leak protection blocks that page while the tunnel
+reconnects, so the desktop clients detect such networks and let you lift
+protection briefly:
+- When the gateway's TLS handshake fails while protection is active (the
+  network answers in the gateway's place with its own certificate), the
+  Linux and Windows apps show **Network sign-in required** and keep retrying
+  instead of giving up.
+- While the tunnel is connecting or reconnecting, or protection is retained
+  after an error, the status card offers **Sign in to network**. It removes
+  leak protection, routes and DNS for up to five minutes. Open any web page
+  to reach the network's sign-in page.
+- Porta checks the gateway every five seconds and reconnects as soon as it
+  answers with its own certificate, or when the five minutes end.
+  **Reconnect now** ends the pause early, and **Disconnect** ends it without
+  reconnecting.
+
+Traffic during the pause is not protected by the tunnel, as without a VPN.
+On Linux the desktop app sends the service's `sign_in_network` control
+command. The command-line clients log the failure and keep retrying; stop them with
+Ctrl+C, which removes protection, sign in, and start them again. Android and
+Apple devices detect captive networks themselves and show the sign-in page
+outside the tunnel.
+
+## Choosing which apps use the tunnel
+
+On Android, the profile dialog's **Apps** setting chooses which apps the
+tunnel carries:
+- **All apps use the tunnel** (the default);
+- **Only chosen apps use the tunnel**: every other app keeps using the
+  device's network directly;
+- **Chosen apps bypass the tunnel**: those apps use the device's network
+  directly, for example a banking app that refuses VPN addresses.
+
+The picker lists launchable apps; up to 256 can be chosen. The choice stays on
+the device: imported profiles start with all apps. Apps chosen but since
+uninstalled are skipped, and a profile limited to chosen apps refuses to
+connect when none of them is installed rather than tunnelling every app.
+Traffic from apps outside the tunnel is not protected by it. Android's
+**Block connections without VPN** setting also blocks the apps kept outside
+the tunnel, so leave it off to use this option. Porta's own control traffic
+always stays outside the tunnel. Desktop clients tunnel the whole device.
+
+## Split tunnels
+
+When the gateway advertises split-tunnel routes, clients route only those
+prefixes (and the tunnel resolver) through Porta and leave all other traffic
+on the local network. Leak protection covers only the advertised prefixes, so
+they fail closed while the tunnel reconnects. The Linux CLI logs
+`split tunnel routes=... dns_domains=...`, the Windows desktop shows a line
+such as *Split tunnel · 2 networks via the gateway*, and Android adds the same
+line to the connection details. See
+[Split tunneling](deployment.md#split-tunneling) for per-platform DNS
+behavior.
+
+## IPv6
+
+When the gateway offers IPv6 (see
+[IPv6](deployment.md#ipv6-dual-stack)), every client configures the IPv6
+address alongside the IPv4 one: Linux adds it to the TUN and routes `::/1` and
+`8000::/1` (or the advertised IPv6 split prefixes) through it, Windows adds it
+to the Wintun adapter and sets the adapter's IPv6 MTU and filters, and Android
+adds it to the VPN with a `::/0` route. The Linux CLI logs `ipv6=ADDRESS` on
+the connected line, and the Windows app and Android show both addresses.
+Clients use IPv6 only when the tunnel MTU is at least 1280 bytes.
+
+Without IPv6 from the gateway, full tunnels keep blocking IPv6 on every
+platform so it cannot leave through the physical network. Split tunnels leave
+IPv6 on the device's own network unless the gateway routes IPv6 prefixes; on
+Android this now also applies to split tunnels, which previously blocked IPv6
+for all apps.
+
+## Subnet routers
+
+The Linux CLI can publish the network behind its device. After an
+administrator assigns subnets to the device, run it with `--subnet-router`:
+
+```sh
+sudo ./porta-client-linux-amd64 --server https://vpn.example.com --subnet-router
+```
+
+The client enables IPv4 forwarding, masquerades tunnel traffic toward the
+assigned subnets, and restores forwarding when it disconnects. It logs the
+subnets on connection. See [Subnet routing](deployment.md#subnet-routing-site-to-site).
+
+## Direct paths
+
+When the gateway runs with `--peer-to-peer`, HTTP/3 clients on split
+tunnels connect directly to the other devices they may reach, through NATs
+where possible, and fall back to the gateway otherwise. Nothing needs to be
+configured on the device. The Linux CLI and Windows CLI log
+`direct paths: 10.66.0.3 via 203.0.113.7:51820` when paths come and go,
+the Linux and Windows desktop apps show the number of directly reached
+devices next to the routing summary, and Android lists them in **Log**. See
+[Direct paths between devices](deployment.md#direct-paths-between-devices).
+
 ## Linux CLI
 
 Automatic Linux networking requires root, `iproute2`, `nftables`, and a running
@@ -136,6 +290,8 @@ The Windows CLI accepts the same `--token-file` option.
 The CLI configures the assigned IPv4 address, MTU, endpoint escape route,
 full-tunnel routes, and per-link DNS automatically. Its owned nftables OUTPUT
 guard blocks physical IPv4, IPv6, and DNS bypass while connected or reconnecting.
+For a [split tunnel](#split-tunnels) it routes and guards only the advertised
+prefixes.
 Use `--manual-network` only when managing all routing, DNS, and protection
 yourself.
 
@@ -160,6 +316,47 @@ traffic is blocked rather than leaked.
 
 Use `--ca` for a private CA or `--thumbprint` for an exact certificate pin;
 do not disable verification in production.
+
+## Linux desktop app
+
+The Linux desktop app is the Windows app's window and tray on Linux. Because
+networking needs root, the window runs as your user and controls a root
+service, `porta-client --daemon`, through the Unix socket
+`/run/porta-client/control.sock`. The service keeps the profiles, with their
+tokens, in the root-only `/var/lib/porta-client/profiles.json` and owns the
+tunnel, so closing or quitting the window leaves the connection up; only
+root and members of the `porta-client` group may use the socket.
+
+Download `porta-desktop-linux-amd64.tar.gz` from the gateway's downloads
+page or the GitHub release, check it against `SHA256SUMS`, and install it.
+It needs GTK 3 and WebKitGTK 4.1, which Ubuntu 22.04 and later and Debian 12
+and later provide:
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0
+tar -xzf porta-desktop-linux-amd64.tar.gz
+sudo ./porta-desktop/scripts/install-linux-desktop.sh
+```
+
+On other architectures, build and install it from a checkout (it needs the
+GTK and WebKitGTK development files, such as `libwebkit2gtk-4.1-dev` and
+`libgtk-3-dev` on Debian and Ubuntu):
+
+```sh
+make build build-linux-desktop
+sudo ./scripts/install-linux-desktop.sh
+```
+
+The installer copies `porta-client` and `porta-desktop` to
+`/usr/local/bin`, creates the `porta-client` group and adds the invoking
+user (sign out and in again for it to apply), enables `porta-client.service`,
+and adds **Porta** to the applications menu. The app then adds, edits and
+deletes profiles, connects and disconnects, shows live traffic, the
+address, account limits and split routes, and restores the network after a
+failure, like the Windows app. The tray icon needs a status-notifier host
+and `libayatana-appindicator3`; without one, closing the window quits the
+app. For a gateway with a private certificate, add `--ca PATH` or
+`--thumbprint SHA256` to the service's `ExecStart` line.
 
 ## Windows
 
@@ -245,8 +442,9 @@ route, and a DNS change installs its replacement before retiring the old route.
 
 Windows uses persistent Windows Filtering Platform filters in Porta's own
 sublayer, not changes to global Windows Firewall defaults. The physical endpoint
-exception is executable/IP/port scoped; IPv4 TUN traffic and loopback are allowed,
-while other IPv4/IPv6 payload and forwarding are blocked. Required IPv6 neighbor
+exception is executable/IP/port scoped; IPv4 TUN traffic (and IPv6 TUN traffic
+with an IPv6 lease) and loopback are allowed, while other IPv4/IPv6 payload and
+forwarding are blocked. Required IPv6 neighbor
 discovery is permitted when using an IPv6 transport endpoint. Other firewall
 blocks remain effective.
 
@@ -292,8 +490,9 @@ all setup and restoration. Do not delete the automatic-networking journal to
 bypass failed cleanup.
 Linux guard persistence covers a process crash, not a reboot or external
 firewall removal.
-Payload tunneling remains IPv4-only; necessary endpoint/control exceptions do
-not provide general IPv6 connectivity.
+IPv6 payload is tunneled only when the gateway assigns an IPv6 address;
+otherwise the necessary endpoint/control exceptions do not provide general
+IPv6 connectivity.
 
 Advertised DNS must be a numeric unicast IPv4 resolver reachable through the
 tunnel; private addresses are supported, but loopback and link-local resolvers
@@ -448,6 +647,15 @@ reconnect counts. The log retains the latest 200 events, includes millisecond
 timestamps, and offers **Copy log** and **Clear**. Tokens are excluded, but
 logs can contain server/network addresses and the device name, so
 share them privately.
+
+## macOS and iOS
+
+There is no macOS or iOS app release yet. [apple/](../apple/README.md) holds
+PortaKit, the Swift package the apps will build on: the Rust tunnel behind a
+C interface, a Secure Enclave device identity with the same `d-...` IDs and
+approval flow as the other clients, `porta://profile` setup links, and a
+packet tunnel provider that applies the gateway's addresses, routes, IPv6
+and DNS and reconnects across backup gateways.
 
 ## Forward proxy clients
 

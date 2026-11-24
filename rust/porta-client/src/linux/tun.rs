@@ -58,10 +58,14 @@ impl Tun {
             .to_str()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TUN name is not UTF-8"))?
             .to_owned();
+        // SAFETY: the OwnedFd keeps its descriptor open and unchanged until
+        // the AsyncFd that owns it is dropped.
+        let descriptor =
+            unsafe { AsyncFd::register(descriptor) }.map_err(|error| error.into_parts().1)?;
         Ok(Self {
             name: actual,
             mtu,
-            descriptor: Arc::new(AsyncFd::new(descriptor)?),
+            descriptor: Arc::new(descriptor),
         })
     }
 

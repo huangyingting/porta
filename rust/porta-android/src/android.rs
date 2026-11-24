@@ -533,6 +533,25 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAddress(
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
+/// The session's IPv6 address, or an empty string without one.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAddress6(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        let session = get_session(id)?;
+        let address = session
+            .connection
+            .lease
+            .ipv6()
+            .map_or_else(String::new, |address| address.addr().to_string());
+        Ok(JString::from_str(env, address)?.into_raw())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_portamobile_Portamobile_nativeSessionPrefixLength(
     mut env: EnvUnowned<'_>,
@@ -592,6 +611,65 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeSessionAccount(
         Ok(JString::from_str(env, encode_account(&session.connection.account()))?.into_raw())
     })
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Split-tunnel routing as `route,route|domain,domain`; no routes is a full tunnel.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeSessionRouting(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        let session = get_session(id)?;
+        let ipv6 = session.connection.lease.ipv6().is_some();
+        Ok(JString::from_str(env, encode_routing(&session.connection.routing, ipv6))?.into_raw())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Devices the session reaches directly, as `address via endpoint` joined
+/// by commas; empty without direct paths.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeSessionDirectPeers(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        let session = get_session(id)?;
+        let peers = session
+            .connection
+            .direct_peers()
+            .map(|peers| {
+                peers
+                    .borrow()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        Ok(JString::from_str(env, peers)?.into_raw())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// IPv6 routes are included only for a session with an IPv6 address.
+fn encode_routing(routing: &porta_client::tunnel::Routing, ipv6: bool) -> String {
+    let routes = routing
+        .routes
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            routing
+                .routes6
+                .iter()
+                .filter(|_| ipv6)
+                .map(ToString::to_string),
+        )
+        .collect::<Vec<_>>();
+    format!("{}|{}", routes.join(","), routing.dns_domains.join(","))
 }
 
 fn encode_account(account: &porta_client::tunnel::AccountStatus) -> String {

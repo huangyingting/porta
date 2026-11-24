@@ -181,14 +181,19 @@ pub enum PortalRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortalSession {
     pub role: PortalRole,
+    /// The client account, or for a named administrator the admin ID.
     pub client_id: String,
     pub client_name: String,
     pub token_hash: String,
     pub encrypted_token: String,
     pub expires_at: u64,
+    /// How an administrator signed in: empty for the break-glass token,
+    /// `admin` for a local password, or `sso`.
+    pub admin_kind: &'static str,
 }
 
 impl PortalSession {
+    /// A break-glass session from the shared admin token.
     pub fn admin(now: u64) -> Self {
         Self {
             role: PortalRole::Admin,
@@ -197,6 +202,17 @@ impl PortalSession {
             token_hash: String::new(),
             encrypted_token: String::new(),
             expires_at: now.saturating_add(PORTAL_SESSION_TTL_SECS),
+            admin_kind: "",
+        }
+    }
+
+    /// A session of a named administrator.
+    pub fn named_admin(id: &str, username: &str, kind: &'static str, now: u64) -> Self {
+        Self {
+            client_id: id.to_owned(),
+            client_name: username.to_owned(),
+            admin_kind: kind,
+            ..Self::admin(now)
         }
     }
 
@@ -576,6 +592,7 @@ mod tests {
             token_hash: "hash".into(),
             encrypted_token: "sealed".into(),
             expires_at: 100,
+            admin_kind: "",
         };
         let (first, cookie) = store.start(session.clone(), 0).unwrap();
         assert!(cookie.contains("Secure; HttpOnly; SameSite=Strict"));

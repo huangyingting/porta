@@ -4,9 +4,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use p256::pkcs8::EncodePublicKey;
 use porta_wire::device_auth::{self, Proof};
+use rand::RngCore as _;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -40,7 +40,7 @@ pub fn create_proof(
     let device_id = device_auth::device_id_from_encoded(encoded_public_key.as_bytes())
         .map_err(|_| DeviceProofError::PublicKey)?;
     let mut nonce = [0_u8; device_auth::NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let mut proof = Proof {
         device_id,
         name: name.to_owned(),
@@ -60,12 +60,12 @@ pub fn create_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate as _;
     use std::time::Duration;
 
     #[test]
     fn generated_proof_round_trips_through_shared_verifier() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let proof = create_proof(
             &key,
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn proof_binds_token_method_and_path() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let proof = create_proof(
             &key,

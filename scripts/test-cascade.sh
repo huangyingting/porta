@@ -72,7 +72,8 @@ trap cleanup EXIT
 
 # Nodes in a line: client(0), gateways 1..N, web(N+1). Link k joins node k
 # ("east") to node k+1 ("west") on 172.31.k.0/30.
-nodes=(client $(seq 1 "$gateways") web)
+mapfile -t hops < <(seq 1 "$gateways")
+nodes=(client "${hops[@]}" web)
 for node in "${nodes[@]}"; do
   ip netns add "$(ns "$node")"
   in_ns "$node" ip link set lo up
@@ -151,9 +152,8 @@ start_gateway() {
   )
   local upstream_token=
   local upstream_options=()
-  local network_options=()
   if ((gateway == 1)); then
-    network_options=(--client-to-client)
+    arguments+=(--client-to-client)
   fi
   if ((gateway < gateways)); then
     arguments+=(
@@ -176,7 +176,7 @@ start_gateway() {
   done
   in_ns "$gateway" env PORTA_RUNTIME_DIRECTORY="$directory/runtime" \
     "$repository_root/scripts/server-up.sh" porta0 10.66.0.1/24 10.66.0.0/24 east "$port" \
-    "${upstream_options[@]}" "${network_options[@]}" >>"$work/gateway-$gateway.log" 2>&1
+    "${upstream_options[@]}" >>"$work/gateway-$gateway.log" 2>&1
 }
 
 stop_gateway() {
@@ -233,13 +233,17 @@ chmod 0755 "$work/bin/resolvectl"
 # Starts a client of gateway 1 and sets $lease once it is connected.
 start_client() {
   local node=$1
+  local identity=${2:-identity}
   install -d "/etc/netns/$(ns "$node")"
   printf 'nameserver 127.0.0.53\n' >"/etc/netns/$(ns "$node")/resolv.conf"
   install -d -m 0700 "$work/$node"
+  # Truncate first: the background redirection may happen after the wait
+  # loop below has already read a previous run's log.
+  : >"$work/$node.log"
   ip netns exec "$(ns "$node")" env PORTA_TOKEN="$(<"$work/gateway-1/token")" PATH="$work/bin:$PATH" \
     "$client_binary" \
     --server "https://$(link_address 0 2):$port" --ca "$work/ca.pem" \
-    --identity "$work/$node/identity.json" --network-state "$work/$node/network-state.json" \
+    --identity "$work/$node/$identity.json" --network-state "$work/$node/network-state.json" \
     --interface porta-ci0 --transport "$transport" >"$work/$node.log" 2>&1 &
   client_pids+=($!)
   local pid=$!
@@ -273,6 +277,35 @@ if in_ns client curl -fsS --max-time 3 http://169.254.169.254:8080/ >/dev/null 2
 fi
 echo "clients can ping the gateway but not reach its host services or instance metadata"
 
+# Device enrollment controls: with approval required, a new device key waits
+# until an administrator approves it.
+peer_pid=${client_pids[1]}
+kill -INT "$peer_pid"; wait "$peer_pid" 2>/dev/null || true
+gateway1_account=$(admin_api http://127.0.0.1:9090/api/clients |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["clients"][0]["id"])')
+admin_api -X PUT --data '{"policy":"approval"}' \
+  "http://127.0.0.1:9090/api/clients/$gateway1_account/enrollment" >/dev/null
+if start_client peer replacement 2>/dev/null; then
+  echo "an unapproved device connected" >&2
+  exit 1
+fi
+grep -q "waiting for administrator approval" "$work/peer.log" || {
+  echo "the unapproved device did not report that it awaits approval" >&2
+  exit 1
+}
+in_ns peer env PATH="$work/bin:$PATH" "$client_binary" --cleanup-network \
+  --network-state "$work/peer/network-state.json" >/dev/null 2>&1 || true
+pending_device=$(admin_api http://127.0.0.1:9090/api/clients | python3 -c '
+import json, sys
+devices = json.load(sys.stdin)["clients"][0]["devices"]
+print(next(device["id"] for device in devices if device["status"] == "pending"))')
+admin_api -X POST "http://127.0.0.1:9090/api/clients/$gateway1_account/devices/$pending_device/approve" >/dev/null
+start_client peer replacement
+in_ns peer ping -n -c 1 -W 5 "$client_lease" >/dev/null
+admin_api -X PUT --data '{"policy":"open"}' \
+  "http://127.0.0.1:9090/api/clients/$gateway1_account/enrollment" >/dev/null
+echo "new devices wait for approval and connect once approved"
+
 
 seen=$(in_ns client curl -fsS --max-time 10 "http://$web_address:8080/")
 [[ $seen == "$exit_address" ]] || {
@@ -285,7 +318,7 @@ bulk=$(in_ns client curl -fsS --max-time 60 -o /dev/null -w '%{size_download} %{
 [[ ${bulk%% *} == 16777216 ]] || { echo "bulk transfer was incomplete: $bulk" >&2; exit 1; }
 echo "16 MiB bulk transfer completed through the chain (${bulk#* } bytes/s)"
 mtu=$(in_ns client cat /sys/class/net/porta-ci0/mtu)
-in_ns client ping -n -c 2 -W 5 -M do -s $((mtu - 28)) "$web_address" >/dev/null
+in_ns client ping -n -c 2 -W 5 -M "do" -s $((mtu - 28)) "$web_address" >/dev/null
 echo "full-size DF ping crosses the chain (client MTU $mtu)"
 for gateway in $(seq 1 $((gateways - 1))); do
   in_ns "$gateway" curl -fsS --max-time 5 http://127.0.0.1:9090/readyz | grep -q '"upstream_tunnel"'

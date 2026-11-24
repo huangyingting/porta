@@ -48,12 +48,13 @@ mod native {
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, UdpSocket};
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::unix::AsyncFd;
 
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+    const TUNGETIFF: libc::c_ulong = 0x8004_54d2;
     const SIOCSIFMTU: libc::c_ulong = 0x8922;
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
@@ -116,8 +117,53 @@ mod native {
     }
 
     impl NativeTun {
+        /// Opens or creates the TUN device `name`, or adopts it from the
+        /// previous program after an in-place restart. Either way the device
+        /// is kept for the next restart.
         pub fn open(name: &str, mtu: usize) -> Result<Self, TunError> {
             validate(name, mtu)?;
+            let device = match crate::ops::handoff::take_tun(name) {
+                Some(fd) => Self::adopt(fd, name, mtu)?,
+                None => Self::create(name, mtu)?,
+            };
+            crate::ops::handoff::pass_tun(&device.name, device.fd.get_ref().as_fd()).map_err(
+                |source| TunError::Io {
+                    context: "keep TUN device for restarts",
+                    source,
+                },
+            )?;
+            Ok(device)
+        }
+
+        fn adopt(fd: std::os::fd::OwnedFd, name: &str, mtu: usize) -> Result<Self, TunError> {
+            let file = File::from(fd);
+            let mut request = IfReq::new("");
+            ioctl(file.as_raw_fd(), TUNGETIFF, &mut request).map_err(|source| TunError::Io {
+                context: "inspect inherited TUN device",
+                source,
+            })?;
+            if request.actual_name() != name {
+                return Err(TunError::Io {
+                    context: "adopt inherited TUN device",
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("inherited device is {}, not {name}", request.actual_name()),
+                    ),
+                });
+            }
+            // SAFETY: reading and setting status flags of an owned descriptor.
+            unsafe {
+                let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            set_mtu(name, mtu)?;
+            Self::from_file(file, name.to_owned(), mtu).map_err(|source| TunError::Io {
+                context: "register TUN with async runtime",
+                source,
+            })
+        }
+
+        fn create(name: &str, mtu: usize) -> Result<Self, TunError> {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -266,8 +312,11 @@ mod native {
         }
 
         fn from_file(file: File, name: String, mtu: usize) -> io::Result<Self> {
+            // SAFETY: the File keeps its descriptor open and unchanged until
+            // the AsyncFd that owns it is dropped.
+            let fd = unsafe { AsyncFd::register(file) }.map_err(|error| error.into_parts().1)?;
             Ok(Self {
-                fd: AsyncFd::new(file)?,
+                fd,
                 name,
                 mtu: AtomicUsize::new(mtu),
             })

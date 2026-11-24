@@ -43,11 +43,15 @@
     <string name="token_hint">访问令牌</string>
     <string name="token_unchanged_hint">留空可继续使用当前令牌</string>
     <string name="gateway_label">网关</string>
+    <string name="backup_gateways_label">备用网关</string>
+    <string name="backup_gateways_hint">可选，每行一个：共享此账户的网关</string>
     <string name="token_label">访问令牌</string>
     <string name="device_identity_automatic">设备身份使用安全密钥，并显示设备或型号名称以便识别。</string>
     <string name="device_identity_unavailable">无法加载此设备的安全密钥。请查看日志了解详情。</string>
     <string name="security_note">受 TLS 和 Android VPN 安全机制保护</string>
     <string name="auto_connect">设备重启后重新连接</string>
+    <string name="allow_lan">允许访问本地网络</string>
+    <string name="allow_lan_help">其他流量经由隧道时，仍可访问此网络上的打印机、文件共享和投屏设备。</string>
     <string name="secure_storage_failed">无法安全存储令牌</string>
     <string name="profile_delete_failed">无法删除 VPN 配置。</string>
     <string name="disconnect_before_editing">编辑前请先断开此配置。</string>
@@ -58,6 +62,17 @@
     <string name="connection_rejected">连接被拒绝</string>
     <string name="account_expired_denied">此账户已过期，请联系管理员续期。</string>
     <string name="quota_exceeded_denied">此账户已用完本月流量额度。下月恢复，或请管理员提高额度。</string>
+    <string name="device_pending_denied">此设备正在等待管理员批准。批准后请重新连接。</string>
+    <string name="enrollment_closed_denied">此账户不再接受新设备，请联系管理员开放注册。</string>
+    <string name="device_denied_denied">管理员未允许此设备连接。</string>
+    <string name="client_outdated_denied">此版本的 Porta 过旧，网关不再允许连接。请从下载页面安装最新版本。</string>
+    <string name="routing_full_tunnel">所有流量均经由网关</string>
+    <plurals name="routing_split_tunnel">
+        <item quantity="other">分流模式 · %1$d 个网络经由网关</item>
+    </plurals>
+    <plurals name="routing_split_tunnel_dns">
+        <item quantity="other">分流模式 · %1$d 个网络经由网关 · %2$s 使用隧道 DNS</item>
+    </plurals>
     <string name="account_expires">可使用至 %1$s</string>
     <string name="account_expires_soon">将于 %1$s 到期</string>
     <string name="quota_usage">本月已用 %1$s / %2$s</string>
@@ -99,4 +114,18 @@
     <string name="notification_connected">安全隧道已连接</string>
     <string name="notification_connected_transport">已通过 %1$s 连接</string>
     <string name="notification_permission_revoked">VPN 权限已撤销</string>
+    <string name="apps_label">应用</string>
+    <string name="apps_all">所有应用</string>
+    <string name="apps_mode_all">所有应用使用隧道</string>
+    <string name="apps_mode_only">仅所选应用使用隧道</string>
+    <string name="apps_mode_except">所选应用不使用隧道</string>
+    <string name="apps_choose_one">请至少选择一个应用</string>
+    <string name="apps_too_many">最多选择 %1$d 个应用</string>
+    <string name="no_selected_apps_installed">此配置所选的应用均未安装</string>
+    <plurals name="apps_only">
+        <item quantity="other">仅 %1$d 个应用</item>
+    </plurals>
+    <plurals name="apps_except">
+        <item quantity="other">除 %1$d 个应用外的所有应用</item>
+    </plurals>
 </resources>

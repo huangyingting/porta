@@ -120,7 +120,8 @@ The default deployment:
   numeric unicast IPv4 address, not loopback or link-local;
 - installs narrowly scoped nftables NAT, forwarding, and public-input guard
   rules;
-- installs hardened systemd services;
+- installs hardened systemd services and runs the daemon as the unprivileged
+  `porta` system user (see [Service user](#service-user));
 - either renews its own Let's Encrypt certificate or synchronizes externally
   managed certificate files every six hours;
 - tunes Linux UDP buffers for QUIC;
@@ -141,6 +142,28 @@ sudo ./scripts/deploy.sh \
   --gateway-cidr 10.77.0.1/24
 ```
 
+### Service user
+
+`porta-server` runs as the `porta` system user, which deployment creates on
+first installation. It holds only the ambient `CAP_NET_ADMIN` capability, plus
+`CAP_NET_BIND_SERVICE` for ports below 1024 such as 443 and the ACME HTTP-01
+listener on 80. It owns `/var/lib/porta` (the client registry, leases, usage,
+ACME cache, and upstream identity) and can read but not change its
+configuration:
+
+- `/etc/porta/porta.env` is read by systemd as root and stays `0600`.
+- Static certificates are published to `/etc/porta/tls` as `root:porta`, with
+  the private key `0640`; `porta-cert-sync.service` keeps this on renewal.
+- Custom landing templates in `/etc/porta/landing` are made group-readable
+  by `porta` on every deployment.
+
+The `server-up.sh` and `server-down.sh` network helpers run as root through
+systemd's `!` prefix, inside the same sandbox and capability bounding set.
+They keep their recovery journals in `/run/porta`, which
+`/etc/tmpfiles.d/porta.conf` creates root-only, so the daemon cannot read or
+alter them. Upgrades from releases that ran the daemon as root hand existing
+state to `porta` automatically.
+
 ### Automatic tunnel MTU
 
 Conservative per-connection HTTP/3 selection is enabled by default, with a
@@ -153,9 +176,10 @@ The deployment script accepts MTUs from 576 through 1400.
 MTU feedback requires Linux to accept gateway-sourced ICMP injected through
 TUN, in both automatic and fixed interface-MTU modes. Deployment passes
 `--auto-mtu` to the daemon; `server-up.sh` takes five positional arguments plus
-the optional `--upstream-interface IF` (cascade relay) and `--client-to-client`
-flags. It always sets `accept_local=1` and loose `rp_filter=2` only on the
-owned TUN, and on a relay's upstream TUN. It does not change global or
+the optional `--upstream-interface IF` (cascade relay), repeatable
+`--exit-interface IF`, `--local-exit` and `--client-host-access` options. It
+always sets `accept_local=1` and loose `rp_filter=2` only on the owned TUN,
+and on a relay's upstream and exit TUNs. It does not change global or
 physical-interface reverse-path
 filtering. These interface-local settings disappear with the TUN. The helper
 records the host's previous `net.ipv4.ip_forward` value under `/run/porta` and
@@ -199,7 +223,8 @@ overrides its saved value, is saved in turn, and is reported as
 `deploy: changing NAME: OLD -> NEW` before services are stopped. Use the
 explicit off-switches to remove saved behavior: `--no-upstream`, `--acme`
 (forget a saved certificate path), `--client-to-client=false`,
-`--client-host-access=false`, `--trust-proxy-headers=false`, and
+`--client-host-access=false`, `--routes=`, `--dns-domains=`,
+`--trust-proxy-headers=false`, and
 `--forward-proxy=true|false`. The external interface is saved only when given
 explicitly; otherwise it is detected on every run. An invalid or
 hand-edited file with unknown keys or unsafe characters is rejected before
@@ -207,6 +232,33 @@ anything is stopped.
 The gateway address is derived from the pool unless explicitly supplied. A
 pool change is rejected when existing leases are incompatible; use
 `--reset-leases` to archive those leases deliberately.
+
+### Restarts without downtime
+
+`sudo systemctl reload porta` restarts the gateway in place. The process
+finishes its tunnels, telling HTTP/3 clients that the gateway is restarting,
+saves its state, and re-executes `/usr/local/bin/porta-server` under the same
+PID with the listening sockets and TUN interfaces still open. Nothing is torn
+down: the interface keeps its addresses, routes and firewall rules, connection
+attempts during the handover wait in the kernel instead of failing, and
+clients reconnect within about a second (their first retry is after 250 ms)
+to the same leases, over the same transport. Use it after replacing the
+binary, or send `SIGHUP` to the daemon directly.
+
+A rerun of `deploy.sh` that changes neither options nor the network helpers
+uses this path automatically and reports `deploy: restarting the running
+gateway in place`; other upgrades stop and start the service as before.
+In-memory state starts over: rate-limit and abuse counters, the device-proof
+nonce cache, and metrics counters. A new binary that fails to start makes
+systemd restart the service normally.
+
+### High availability
+
+A single gateway is a single host. For redundancy, run two or more gateways
+with [federation](#several-gateways-for-one-account-federation) and list them
+all in client profiles: clients measure them, use the nearest, and move to
+another one within seconds when a gateway stops, keeping leak protection on.
+Leases are per gateway, so a device has a different address on each.
 
 The generated unit carries an inert ordering rule for `docker.service`. If
 Docker is installed, deployment also adds it as a weak startup dependency so
@@ -280,6 +332,100 @@ limit on the next hop's account, or an unreachable next hop. Monitor
 Avoid loops: a chain that eventually points back to an earlier hop forwards
 packets until their TTL expires.
 
+## Built-in DNS resolver
+
+`--dns-resolver` (`deploy.sh --dns-resolver`) serves DNS on the gateway's
+tunnel address, `10.66.0.1` by default, and advertises it to clients instead
+of `--dns`:
+
+- Every connected device gets a name, `device.account.porta.internal`, built
+  from its device and account names (duplicates get a short suffix). The
+  admin page shows each device's name. A client resolves only the devices it
+  may reach (same account, shared access group, or `--client-to-client`, and
+  both access policies); other names do not exist for it. Reverse lookups of
+  client addresses return these names.
+- Other names are forwarded to `--dns-upstream` resolvers
+  (`deploy.sh --dns-upstreams 9.9.9.9,149.112.112.112`), by default the
+  host's `/etc/resolv.conf` servers. `--dns-forward corp.example=10.20.0.53`
+  sends a domain and its subdomains to another resolver, for example an
+  internal zone reached through a subnet router.
+- `--dns-blocklist FILE` refuses listed domains and their subdomains with
+  NXDOMAIN. The file holds one domain per line or uses hosts-file format, and
+  is reloaded within a minute of changing. `deploy.sh` installs it as
+  `/etc/porta/dns-blocklist.txt`, which you can then edit in place.
+
+Split tunnels add `porta.internal` to their DNS domains automatically. The
+resolver answers only live clients and the gateway host: `server-up.sh` drops
+traffic to the gateway's tunnel address from any other interface. On a
+cascade relay, forwarded queries leave from the relay itself, not through the
+exit; point `--dns-upstream` at a resolver you trust there. The daemon needs
+`CAP_NET_BIND_SERVICE` for port 53, which `deploy.sh` grants.
+
+## Several gateways for one account (federation)
+
+To give users more than one gateway, for capacity, nearby regions or
+availability, run one gateway as the **primary** and the others as
+**replicas** that mirror its accounts, devices and access policies. Use the
+same secret of at least 32 characters on all of them:
+
+```sh
+# On the primary:
+sudo PORTA_FEDERATION_TOKEN=... ./scripts/deploy.sh --domain eu.example.com
+# On each replica:
+sudo PORTA_FEDERATION_TOKEN=... ./scripts/deploy.sh --domain us.example.com \
+  --federation-primary https://eu.example.com
+```
+
+The daemon options are `PORTA_FEDERATION_TOKEN` and, on replicas,
+`--federation-primary URL` and `--federation-ca PATH` (`deploy.sh` passes
+`--upstream-ca` for a privately signed primary). The primary serves its
+accounts to replicas at `GET /federation/v1/registry` on its public
+listener, only to the federation token. Replicas poll every 15 seconds and
+keep the last copy, so they keep working while the primary is down:
+
+- Accounts are read-only on a replica; the admin page says so and changes
+  are refused. Manage accounts on the primary.
+- A device that a replica does not know yet is refused with a retryable
+  `503`, so the client tries the next gateway; it enrolls on the primary and
+  can use the replicas once they have synced.
+- Disabling an account, rotating its token, or denying or forgetting a
+  device on the primary ends the matching sessions on every replica at the
+  next sync.
+- Leases, usage statistics and monthly quotas are counted per gateway.
+
+`deploy.sh --disable-federation` stops a primary from serving replicas and
+forgets the token. Client profiles then list every gateway; see
+[Multi-gateway profiles](clients.md#multi-gateway-profiles).
+
+## Exit selection
+
+A gateway can offer several exits and let each account choose one in its
+access policy, for example to route some customers through another region.
+Name each additional next hop with `--exits`, and offer this host's own
+egress with `--local-exit` on a relay:
+
+```sh
+sudo PORTA_UPSTREAM_TOKEN=... PORTA_EXIT_TOKEN_US=... ./scripts/deploy.sh \
+  --upstream https://eu.example.com --exits us=https://us.example.com --local-exit
+```
+
+The daemon options are `--exit NAME=URL` (repeatable, at most 8) with the
+client token in `PORTA_EXIT_TOKEN_<NAME>` (upper case, `-` as `_`), and
+`--local-exit`. All next hops share `--upstream-ca`, `--upstream-transport`
+and the gateway's upstream device key, which each next hop enrolls like any
+other device. Exit *i* uses the TUN `porta-up<i>` and routing table
+`10066+i`; `server-up.sh` takes the matching `--exit-interface` and
+`--local-exit` options. Without `--upstream`, traffic exits locally by
+default and `local` is selectable next to the named exits.
+
+Pick an account's exit in the admin page's **Network access** section or set
+`exit` with `PUT /api/clients/{id}/access`. The gateway installs a policy
+routing rule for each of the account's leases before its tunnel carries
+traffic, and removes it when the tunnel ends. A selected exit that is down
+blackholes that account's traffic instead of falling back to another path;
+readiness reports each named exit as an optional `exit_<name>` component,
+and the admin page shows every next hop.
+
 ## Client isolation
 
 VPN clients can never reach link-local destinations, including the cloud
@@ -295,14 +441,197 @@ listening on all addresses, are unreachable from the tunnel. Add
 `--client-host-access` to allow clients to reach every host service, for
 example to administer the gateway over the tunnel; metadata remains blocked.
 
-## Client-to-client traffic
+## Client-to-client traffic and access policy
 
-By default each client can reach only its exit; traffic between leases is
-dropped. Add `--client-to-client` to let all clients of the gateway reach each
-other's tunnel addresses, as in a hub-and-spoke WireGuard bounce server. This
-applies to every account on the gateway, so enable it only when all clients
-are trusted to see each other. It combines with `--upstream`: inter-client
-traffic stays on the hub while Internet traffic continues to the next hop.
+The gateway switches traffic between clients itself; the kernel never
+forwards it. Devices of one account always reach each other. Devices of
+different accounts reach each other only when both accounts share an access
+group, or when the daemon runs with `--client-to-client`
+(`deploy.sh --client-to-client`), which makes every client a peer, as in a
+hub-and-spoke WireGuard bounce server. Enable that only when all clients are
+trusted to see each other.
+
+### Direct paths between devices
+
+With `--peer-to-peer` (`deploy.sh --peer-to-peer`), devices that may reach
+each other under these rules connect directly instead of through the
+gateway, like a Tailscale or NetBird mesh. The gateway only introduces
+them: it tells each HTTP/3 client the public UDP address it sees for each
+of its peers and the certificate fingerprint each peer chose for this
+tunnel. The clients then open QUIC connections to each other from the
+socket that carries their tunnel, authenticate each other by those
+fingerprints, and carry IP packets between their tunnel addresses as QUIC
+datagrams. A device's list changes as peers connect and leave, and when an
+account is disabled or a device revoked its sessions end and its peers drop
+their paths to it.
+
+Direct paths work through NATs that keep a socket's public address for
+every destination, as most home and office routers do. Behind symmetric
+NATs or carrier-grade NATs that do not, a firewall that blocks UDP, or with
+two devices behind one NAT that does not hairpin, the devices keep using
+the gateway, as they do for anything a path cannot carry: packets larger
+than the path allows, traffic to a subnet behind a device, and the moments
+before a path is up or after it breaks (a silent path is given up after 8
+seconds). Only split-tunnel clients use direct paths, because a full tunnel
+sends everything through the gateway by definition, and HTTP/2 clients have
+no UDP socket to share. The admin page's routing banner shows whether the
+gateway offers direct paths.
+
+Traffic on a direct path does not pass the gateway, so it does not count
+toward usage, quotas or rate limits, and the gateway does not see it.
+Access policy still decides which devices are introduced, in both
+directions, and each client accepts only packets from the peer's own tunnel
+addresses to its own.
+
+Each account also has an access policy, set in the admin page's **Network
+access** section or with `PUT /api/clients/{id}/access`:
+
+- **Allowed destinations**: rules for what the account may reach. Empty allows
+  everything.
+- **Blocked destinations**: rules for what the account may never reach; they
+  win over allowed ones and over a shared group.
+- **Group**: accounts with the same group name reach each other's devices and
+  subnets.
+
+A rule is a prefix or address, optionally narrowed to a protocol and ports,
+separated by commas in the admin page:
+
+| Rule | Matches |
+|---|---|
+| `10.20.0.0/16` | everything to the prefix |
+| `10.1.2.3 tcp/443` | TCP connections to port 443 |
+| `10.1.2.0/24 tcp/8000-8100` | TCP connections to a port range |
+| `10.1.2.0/24 tcp` | TCP connections to any port |
+| `192.0.2.53 udp/53` | UDP with port 53 at either end |
+| `10.1.2.0/24 icmp` | ICMP and ICMPv6 |
+
+The gateway filters each packet without tracking connections, so port rules
+decide which connections a device may open:
+- A TCP rule matches packets that open a connection (SYN without ACK).
+  Later packets of any connection, including replies to connections other
+  devices opened to this one, need only the address to be allowed.
+- A UDP rule matches packets with one of its ports at either end, so replies
+  from the service match.
+- ICMP errors and later fragments need only the address, so path MTU
+  discovery keeps working.
+
+The gateway address and its `--dns` server stay reachable whatever the lists
+say. Policies apply to traffic in both directions between clients, and to
+traffic toward the exit; for traffic a device receives from another, that
+device's address must be allowed. With `--peer-to-peer`, devices are
+introduced for direct paths only when neither one's rules narrow what it may
+send to the other, since direct traffic bypasses the gateway. Changing an
+account's policy reconnects its devices, which pick up the new rules
+automatically.
+
+## Requiring up-to-date clients
+
+Porta apps report their version when they connect. Start the gateway with
+`--min-client-version 0.1.41` (`deploy.sh --min-client-version 0.1.41`) to
+refuse older apps, for example after a security fix. They are refused before
+authenticating, so they enrol no device, and they show a message asking the
+user to install the latest version from the downloads page. Apps from
+before this setting existed report no version and are refused whenever a
+minimum is set. Standard CONNECT-IP clients are not Porta apps and are not
+affected. `deploy.sh --min-client-version=` removes the requirement.
+
+## Subnet routing (site-to-site)
+
+A device can publish the network behind it, like a WireGuard peer with
+`AllowedIPs` or a Tailscale subnet router. In the admin page, open the
+account's devices and choose **Subnets** for the router device, or call
+`PUT /api/clients/{id}/devices/{device}/subnets` with
+`{"subnets": ["10.30.0.0/24"]}`. Subnets must be unicast prefixes of `/8` or
+longer, may not overlap the client pool or another device's subnets, and are
+limited to 16 per device.
+
+Run the Linux client on that device with `--subnet-router`. It enables IPv4
+forwarding (restoring the previous value when it disconnects) and
+masquerades tunnel traffic toward the subnets, so LAN hosts need no route back
+to the client pool. The gateway then accepts packets from that device whose
+source lies in its subnets, routes the subnets to it, and lets peers reach
+them under the same rules as client-to-client traffic: same account, shared
+group, or `--client-to-client`, and each side's access policy. Hosts behind a
+subnet router can only talk to clients, never to the exit. Split-tunnel
+clients also route every published subnet and the client pool through the
+tunnel. A host firewall that drops forwarded traffic on the router, such as
+Docker's `FORWARD` policy, must allow traffic from the tunnel interface to the
+LAN.
+
+## Split tunneling
+
+By default clients send all IPv4 traffic through the gateway (a full tunnel).
+To tunnel only private networks behind the gateway, advertise them with
+`--routes` and, optionally, the DNS domains the gateway's resolver should
+answer:
+
+```sh
+sudo ./scripts/deploy.sh --routes 10.20.0.0/16,192.168.5.0/24 \
+  --dns 10.20.0.53 --dns-domains corp.example
+```
+
+The daemon options are `--route CIDR` and `--dns-domain NAME`, repeated per
+entry (at most 64 routes and 16 domains). Routes cannot be `/0`, loopback, or
+multicast; DNS domains require routes. `--routes=` restores a full tunnel.
+
+Clients then route only those prefixes and the `--dns` resolver into the
+tunnel; all other traffic keeps the device's own network. Leak protection is
+scoped the same way: advertised prefixes are blocked outside the tunnel while
+it reconnects, and everything else is unaffected. DNS behaves per platform:
+
+- Linux scopes the tunnel resolver to the domains with a systemd-resolved
+  routing domain; without domains the host resolver is untouched.
+- Windows adds NRPT rules for the domains; without domains it sets no tunnel
+  DNS.
+- Android cannot scope DNS by domain for a VPN, so with domains it sends all
+  DNS to the tunnel resolver, and without domains it leaves DNS alone.
+
+The admin page shows a **Split tunnel** banner listing the advertised routes,
+and every client shows whether its connection is a full or split tunnel.
+
+## IPv6 (dual stack)
+
+Clients are IPv4-only by default: full tunnels block IPv6 so it cannot leak
+around the tunnel. To give clients IPv6 as well:
+
+```sh
+sudo ./scripts/deploy.sh --ipv6
+```
+
+`--ipv6` picks a random unique local /64 (RFC 4193) once and keeps it across
+upgrades; `--ipv6-pool CIDR` uses a prefix of your choice instead, and
+`--no-ipv6` turns IPv6 off again. The daemon option is `--ipv6-pool CIDR`.
+Each device's IPv6 address mirrors its IPv4 lease: `10.66.0.5` becomes
+`PREFIX::5`, and the gateway is `PREFIX::1`. Both families therefore share one
+allocator and one lease file, a device keeps both addresses across
+reconnects, and the prefix must leave at least as many host bits as the IPv4
+pool (`/64` through `/120` for the default `/24`).
+
+`scripts/server-up.sh` (with `--ipv6 GATEWAY6/LEN POOL6`) enables IPv6 on the
+TUN, turns on IPv6 forwarding, and masquerades the pool through the external
+interface. A prefix routed to this host by your provider can skip NAT with
+`--ipv6-routed`. Forwarding makes the kernel ignore router advertisements on
+interfaces with `accept_ra=1`; the helper sets the external interface to
+`accept_ra=2` so the host keeps its own IPv6 default route, and
+`server-down.sh` restores both settings. It applies the same guards as for
+IPv4: clients cannot reach link-local or multicast destinations or the AWS
+`fd00:ec2::254` metadata address, only ping and DNS reach the gateway host,
+and Docker's `ip6tables` `DOCKER-USER` chain gets matching accept rules.
+
+With a unique local pool, operating systems prefer IPv4 for destinations that
+have both families and use IPv6 for IPv6-only destinations; a routed global
+prefix makes clients prefer IPv6 as usual. The tunnel MTU must be at least
+1280, the IPv6 minimum. When a QUIC path cannot carry 1280-byte datagrams,
+IPv6 packets take the reliable stream instead of being told to shrink.
+
+IPv6 is not yet available on a cascade relay (`--upstream`): its next hop
+carries IPv4 only, and the gateway refuses the combination rather than let
+IPv6 leave locally. Devices whose access policy selects a named exit get no
+IPv6 address for the same reason. Split-tunnel `--routes` may include IPv6
+prefixes once IPv6 is on; split tunnels also route the IPv6 client pool so
+peers stay reachable, and access-policy allow and deny lists accept IPv6
+prefixes. The built-in resolver answers `AAAA` and `ip6.arpa` queries for
+devices that both have IPv6. The admin page shows a **Dual stack** banner.
 
 ## Token portal and client downloads
 
@@ -529,6 +858,102 @@ waits for session workers and accounting to finish. Forgetting a device also
 disconnects it, but a device with a still-valid shared token can enroll again.
 Use **Disconnect now** to end current sessions without changing credentials;
 clients with automatic reconnect enabled may reconnect immediately.
+
+### Administrators, single sign-on and the audit log
+
+`PORTA_ADMIN_TOKEN` is a break-glass owner credential. For day-to-day use,
+sign in with it once, open **Administrators**, and create an account for each
+person:
+
+- **Owner** manages administrators and everything else.
+- **Operator** manages clients, devices, limits and access policies.
+- **Viewer** can only look.
+
+Administrators sign in at `/admin/sign-in` with a password of at least 12
+characters (stored as PBKDF2-SHA256) and can turn on two-factor
+authentication with any TOTP authenticator app from the page header. Codes
+are accepted once, with 30 seconds of clock drift either way. Disabling or
+deleting an administrator ends what their sessions can do immediately.
+
+For single sign-on, register Porta with your OpenID Connect provider using the
+redirect URL `https://DOMAIN[:PORT]/auth/oidc/callback`, then deploy with
+`--oidc-issuer URL --oidc-client-id ID` and the client secret, if any, in
+`PORTA_OIDC_CLIENT_SECRET` (daemon options: `--oidc-issuer`,
+`--oidc-client-id`, `--oidc-redirect-url`, `--oidc-ca` for a private issuer).
+Give an administrator a **Single sign-on email**; a user whose verified email
+matches signs in with **Sign in with single sign-on**. Porta uses the
+authorization code flow with PKCE and a nonce, and checks the ID token's
+RS256 or ES256 signature against the issuer's keys, its issuer, audience and
+expiry. Users without a matching administrator are refused.
+
+### Letting users sign in with single sign-on
+
+Instead of handing out account tokens, let people sign in on the portal with
+the same OpenID Connect provider. Deploy with
+`--sso-user-domains example.com[,example.org]` (and optionally
+`--sso-max-devices N`, default 5) next to the `--oidc-*` options. The
+portal's **Get access** page then offers **Sign in with your organisation**.
+No second redirect URL is needed.
+
+- A user whose verified email is in one of the domains gets an account on
+  first sign-in, named after the email, with the configured device limit and
+  the default policies. The downloads page then shows their setup, as for a
+  token sign-in. Signing in again shows the same account and token, so their
+  other devices keep working.
+- Other emails, and emails the provider has not verified, are refused.
+- Administrators manage these accounts like any other. **Disabling** one
+  refuses the user's sign-in and disconnects their devices. Deleting one lets
+  the user start afresh with a new account at their next sign-in. To block a
+  person, disable the account or remove them at the provider. Rotating the
+  token disconnects their devices; their next sign-in shows the new token.
+- Sign-ins and refusals are audited as `user.sign_in`, and created accounts
+  as `client.create` by the `sso` actor.
+
+The gateway keeps each user's account and token in
+`/var/lib/porta/sso-users.json` (daemon option `--sso-users`), written `0600`.
+Tokens there are encrypted with a key derived from `PORTA_ADMIN_TOKEN`, which
+is therefore required, so the file alone does not reveal them. Changing the
+admin token makes them unreadable: each user's token is rotated at their next
+sign-in, and their devices need the new setup. Configure user sign-in on the
+primary gateway; replicas mirror the accounts it creates.
+
+Every admin API change, denied request, administrator sign-in (successful or
+not) and tunnel connection is appended to `/var/lib/porta/audit.log` as JSON
+lines with the actor, action, target, outcome, address and time. Request
+bodies, such as passwords, are never recorded. The file rotates at 10 MiB,
+keeping five older files. Owners and operators see recent events under
+**Audit log** and can export them all. The daemon options `--admin-store` and
+`--audit-log` move the administrator store and the log.
+
+### Device enrollment
+
+A client token can enroll devices, so a leaked token could otherwise add
+devices until the account's device limit is reached. Each account has a policy
+for device keys it has not seen before, set under **New devices** in the client
+dialog or with `PUT /api/clients/{id}/enrollment`:
+
+- **Enroll automatically** (`open`, the default): new devices enroll on first
+  connection, up to the device limit.
+- **Wait for my approval** (`approval`): a new device is recorded as *awaiting
+  approval* and cannot connect. **Approve** it in the device list (it then
+  counts toward the device limit) or **Deny** it.
+- **Block new devices** (`closed`): new devices are refused.
+
+**Allow new devices for 15 min** opens a temporary window in which new devices
+enroll directly whatever the policy, which suits setting up a new phone or
+laptop. Already enrolled devices are unaffected by the policy. Denied devices
+stay refused until approved or forgotten. At most 16 pending or denied devices
+are kept per account; beyond that, new devices are refused. Clients explain
+these refusals in their own language. The forward proxy has no device identity
+and is not subject to enrollment policy; disable it with
+`--disable-forward-proxy` if token-only proxy access is unwanted.
+
+**Allow standard MASQUE clients** in the same dialog lets third-party RFC 9484
+CONNECT-IP clients, which know nothing of Porta's device keys, connect with
+the account's token alone. It is off by default. They share one device slot
+and one address, and since the token is their only credential, use it only
+for accounts dedicated to such clients. See
+[Standard CONNECT-IP clients](endpoints.md#standard-connect-ip-clients).
 
 ### Account limits
 

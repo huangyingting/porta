@@ -14,6 +14,8 @@ Node.js or npm build.
 
 ```sh
 make check-version
+make check-dependencies
+make lint-scripts
 make test-automation
 make test
 make test-rust-server
@@ -22,9 +24,23 @@ make test-rust-interop
 make test-windows-cross
 make test-native-firewall
 make test-cascade
+make test-split-tunnel
+make test-subnet-router
+make test-exit-selection
+make test-dns-resolver
+make test-admin-identity
+make test-gateway-failover
+make test-ipv6
+make test-graceful-restart
+make test-client-daemon
+make test-peer-to-peer
+make test-standard-masque
+make test-apple-ffi
+make test-service-user
 make vet
 make build
 make build-windows
+make build-linux-desktop
 make android-debug
 make android
 ```
@@ -39,6 +55,88 @@ gateways in network namespaces form a client -> relay -> relay -> exit chain
 with identical pools. It checks the exit address seen by a web server, a
 full-size DF ping, a bulk transfer, client-to-client reachability, fail-closed
 behavior while the exit is down, and automatic recovery after it returns.
+
+`make test-service-user` runs `scripts/test-service-user.sh`, which needs
+systemd. It starts a relay and an exit gateway with every sandbox setting of
+`deploy/porta.service` through `systemd-run`, each in a network namespace and
+as an unprivileged user. It checks that the daemons hold only
+`CAP_NET_ADMIN`, own their state, relay a client's traffic, and that the root
+network helpers configure and remove the firewall.
+
+`make test-subnet-router` and `make test-exit-selection` run
+`scripts/test-subnet-router.sh` and `scripts/test-exit-selection.sh` over
+both transports. The first routes a LAN behind one client to a client of
+another account and checks access groups, allow and deny lists, and the
+router's forwarding restore. The second relays one account through a default
+upstream, a named exit, and the local exit, and checks that a selected exit
+that is down fails closed.
+
+`make test-dns-resolver` runs `scripts/test-dns-resolver.sh`: three clients
+of two accounts use the gateway's built-in resolver, which must resolve and
+reverse-resolve peer device names only, forward over UDP and TCP to a fake
+upstream, refuse a blocklisted domain, and stay unreachable from outside the
+tunnel.
+
+`make test-admin-identity` runs `scripts/test-admin-identity.sh` against a
+fake OpenID provider that enforces PKCE and signs RS256 ID tokens. It checks
+local sign-in, TOTP enrollment and replay protection, role limits, single
+sign-on for a mapped and an unknown email, that disabling an administrator
+ends their session's rights, and the audit log's contents and permissions.
+
+`make test-gateway-failover` runs `scripts/test-gateway-failover.sh` over both
+transports: a client lists a primary and a faster replica, enrolls through
+the primary, fails over to the replica when the primary stops, and loses its
+replica session when the primary disables the account.
+
+`make test-ipv6` runs `scripts/test-ipv6.sh` over both transports: a
+dual-stack gateway's clients reach an IPv6 web server through the gateway's
+NAT66 address and never through their own IPv6 network, download a large
+file over IPv6, and reach each other's IPv6 addresses; an IPv4-only gateway's
+full tunnel blocks IPv6 instead of leaking it; and a dual-stack split tunnel
+routes only its IPv6 prefixes.
+
+`make test-graceful-restart` runs `scripts/test-graceful-restart.sh` over both
+transports: it replaces the gateway binary, sends `SIGHUP`, and checks that
+the same process re-executes the new binary, keeps its TUN interface,
+addresses and firewall rules, and that the client resumes within five
+seconds with the same lease and transport, twice in a row.
+
+`make test-client-daemon` runs `scripts/test-client-daemon.sh`: it drives the
+Linux desktop service's control socket like the app, saving a profile,
+connecting, checking traffic and the reported state, disconnecting,
+reporting a rejected token, and checking that only root and the control
+group may use the socket. `make build-linux-desktop` builds the window
+itself (`porta-linux --features gui`); workspace builds leave it out so
+they need no GTK files.
+
+`make test-peer-to-peer` runs `scripts/test-peer-to-peer.sh`: two clients
+behind separate masquerading NATs, which drop unsolicited packets like home
+routers, learn each other's public addresses from a `--peer-to-peer`
+gateway and punch through both NATs. The test checks that their traffic
+takes the direct path, returns to the gateway when the path is blocked and
+goes direct again when it heals, and that a device disconnecting ends its
+peers' paths to it.
+
+`make test-standard-masque` builds the interop probe in
+`experiments/masque-interop` (Go, using the independent quic-go/connect-ip-go
+CONNECT-IP client; it is test tooling and the only Go in the repository) and
+runs `scripts/test-standard-masque.sh`: the probe is refused until the
+account allows standard clients, then receives an address and routes with or
+without asking and pings the gateway and an Internet host through the tunnel.
+
+`make test-apple-ffi` links `rust/porta-apple/tests/probe.c` against
+`libporta.a` and runs `scripts/test-apple-ffi.sh`: through the C interface
+the macOS and iOS apps use, the probe connects with a device proof, reads the
+session's settings, pings through the tunnel and cancels; a wrong token is
+reported as denied. On macOS with Xcode, `make build-apple` builds
+`apple/build/Porta.xcframework` and `make test-apple` runs PortaKit's Swift
+tests and an iOS build.
+
+`make test-split-tunnel` runs `scripts/test-split-tunnel.sh` the same way. A
+gateway advertises one private prefix and a DNS domain; the test checks that
+only that prefix uses the tunnel, other traffic goes direct, DNS is scoped to
+the domain, the prefix fails closed rather than leaking while the gateway is
+down, and disconnecting restores the host's routing.
 
 `make test-automation` uses Python 3's standard library to exercise
 deployment, certificate sync, firewall cleanup and packaging with isolated
@@ -288,6 +386,44 @@ no release signing secrets. These developer artifacts are not release updates
 and must not be copied into the download portal. Post-merge releases use
 the persistent key and are the distributable update artifacts.
 
+## Dependencies
+
+`rust/deny.toml` is the dependency policy: no known vulnerable, unsound or
+unmaintained crate without a recorded reason, only permissive licenses (and
+MPL-2.0 for unmodified Tauri dependencies), and only crates.io plus the
+pinned h3 revision as sources. `make check-dependencies` runs it with
+`cargo-deny` (`cargo install cargo-deny --locked`), and the required
+**dependencies** CI job runs it on every push, so a newly published advisory
+fails CI until the dependency is updated or the exception is justified in
+`deny.toml`. Dependabot proposes weekly updates to the `rust` branch.
+
+`rustls-platform-verifier` is pinned to exactly 0.7.0: later releases stop
+bundling the Android verifier AAR that the Android build loads from the
+crate. Moving past it means fetching that AAR from a pinned, checksummed
+source in `android/app/build.gradle.kts`.
+
+## Fuzzing
+
+`rust/fuzz` holds coverage-guided fuzz targets for every parser that reads
+network input: MASQUE capsules (`capsules`), IP packets with fragmentation,
+ICMP errors and NAT (`ip_packets`), device proof headers (`device_proof`),
+direct-path messages (`peer_messages`), the HTTP/2 packet stream
+(`packet_frames`) and durations (`durations`). Targets assert that what
+decodes re-encodes to the same value. It is a separate workspace because
+fuzzing needs nightly:
+
+```sh
+rustup toolchain install nightly --profile minimal
+cargo +nightly install cargo-fuzz --locked
+make fuzz FUZZ_SECONDS=300          # every target, 5 minutes each
+cd rust/fuzz && cargo +nightly fuzz run ip_packets   # one target, until stopped
+```
+
+The required **fuzz** CI job runs every target for 30 seconds and uploads
+any crashing input as the `fuzz-crashes` artifact. Reproduce one with
+`cargo +nightly fuzz run <target> <file>`, fix the bug and add the input as
+a unit test next to the parser.
+
 ## Version policy
 
 The application version is stored in `internal/buildinfo/VERSION` and currently
@@ -321,7 +457,9 @@ workflows. `golang` is a separate implementation branch; do not merge its Go
 build/release workflows into `main`.
 
 **CI** builds and tests branch pushes, PRs targeting `main`, and manual runs.
-Linux/Rust, native Windows, and Android must all pass. The stable
+Linux/Rust, the dependency policy, fuzzing, the standard CONNECT-IP interop
+job, the macOS job that builds and tests PortaKit, native Windows, and
+Android must all pass. The stable
 **Rust PR required** check rejects failed, cancelled or skipped jobs and rejects
 promotion PRs whose source is not this repository's `rust` branch. Branch/main
 and manual runs use **Rust CI required**, so they cannot substitute for the

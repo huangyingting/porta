@@ -7,6 +7,7 @@ import fcntl
 import http.server
 import json
 import os
+import pathlib
 from pathlib import Path
 import re
 import shutil
@@ -40,6 +41,7 @@ class AutomationTests(unittest.TestCase):
             "GH_TOKEN": "",
             "GITHUB_TOKEN": "",
             "PORTA_RUNTIME_DIRECTORY": str(self.root / "runtime"),
+            "PORTA_BACKUP_ALLOW_NONROOT": "1",
         }
         self.write_state(
             sysctl={
@@ -49,9 +51,9 @@ class AutomationTests(unittest.TestCase):
             }
         )
         for command in (
-            "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "openssl",
+            "mktemp", "systemctl", "sysctl", "ip", "nft", "iptables", "ip6tables", "openssl",
             "curl", "ss", "make", "mv", "git", "adb", "sleep", "gh", "uname",
-            "sudo", "unshare",
+            "sudo", "unshare", "getent", "useradd", "groupadd", "usermod", "chown", "chgrp", "systemd-tmpfiles",
         ):
             (self.bin / command).symlink_to(MOCK)
 
@@ -104,6 +106,19 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(before, (destination / "server.crt").stat().st_mtime_ns)
         self.assertEqual((destination / "server.key").stat().st_mode & 0o777, 0o600)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        self.assert_no_stages(destination)
+
+    def test_certificate_group_grants_the_service_user_read_access(self):
+        cert, key = self.certificate_pair("source", "one")
+        destination = self.root / "tls"
+        self.run_script("sync-cert.sh", cert, key, destination)
+        # An unchanged pair still gains group access when a group is added.
+        self.run_script("sync-cert.sh", cert, key, destination, "porta")
+        self.assertEqual((destination / "server.key").stat().st_mode & 0o777, 0o640)
+        self.assertEqual((destination / "server.crt").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o750)
+        self.assertIn(["chgrp", "porta", str(destination / "server.key")],
+                      self.state()["ownership"])
         self.assert_no_stages(destination)
 
     def test_certificate_mismatch_and_copy_failure_preserve_old_pair(self):
@@ -298,6 +313,47 @@ class AutomationTests(unittest.TestCase):
         self.assertIn('oifname "eth0" ip saddr 10.66.0.0/24 masquerade',
                       self.state()["nft_transaction"])
 
+    def test_named_and_local_exits_get_tables_forwarding_and_cleanup(self):
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                        "--upstream-interface", "porta-up0", "--exit-interface", "porta-up1",
+                        "--local-exit")
+        state = self.state()
+        transaction = state["nft_transaction"]
+        forward = transaction.split("chain forward {", 1)[1].split("}", 1)[0]
+        rules = [line.strip() for line in forward.splitlines()
+                 if line.strip() and "type filter" not in line and not line.strip().startswith("#")]
+        # The default egress stays first for readiness.
+        self.assertEqual(rules[:6], [
+            'iifname "porta0" oifname "porta-up0" accept',
+            'iifname "porta-up0" oifname "porta0" ct state established,related accept',
+            'iifname "porta0" oifname "porta-up1" accept',
+            'iifname "porta-up1" oifname "porta0" ct state established,related accept',
+            'iifname "porta0" oifname "eth0" accept',
+            'iifname "eth0" oifname "porta0" ct state established,related accept',
+        ])
+        for interface in ("porta-up0", "porta-up1", "eth0"):
+            self.assertIn(f'oifname "{interface}" ip saddr 10.66.0.0/24 masquerade', transaction)
+        self.assertIn('iifname "porta-up1" drop', transaction.split("chain relay_input {", 1)[1])
+        self.assertEqual(state["ip_routes"]["10067"],
+                         ["default dev porta-up1", "unreachable default metric 4294967295"])
+        self.assertEqual(state["sysctl"]["net.ipv4.conf.porta-up1.rp_filter"], "2")
+
+        # A stopped daemon's per-lease exit rules are removed with the tables.
+        self.update_state(ip_rules=self.state()["ip_rules"] + [
+            "10065:\tfrom 10.66.0.5 iif porta0 lookup 10067",
+            "10065:\tfrom 10.66.0.6 iif porta0 lookup main",
+        ])
+        self.run_script("server-down.sh", "porta0", "eth0")
+        state = self.state()
+        self.assertEqual(state["ip_rules"], [])
+        self.assertNotIn("10067", state["ip_routes"])
+
+        for options in (["--local-exit"], ["--exit-interface", "porta0"],
+                        ["--exit-interface", "porta-up1", "--exit-interface", "porta-up1"]):
+            with self.subTest(options=options):
+                self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                "eth0", "8443", *options, success=False)
+
     def test_relay_rejects_reused_interfaces_before_mutation(self):
         for options in (["--upstream-interface", "porta0"], ["--upstream-interface", "eth0"],
                         ["--upstream-interface", "bad/name"], ["--upstream-interface"],
@@ -316,6 +372,7 @@ class AutomationTests(unittest.TestCase):
         self.assertIn('iifname "porta0" ct state established,related accept', guard)
         self.assertIn("th dport 53 accept", guard)
         self.assertTrue(guard.rstrip().endswith('iifname "porta0" drop'))
+        self.assertIn('iifname != { "lo", "porta0" } ip daddr 10.66.0.1 drop', transaction)
 
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
                         "--client-host-access")
@@ -324,21 +381,23 @@ class AutomationTests(unittest.TestCase):
         # Instance metadata stays blocked even when host access is allowed.
         self.assertIn("169.254.0.0/16", transaction)
 
-    def test_client_to_client_forwarding_is_opt_in(self):
+    def test_kernel_never_forwards_between_clients(self):
         self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
-        self.assertNotIn('oifname "porta0" ip saddr', self.state()["nft_transaction"])
-        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
-                        "--client-to-client")
         transaction = self.state()["nft_transaction"]
         forward = transaction.split("chain forward {", 1)[1].split("}", 1)[0].splitlines()
-        rules = [line.strip() for line in forward if line.strip() and "type filter" not in line]
-        # Readiness requires the egress and return rules to stay first.
-        self.assertEqual(rules[:3], [
+        rules = [line.strip() for line in forward
+                 if line.strip() and "type filter" not in line and not line.strip().startswith("#")]
+        # Readiness requires the egress and return rules to stay first; the
+        # daemon switches client-to-client traffic itself.
+        self.assertEqual(rules, [
             'iifname "porta0" oifname "eth0" accept',
             'iifname "eth0" oifname "porta0" ct state established,related accept',
-            'iifname "porta0" oifname "porta0" ip saddr 10.66.0.0/24 ip daddr 10.66.0.0/24 accept',
+            'iifname "porta0" drop',
+            'oifname "porta0" drop',
         ])
-        self.assertIn('oifname "porta0" icmp type redirect drop', transaction)
+        # The option moved to the daemon.
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                        "--client-to-client", success=False)
 
     def test_ipv6_sysctl_preserves_dots_in_interface_name(self):
         proc = self.root / "proc/sys"
@@ -379,6 +438,63 @@ class AutomationTests(unittest.TestCase):
         self.run_script("server-down.sh", "porta0", success=False)
         self.assertTrue((self.root / "runtime/docker-rules-porta0").exists())
         self.assertEqual(len(self.state()["iptables_rules"]), 2)
+
+    def test_server_up_forwards_and_guards_ipv6_and_server_down_restores_it(self):
+        sysctl = self.state()["sysctl"] | {
+            "net.ipv6.conf.all.forwarding": "0",
+            "net.ipv6.conf.eth0.accept_ra": "1",
+        }
+        self.update_state(sysctl=sysctl, docker=True, docker6=True)
+        dual = ("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443",
+                "--ipv6", "fd66::1/64", "fd66::/64")
+        result = self.run_script(*dual)
+        self.assertIn("masqueraded through eth0", result.stdout)
+        state = self.state()
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.all.forwarding"], "1")
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.eth0.accept_ra"], "2")
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.porta0.disable_ipv6"], "0")
+        self.assertIn(["ip", "-6", "address", "replace", "fd66::1/64", "dev", "porta0", "nodad"],
+                      self.commands())
+        transaction = state["nft_transaction"]
+        self.assertIn("table ip6 porta {", transaction)
+        self.assertIn('iifname "porta0" oifname "eth0" accept', transaction)
+        self.assertIn('oifname "eth0" ip6 saddr fd66::/64 masquerade', transaction)
+        self.assertIn("fd00:ec2::254", transaction)
+        self.assertIn('iifname != { "lo", "porta0" } ip6 daddr fd66::1 drop', transaction)
+        self.assertIn("packet-too-big", transaction)
+        self.assertEqual(len(state["ip6tables_rules"]), 2)
+        self.assertEqual(len(state["iptables_rules"]), 2)
+
+        # Restarting keeps the saved originals; routed prefixes skip NAT.
+        self.run_script(*dual, "--ipv6-routed")
+        state = self.state()
+        self.assertNotIn("ip6 saddr fd66::/64 masquerade", state["nft_transaction"])
+        self.assertEqual(len(state["ip6tables_rules"]), 2)
+
+        self.run_script("server-down.sh", "porta0", "eth0")
+        state = self.state()
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.all.forwarding"], "0")
+        self.assertEqual(state["sysctl"]["net.ipv6.conf.eth0.accept_ra"], "1")
+        self.assertNotIn("ip6 porta", state["nft_tables"])
+        self.assertEqual(state["ip6tables_rules"], [])
+        self.assertFalse(any((self.root / "runtime").glob("*6*")))
+
+        # Without --ipv6 a later start removes the IPv6 table and rules.
+        self.run_script(*dual)
+        self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24", "eth0", "8443")
+        state = self.state()
+        self.assertNotIn("ip6 porta", state["nft_tables"])
+        self.assertEqual(state["ip6tables_rules"], [])
+
+    def test_server_up_rejects_ipv6_on_a_cascade_relay(self):
+        result = self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                 "eth0", "8443", "--upstream-interface", "porta-up0",
+                                 "--ipv6", "fd66::1/64", "fd66::/64", success=False)
+        self.assertIn("not supported with --upstream-interface", result.stderr)
+        result = self.run_script("server-up.sh", "porta0", "10.66.0.1/24", "10.66.0.0/24",
+                                 "eth0", "8443", "--ipv6", "10.0.0.1/24", "fd66::/64",
+                                 success=False)
+        self.assertIn("invalid IPv6", result.stderr)
 
     def test_server_up_reconciles_previous_docker_interface(self):
         self.update_state(docker=True)
@@ -633,8 +749,9 @@ class AutomationTests(unittest.TestCase):
         shutil.copytree(ROOT / "deploy", checkout / "deploy")
         source = (checkout / "scripts/deploy.sh").read_text()
         for prefix in (
-            "/usr/local/bin", "/usr/local/libexec/porta", "/etc/porta",
-            "/etc/sysctl.d", "/etc/systemd/system", "/var/lib/porta", "/run/lock",
+            "/usr/local/bin", "/usr/local/sbin", "/usr/local/libexec/porta", "/etc/porta",
+            "/etc/sysctl.d", "/etc/tmpfiles.d", "/etc/systemd/system", "/var/lib/porta",
+            "/var/backups/porta", "/run/lock",
         ):
             source = source.replace(prefix, str(self.root / "system" / prefix[1:]))
         source = source.replace("[[ $EUID -eq 0 ]]", "true")
@@ -642,7 +759,7 @@ class AutomationTests(unittest.TestCase):
         deploy.write_text(source)
         for directory in (
             "usr/local/bin", "usr/local/libexec/porta", "etc/porta/tls",
-            "etc/porta/landing", "etc/sysctl.d", "etc/systemd/system",
+            "etc/porta/landing", "etc/sysctl.d", "etc/tmpfiles.d", "etc/systemd/system",
             "var/lib/porta/downloads", "run/lock",
         ):
             (self.root / "system" / directory).mkdir(parents=True, exist_ok=True)
@@ -820,13 +937,336 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(environment.read_text().count("PORTA_UPSTREAM_TOKEN="), 1)
         self.assertIn(f"PORTA_UPSTREAM_TOKEN={token}\n", environment.read_text())
 
-    def test_deploy_client_to_client_is_passed_to_network_setup(self):
+    def test_deploy_named_exits_get_tokens_interfaces_and_local_exit(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.env["PORTA_UPSTREAM_TOKEN"] = "relay-account-token-0123456789"
+        self.env["PORTA_EXIT_TOKEN_US_WEST"] = "us-west-account-token-0123456789"
+        result = self.run_deploy(deploy, "--build-local", "--upstream", "https://eu.example",
+                                 "--exits", "us-west=https://us.example:8443", "--local-exit")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn("--exit us-west=https://us.example:8443 --local-exit", start)
+        self.assertIn("--upstream-interface porta-up0 --exit-interface porta-up1 --local-exit;",
+                      unit)
+        environment = (self.root / "system/etc/porta/porta.env").read_text()
+        self.assertIn("PORTA_EXIT_TOKEN_US_WEST=us-west-account-token-0123456789\n", environment)
+        self.assertNotIn("us-west-account-token", unit + result.stdout + result.stderr)
+        self.assertIn("Selectable exits: local, us-west", result.stdout)
+        config = (self.root / "system/etc/porta/deploy.conf").read_text()
+        self.assertIn("exits=us-west=https://us.example:8443\n", config)
+
+        # Upgrades reuse the saved exit token; --exits= removes exits and tokens.
+        del self.env["PORTA_EXIT_TOKEN_US_WEST"]
+        self.run_deploy(deploy, "--build-local")
+        self.assertIn("PORTA_EXIT_TOKEN_US_WEST=",
+                      (self.root / "system/etc/porta/porta.env").read_text())
+        self.run_deploy(deploy, "--build-local", "--exits=", "--local-exit=false")
+        self.assertNotIn("PORTA_EXIT_TOKEN_", (self.root / "system/etc/porta/porta.env").read_text())
+        self.assertNotIn("--exit", (self.root / "system/etc/systemd/system/porta.service").read_text())
+
+        for options in (("--exits", "us=https://us.example"),
+                        ("--exits", "local=https://us.example"),
+                        ("--exits", "us=http://us.example"),
+                        ("--no-upstream", "--local-exit")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_deploy_dns_resolver_installs_blocklist_and_binds_port_53(self):
+        deploy = self.prepare_deploy(timer=False)
+        cert, key = self.certificate_pair("source", "new")
+        blocklist = self.root / "blocklist.txt"
+        blocklist.write_text("ads.example\n")
+        result = self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key,
+                                 "--port", "8443", "--dns-resolver",
+                                 "--dns-upstreams", "9.9.9.9,149.112.112.112:53",
+                                 "--dns-forwards", "corp.example=10.20.0.53",
+                                 "--dns-blocklist", blocklist)
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        installed = self.root / "system/etc/porta/dns-blocklist.txt"
+        self.assertIn("--dns-resolver --dns-upstream 9.9.9.9 --dns-upstream 149.112.112.112:53 "
+                      f"--dns-forward corp.example=10.20.0.53 --dns-blocklist {installed}", start)
+        # Port 53 needs the bind capability even with a high public port.
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n", unit)
+        self.assertEqual(installed.read_text(), "ads.example\n")
+        self.assertIn("built-in resolver on 10.66.0.1", result.stdout)
+
+        self.run_deploy(deploy, "--build-local", "--dns-resolver=false", "--dns-upstreams=",
+                        "--dns-forwards=", "--dns-blocklist=")
+        self.assertFalse(installed.exists())
+        self.assertNotIn("--dns-resolver",
+                         (self.root / "system/etc/systemd/system/porta.service").read_text())
+        for options in (("--dns-upstreams", "9.9.9.9"), ("--dns-resolver", "--dns-upstreams", "bad"),
+                        ("--dns-resolver", "--dns-blocklist", "/missing")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_deploy_oidc_derives_the_redirect_and_keeps_the_secret_private(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.env["PORTA_OIDC_CLIENT_SECRET"] = "oidc-client-secret-0123456789"
+        result = self.run_deploy(deploy, "--build-local", "--port", "8443",
+                                 "--oidc-issuer", "https://login.example.com/tenant/v2.0",
+                                 "--oidc-client-id", "porta-admin")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--oidc-issuer https://login.example.com/tenant/v2.0 --oidc-client-id porta-admin "
+                      "--oidc-redirect-url https://vpn.example:8443/auth/oidc/callback", unit)
+        environment = self.root / "system/etc/porta/porta.env"
+        self.assertIn("PORTA_OIDC_CLIENT_SECRET=oidc-client-secret-0123456789\n", environment.read_text())
+        self.assertNotIn("oidc-client-secret", unit + result.stdout + result.stderr)
+        self.assertIn("User sign-in:    access tokens from an administrator", result.stdout)
+        result = self.run_deploy(deploy, "--build-local", "--sso-user-domains", "example.org,corp.example",
+                                 "--sso-max-devices", "3")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("/auth/oidc/callback --sso-user-domains example.org,corp.example --sso-max-devices 3", unit)
+        self.assertIn("User sign-in:    single sign-on for example.org, corp.example (up to 3 devices each)",
+                      result.stdout)
+        for options in (("--sso-user-domains", "not a domain"), ("--sso-max-devices", "0"),
+                        ("--sso-max-devices", "101"), ("--sso-max-devices", "08")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+        self.run_deploy(deploy, "--build-local", "--sso-user-domains=")
+        self.assertNotIn("--sso-user-domains", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        del self.env["PORTA_OIDC_CLIENT_SECRET"]
+        self.run_deploy(deploy, "--build-local")
+        self.assertIn("PORTA_OIDC_CLIENT_SECRET=", environment.read_text())
+        self.run_deploy(deploy, "--build-local", "--oidc-issuer=", "--oidc-client-id=")
+        self.assertNotIn("PORTA_OIDC_CLIENT_SECRET", environment.read_text())
+        self.assertNotIn("--oidc", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        for options in (("--oidc-issuer", "http://login.example.com"), ("--oidc-issuer", "https://login.example.com")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_deploy_federation_saves_the_token_and_points_replicas_at_the_primary(self):
+        deploy = self.prepare_deploy(timer=False)
+        token = "federation-token-0123456789abcdefghij"
+        self.env["PORTA_FEDERATION_TOKEN"] = token
+        result = self.run_deploy(deploy, "--build-local", "--federation-primary", "https://primary.example/")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--federation-primary https://primary.example --mtu", unit)
+        environment = self.root / "system/etc/porta/porta.env"
+        self.assertIn(f"PORTA_FEDERATION_TOKEN={token}\n", environment.read_text())
+        self.assertNotIn(token, unit + result.stdout + result.stderr)
+        self.assertIn("mirrored from https://primary.example", result.stdout)
+        del self.env["PORTA_FEDERATION_TOKEN"]
+        # The primary keeps serving replicas with the saved token.
+        self.run_deploy(deploy, "--build-local", "--federation-primary=")
+        self.assertIn("PORTA_FEDERATION_TOKEN=", environment.read_text())
+        self.assertNotIn("--federation-primary", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        self.run_deploy(deploy, "--build-local", "--disable-federation")
+        self.assertNotIn("PORTA_FEDERATION_TOKEN", environment.read_text())
+        self.env["PORTA_FEDERATION_TOKEN"] = "short"
+        self.run_deploy(deploy, "--build-local", success=False)
+        del self.env["PORTA_FEDERATION_TOKEN"]
+        self.run_deploy(deploy, "--build-local", "--federation-primary", "https://primary.example", success=False)
+
+    def test_deploy_client_to_client_is_passed_to_the_daemon(self):
         deploy = self.prepare_deploy(timer=False)
         result = self.run_deploy(deploy, "--build-local", "--client-to-client")
         unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
-        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443 --client-to-client;",
-                      unit)
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn("--dns 1.1.1.1 --client-to-client --mtu", start)
+        self.assertIn("server-up.sh porta0 10.66.0.1/24 10.66.0.0/24 eth0 443;", unit)
         self.assertIn("allowed within 10.66.0.0/24", result.stdout)
+        self.assertIn("Direct paths:    off", result.stdout)
+
+        # Saved like other options, so a plain redeploy keeps direct paths.
+        self.run_deploy(deploy, "--build-local", "--peer-to-peer")
+        result = self.run_deploy(deploy, "--build-local")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn("--dns 1.1.1.1 --client-to-client --peer-to-peer --mtu", start)
+        self.assertIn("Direct paths:    offered", result.stdout)
+        self.run_deploy(deploy, "--build-local", "--peer-to-peer=false")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertNotIn("--peer-to-peer", unit)
+
+        result = self.run_deploy(deploy, "--build-local", "--min-client-version", "0.1.41")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("--min-client-version 0.1.41", unit)
+        self.assertIn("Client versions: 0.1.41 or newer", result.stdout)
+        self.run_deploy(deploy, "--build-local", "--min-client-version", "latest", success=False)
+        self.run_deploy(deploy, "--build-local", "--min-client-version=")
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertNotIn("--min-client-version", unit)
+
+    def test_deploy_backs_up_before_upgrading_and_installs_daily_backups(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local")
+        system = self.root / "system"
+        archives = sorted((system / "var/backups/porta").glob("porta-*.tar.gz"))
+        self.assertEqual(len(archives), 1, result.stdout)
+        self.assertIn(f"backed up the current gateway to {archives[0]}", result.stdout)
+        listing = subprocess.run(["tar", "-tzf", str(archives[0])], text=True,
+                                 capture_output=True, check=True).stdout
+        self.assertIn("state/clients.json", listing)
+        self.assertIn("config/porta.env", listing)
+        restored = subprocess.run(["tar", "-xOzf", str(archives[0]), "state/clients.json"],
+                                  capture_output=True, check=True).stdout
+        self.assertEqual(restored, b'{"old":"client"}')
+        self.assertTrue((system / "usr/local/sbin/porta-backup").stat().st_mode & 0o111)
+        for unit in ("porta-backup.service", "porta-backup.timer"):
+            self.assertTrue((system / "etc/systemd/system" / unit).is_file())
+        self.assertIn("porta-backup.timer", self.state()["enabled"])
+        self.assertIn("Backups:         daily to", result.stdout)
+
+        # A fresh installation has nothing to back up.
+        shutil.rmtree(self.root / "system")
+        shutil.rmtree(self.root / "checkout")
+        fresh = self.prepare_deploy(existing=False, timer=False)
+        self.run_deploy(fresh, "--build-local")
+        self.assertEqual(list((self.root / "system/var/backups/porta").glob("*.tar.gz")), [])
+
+    def test_deploy_runs_the_daemon_as_an_unprivileged_user(self):
+        deploy = self.prepare_deploy(timer=False)
+        cert, key = self.certificate_pair("source", "new")
+        self.run_deploy(deploy, "--build-local", "--cert", cert, "--key", key)
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn("\nUser=porta\nGroup=porta\n", unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n", unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n", unit)
+        self.assertNotIn("RuntimeDirectory", unit)
+        self.assertIn("ReadWritePaths=/run/porta\n", unit)
+        tmpfiles = self.root / "system/etc/tmpfiles.d/porta.conf"
+        self.assertIn("d /run/porta 0700 root root -", tmpfiles.read_text())
+        self.assertIn(["systemd-tmpfiles", "--create", str(tmpfiles)], self.commands())
+        # Network helpers keep root but not the daemon's other privileges.
+        self.assertIn("ExecStartPost=!/bin/bash -c", unit)
+        self.assertIn("ExecStopPost=!", unit)
+        self.assertIn("test -r " + str(self.root / "system/etc/porta/tls/server.key"), unit)
+        sync = (self.root / "system/etc/systemd/system/porta-cert-sync.service").read_text()
+        self.assertIn(str(self.root / "system/etc/porta/tls") + " porta\n", sync)
+        self.assertEqual(self.state()["users"], ["porta"])
+        ownership = self.state()["ownership"]
+        self.assertIn(["chown", "porta:porta", str(self.root / "system/var/lib/porta")], ownership)
+        self.assertTrue(any(call[:2] == ["chgrp", "porta"] and call[2].endswith("/server.key")
+                            for call in ownership), ownership)
+        tls = self.root / "system/etc/porta/tls"
+        self.assertEqual((tls / "server.key").stat().st_mode & 0o777, 0o640)
+        self.assertEqual(tls.stat().st_mode & 0o777, 0o750)
+
+        # Redeploying keeps the existing user.
+        self.run_deploy(deploy, "--build-local")
+        self.assertEqual(self.state()["users"], ["porta"])
+
+    def test_release_bundle_contains_every_deploy_file_the_script_installs(self):
+        import re
+        used = set(re.findall(r"\bdeploy/[A-Za-z0-9_.-]+", (ROOT / "scripts/deploy.sh").read_text()))
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        package = workflow.split("name: Package deployment tools", 1)[1].split("- name:", 1)[0]
+        self.assertTrue(used)
+        for path in used:
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).is_file())
+                self.assertIn(path, package)
+
+    def test_bundled_units_run_the_daemon_unprivileged(self):
+        unit = (ROOT / "deploy/porta.service").read_text()
+        self.assertIn("\nUser=porta\nGroup=porta\n", unit)
+        self.assertIn("ExecStartPost=!/bin/bash", unit)
+        self.assertIn("ExecStopPost=!/usr/local/libexec/porta/server-down.sh", unit)
+        sync = (ROOT / "deploy/porta-cert-sync.service").read_text()
+        self.assertIn("/etc/porta/tls porta\n", sync)
+        self.assertIn("CAP_CHOWN", sync)
+
+    def test_deploy_split_tunnel_routes_are_passed_saved_and_cleared(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local", "--routes", "10.20.0.0/16,192.168.5.0/24",
+                                 "--dns-domains", "corp.example")
+        unit_path = self.root / "system/etc/systemd/system/porta.service"
+        unit = unit_path.read_text()
+        self.assertIn("--dns 1.1.1.1 --route 10.20.0.0/16 --route 192.168.5.0/24 "
+                      "--dns-domain corp.example --mtu", unit)
+        self.assertIn("split tunnel: 10.20.0.0/16, 192.168.5.0/24 (DNS for corp.example)",
+                      result.stdout)
+        config = (self.root / "system/etc/porta/deploy.conf").read_text()
+        self.assertIn("routes=10.20.0.0/16,192.168.5.0/24\n", config)
+
+        result = self.run_deploy(deploy, "--build-local", "--routes=", "--dns-domains=")
+        self.assertNotIn("--route", unit_path.read_text())
+        self.assertIn("Client routing:  full tunnel", result.stdout)
+        for options in (("--routes", "10.20.0.0/16;reboot"), ("--routes", "corp"),
+                        ("--dns-domains", "corp.example"),
+                        ("--routes", "10.20.0.0/16", "--dns-domains", "bad_domain")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_deploy_ipv6_pool_is_generated_passed_saved_and_cleared(self):
+        deploy = self.prepare_deploy(timer=False)
+        result = self.run_deploy(deploy, "--build-local", "--ipv6",
+                                 "--routes", "10.20.0.0/16,2001:db8::/32")
+        unit_path = self.root / "system/etc/systemd/system/porta.service"
+        unit = unit_path.read_text()
+        match = re.search(r"--ipv6-pool (fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}::/64) ", unit)
+        self.assertIsNotNone(match, unit)
+        prefix = match.group(1)
+        gateway = prefix.replace("::/64", "::1/64")
+        self.assertIn(f"--ipv6 {gateway} {prefix};", unit)
+        self.assertIn("--route 2001:db8::/32", unit)
+        self.assertIn(f"Client IPv6:     {prefix}, masqueraded through eth0", result.stdout)
+        config_path = self.root / "system/etc/porta/deploy.conf"
+        self.assertIn(f"ipv6_pool={prefix}\n", config_path.read_text())
+
+        # Upgrades keep the generated prefix; a routed prefix skips NAT.
+        self.run_deploy(deploy, "--build-local", "--ipv6")
+        self.assertIn(f"--ipv6-pool {prefix} ", unit_path.read_text())
+        self.run_deploy(deploy, "--build-local", "--ipv6-pool", "2001:db8:66::/64",
+                        "--ipv6-routed", "--routes=")
+        unit = unit_path.read_text()
+        self.assertIn("--ipv6 2001:db8:66::1/64 2001:db8:66::/64 --ipv6-routed;", unit)
+
+        result = self.run_deploy(deploy, "--build-local", "--no-ipv6")
+        self.assertNotIn("ipv6", unit_path.read_text())
+        self.assertIn("Client IPv6:     off", result.stdout)
+        for options in (("--ipv6-pool", "fd66::/121"), ("--ipv6-pool", "10.0.0.0/8"),
+                        ("--routes", "2001:db8::/32"), ("--ipv6-routed",),
+                        ("--ipv6", "--mtu", "1200")):
+            with self.subTest(options=options):
+                self.run_deploy(deploy, "--build-local", *options, success=False)
+
+    def test_linux_desktop_installer_sets_up_service_group_and_menu_entry(self):
+        checkout = self.root / "checkout"
+        shutil.copytree(ROOT / "scripts", checkout / "scripts")
+        shutil.copytree(ROOT / "deploy", checkout / "deploy")
+        script = checkout / "scripts/install-linux-desktop.sh"
+        source = script.read_text().replace("[[ $EUID -eq 0 ]]", "true")
+        for prefix in ("/usr/local/bin", "/etc/systemd/system", "/usr/share"):
+            source = source.replace(prefix, str(self.root / "system" / prefix[1:]))
+        script.write_text(source)
+        for directory in ("usr/local/bin", "etc/systemd/system"):
+            (self.root / "system" / directory).mkdir(parents=True, exist_ok=True)
+        binaries = checkout / "bin"
+        binaries.mkdir()
+        for name in ("porta-client", "porta-desktop"):
+            (binaries / name).write_text("#!/bin/sh\n")
+            (binaries / name).chmod(0o755)
+
+        result = subprocess.run(["bash", str(script), "--user", "root"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("added root", result.stdout)
+        system = self.root / "system"
+        unit = (system / "etc/systemd/system/porta-client.service").read_text()
+        self.assertIn("--daemon --control-group porta-client", unit)
+        self.assertIn("RuntimeDirectory=porta-client", unit)
+        self.assertTrue((system / "usr/local/bin/porta-desktop").exists())
+        entry = (system / "usr/share/applications/porta-desktop.desktop").read_text()
+        self.assertIn("Exec=porta-desktop", entry)
+        self.assertTrue((system / "usr/share/icons/hicolor/256x256/apps/porta.png").exists())
+        state = self.state()
+        self.assertEqual(state["groups"], ["porta-client"])
+        self.assertEqual(state["members"], [["porta-client", "root"]])
+        self.assertTrue(state["active"]["porta-client.service"])
+        self.assertEqual(state["enabled"]["porta-client.service"], "enabled")
+
+        # Reinstalling keeps the existing group.
+        result = subprocess.run(["bash", str(script), "--user", "root"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state()["groups"], ["porta-client"])
+        for options in (["--user", "no such user"], ["--client", str(checkout / "missing")]):
+            result = subprocess.run(["bash", str(script), *options], cwd=self.root,
+                                    env=self.env, text=True, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0, options)
 
     def test_deploy_relay_without_token_fails_before_stopping_service(self):
         deploy = self.prepare_deploy(timer=False)
@@ -861,11 +1301,17 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("deploy: changing", result.stdout)
         self.assertEqual(unit_path.read_text(), first)
+        # Nothing but the binary changed: the gateway restarts in place.
+        self.assertIn("ExecReload=/bin/kill -HUP $MAINPID\n", first)
+        self.assertIn("restarting the running gateway in place", result.stdout)
+        self.assertEqual(self.state()["reloaded"], ["porta.service"])
 
         # Explicit options override and are saved; off-switches clear values.
         result = self.run_deploy(deploy, "--build-local", "--no-upstream",
                                  "--client-to-client=false", "--dns", "1.0.0.1")
         self.assertIn("deploy: changing upstream: https://exit.example -> (unset)", result.stdout)
+        self.assertNotIn("in place", result.stdout)
+        self.assertEqual(self.state()["reloaded"], ["porta.service"])
         self.assertIn("deploy: changing dns: 9.9.9.9 -> 1.0.0.1", result.stdout)
         unit = unit_path.read_text()
         self.assertNotIn("--upstream", unit)
@@ -907,7 +1353,11 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("--landing-template-dir /etc/porta/landing", start)
         self.assertNotIn("--auto-mtu", setup)
         self.assertIn("eth0 8443;", setup)
-        self.assertIn("RuntimeDirectoryPreserve=yes", unit)
+        # Helper journals live in a root-only directory that outlives restarts.
+        self.assertIn("ReadWritePaths=/run/porta\n", unit)
+        self.assertNotIn("RuntimeDirectory", unit)
+        tmpfiles = (ROOT / "deploy/porta-tmpfiles.conf").read_text()
+        self.assertIn("d /run/porta 0700 root root -", tmpfiles)
 
     def test_acme_rejects_admin_port_80_before_stopping_service(self):
         deploy = self.prepare_deploy()
@@ -1023,7 +1473,7 @@ class AutomationTests(unittest.TestCase):
                 worker.join(timeout=5)
                 self.assertFalse(worker.is_alive())
 
-    def release_assets(self, landing_templates=True, proxy_headers=True):
+    def release_assets(self, landing_templates=True, proxy_headers=True, desktop=False):
         release = self.root / "release"
         release.mkdir()
         assets = [
@@ -1031,7 +1481,7 @@ class AutomationTests(unittest.TestCase):
             "porta-client-linux-arm64", "porta-client-windows-amd64.zip",
             "porta-android-arm64-v8a.apk", "porta-android-armeabi-v7a.apk",
             "porta-android-x86_64.apk",
-        ]
+        ] + (["porta-desktop-linux-amd64.tar.gz"] if desktop else [])
         checksums = []
         for name in assets:
             if name.startswith("porta-server"):
@@ -1066,6 +1516,32 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue((downloads / "release-signing-cert.der").is_file())
         self.assertFalse((downloads / "old-client").exists())
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_releases_with_the_desktop_package_serve_it_and_others_do_not_need_it(self):
+        deploy = self.prepare_deploy()
+        self.release_assets(desktop=True)
+        result = self.run_deploy(deploy)
+        downloads = self.root / "system/var/lib/porta/downloads"
+        self.assertEqual((downloads / "porta-desktop-linux-amd64.tar.gz").read_text(),
+                         "porta-desktop-linux-amd64.tar.gz")
+        self.assertIn("Linux app:   https://vpn.example/download/porta-desktop-linux-amd64.tar.gz",
+                      result.stdout)
+        self.assertNotIn("\n\n  Linux ARM64", result.stdout)
+
+        shutil.rmtree(self.root / "release")
+        self.release_assets()
+        result = self.run_deploy(deploy)
+        self.assertFalse((downloads / "porta-desktop-linux-amd64.tar.gz").exists())
+        self.assertNotIn("Linux app:", result.stdout)
+        self.assertIn("  Linux AMD64: https://vpn.example/download/porta-client-linux-amd64\n"
+                      "  Linux ARM64:", result.stdout)
+
+        shutil.rmtree(self.root / "release")
+        self.release_assets(desktop=True)
+        (self.root / "release/porta-desktop-linux-amd64.tar.gz").write_text("corrupt")
+        before = self.snapshot()
+        self.run_deploy(deploy, success=False)
+        self.assertEqual(self.snapshot(), before)
 
     def test_release_token_is_not_exposed_in_curl_arguments(self):
         deploy = self.prepare_deploy()
@@ -1144,15 +1620,17 @@ class AutomationTests(unittest.TestCase):
         self.assertNotIn("secrets.", workflow)
         self.assertIn("name: ${{ github.event_name == 'pull_request' && 'Rust PR required' || 'Rust CI required' }}\n"
                       "    if: ${{ always() }}", workflow)
-        self.assertIn("needs: [rust, windows, android]", workflow)
+        self.assertIn("needs: [rust, dependencies, fuzz, masque-interop, apple, windows, android]", workflow)
         script = self.workflow_script("ci.yml", "Require Rust promotion and every build")
         good = {
             "EVENT_NAME": "pull_request", "HEAD_BRANCH": "rust",
             "HEAD_REPOSITORY": "huangyingting/porta", "REPOSITORY": "huangyingting/porta",
             "RUST_RESULT": "success", "WINDOWS_RESULT": "success", "ANDROID_RESULT": "success",
+            "INTEROP_RESULT": "success", "APPLE_RESULT": "success",
+            "DEPENDENCIES_RESULT": "success", "FUZZ_RESULT": "success",
         }
         cases = [(good, True), (good | {"EVENT_NAME": "push", "HEAD_BRANCH": ""}, True)]
-        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT"):
+        for job in ("RUST_RESULT", "WINDOWS_RESULT", "ANDROID_RESULT", "INTEROP_RESULT", "APPLE_RESULT", "DEPENDENCIES_RESULT", "FUZZ_RESULT"):
             for outcome in ("failure", "cancelled", "skipped"):
                 cases.append((good | {job: outcome}, False))
         cases.extend([
@@ -1264,6 +1742,126 @@ class AutomationTests(unittest.TestCase):
         command.write_text("#!/bin/sh\nset -eu\n" + script)
         command.chmod(0o755)
 
+    def test_backups_round_trip_verify_prune_and_restore_with_an_undo_copy(self):
+        root = self.root / "backup"
+        config, state, archives, tools = (root / name for name in ("etc", "state", "archives", "bin"))
+        for directory in (config / "tls", state / "acme", state / "downloads", tools):
+            directory.mkdir(parents=True)
+        (config / "porta.env").write_text("PORTA_ADMIN_TOKEN=secret\n")
+        (config / "tls/server.key").write_text("key")
+        for name, text in {"clients.json": "clients-v1", "leases.json": "leases-v1",
+                           "usage.json": "{}", "admins.json": "[]", "sso-users.json": "{}", "audit.log": "line\n",
+                           "audit.log.1": "older\n", "acme/cert": "acme",
+                           "downloads/porta-client": "binary", "clients.json.lock": ""}.items():
+            (state / name).write_text(text)
+        log = root / "systemctl.log"
+        (tools / "systemctl").write_text(f"#!/bin/sh\necho \"$*\" >> {log}\n")
+        (tools / "curl").write_text("#!/bin/sh\nexit 0\n")
+        for tool in ("systemctl", "curl"):
+            (tools / tool).chmod(0o755)
+        env = {**os.environ, "PATH": f"{tools}:/usr/bin:/bin", "PORTA_BACKUP_ALLOW_NONROOT": "1",
+               "PORTA_CONFIG_DIR": str(config), "PORTA_STATE_DIR": str(state),
+               "PORTA_BACKUP_DIR": str(archives), "PORTA_READY_URL": "http://127.0.0.1:1/readyz",
+               "TMPDIR": str(self.root / "scratch")}
+
+        def backup(*args, success=True):
+            result = subprocess.run(["bash", str(ROOT / "scripts/porta-backup.sh"), *args],
+                                    env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+            return result
+
+        first = pathlib.Path(backup("create").stdout.strip())
+        self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+        listing = subprocess.run(["tar", "-tzf", str(first)], text=True, capture_output=True).stdout
+        for member in ("config/porta.env", "config/tls/server.key", "state/clients.json",
+                       "state/sso-users.json", "state/audit.log.1", "state/acme/cert", "MANIFEST", "SHA256SUMS"):
+            self.assertIn(member, listing)
+        self.assertNotIn("downloads", listing)
+        self.assertNotIn("clients.json.lock", listing)
+        self.assertIn("files verified", backup("verify", first).stdout)
+
+        # Archives are named by second; retention keeps the newest.
+        import time as clock
+        for _ in range(2):
+            clock.sleep(1.1)
+            backup("create", "--keep", "2")
+        self.assertEqual(len(backup("list").stdout.split()), 2)
+        self.assertFalse(first.exists())
+        newest = pathlib.Path(backup("list").stdout.split()[0])
+
+        tampered = archives / "porta-tampered.tar.gz"
+        work = self.root / "scratch/tamper"
+        work.mkdir()
+        subprocess.run(["tar", "-C", str(work), "-xzf", str(newest)], check=True)
+        (work / "state/clients.json").write_text("forged")
+        subprocess.run(["tar", "-C", str(work), "-czf", str(tampered), "."], check=True)
+        self.assertIn("checksums", backup("verify", tampered, success=False).stderr)
+        self.assertIn("no archive",
+                      backup("verify", archives / "missing.tar.gz", success=False).stderr)
+        foreign = archives / "foreign.tar.gz"
+        subprocess.run(["tar", "-C", str(config), "-czf", str(foreign), "porta.env"], check=True)
+        self.assertIn("not a Porta backup", backup("verify", foreign, success=False).stderr)
+        foreign.unlink()
+        tampered.unlink()
+
+        (state / "clients.json").write_text("clients-v2")
+        (state / "leases.json").unlink()
+        (config / "added-later.conf").write_text("new")
+        (config / "porta.env").write_text("PORTA_ADMIN_TOKEN=rotated\n")
+        restored = backup("restore", newest).stdout
+        self.assertFalse((config / "added-later.conf").exists())
+        self.assertEqual((config / "porta.env").read_text(), "PORTA_ADMIN_TOKEN=secret\n")
+        self.assertEqual((state / "clients.json").read_text(), "clients-v1")
+        self.assertEqual((state / "leases.json").read_text(), "leases-v1")
+        self.assertEqual((state / "downloads/porta-client").read_text(), "binary")
+        undo = next(state.glob("restore-replaced-*"))
+        self.assertEqual((undo / "state/clients.json").read_text(), "clients-v2")
+        self.assertEqual((undo / "config/added-later.conf").read_text(), "new")
+        self.assertIn("previous state kept in", restored)
+        self.assertEqual(log.read_text().split("\n")[:2], ["stop porta.service", "start porta.service"])
+
+    def test_documentation_links_and_anchors_resolve(self):
+        def slug(heading):
+            heading = re.sub(r"[`*_]", "", heading.strip().lower())
+            return re.sub(r"[^\w\- ]", "", heading).replace(" ", "-")
+
+        documents = [path for path in ROOT.rglob("*.md")
+                     if not {"target", "vendor", ".build", "node_modules"} & set(path.parts)
+                     and not any(part.startswith(".automation") for part in path.parts)]
+        anchors = {}
+        for document in documents:
+            seen, found = {}, set()
+            for line in document.read_text().splitlines():
+                heading = re.match(r"^#{1,6}\s+(.*)", line)
+                if heading:
+                    name = slug(heading.group(1))
+                    found.add(name if name not in seen else f"{name}-{seen[name]}")
+                    seen[name] = seen.get(name, 0) + 1
+            anchors[document.resolve()] = found
+        for document in documents:
+            text = re.sub(r"```.*?```", "", document.read_text(), flags=re.DOTALL)
+            for target in re.findall(r"\]\(([^)\s]+)\)", text):
+                if re.match(r"^[a-z]+:", target):
+                    continue
+                path, _, fragment = target.partition("#")
+                destination = (document.parent / path).resolve() if path else document.resolve()
+                with self.subTest(document=str(document.relative_to(ROOT)), target=target):
+                    self.assertTrue(destination.exists())
+                    if fragment and destination.suffix == ".md":
+                        self.assertIn(fragment, anchors[destination])
+
+    def test_alert_rules_only_use_metrics_the_gateway_exports(self):
+        # Without PyYAML, which release runners do not guarantee: every
+        # porta_ identifier in the file is a metric name.
+        rules = (ROOT / "deploy/prometheus/porta-alerts.yml").read_text()
+        self.assertGreaterEqual(rules.count("- alert: "), 9)
+        sources = "".join(
+            path.read_text() for path in (ROOT / "rust/porta-server/src").rglob("*.rs")
+        )
+        for name in sorted(set(re.findall(r"\bporta_[a-z_]+", rules))):
+            with self.subTest(metric=name):
+                self.assertIn(f'"{name}"', sources)
+
     def test_workflows_pin_actions_and_gradle_distribution(self):
         action_reference = re.compile(r"^[^@\s]+@[0-9a-f]{40}(?:\s+#\s+v\S+)?$")
         for workflow in (ROOT / ".github/workflows").glob("*.yml"):
@@ -1276,8 +1874,14 @@ class AutomationTests(unittest.TestCase):
         self.assertRegex(wrapper, r"(?m)^distributionSha256Sum=[0-9a-f]{64}$")
 
     def test_client_builds_use_rust_without_go_tooling(self):
+        # The only Go is the independent CONNECT-IP interop probe: its own
+        # module, Makefile target and CI job, never part of a client build.
+        def without_interop_probe(text):
+            text = re.sub(r"(?ms)^build-masque-probe:.*?(?=^\S)", "", text)
+            return re.sub(r"(?ms)^  masque-interop:.*?(?=^  \S|\Z)", "", text)
+
         build_sources = "\n".join(
-            (ROOT / path).read_text()
+            without_interop_probe((ROOT / path).read_text())
             for path in ("Makefile", ".github/workflows/ci.yml",
                          ".github/workflows/release.yml", ".github/workflows/live.yml")
         )
@@ -1288,6 +1892,7 @@ class AutomationTests(unittest.TestCase):
             path.relative_to(ROOT)
             for directory in ("cmd", "internal", "mobile", "scripts", "experiments")
             for path in (ROOT / directory).rglob("*.go")
+            if path.parent != ROOT / "experiments/masque-interop"
         )
         self.assertEqual(go_sources, [])
         for obsolete in (
@@ -1316,10 +1921,9 @@ class AutomationTests(unittest.TestCase):
             "rust/porta-server/vendor/h3/src",
             "rust/porta-server/vendor/hyper/Cargo.toml",
             "rust/porta-server/vendor/hyper/src",
-            "rust/porta-server/vendor/quinn-proto/Cargo.toml",
-            "rust/porta-server/vendor/quinn-proto/src",
         ):
             self.assertIn(path, gradle)
+        self.assertNotIn("vendor/quinn-proto", gradle)
         build = (ROOT / "scripts/build-android-rust.sh").read_text()
         self.assertIn("max-page-size=16384", build)
         self.assertIn("common-page-size=16384", build)
@@ -1375,8 +1979,10 @@ class AutomationTests(unittest.TestCase):
             self.assertNotIn("networkSecurityConfig", manifest_path.read_text())
 
         service = (ROOT / "android/app/src/main/java/dev/porta/android/TunnelService.kt").read_text()
+        # Porta itself stays outside the tunnel in every app mode; AppRulesTest
+        # covers the rules.
         self.assertLess(
-            service.index("builder.addDisallowedApplication(packageName)"),
+            service.index("appRules(configuration.appMode, configuration.apps, packageName)"),
             service.index("builder.establish()"),
         )
 
@@ -1443,7 +2049,7 @@ class AutomationTests(unittest.TestCase):
             "ping -n -c 3",
             "interface_mtu=$(<\"/sys/class/net/$interface/mtu\")",
             "df_payload=$((interface_mtu - 28))",
-            "ping -n -c 1 -W 5 -M do -s \"$df_payload\"",
+            "ping -n -c 1 -W 5 -M \"do\" -s \"$df_payload\"",
             "Porta-owned routes remain",
             "Porta leak-protection table remains",
             "private Porta gateway remains reachable",

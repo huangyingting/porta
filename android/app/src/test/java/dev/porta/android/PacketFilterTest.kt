@@ -85,6 +85,34 @@ class PacketFilterTest {
     }
 
     @Test
+    fun acceptsOnlyAssignedIPv6Source() {
+        val assigned = parseIPv6Address("fd66::2")!!
+        val packet = ByteArray(48)
+        packet[0] = 0x60
+        packet[5] = 8
+        assigned.copyInto(packet, 8)
+        assertTrue(isAssignedIPv6Packet(packet, packet.size, assigned))
+        assertFalse(isAssignedIPv6Packet(packet, 47, assigned))
+        assertFalse(isAssignedIPv4Packet(packet, packet.size, parseIPv4Address("10.66.0.2")!!))
+        packet[23] = 3
+        assertFalse(isAssignedIPv6Packet(packet, packet.size, assigned))
+    }
+
+    @Test
+    fun parsesNumericIPv6Addresses() {
+        val expected = ByteArray(16).also {
+            it[0] = 0xfd.toByte(); it[1] = 0x66; it[15] = 2
+        }
+        assertTrue(parseIPv6Address("fd66::2")!!.contentEquals(expected))
+        assertTrue(parseIPv6Address("fd66:0:0:0:0:0:0:2")!!.contentEquals(expected))
+        assertTrue(parseIPv6Address("::")!!.contentEquals(ByteArray(16)))
+        for (address in listOf("", "fd66", "fd66::2::3", "fd66:::2", "1:2:3:4:5:6:7:8:9",
+            "fd66::12345", "fe80::1%wlan0", "::ffff:1.2.3.4", "1:2:3:4:5:6:7::8")) {
+            assertNull(address, parseIPv6Address(address))
+        }
+    }
+
+    @Test
     fun rejectsNonCanonicalLeaseAddresses() {
         for (address in listOf("+10.66.0.2", "010.66.0.2", "10.66.0.256", "10.66.0", "10..0.2")) {
             assertNull(address, parseIPv4Address(address))

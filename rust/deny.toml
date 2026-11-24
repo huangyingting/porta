@@ -1,0 +1,53 @@
+# Dependency policy, enforced in CI by `make check-dependencies`
+# (cargo-deny). Run it after changing Cargo.toml or Cargo.lock.
+
+[graph]
+all-features = false
+
+[advisories]
+# Every vulnerability, unsound or unmaintained notice fails the check
+# unless it is listed here with the reason it does not apply.
+ignore = [
+  # chrono is unmaintained. rustls-acme depends on it for certificate
+  # validity dates; the Windows desktop uses it to show local times.
+  # Neither parses untrusted input with it. Replace when rustls-acme moves.
+  { id = "RUSTSEC-2026-0543", reason = "transitive via rustls-acme; no untrusted parsing" },
+]
+
+[licenses]
+# Permissive licenses, plus MPL-2.0 for unmodified Tauri dependencies
+# (file-level copyleft that ships no changes of ours).
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Porta's own crates are not published; the repository is MIT licensed.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  # The h3 revision Porta's vendored patch is based on.
+  "https://github.com/hyperium/h3.git",
+]

@@ -34,11 +34,10 @@ mod linux {
     )]
     struct Arguments {
         #[arg(
-            long,
-            default_value = "",
-            help = "Gateway origin, for example https://vpn.example.com:8443"
+            long = "server",
+            help = "Gateway origin, for example https://vpn.example.com:8443; repeat it for gateways that share accounts to use the fastest and fail over"
         )]
-        server: String,
+        servers: Vec<String>,
         #[arg(
             long,
             value_enum,
@@ -95,6 +94,18 @@ mod linux {
         #[arg(
             long,
             action = ArgAction::SetTrue,
+            help = "Route the subnets the gateway assigns to this device: forward and masquerade tunnel traffic to them"
+        )]
+        subnet_router: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            help = "In a full tunnel, keep printers and other devices on the local network reachable"
+        )]
+        allow_lan: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
         cleanup_network: bool,
@@ -104,10 +115,33 @@ mod linux {
             help = "Network recovery state file"
         )]
         network_state: PathBuf,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            help = "Run as the background service of the desktop app: keep profiles and connect on request over --control-socket"
+        )]
+        daemon: bool,
+        #[arg(
+            long,
+            default_value = "/run/porta-client/control.sock",
+            help = "Control socket of --daemon"
+        )]
+        control_socket: PathBuf,
+        #[arg(
+            long,
+            default_value = "/var/lib/porta-client/profiles.json",
+            help = "Root-only profile store of --daemon"
+        )]
+        profiles: PathBuf,
+        #[arg(
+            long,
+            help = "Group whose members may control --daemon; root only without it"
+        )]
+        control_group: Option<String>,
     }
 
     fn parse_duration(value: &str) -> Result<Duration, String> {
-        humantime::parse_duration(value).map_err(|error| error.to_string())
+        porta_wire::duration::parse_duration(value).map_err(|error| error.to_string())
     }
 
     pub async fn run() -> Result<(), client::RunError> {
@@ -127,12 +161,27 @@ mod linux {
 
         let result = if arguments.cleanup_network {
             client::cleanup_network(arguments.network_state, &cancellation).await
+        } else if arguments.daemon {
+            porta_client::linux::daemon::run(
+                porta_client::linux::daemon::DaemonConfig {
+                    control_socket: arguments.control_socket,
+                    profiles: arguments.profiles,
+                    network_state: arguments.network_state,
+                    identity_path: arguments.identity,
+                    interface_name: arguments.interface,
+                    group: arguments.control_group,
+                    ca_path: arguments.ca,
+                    thumbprint: arguments.thumbprint,
+                },
+                &cancellation,
+            )
+            .await
         } else {
             let token =
                 super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;
             client::run(
                 client::Config {
-                    server_url: arguments.server,
+                    server_urls: arguments.servers,
                     token,
                     transport: arguments.transport.into(),
                     interface_name: arguments.interface,
@@ -144,6 +193,8 @@ mod linux {
                     reconnect_max_delay: arguments.reconnect_max_delay,
                     manual_network: arguments.manual_network,
                     network_state: arguments.network_state,
+                    subnet_router: arguments.subnet_router,
+                    allow_lan: arguments.allow_lan,
                 },
                 &cancellation,
                 print_event,
@@ -157,10 +208,15 @@ mod linux {
 
     fn print_event(event: Event) {
         if event.state == State::Connected {
+            // Changes while connected, such as direct paths.
+            if event.message != "Connected" {
+                eprintln!("porta-client: {}", event.message);
+            }
             let lease = event.lease.expect("connected event includes a lease");
             eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={} uploaded={} downloaded={}{}",
+                "porta-client: connected address={}{} dns={} mtu={} transport={} uploaded={} downloaded={}{}",
                 lease.address,
+                super::ipv6_summary(&lease),
                 lease
                     .dns
                     .map_or_else(|| "-".to_owned(), |address| address.to_string()),
@@ -253,11 +309,10 @@ mod windows {
     )]
     struct Arguments {
         #[arg(
-            long,
-            default_value = "",
-            help = "Gateway origin, for example https://vpn.example.com:8443"
+            long = "server",
+            help = "Gateway origin, for example https://vpn.example.com:8443; repeat it for gateways that share accounts to use the fastest and fail over"
         )]
-        server: String,
+        servers: Vec<String>,
         #[arg(
             long,
             value_enum,
@@ -312,6 +367,12 @@ mod windows {
         #[arg(
             long,
             action = ArgAction::SetTrue,
+            help = "In a full tunnel, keep printers and other devices on the local network reachable"
+        )]
+        allow_lan: bool,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
         cleanup_network: bool,
@@ -320,7 +381,7 @@ mod windows {
     }
 
     fn parse_duration(value: &str) -> Result<Duration, String> {
-        humantime::parse_duration(value).map_err(|error| error.to_string())
+        porta_wire::duration::parse_duration(value).map_err(|error| error.to_string())
     }
 
     pub async fn run() -> Result<(), client::RunError> {
@@ -332,7 +393,14 @@ mod windows {
             return manager.down().await.map_err(client::RunError::Network);
         }
 
-        let server = parse_origin(&arguments.server)?;
+        if arguments.servers.is_empty() {
+            return Err(client::RunError::Invalid("--server is required".to_owned()));
+        }
+        let servers = arguments
+            .servers
+            .iter()
+            .map(|server| parse_origin(server))
+            .collect::<Result<Vec<_>, _>>()?;
         let token =
             super::token(arguments.token_file.as_deref()).map_err(client::RunError::Invalid)?;
         if token.is_empty() {
@@ -355,7 +423,7 @@ mod windows {
         });
         let result = client::run(
             client::Config {
-                server,
+                servers,
                 token,
                 tls,
                 transport: arguments.transport.into(),
@@ -366,6 +434,7 @@ mod windows {
                 reconnect: arguments.reconnect,
                 connect_timeout: Duration::from_secs(15),
                 reconnect_max_delay: arguments.reconnect_max_delay,
+                allow_lan: arguments.allow_lan,
             },
             cancellation,
             Arc::new(print_event),
@@ -403,6 +472,23 @@ mod windows {
             .map_err(|error| client::RunError::Invalid(error.to_string()))
     }
 
+    fn split_summary(routing: &porta_client::tunnel::Routing) -> String {
+        if routing.is_full_tunnel() {
+            return String::new();
+        }
+        let routes = routing
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut summary = format!(" routes={}", routes.join(","));
+        if !routing.dns_domains.is_empty() {
+            summary.push_str(" dns_domains=");
+            summary.push_str(&routing.dns_domains.join(","));
+        }
+        summary
+    }
+
     fn print_event(event: Event) {
         match event {
             Event::RecoveringNetwork => {
@@ -410,28 +496,36 @@ mod windows {
             }
             Event::Connecting {
                 attempt,
+                gateway,
                 remote_address,
-            } => eprintln!("porta-client: connecting attempt={attempt} endpoint={remote_address}"),
+            } => eprintln!(
+                "porta-client: connecting attempt={attempt} gateway={gateway} endpoint={remote_address}"
+            ),
             Event::ConfiguringNetwork => eprintln!("porta-client: configuring network"),
             Event::Connected(info) => eprintln!(
-                "porta-client: connected address={} dns={} mtu={} transport={:?}{}",
+                "porta-client: connected address={}{} dns={} mtu={} transport={:?}{}{}",
                 info.lease.address,
+                super::ipv6_summary(&info.lease),
                 info.lease
                     .dns
                     .map_or_else(|| "-".to_owned(), |address| address.to_string()),
                 info.lease.mtu,
                 info.transport,
-                super::account_summary(&info.account)
+                super::account_summary(&info.account),
+                split_summary(&info.routing)
             ),
             Event::Progress {
                 uploaded_bytes,
                 downloaded_bytes,
                 ..
             } => eprintln!("porta-client: uploaded={uploaded_bytes} downloaded={downloaded_bytes}"),
-            Event::Reconnecting { reason, delay } => eprintln!(
+            Event::Reconnecting { reason, delay, .. } => eprintln!(
                 "porta-client: reconnecting in {}: {reason}",
-                humantime::format_duration(delay)
+                porta_wire::duration::format_duration(delay)
             ),
+            Event::DirectPeers(peers) => {
+                eprintln!("porta-client: {}", porta_client::tunnel::direct_summary(&peers))
+            }
             Event::Stopping => eprintln!("porta-client: stopping"),
         }
     }
@@ -455,6 +549,17 @@ mod windows {
     }
 }
 
+/// The IPv6 address of a dual-stack lease, for the connected line.
+#[cfg(any(
+    all(target_os = "linux", not(target_os = "android")),
+    target_os = "windows"
+))]
+fn ipv6_summary(lease: &porta_client::tunnel::Lease) -> String {
+    lease
+        .ipv6()
+        .map_or_else(String::new, |address| format!(" ipv6={address}"))
+}
+
 /// Formats gateway-reported account limits for status lines, or nothing for
 /// unrestricted accounts.
 #[cfg(any(
@@ -465,13 +570,13 @@ fn account_summary(account: &porta_client::tunnel::AccountStatus) -> String {
     let mut summary = String::new();
     if let Some(expires) = account
         .expires_at
-        .and_then(|seconds| u64::try_from(seconds).ok())
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
     {
-        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires);
-        summary.push_str(&format!(
-            " expires={}",
-            humantime::format_rfc3339_seconds(at)
-        ));
+        summary.push_str(&format!(" expires={expires}"));
     }
     if let Some(quota) = account.quota_bytes {
         let used = account

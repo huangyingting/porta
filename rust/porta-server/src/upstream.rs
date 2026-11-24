@@ -189,7 +189,7 @@ impl Upstream {
                     tracing::warn!(
                         upstream = %self.config.url,
                         error = %error,
-                        retry_in = %humantime::format_duration(delay),
+                        retry_in = %crate::wire::duration::format_duration(delay),
                         "next-hop tunnel connection failed"
                     );
                     self.status.failed(error.to_string());
@@ -205,7 +205,7 @@ impl Upstream {
                 tracing::error!(
                     interface = self.device.name(),
                     error = %format!("{error:#}"),
-                    retry_in = %humantime::format_duration(delay),
+                    retry_in = %crate::wire::duration::format_duration(delay),
                     "could not configure the upstream interface"
                 );
                 self.status.failed(format!("{error:#}"));
@@ -241,7 +241,7 @@ impl Upstream {
             tracing::warn!(
                 upstream = %self.config.url,
                 reason = %reason,
-                retry_in = %humantime::format_duration(delay),
+                retry_in = %crate::wire::duration::format_duration(delay),
                 "next-hop tunnel interrupted"
             );
             if !sleep_or_cancel(delay, &cancellation).await {
@@ -442,6 +442,7 @@ mod tests {
             gateway: Some(Ipv4Addr::new(10, 77, 0, 1)),
             dns: None,
             mtu: 1280,
+            address6: None,
         }
     }
 

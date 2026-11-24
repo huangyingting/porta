@@ -4,7 +4,9 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
@@ -14,6 +16,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.OsConstants
 import android.util.Log
 import portamobile.Portamobile
 import portamobile.Dialer
@@ -87,6 +90,8 @@ class TunnelService : VpnService() {
         val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
         val profileId = intent.getStringExtra(EXTRA_PROFILE_ID).orEmpty()
         val profileLabel = intent.getStringExtra(EXTRA_PROFILE_NAME).orEmpty()
+        val backupServers = intent.getStringArrayExtra(EXTRA_BACKUP_SERVERS)
+            ?.filter(::isHttpsOrigin)?.take(7).orEmpty()
         if (!isHttpsOrigin(server) || !isValidToken(token)) {
             logEvent("Connection rejected: invalid profile configuration")
             stopTunnel("Invalid tunnel configuration")
@@ -94,6 +99,10 @@ class TunnelService : VpnService() {
         }
         currentProfileId = profileId.ifBlank { server }
         currentProfileName = profileLabel.ifBlank { profileName(server) }
+        currentAllowLan = intent.getBooleanExtra(EXTRA_ALLOW_LAN, false)
+        currentAppMode = AppMode.fromCode(intent.getStringExtra(EXTRA_APP_MODE))
+        currentApps = intent.getStringArrayExtra(EXTRA_APPS)
+            ?.filter(::isPackageName)?.take(MAX_PROFILE_APPS).orEmpty()
         currentSessionId = runGeneration
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification("Connecting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -124,7 +133,7 @@ class TunnelService : VpnService() {
         sendStatus("Connecting")
         startStats(runGeneration)
         worker = Thread(
-            { runTunnel(server, token, deviceIdentity, runGeneration, startId) },
+            { runTunnel(listOf(server) + backupServers, token, deviceIdentity, runGeneration, startId) },
             "porta-transport",
         ).also { it.start() }
         return START_NOT_STICKY
@@ -141,7 +150,7 @@ class TunnelService : VpnService() {
     }
 
     private fun runTunnel(
-        server: String,
+        servers: List<String>,
         token: String,
         deviceIdentity: AndroidDeviceIdentity,
         runGeneration: Long,
@@ -185,7 +194,7 @@ class TunnelService : VpnService() {
                     updateConnectionStatus(if (reconnecting) "Reconnecting" else "Connecting", runGeneration)
                     logEvent(formatAttemptEvent("Automatic HTTP/3 or HTTP/2", selectedNetworkType))
                     connectNativeOnce(
-                        server,
+                        servers,
                         token,
                         deviceIdentity,
                         network,
@@ -235,7 +244,7 @@ class TunnelService : VpnService() {
     }
 
     private fun connectNativeOnce(
-        server: String,
+        servers: List<String>,
         token: String,
         deviceIdentity: AndroidDeviceIdentity,
         network: Network,
@@ -246,16 +255,36 @@ class TunnelService : VpnService() {
         onConnected: () -> Unit,
     ) {
         val attemptStartedAt = System.nanoTime()
-        val host = gatewayHost(server)
-            ?: throw PermanentTunnelException("Gateway URL has no hostname")
         if (!attemptActive.get()) throw IOException("Underlying network changed before connection")
-        val remoteAddresses = try {
-            network.getAllByName(host).mapNotNull { it.hostAddress }.distinct()
-        } catch (error: UnknownHostException) {
-            throw IOException("Could not resolve the gateway on the underlying network", error)
+        var resolveFailure: Exception? = null
+        val resolved = servers.flatMap { server ->
+            val host = gatewayHost(server)
+                ?: throw PermanentTunnelException("Gateway URL has no hostname")
+            try {
+                network.getAllByName(host).mapNotNull { it.hostAddress }.distinct()
+                    .map { GatewayCandidate(server, it) }
+            } catch (error: UnknownHostException) {
+                // Another gateway of the profile may still resolve.
+                resolveFailure = error
+                emptyList()
+            }
         }
-        if (remoteAddresses.isEmpty()) {
-            throw IOException("Gateway hostname resolved to no addresses")
+        if (resolved.isEmpty()) {
+            throw IOException("Could not resolve the gateway on the underlying network", resolveFailure)
+        }
+        // Try the fastest gateway first; this app's sockets bypass the VPN.
+        val candidates = if (resolved.size > 1) {
+            val latencies = probeCandidates(resolved) { candidate ->
+                tcpConnectMillis(network.socketFactory.createSocket(), candidate.address, gatewayPort(candidate.server))
+            }
+            orderCandidates(resolved, latencies).also { ordered ->
+                logEvent("Gateway order: " + ordered.joinToString { candidate ->
+                    val latency = latencies[resolved.indexOf(candidate)]
+                    "${gatewayHost(candidate.server)} " + (latency?.let { "$it ms" } ?: "no answer")
+                })
+            }
+        } else {
+            resolved
         }
 
         val protector = object : Protector {
@@ -297,9 +326,12 @@ class TunnelService : VpnService() {
         }
         var session: Session? = null
         var unavailable: Exception? = null
+        var retryable: Exception? = null
         var connected = false
         try {
-            for (remoteAddress in remoteAddresses) {
+            for (candidate in candidates) {
+                val server = candidate.server
+                val remoteAddress = candidate.address
                 try {
                     if (!isRunActive(runGeneration)) throw InterruptedException("Tunnel stopped")
                     if (!attemptActive.get()) {
@@ -325,7 +357,8 @@ class TunnelService : VpnService() {
                     val message = error.message.orEmpty()
                     when {
                         Portamobile.isTransportUnavailable(message) -> unavailable = error
-                        Portamobile.isRetryable(message) -> throw IOException(message, error)
+                        // Fail over to the next gateway or endpoint.
+                        Portamobile.isRetryable(message) -> retryable = error
                         else -> throw PermanentTunnelException(message.ifBlank { "Native tunnel rejected" })
                     }
                 }
@@ -337,6 +370,7 @@ class TunnelService : VpnService() {
             }
         }
         val activeSession = session
+            ?: retryable?.let { throw IOException(it.message, it) }
             ?: throw IOException(unavailable?.message ?: "No supported tunnel transport is available")
         synchronized(this) {
             if (!isRunActive(runGeneration) || !nativeSession.compareAndSet(null, activeSession)) {
@@ -378,12 +412,17 @@ class TunnelService : VpnService() {
 
         try {
             val address = "${activeSession.address()}/${activeSession.prefixLength()}"
+            val address6 = activeSession.address6()
+            val routing = parseTunnelRouting(activeSession.routing())
+                ?: throw PermanentTunnelException("Gateway returned an invalid split-tunnel advertisement")
             val dns = activeSession.dns()
             val mtu = activeSession.mtu()
             configureVpn(
                 address,
+                address6,
                 dns,
                 mtu.toString(),
+                routing,
                 runGeneration,
             )
             val transport = when (val selected = activeSession.transport()) {
@@ -396,7 +435,7 @@ class TunnelService : VpnService() {
                 mtu = mtu,
                 automaticMtu = activeSession.automaticMTU(),
                 mtuCeiling = activeSession.maximumMTU().takeIf { it > 0 },
-                address = address,
+                address = if (address6.isEmpty()) address else "$address · $address6",
                 dns = dns,
                 deliveryMode = when (activeSession.packetDeliveryMode()) {
                     "datagram" -> "datagrams"
@@ -409,6 +448,7 @@ class TunnelService : VpnService() {
                 appVersion = Portamobile.version(),
                 protocolVersion = PacketFraming.VERSION,
                 account = parseAccountLimits(activeSession.accountStatus()),
+                routing = routing,
             )
             if (!publishConnectionDetails(attemptToken, details.toConnectionDetails())) {
                 throw InterruptedException("Native tunnel was replaced")
@@ -418,7 +458,21 @@ class TunnelService : VpnService() {
             formatConnectedEvents(details).forEach(::logEvent)
             updateConnectionStatus("Connected over $transport", runGeneration)
             sender.start()
+            var directPeers = ""
+            var directCheckedAt = System.nanoTime()
             while (isRunActive(runGeneration) && attemptActive.get()) {
+                val now = System.nanoTime()
+                if (now - directCheckedAt >= DIRECT_PEERS_CHECK_NANOS) {
+                    directCheckedAt = now
+                    val current = activeSession.directPeers()
+                    if (current != directPeers) {
+                        directPeers = current
+                        logEvent(
+                            if (current.isEmpty()) "Direct paths: none; peers are reached through the gateway"
+                            else "Direct paths: ${current.replace(",", ", ")}"
+                        )
+                    }
+                }
                 val packet = try {
                     activeSession.receive()
                 } catch (error: Exception) {
@@ -468,18 +522,22 @@ class TunnelService : VpnService() {
 
     private fun configureVpn(
         addressHeader: String?,
+        address6: String,
         dnsHeader: String?,
         mtuHeader: String?,
+        routing: TunnelRouting,
         runGeneration: Long,
     ) = configureVpn(
-        parseVpnConfiguration(addressHeader, dnsHeader, mtuHeader),
+        parseVpnConfiguration(addressHeader, address6, dnsHeader, mtuHeader, routing),
         runGeneration,
     )
 
     private fun parseVpnConfiguration(
         addressHeader: String?,
+        address6: String,
         dnsHeader: String?,
         mtuHeader: String?,
+        routing: TunnelRouting,
     ): VpnConfiguration {
         val addressParts = addressHeader?.split('/')
         if (addressParts?.size != 2) throw PermanentTunnelException("Gateway returned an invalid lease")
@@ -492,7 +550,30 @@ class TunnelService : VpnService() {
         if (parseIPv4Address(addressParts[0]) == null) {
             throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
         }
-        return VpnConfiguration(addressParts[0], prefix, dnsHeader.orEmpty(), mtu)
+        val dns = dnsHeader.orEmpty().takeIf { routing.usesTunnelDns }.orEmpty()
+        if (!routing.isFullTunnel && routing.dnsDomains.isNotEmpty() && parseIPv4Address(dns) == null) {
+            throw PermanentTunnelException("Gateway advertised split DNS without a resolver")
+        }
+        if (address6.isNotEmpty() && (parseIPv6Address(address6) == null || mtu < 1280)) {
+            throw PermanentTunnelException("Gateway returned an invalid IPv6 address")
+        }
+        val local = if (currentAllowLan && routing.isFullTunnel) {
+            localNetworks(listOfNotNull(parseIPv4Address(addressParts[0]), parseIPv4Address(dns), parseIPv6Address(address6)))
+        } else {
+            emptyList()
+        }
+        return VpnConfiguration(
+            addressParts[0],
+            address6,
+            prefix,
+            dns,
+            mtu,
+            routing,
+            localAccess = currentAllowLan && routing.isFullTunnel,
+            localNetworks = local,
+            appMode = currentAppMode,
+            apps = currentApps,
+        )
     }
 
     @Synchronized
@@ -502,14 +583,59 @@ class TunnelService : VpnService() {
 
         val sourceAddress = parseIPv4Address(configuration.address)
             ?: throw PermanentTunnelException("Gateway returned an invalid IPv4 address")
+        val sourceAddress6 = configuration.address6.takeIf { it.isNotEmpty() }?.let {
+            parseIPv6Address(it) ?: throw PermanentTunnelException("Gateway returned an invalid IPv6 address")
+        }
         val builder = Builder()
             .setSession(currentProfileName ?: "Porta")
             .setMtu(configuration.mtu)
             .addAddress(configuration.address, configuration.prefix)
-            .addRoute("0.0.0.0", 0)
             .setBlocking(true)
-        // Platform certificate checks create Java sockets outside the native socket protector.
-        builder.addDisallowedApplication(packageName)
+        if (sourceAddress6 != null) builder.addAddress(configuration.address6, 128)
+        if (configuration.routing.isFullTunnel && configuration.localAccess) {
+            // Local network access routes everything except the local
+            // networks and the multicast and broadcast discovery uses.
+            val excluded = configuration.localNetworks + LOCAL_DISCOVERY
+            routesExcluding(ipv6 = false, excluded).forEach { builder.addRoute(it.address, it.prefixLength) }
+            if (sourceAddress6 != null) {
+                routesExcluding(ipv6 = true, excluded).forEach { builder.addRoute(it.address, it.prefixLength) }
+            }
+        } else if (configuration.routing.isFullTunnel) {
+            builder.addRoute("0.0.0.0", 0)
+            // Without an IPv6 address Android blocks IPv6 for a VPN that
+            // claims none, so a full tunnel never leaks it.
+            if (sourceAddress6 != null) builder.addRoute("::", 0)
+        } else {
+            // A split tunnel only claims the advertised prefixes; other traffic
+            // keeps using the underlying network.
+            configuration.routing.routes
+                .filter { sourceAddress6 != null || !it.isIPv6 }
+                .forEach { builder.addRoute(it.address, it.prefixLength) }
+            if (configuration.dns.isNotBlank()) builder.addRoute(configuration.dns, 32)
+            if (sourceAddress6 == null) builder.allowFamily(OsConstants.AF_INET6)
+        }
+        // Platform certificate checks create Java sockets outside the native
+        // socket protector, so Porta itself always stays outside the tunnel.
+        val rules = appRules(configuration.appMode, configuration.apps, packageName)
+        var carried = 0
+        for (app in rules.allowed) {
+            try {
+                builder.addAllowedApplication(app)
+                carried++
+            } catch (_: PackageManager.NameNotFoundException) {
+                logEvent("Skipping $app: the app is not installed")
+            }
+        }
+        if (configuration.appMode == AppMode.ONLY && carried == 0) {
+            throw PermanentTunnelException(getString(R.string.no_selected_apps_installed))
+        }
+        for (app in rules.disallowed) {
+            try {
+                builder.addDisallowedApplication(app)
+            } catch (_: PackageManager.NameNotFoundException) {
+                logEvent("Skipping $app: the app is not installed")
+            }
+        }
         if (configuration.dns.isNotBlank()) builder.addDnsServer(configuration.dns)
         val vpn = builder.establish() ?: throw PermanentTunnelException("Android refused to establish the VPN")
         val previousReader = vpnReader
@@ -530,10 +656,10 @@ class TunnelService : VpnService() {
             throw error
         }
         if (previousVpn != null) outboundPackets.discardForRecovery()
-        startVpnReader(sourceAddress)
+        startVpnReader(sourceAddress, sourceAddress6)
     }
 
-    private fun startVpnReader(sourceAddress: ByteArray) {
+    private fun startVpnReader(sourceAddress: ByteArray, sourceAddress6: ByteArray?) {
         val readerDescriptor = descriptor.get() ?: return
         val readerInput = input ?: return
         vpnReader = Thread({
@@ -562,7 +688,9 @@ class TunnelService : VpnService() {
                         uplinkPacketPool.recycle(buffer)
                         continue
                     }
-                    if (!isAssignedIPv4Packet(buffer, count, sourceAddress)) {
+                    if (!isAssignedIPv4Packet(buffer, count, sourceAddress) &&
+                        (sourceAddress6 == null || !isAssignedIPv6Packet(buffer, count, sourceAddress6))
+                    ) {
                         uplinkPacketPool.recycle(buffer)
                         continue
                     }
@@ -988,6 +1116,31 @@ class TunnelService : VpnService() {
         const val ACTION_STATUS = "dev.porta.android.STATUS"
         const val ACTION_STATS = "dev.porta.android.STATS"
         const val EXTRA_SERVER = "server"
+        const val EXTRA_BACKUP_SERVERS = "backupServers"
+        const val EXTRA_ALLOW_LAN = "allowLan"
+        const val EXTRA_APP_MODE = "appMode"
+        const val EXTRA_APPS = "apps"
+
+        /** Multicast and broadcast that local discovery (mDNS, SSDP) uses. */
+        private val LOCAL_DISCOVERY = listOf(
+            RoutePrefix("224.0.0.0", 4),
+            RoutePrefix("255.255.255.255", 32),
+            RoutePrefix("fe80::", 10),
+            RoutePrefix("ff00::", 8),
+        )
+
+        /** Starts [profile]; the app and the boot receiver share it. */
+        internal fun startIntent(context: Context, profile: VpnProfile): Intent =
+            Intent(context, TunnelService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_PROFILE_ID, profile.id)
+                .putExtra(EXTRA_PROFILE_NAME, profile.name)
+                .putExtra(EXTRA_SERVER, profile.server)
+                .putExtra(EXTRA_BACKUP_SERVERS, profile.backupServers.toTypedArray())
+                .putExtra(EXTRA_TOKEN, profile.token)
+                .putExtra(EXTRA_ALLOW_LAN, profile.allowLan)
+                .putExtra(EXTRA_APP_MODE, profile.appMode.code)
+                .putExtra(EXTRA_APPS, profile.apps.toTypedArray())
         const val EXTRA_TOKEN = "token"
         const val EXTRA_PROFILE_ID = "profile_id"
         const val EXTRA_PROFILE_NAME = "profile_name"
@@ -1000,6 +1153,9 @@ class TunnelService : VpnService() {
         @Volatile private var currentStatus = "Disconnected"
         @Volatile private var currentProfileId: String? = null
         @Volatile private var currentProfileName: String? = null
+        @Volatile private var currentAllowLan = false
+        @Volatile private var currentAppMode = AppMode.ALL
+        @Volatile private var currentApps = emptyList<String>()
         @Volatile private var currentSessionId = NO_SESSION
         @Volatile private var currentSnapshot = TrafficSnapshot()
         private val nextSessionId = AtomicLong()
@@ -1009,6 +1165,7 @@ class TunnelService : VpnService() {
         private const val STABLE_CONNECTION_MILLIS = 30_000L
         private const val VPN_READER_STOP_TIMEOUT_MILLIS = 2_000L
         private const val NATIVE_SENDER_STOP_TIMEOUT_MILLIS = 2_000L
+        private val DIRECT_PEERS_CHECK_NANOS = TimeUnit.SECONDS.toNanos(2)
         private const val STATS_INTERVAL_MILLIS = 1_000L
         private const val STATS_STOP_TIMEOUT_MILLIS = 2_000L
         private const val NANOS_PER_SECOND = 1_000_000_000L
@@ -1024,10 +1181,37 @@ class TunnelService : VpnService() {
 
     private data class VpnConfiguration(
         val address: String,
+        /** Empty without IPv6. */
+        val address6: String,
         val prefix: Int,
         val dns: String,
         val mtu: Int,
+        val routing: TunnelRouting,
+        /** Full tunnel that keeps the local network reachable. */
+        val localAccess: Boolean = false,
+        /** The local networks routed around the tunnel. */
+        val localNetworks: List<RoutePrefix> = emptyList(),
+        val appMode: AppMode = AppMode.ALL,
+        val apps: List<String> = emptyList(),
     )
+
+    /**
+     * Private networks the device is attached to outside the VPN, without
+     * the tunnel's own addresses [keep].
+     */
+    @Suppress("DEPRECATION")
+    private fun localNetworks(keep: List<ByteArray>): List<RoutePrefix> {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        return manager.allNetworks.flatMap { network ->
+            val capabilities = manager.getNetworkCapabilities(network)
+            if (capabilities == null || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                return@flatMap emptyList()
+            }
+            manager.getLinkProperties(network)?.linkAddresses.orEmpty().mapNotNull { link ->
+                localNetworkPrefix(link.address.address, link.prefixLength, keep)
+            }
+        }.distinct().sortedBy { it.toString() }
+    }
 
     private data class SelectedNetworkCallbacks(
         val defaultCallback: ConnectivityManager.NetworkCallback,
@@ -1053,6 +1237,13 @@ internal fun gatewayHost(server: String): String? = try {
     null
 }
 
+/** The gateway's HTTPS port. */
+internal fun gatewayPort(server: String): Int = try {
+    URI(server).port.takeIf { it > 0 } ?: 443
+} catch (_: Exception) {
+    443
+}
+
 internal fun parseIPv4Address(value: String): ByteArray? {
     val parts = value.split('.')
     if (parts.size != 4) return null
@@ -1067,6 +1258,45 @@ internal fun parseIPv4Address(value: String): ByteArray? {
         result[index] = octet.toByte()
     }
     return result
+}
+
+/** Parses a numeric IPv6 address without zone or embedded IPv4. */
+internal fun parseIPv6Address(value: String): ByteArray? {
+    if (value.isEmpty() || value.length > 39 ||
+        value.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' && it != ':' }
+    ) return null
+    val halves = value.split("::")
+    if (halves.size > 2) return null
+    fun groups(part: String): List<Int>? {
+        if (part.isEmpty()) return emptyList()
+        return part.split(':').map { group ->
+            if (group.isEmpty() || group.length > 4) return null
+            group.toInt(16)
+        }
+    }
+    val head = groups(halves[0]) ?: return null
+    val tail = if (halves.size == 2) groups(halves[1]) ?: return null else emptyList()
+    val count = head.size + tail.size
+    if ((halves.size == 1 && count != 8) || (halves.size == 2 && count > 7)) return null
+    val words = head + List(8 - count) { 0 } + tail
+    val result = ByteArray(16)
+    for (index in words.indices) {
+        result[index * 2] = (words[index] shr 8).toByte()
+        result[index * 2 + 1] = words[index].toByte()
+    }
+    return result
+}
+
+internal fun isAssignedIPv6Packet(packet: ByteArray, length: Int, sourceAddress: ByteArray): Boolean {
+    if (length < 40 || length > packet.size || sourceAddress.size != 16 ||
+        (packet[0].toInt() ushr 4) != 6
+    ) return false
+    val payloadLength = ((packet[4].toInt() and 0xff) shl 8) or (packet[5].toInt() and 0xff)
+    if (payloadLength + 40 != length) return false
+    for (index in sourceAddress.indices) {
+        if (packet[8 + index] != sourceAddress[index]) return false
+    }
+    return true
 }
 
 internal fun isAssignedIPv4Packet(packet: ByteArray, length: Int, sourceAddress: ByteArray): Boolean {

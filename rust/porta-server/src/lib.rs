@@ -1,9 +1,11 @@
 pub mod app;
 pub mod config;
 pub mod data;
+pub mod dns;
 pub mod http_handler;
 pub mod integration;
 pub mod ops;
+pub mod policy;
 pub mod proxy;
 pub mod server;
 pub mod state;

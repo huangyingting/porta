@@ -18,16 +18,18 @@ use crate::http_handler::EffectiveClientAddress;
 use crate::server::{plain_response, BoxError, Handler, RequestLifetime, ResponseBody};
 use crate::transport::http3::{
     address_response, append_ip_capsule, decode_ip_bytes, inject_packet, take_capsule,
+    unsolicited_assignment,
 };
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, parse_lane_config, set_account_headers,
-    AuthenticationRequest, DenialReason, DeviceProof, LaneConfig, LeaseError, MtuError,
-    OpenSessionError, OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES,
-    CONTENT_TYPE, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION, HEADER_MAX_VERSION,
-    HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, MASQUE_PATH, PACKET_BATCH,
-    PROTOCOL_VERSION, REASON_HEADER, TUNNEL_PATH,
+    bearer_token, client_version, fragment_ipv4, icmp_fragmentation_needed, is_masque_path,
+    is_standard_request, parse_lane_config, set_account_headers, AuthenticationRequest,
+    DenialReason, DeviceProof, LaneConfig, LeaseError, MtuError, OpenSessionError,
+    OpenSessionRequest, RouteError, RouteKind, Services, Session, BATCH_BYTES, CONTENT_TYPE,
+    HEADER_ADDRESS6, HEADER_LANE, HEADER_LANES, HEADER_LANE_SESSION, HEADER_MAX_VERSION,
+    HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH, PACKET_BATCH, PROTOCOL_VERSION,
+    REASON_HEADER, TUNNEL_PATH,
 };
-use crate::wire::ip::parse_ipv4;
+use crate::wire::ip::parse_ip;
 use crate::wire::masque::{
     decode_address_assign, decode_route_advertisement, CAPSULE_ADDRESS_ASSIGN,
     CAPSULE_ADDRESS_REQUEST, CAPSULE_DATAGRAM, CAPSULE_ROUTE_ADVERTISEMENT, MAX_CAPSULE_SIZE,
@@ -79,7 +81,7 @@ impl Http2Handler {
         request: Request<Incoming>,
         peer: SocketAddr,
     ) -> Result<Response<ResponseBody>> {
-        if request.uri().path().eq_ignore_ascii_case(MASQUE_PATH) {
+        if is_masque_path(request.uri().path()) {
             return self.handle_masque(request, peer).await;
         }
         if request.uri().path() != TUNNEL_PATH {
@@ -143,6 +145,8 @@ impl Http2Handler {
                 .extensions()
                 .get::<EffectiveClientAddress>()
                 .map_or(peer, |address| SocketAddr::new(address.0, peer.port())),
+            standard: false,
+            client_version: client_version(request.headers()),
         };
         let session = match self
             .services
@@ -224,7 +228,8 @@ impl Http2Handler {
                 "Capsule-Protocol is required\n",
             ));
         }
-        if !protocol_version_supported(request.headers()) {
+        let standard = is_standard_request(request.headers());
+        if !standard && !protocol_version_supported(request.headers()) {
             return Ok(version_error_response());
         }
         let token = match bearer_token(request.headers()) {
@@ -236,13 +241,19 @@ impl Http2Handler {
         };
         let authentication = AuthenticationRequest {
             bearer_token: token,
-            proof: DeviceProof::from_headers(request.headers()),
+            proof: if standard {
+                DeviceProof::standard()
+            } else {
+                DeviceProof::from_headers(request.headers())
+            },
             method: request.method().clone(),
             path: MASQUE_AUTH_PATH.to_owned(),
             peer: request
                 .extensions()
                 .get::<EffectiveClientAddress>()
                 .map_or(peer, |address| SocketAddr::new(address.0, peer.port())),
+            standard,
+            client_version: client_version(request.headers()),
         };
         let session = match self
             .services
@@ -268,6 +279,7 @@ impl Http2Handler {
                 .boxed(),
         );
         set_account_headers(response.headers_mut(), &session.account);
+        session.routing.set_headers(response.headers_mut());
         let mtu = self.config.mtu;
         tokio::spawn(async move {
             let _lifetime = lifetime;
@@ -347,6 +359,11 @@ fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
             let body = match reason {
                 DenialReason::AccountExpired => "account-expired\n",
                 DenialReason::QuotaExceeded => "quota-exceeded\n",
+                DenialReason::DevicePending => "device-pending\n",
+                DenialReason::EnrollmentClosed => "enrollment-closed\n",
+                DenialReason::DeviceDenied => "device-denied\n",
+                DenialReason::StandardClientsDisabled => "standard-clients-disabled\n",
+                DenialReason::ClientOutdated => "client-outdated\n",
             };
             let mut response = plain_response(StatusCode::FORBIDDEN, body);
             response.headers_mut().insert(
@@ -366,6 +383,17 @@ fn open_error_response(error: OpenSessionError) -> Response<ResponseBody> {
                 http::header::RETRY_AFTER,
                 retry_after_seconds.to_string().parse().unwrap(),
             );
+            response
+        }
+        OpenSessionError::Unavailable(message) => {
+            let mut response = plain_response(StatusCode::SERVICE_UNAVAILABLE, message);
+            response.headers_mut().insert(
+                http::header::RETRY_AFTER,
+                http::HeaderValue::from_static("5"),
+            );
+            if let Ok(value) = http::HeaderValue::from_str(message) {
+                response.headers_mut().insert(REASON_HEADER, value);
+            }
             response
         }
         OpenSessionError::Lease(LeaseError::Exhausted | LeaseError::Internal) => plain_response(
@@ -414,11 +442,18 @@ fn success_response(
         "X-Porta-Gateway",
         session.lease.gateway.to_string().parse().unwrap(),
     );
+    if let Some(ipv6) = session.lease.ipv6 {
+        headers.insert(
+            HEADER_ADDRESS6,
+            format!("{}/128", ipv6.address).parse().unwrap(),
+        );
+    }
     headers.insert("X-Porta-MTU", mtu.to_string().parse().unwrap());
     headers.insert(HEADER_LANE_SESSION, lanes.session_id.parse().unwrap());
     headers.insert(HEADER_LANE, lanes.index.to_string().parse().unwrap());
     headers.insert(HEADER_LANES, lanes.count.to_string().parse().unwrap());
     set_account_headers(headers, &session.account);
+    session.routing.set_headers(headers);
     if let Some(dns) = dns {
         headers.insert("X-Porta-DNS", dns.to_string().parse().unwrap());
     }
@@ -464,6 +499,13 @@ where
     let mut assigned = false;
     let mut downlink_ready = false;
     let mut icmp_after = Instant::now();
+    // Standard clients may wait for the proxy to assign addresses unasked.
+    if session.proof.is_standard() {
+        let control = unsolicited_assignment(&session.lease, &session.routing)?;
+        write_masque_output(&mut writer, &control, &session).await?;
+        assigned = true;
+        downlink_ready = true;
+    }
     loop {
         tokio::select! {
             biased;
@@ -478,7 +520,7 @@ where
                     match capsule_type {
                         CAPSULE_ADDRESS_REQUEST => {
                             let (response, now_assigned) =
-                                address_response(&session.lease, assigned, &value)?;
+                                address_response(&session.lease, &session.routing, assigned, &value)?;
                             assigned = now_assigned;
                             downlink_ready = downlink_ready || now_assigned;
                             write_masque_output(&mut writer, &response, &session).await?;
@@ -679,11 +721,11 @@ async fn consume_uploads(input: &mut BytesMut, session: &Session, mtu: u16) -> R
             session.services().metrics.dropped_from_client();
             continue;
         }
-        let Ok(info) = parse_ipv4(&packet) else {
+        let Ok(info) = parse_ip(&packet) else {
             session.services().metrics.dropped_from_client();
             continue;
         };
-        if info.source != session.lease.address {
+        if !session.may_send_from(info.source) {
             session.services().metrics.dropped_from_client();
             continue;
         }
@@ -761,6 +803,7 @@ impl Drop for ChannelBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::session::MASQUE_PATH;
     use crate::transport::session::{
         Authenticated, AuthenticationError, Authenticator, ClientIdentity, Lease, LeaseAllocator,
         LeaseRequest, NoopCleanup, NoopMetrics, NoopUsage, PacketQueue, PacketRouter, PacketSource,
@@ -814,6 +857,7 @@ mod tests {
                     },
                     cancellation: Arc::new(TokenCancellation::new(token)),
                     cleanup: Arc::new(NoopCleanup),
+                    network: Default::default(),
                 })
             })
         }
@@ -838,6 +882,7 @@ mod tests {
                     },
                     cancellation: Arc::new(TokenCancellation::new(cancellation)),
                     cleanup: Arc::new(NoopCleanup),
+                    network: Default::default(),
                 })
             })
         }
@@ -853,6 +898,7 @@ mod tests {
                     prefix_len: 24,
                     gateway: "10.66.0.1".parse().unwrap(),
                     opaque_id: 1,
+                    ipv6: None,
                 })
             })
         }
@@ -922,6 +968,8 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -934,6 +982,8 @@ mod tests {
                     method: http::Method::POST,
                     path: TUNNEL_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
+                    client_version: None,
                 },
                 group_id: Some("session-12345678".into()),
                 route: RouteKind::Http2Lane {
@@ -993,6 +1043,8 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -1005,6 +1057,8 @@ mod tests {
                     method: http::Method::CONNECT,
                     path: MASQUE_AUTH_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
+                    client_version: None,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,
@@ -1078,6 +1132,8 @@ mod tests {
             router: Arc::new(FakeRouter { uploads, downlink }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let handler = Arc::new(
             Http2Handler::new(
@@ -1223,6 +1279,8 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let handler = Arc::new(
             Http2Handler::new(

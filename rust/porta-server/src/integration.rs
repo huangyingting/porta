@@ -1,36 +1,41 @@
+use crate::data::queue::DropReason;
 use crate::data::ratelimit::{AccountRateLimiter, Direction as RateDirection, RateLimiters};
 use crate::data::router::{Router, RouterError, Session as RouterSession};
 use crate::ops::abuse::{AbuseGuard, Surface};
+use crate::ops::exits::ExitRules;
 use crate::ops::metrics::Metrics as OperationalMetrics;
 use crate::proxy::service::{
     AuthenticationLimiter, AuthenticationReservation, AuthorizedSession,
     Authorizer as ProxyAuthorizer, BoxError as ProxyError, Identity as ProxyIdentity,
     UsageHooks as ProxyUsage, UsageSession as ProxyUsageSession, DEVICE_ID as PROXY_DEVICE_ID,
 };
-use crate::state::pool::{Lease as PoolLease, Pool, PoolError};
+use crate::state::pool::{Ipv6Pool, Lease as PoolLease, Pool, PoolError};
 use crate::state::registry::{
-    AccountLimits, ClientRegistry as StateRegistry, RegistryError as StateRegistryError,
-    UsagePeriod,
+    AccessPolicy, AccountLimits, ClientRegistry as StateRegistry, EnrollmentPolicy,
+    RegistryError as StateRegistryError, UsagePeriod,
 };
 use crate::state::sessions::SessionGuard;
 use crate::state::usage;
 use crate::transport::session::{
     AccountStatus, Authenticated, AuthenticationError, AuthenticationRequest, Authenticator,
-    Cleanup, ClientIdentity as TransportIdentity, DenialReason, Lease, LeaseAllocator, LeaseError,
-    LeaseMode, LeaseRequest, Metrics, PacketRouter, PacketSource, QueueDrop, RouteError, RouteKind,
-    RouteRequest, RouteSession, TokenCancellation, Usage, UsageMetadata, UsageSession,
+    Cleanup, ClientIdentity as TransportIdentity, DenialReason, Ipv6Lease, Lease, LeaseAllocator,
+    LeaseError, LeaseMode, LeaseRequest, Metrics, NetworkPolicy, PacketRouter, PacketSource,
+    QueueDrop, RouteError, RouteKind, RouteRequest, RouteSession, TokenCancellation, Usage,
+    UsageMetadata, UsageSession,
 };
 use crate::web::admin::{
+    ClientAccess as WebClientAccess, ClientEnrollment as WebClientEnrollment,
     ClientIdentity as WebIdentity, ClientLimits as WebClientLimits, ClientRegistry as WebRegistry,
     ClientSummary as WebClientSummary, DeviceSummary as WebDeviceSummary,
     RegistryError as WebRegistryError,
 };
 use crate::wire::device_auth;
+use crate::wire::peer::{Fingerprint, Peer, MAX_PEERS};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +45,8 @@ pub struct NativeAuthenticator {
     registry: Arc<StateRegistry>,
     abuse: Arc<AbuseGuard>,
     usage: Option<Arc<usage::Store>>,
+    /// Native clients older than this are refused (`--min-client-version`).
+    min_client_version: Option<(u64, u64, u64)>,
 }
 
 impl NativeAuthenticator {
@@ -48,6 +55,7 @@ impl NativeAuthenticator {
             registry,
             abuse,
             usage: None,
+            min_client_version: None,
         })
     }
 
@@ -56,11 +64,24 @@ impl NativeAuthenticator {
         registry: Arc<StateRegistry>,
         abuse: Arc<AbuseGuard>,
         usage: Arc<usage::Store>,
+        min_client_version: Option<(u64, u64, u64)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             abuse,
             usage: Some(usage),
+            min_client_version,
+        })
+    }
+
+    /// Whether a native client reporting `version` is too old to admit.
+    /// Clients that report no version predate the header and are too old
+    /// whenever a minimum is set.
+    fn outdated(&self, version: Option<&str>) -> bool {
+        self.min_client_version.is_some_and(|minimum| {
+            version
+                .and_then(crate::transport::session::parse_version)
+                .is_none_or(|version| version < minimum)
         })
     }
 }
@@ -101,7 +122,14 @@ impl Authenticator for NativeAuthenticator {
         let registry = self.registry.clone();
         let abuse = self.abuse.clone();
         let usage = self.usage.clone();
+        // Standard CONNECT-IP clients are not Porta apps and have no version.
+        let outdated = !request.standard && self.outdated(request.client_version.as_deref());
         Box::pin(async move {
+            // Refused before authenticating, so an outdated app enrolls no
+            // device; the minimum version is not a secret.
+            if outdated {
+                return Err(AuthenticationError::Forbidden(DenialReason::ClientOutdated));
+            }
             let Some(reservation) = abuse.reserve(Surface::Native, request.peer.ip()) else {
                 return Err(AuthenticationError::RateLimited {
                     retry_after_seconds: 5,
@@ -119,14 +147,20 @@ impl Authenticator for NativeAuthenticator {
             // disappears while the registry's detached persistence task is running.
             let status_registry = registry.clone();
             let session = tokio::spawn(async move {
-                registry
-                    .authenticate_device_session(
-                        &request.bearer_token,
-                        &proof,
-                        request.method.as_str(),
-                        &request.path,
-                    )
-                    .await
+                if request.standard {
+                    registry
+                        .authenticate_standard_session(&request.bearer_token)
+                        .await
+                } else {
+                    registry
+                        .authenticate_device_session(
+                            &request.bearer_token,
+                            &proof,
+                            request.method.as_str(),
+                            &request.path,
+                        )
+                        .await
+                }
             })
             .await
             .map_err(|error| {
@@ -140,6 +174,22 @@ impl Authenticator for NativeAuthenticator {
                 StateRegistryError::QuotaExceeded => {
                     AuthenticationError::Forbidden(DenialReason::QuotaExceeded)
                 }
+                StateRegistryError::DevicePending => {
+                    AuthenticationError::Forbidden(DenialReason::DevicePending)
+                }
+                StateRegistryError::EnrollmentClosed => {
+                    AuthenticationError::Forbidden(DenialReason::EnrollmentClosed)
+                }
+                StateRegistryError::DeviceDenied => {
+                    AuthenticationError::Forbidden(DenialReason::DeviceDenied)
+                }
+                StateRegistryError::StandardClientsDisabled => {
+                    AuthenticationError::Forbidden(DenialReason::StandardClientsDisabled)
+                }
+                // A client with several gateways moves on to the primary.
+                StateRegistryError::EnrollOnPrimary => AuthenticationError::Unavailable(
+                    "new devices enroll on the primary gateway first",
+                ),
                 StateRegistryError::Unauthorized
                 | StateRegistryError::Disabled
                 | StateRegistryError::DeviceLimit
@@ -156,8 +206,14 @@ impl Authenticator for NativeAuthenticator {
                 usage.as_deref(),
                 &session.identity.account_id,
             );
+            let network = network_policy(
+                &status_registry,
+                &session.identity.account_id,
+                &session.device_id,
+            );
             Ok(Authenticated {
                 account,
+                network,
                 identity: TransportIdentity {
                     account_id: session.identity.account_id,
                     lease_id: session.identity.lease_id,
@@ -166,6 +222,40 @@ impl Authenticator for NativeAuthenticator {
                 cleanup: Arc::new(RegistrySessionCleanup::new(session.guard)),
             })
         })
+    }
+}
+
+/// The network rules of one device's tunnel.
+pub fn network_policy(
+    registry: &StateRegistry,
+    account_id: &str,
+    device_id: &str,
+) -> NetworkPolicy {
+    let device = registry.device_network(account_id, device_id);
+    NetworkPolicy {
+        allow: device.access.allow,
+        deny: device.access.deny,
+        group: device.access.group,
+        exit: device.access.exit,
+        subnets: device.subnets,
+        published: registry
+            .routed_subnets()
+            .into_iter()
+            .filter(|routed| routed.account_id != account_id || routed.device_id != device_id)
+            .map(|routed| routed.subnet)
+            .collect(),
+    }
+}
+
+/// Current device names for the resolver.
+pub trait NameSource: Send + Sync {
+    /// Names relative to the resolver zone, by account and device ID.
+    fn names(&self) -> HashMap<(String, String), String>;
+}
+
+impl NameSource for StateRegistry {
+    fn names(&self) -> HashMap<(String, String), String> {
+        self.dns_names()
     }
 }
 
@@ -320,20 +410,43 @@ impl ProxyUsage for ProxyUsageAdapter {
 pub struct WebRegistryAdapter {
     registry: Arc<StateRegistry>,
     usage: Arc<usage::Store>,
+    network: GatewayNetwork,
+}
+
+/// Gateway facts that access policies and subnet routes are checked against.
+#[derive(Clone, Debug, Default)]
+pub struct GatewayNetwork {
+    /// Exit names an account may select.
+    pub exits: Vec<String>,
+    /// Networks no device may route, such as the client pool.
+    pub reserved: Vec<ipnet::Ipv4Net>,
 }
 
 impl WebRegistryAdapter {
     pub fn new(registry: Arc<StateRegistry>, usage: Arc<usage::Store>) -> Arc<Self> {
-        Arc::new(Self { registry, usage })
+        Self::with_network(registry, usage, GatewayNetwork::default())
+    }
+
+    pub fn with_network(
+        registry: Arc<StateRegistry>,
+        usage: Arc<usage::Store>,
+        network: GatewayNetwork,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            usage,
+            network,
+        })
     }
 
     fn summary(&self, id: &str) -> Result<WebClientSummary, WebRegistryError> {
         let snapshot = self.usage.snapshot();
+        let names = self.registry.dns_names();
         self.registry
             .list_with_usage(&snapshot)
             .into_iter()
             .find(|client| client.id == id)
-            .map(web_client_summary)
+            .map(|summary| web_client_summary(summary, &names))
             .ok_or(WebRegistryError::NotFound)
     }
 }
@@ -448,11 +561,12 @@ pub fn usage_month(now: time::OffsetDateTime) -> String {
 impl WebRegistry for WebRegistryAdapter {
     fn list_clients(&self) -> Result<Vec<WebClientSummary>, WebRegistryError> {
         let snapshot = self.usage.snapshot();
+        let names = self.registry.dns_names();
         Ok(self
             .registry
             .list_with_usage(&snapshot)
             .into_iter()
-            .map(web_client_summary)
+            .map(|summary| web_client_summary(summary, &names))
             .collect())
     }
 
@@ -465,10 +579,10 @@ impl WebRegistry for WebRegistryAdapter {
         let name = name.to_owned();
         Box::pin(async move {
             join_web_mutation(tokio::spawn(async move {
-                registry
-                    .create(name, max_devices)
-                    .await
-                    .map(|(summary, token)| (web_client_summary(summary), token))
+                let created = registry.create(name, max_devices).await;
+                let names = registry.dns_names();
+                created
+                    .map(|(summary, token)| (web_client_summary(summary, &names), token))
                     .map_err(web_registry_error)
             }))
             .await
@@ -487,10 +601,10 @@ impl WebRegistry for WebRegistryAdapter {
         let name = name.to_owned();
         Box::pin(async move {
             join_web_mutation(tokio::spawn(async move {
-                registry
-                    .update(&id, name, max_devices, enabled)
-                    .await
-                    .map(web_client_summary)
+                let updated = registry.update(&id, name, max_devices, enabled).await;
+                let names = registry.dns_names();
+                updated
+                    .map(|summary| web_client_summary(summary, &names))
                     .map_err(web_registry_error)
             }))
             .await
@@ -641,6 +755,120 @@ impl WebRegistry for WebRegistryAdapter {
         })
     }
 
+    fn set_client_enrollment<'a>(
+        &'a self,
+        id: &'a str,
+        enrollment: WebClientEnrollment,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        Box::pin(async move {
+            let policy = match enrollment.policy.as_str() {
+                "open" => EnrollmentPolicy::Open,
+                "approval" => EnrollmentPolicy::Approval,
+                "closed" => EnrollmentPolicy::Closed,
+                _ => {
+                    return Err(WebRegistryError::Invalid(
+                        "policy must be open, approval, or closed".into(),
+                    ))
+                }
+            };
+            let window = enrollment
+                .open_for_minutes
+                .map(|minutes| std::time::Duration::from_secs(u64::from(minutes) * 60));
+            let standard_clients = enrollment.standard_clients;
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_enrollment(&owned_id, policy, window)
+                    .await
+                    .map_err(web_registry_error)?;
+                if let Some(allowed) = standard_clients {
+                    registry
+                        .set_standard_clients(&owned_id, allowed)
+                        .await
+                        .map_err(web_registry_error)?;
+                }
+                Ok(())
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
+    fn set_client_access<'a>(
+        &'a self,
+        id: &'a str,
+        access: WebClientAccess,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        let exits = self.network.exits.clone();
+        Box::pin(async move {
+            let access = AccessPolicy {
+                allow: parse_access_prefixes(&access.allow)?,
+                deny: parse_access_prefixes(&access.deny)?,
+                group: access.group,
+                exit: access.exit,
+            };
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_access(&owned_id, access, &exits)
+                    .await
+                    .map(|_| ())
+                    .map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
+    fn set_device_subnets<'a>(
+        &'a self,
+        id: &'a str,
+        device_id: &'a str,
+        subnets: Vec<String>,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        let owned_device = device_id.to_owned();
+        let reserved = self.network.reserved.clone();
+        Box::pin(async move {
+            let subnets = parse_prefixes(&subnets)?;
+            join_web_mutation(tokio::spawn(async move {
+                registry
+                    .set_device_subnets(&owned_id, &owned_device, subnets, &reserved)
+                    .await
+                    .map(|_| ())
+                    .map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
+    fn review_device<'a>(
+        &'a self,
+        id: &'a str,
+        device_id: &'a str,
+        approve: bool,
+    ) -> BoxFuture<'a, Result<WebClientSummary, WebRegistryError>> {
+        let registry = self.registry.clone();
+        let owned_id = id.to_owned();
+        let device_id = device_id.to_owned();
+        Box::pin(async move {
+            join_web_mutation(tokio::spawn(async move {
+                let result = if approve {
+                    registry.approve_device(&owned_id, &device_id).await
+                } else {
+                    registry.deny_device(&owned_id, &device_id).await
+                };
+                result.map(|_| ()).map_err(web_registry_error)
+            }))
+            .await?;
+            self.summary(id)
+        })
+    }
+
     fn reset_client_usage<'a>(
         &'a self,
         id: &'a str,
@@ -685,6 +913,9 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
         StateRegistryError::Disabled
         | StateRegistryError::Expired
         | StateRegistryError::QuotaExceeded => WebRegistryError::Disabled,
+        StateRegistryError::EnrollmentClosed | StateRegistryError::ReadOnly => {
+            WebRegistryError::Invalid(error.to_string())
+        }
         StateRegistryError::InvalidInput(message) => WebRegistryError::Invalid(message),
         error => {
             tracing::error!(%error, "client registry operation failed");
@@ -693,7 +924,41 @@ fn web_registry_error(error: StateRegistryError) -> WebRegistryError {
     }
 }
 
-fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClientSummary {
+/// Parses IPv4 or IPv6 prefixes, or bare addresses as host prefixes.
+fn parse_access_prefixes(
+    values: &[String],
+) -> Result<Vec<crate::policy::AccessRule>, WebRegistryError> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<crate::policy::AccessRule>()
+                .map_err(|error| WebRegistryError::Invalid(error.to_string()))
+        })
+        .collect()
+}
+
+fn parse_prefixes(values: &[String]) -> Result<Vec<ipnet::Ipv4Net>, WebRegistryError> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<ipnet::Ipv4Net>()
+                .or_else(|_| value.parse::<Ipv4Addr>().map(ipnet::Ipv4Net::from))
+                .map_err(|_| WebRegistryError::Invalid(format!("{value:?} is not an IPv4 prefix")))
+        })
+        .collect()
+}
+
+fn web_client_summary(
+    summary: crate::state::registry::ClientSummary,
+    names: &HashMap<(String, String), String>,
+) -> WebClientSummary {
+    let account_id = summary.id.clone();
     WebClientSummary {
         id: summary.id,
         name: summary.name,
@@ -714,10 +979,34 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
         rate_limit_kbps: summary.limits.rate_limit_kbps,
         quota_used_bytes: summary.quota_used_bytes,
         status: summary.status.to_owned(),
+        enrollment: summary.enrollment.to_owned(),
+        enrollment_open_until: summary.enrollment_open_until.map(format_time),
+        pending_devices: summary.pending_devices,
+        access: WebClientAccess {
+            allow: summary
+                .access
+                .allow
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            deny: summary
+                .access
+                .deny
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            group: summary.access.group,
+            exit: summary.access.exit,
+        },
+        standard_clients: summary.standard_clients,
         devices: summary
             .devices
             .into_iter()
             .map(|device| WebDeviceSummary {
+                dns_name: names
+                    .get(&(account_id.clone(), device.id.clone()))
+                    .map(|name| format!("{name}.{}", crate::dns::ZONE))
+                    .unwrap_or_default(),
                 id: device.id,
                 name: device.name,
                 first_seen: format_time(device.first_seen),
@@ -730,9 +1019,11 @@ fn web_client_summary(summary: crate::state::registry::ClientSummary) -> WebClie
                 packets_downloaded: device.packets_downloaded,
                 last_connected: device.last_connected.map(format_time),
                 last_disconnected: device.last_disconnected.map(format_time),
+                status: device.status.to_owned(),
                 transport: device.transport,
                 assigned_address: device.assigned_address,
                 target: device.target,
+                subnets: device.subnets.iter().map(ToString::to_string).collect(),
             })
             .collect(),
     }
@@ -747,14 +1038,21 @@ fn format_time(value: time::OffsetDateTime) -> String {
 #[derive(Clone)]
 pub struct PoolAdapter {
     pool: Arc<Pool>,
+    ipv6: Option<Ipv6Pool>,
     next_id: Arc<AtomicU64>,
     active: Arc<Mutex<HashMap<u64, PoolLease>>>,
 }
 
 impl PoolAdapter {
     pub fn new(pool: Arc<Pool>) -> Arc<Self> {
+        Self::with_ipv6(pool, None)
+    }
+
+    /// Dual-stack leases: each also carries the paired address in `ipv6`.
+    pub fn with_ipv6(pool: Arc<Pool>, ipv6: Option<Ipv6Pool>) -> Arc<Self> {
         Arc::new(Self {
             pool,
+            ipv6,
             next_id: Arc::new(AtomicU64::new(0)),
             active: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -771,6 +1069,13 @@ impl PoolAdapter {
             prefix_len: lease.prefix_bits,
             gateway: lease.gateway,
             opaque_id,
+            ipv6: self.ipv6.and_then(|ipv6| {
+                Some(Ipv6Lease {
+                    address: ipv6.address(lease.address)?,
+                    prefix_len: ipv6.prefix().prefix_len(),
+                    gateway: ipv6.gateway(),
+                })
+            }),
         };
         self.active.lock().insert(opaque_id, lease);
         value
@@ -847,6 +1152,313 @@ pub struct RouterAdapter {
     limiters: Arc<RateLimiters>,
     /// Uplink limiter by lease; leases are unique per live device session.
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
+    /// Account and network policy of each live session, by lease.
+    contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
+    peers: Arc<PeerDirectory>,
+    switching: SwitchConfig,
+}
+
+/// Gateway-wide rules for traffic between clients.
+#[derive(Clone, Debug, Default)]
+pub struct SwitchConfig {
+    /// Every client may reach every other client, as if in one group.
+    pub client_to_client: bool,
+    /// Devices learn each other's public addresses to connect directly.
+    pub peer_to_peer: bool,
+    /// Destinations that access policies never block, such as the gateway
+    /// addresses and its DNS server.
+    pub always_reachable: Vec<IpAddr>,
+    /// Policy routing for accounts that select an exit.
+    pub exits: Option<Arc<ExitRules>>,
+    /// Device names for the built-in resolver.
+    pub names: Option<Arc<dyn NameSource>>,
+}
+
+impl std::fmt::Debug for dyn NameSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NameSource")
+    }
+}
+
+struct RouteContext {
+    account_id: String,
+    device_id: String,
+    network: NetworkPolicy,
+    /// The session's IPv6 address, when it has one.
+    ipv6: Option<std::net::Ipv6Addr>,
+}
+
+/// Whether two sessions' devices may exchange traffic.
+fn may_peer(client_to_client: bool, first: &RouteContext, second: &RouteContext) -> bool {
+    client_to_client
+        || first.account_id == second.account_id
+        || (first.network.group.is_some() && first.network.group == second.network.group)
+}
+
+/// Sessions published for direct paths, and the peer list each receives.
+///
+/// A change to one device only rewrites the lists of devices that may peer
+/// with it, and inside the runtime rewrites are coalesced, so a gateway
+/// restart that reconnects every device costs a few passes, not one per
+/// device.
+#[derive(Default)]
+struct PeerDirectory {
+    client_to_client: bool,
+    state: Mutex<PeerState>,
+    publisher: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+}
+
+#[derive(Default)]
+struct PeerState {
+    announced: std::collections::BTreeMap<Ipv4Addr, Announced>,
+    by_account: HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+    by_group: HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+    /// Which session published each certificate fingerprint.
+    fingerprints: HashMap<Fingerprint, Ipv4Addr>,
+    /// Sessions whose lists may be stale; `all_dirty` covers every one.
+    dirty: std::collections::HashSet<Ipv4Addr>,
+    all_dirty: bool,
+}
+
+struct Announced {
+    context: Arc<RouteContext>,
+    endpoint: SocketAddr,
+    fingerprint: Fingerprint,
+    updates: tokio::sync::watch::Sender<Vec<Peer>>,
+}
+
+/// How long changes collect before peer lists are rewritten.
+const PEER_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl PeerDirectory {
+    fn announce(
+        self: &Arc<Self>,
+        lease: Ipv4Addr,
+        context: Arc<RouteContext>,
+        endpoint: SocketAddr,
+        fingerprint: Fingerprint,
+    ) -> Option<tokio::sync::watch::Receiver<Vec<Peer>>> {
+        let mut state = self.state.lock();
+        // Fingerprints are visible to peers; a device offering another's
+        // would displace that device in its peers' lists.
+        if state
+            .fingerprints
+            .get(&fingerprint)
+            .is_some_and(|owner| *owner != lease)
+        {
+            return None;
+        }
+        // A reconnect may change the account or group, and with it the
+        // devices whose lists hold this one.
+        if let Some(previous) = state.announced.remove(&lease) {
+            self.mark_peers_of(&mut state, lease, &previous.context);
+            state.unindex(lease, &previous.context);
+            state.fingerprints.remove(&previous.fingerprint);
+        }
+        state.fingerprints.insert(fingerprint, lease);
+        state.index(lease, &context);
+        // The new session gets its list at once; its peers' lists follow.
+        let entry = Announced {
+            context,
+            endpoint: SocketAddr::new(endpoint.ip().to_canonical(), endpoint.port()),
+            fingerprint,
+            updates: tokio::sync::watch::channel(Vec::new()).0,
+        };
+        let own = state.list_for(self.client_to_client, lease, &entry);
+        entry.updates.send_replace(own);
+        let receiver = entry.updates.subscribe();
+        state.announced.insert(lease, entry);
+        let context = state.announced[&lease].context.clone();
+        self.mark_peers_of(&mut state, lease, &context);
+        state.dirty.remove(&lease);
+        drop(state);
+        self.schedule();
+        Some(receiver)
+    }
+
+    /// Removes the session at `lease` if `context` is still its session.
+    fn withdraw(self: &Arc<Self>, lease: Ipv4Addr, context: &Arc<RouteContext>) {
+        let mut state = self.state.lock();
+        if !state
+            .announced
+            .get(&lease)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.context, context))
+        {
+            return;
+        }
+        if let Some(entry) = state.announced.remove(&lease) {
+            state.fingerprints.remove(&entry.fingerprint);
+        }
+        state.unindex(lease, context);
+        self.mark_peers_of(&mut state, lease, context);
+        state.dirty.remove(&lease);
+        drop(state);
+        self.schedule();
+    }
+
+    /// Marks the lists that may include the device at `lease`.
+    fn mark_peers_of(&self, state: &mut PeerState, lease: Ipv4Addr, context: &RouteContext) {
+        if self.client_to_client {
+            state.all_dirty = true;
+            return;
+        }
+        let candidates = state.candidates(false, context).collect::<Vec<_>>();
+        state.dirty.extend(candidates);
+        state.dirty.insert(lease);
+    }
+
+    /// Rewrites stale lists now, or soon when running inside the runtime.
+    fn schedule(self: &Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.publish();
+            return;
+        };
+        let publisher = self.publisher.get_or_init(|| {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let directory = Arc::downgrade(self);
+            let wake = notify.clone();
+            runtime.spawn(async move {
+                loop {
+                    wake.notified().await;
+                    tokio::time::sleep(PEER_PUBLISH_DELAY).await;
+                    let Some(directory) = directory.upgrade() else {
+                        return;
+                    };
+                    directory.publish();
+                }
+            });
+            notify
+        });
+        publisher.notify_one();
+    }
+
+    /// Sends every stale session the devices it and they may both reach:
+    /// the same rules as traffic switched through the gateway, in both
+    /// directions.
+    fn publish(&self) {
+        let mut state = self.state.lock();
+        let targets: Vec<Ipv4Addr> = if state.all_dirty {
+            state.announced.keys().copied().collect()
+        } else {
+            state.dirty.iter().copied().collect()
+        };
+        state.dirty.clear();
+        state.all_dirty = false;
+        for address in targets {
+            let Some(entry) = state.announced.get(&address) else {
+                continue;
+            };
+            let peers = state.list_for(self.client_to_client, address, entry);
+            entry.updates.send_if_modified(|current| {
+                let changed = *current != peers;
+                if changed {
+                    *current = peers;
+                }
+                changed
+            });
+        }
+    }
+
+    fn published(&self) -> usize {
+        self.state.lock().announced.len()
+    }
+}
+
+impl PeerState {
+    fn index(&mut self, lease: Ipv4Addr, context: &RouteContext) {
+        self.by_account
+            .entry(context.account_id.clone())
+            .or_default()
+            .insert(lease);
+        if let Some(group) = &context.network.group {
+            self.by_group
+                .entry(group.clone())
+                .or_default()
+                .insert(lease);
+        }
+    }
+
+    fn unindex(&mut self, lease: Ipv4Addr, context: &RouteContext) {
+        fn remove(
+            index: &mut HashMap<String, std::collections::BTreeSet<Ipv4Addr>>,
+            key: &str,
+            lease: Ipv4Addr,
+        ) {
+            if let Some(members) = index.get_mut(key) {
+                members.remove(&lease);
+                if members.is_empty() {
+                    index.remove(key);
+                }
+            }
+        }
+        remove(&mut self.by_account, &context.account_id, lease);
+        if let Some(group) = &context.network.group {
+            remove(&mut self.by_group, group, lease);
+        }
+    }
+
+    /// Devices that may peer with `context`, in address order: everyone
+    /// with `client_to_client`, otherwise its account and access group.
+    fn candidates<'a>(
+        &'a self,
+        client_to_client: bool,
+        context: &RouteContext,
+    ) -> Box<dyn Iterator<Item = Ipv4Addr> + 'a> {
+        if client_to_client {
+            return Box::new(self.announced.keys().copied());
+        }
+        let mut members = self
+            .by_account
+            .get(&context.account_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(group) = context
+            .network
+            .group
+            .as_ref()
+            .and_then(|group| self.by_group.get(group))
+        {
+            members.extend(group.iter().copied());
+        }
+        Box::new(members.into_iter())
+    }
+
+    /// The first `MAX_PEERS` devices, by address, that the device at
+    /// `address` and they may both reach.
+    fn list_for(&self, client_to_client: bool, address: Ipv4Addr, entry: &Announced) -> Vec<Peer> {
+        let own = &entry.context;
+        self.candidates(client_to_client, own)
+            .filter(|other| *other != address)
+            .filter_map(|other| {
+                let peer = self.announced.get(&other)?;
+                (may_peer(client_to_client, own, &peer.context)
+                    && own.network.permits_fully(IpAddr::V4(other))
+                    && peer.context.network.permits_fully(IpAddr::V4(address)))
+                .then(|| Peer {
+                    address: other,
+                    address6: own.ipv6.zip(peer.context.ipv6).and_then(|(mine, theirs)| {
+                        (own.network.permits_fully(IpAddr::V6(theirs))
+                            && peer.context.network.permits_fully(IpAddr::V6(mine)))
+                        .then_some(theirs)
+                    }),
+                    endpoint: peer.endpoint,
+                    fingerprint: peer.fingerprint,
+                })
+            })
+            .take(MAX_PEERS)
+            .collect()
+    }
+}
+
+/// What happens to a packet a client sent.
+#[derive(Debug, Eq, PartialEq)]
+enum Verdict {
+    /// Continue through the TUN device to the kernel: the exit or the
+    /// gateway host.
+    Kernel,
+    /// Switch directly to the live session at this lease address.
+    Deliver(Ipv4Addr),
+    Drop(DropReason),
 }
 
 impl RouterAdapter {
@@ -859,12 +1471,108 @@ impl RouterAdapter {
         leases: Arc<PoolAdapter>,
         limiters: Arc<RateLimiters>,
     ) -> Arc<Self> {
+        Self::with_switching(router, leases, limiters, SwitchConfig::default())
+    }
+
+    pub fn with_switching(
+        router: Arc<Router>,
+        leases: Arc<PoolAdapter>,
+        limiters: Arc<RateLimiters>,
+        switching: SwitchConfig,
+    ) -> Arc<Self> {
         Arc::new(Self {
             router,
             leases,
             limiters,
             uplink: Arc::default(),
+            contexts: Arc::default(),
+            peers: Arc::new(PeerDirectory {
+                client_to_client: switching.client_to_client,
+                ..PeerDirectory::default()
+            }),
+            switching,
         })
+    }
+
+    fn peers(&self, sender: &RouteContext, receiver: &RouteContext) -> bool {
+        may_peer(self.switching.client_to_client, sender, receiver)
+    }
+
+    /// Sessions currently published for direct paths.
+    pub fn published_peers(&self) -> usize {
+        self.peers.published()
+    }
+
+    /// Whether `querier` may learn about the device at `address`.
+    fn visible(
+        &self,
+        querier: IpAddr,
+        asker: &RouteContext,
+        address: IpAddr,
+        target: &RouteContext,
+    ) -> bool {
+        self.peers(asker, target)
+            && asker.network.permits(address)
+            && target.network.permits(querier)
+    }
+
+    /// Applies source validation, access policy and client-to-client rules
+    /// to a packet from the session at `lease`.
+    fn classify(&self, lease: Ipv4Addr, packet: &[u8]) -> Result<Verdict, RouterError> {
+        let info = porta_wire::ip::parse_ip(packet)
+            .map_err(|_| RouterError::InvalidPacket("client packet"))?;
+        let (source, destination) = (info.source, info.destination);
+        let transport = porta_wire::ip::transport(packet);
+        let contexts = self.contexts.read();
+        let sender = contexts.get(&lease);
+        let own_source = match source {
+            IpAddr::V4(source) => source == lease,
+            IpAddr::V6(source) => {
+                sender.is_some_and(|sender| sender.ipv6.is_some())
+                    && self
+                        .router
+                        .ipv6()
+                        .and_then(|ipv6| ipv6.ipv4_address(source))
+                        == Some(lease)
+            }
+        };
+        let from_subnet = !own_source;
+        if from_subnet && !sender.is_some_and(|sender| sender.network.routes_subnet(source)) {
+            return Err(RouterError::SourceSpoofed {
+                got: source,
+                expected: lease,
+            });
+        }
+        if let Some(target) = self.router.owner(destination) {
+            if target == lease {
+                return Ok(Verdict::Drop(DropReason::PolicyDenied));
+            }
+            let receiver = contexts.get(&target);
+            let peers = self.switching.client_to_client
+                || match (sender, receiver) {
+                    (Some(sender), Some(receiver)) => self.peers(sender, receiver),
+                    _ => false,
+                };
+            let permitted = sender
+                .is_none_or(|sender| sender.network.permits_packet(destination, &transport))
+                && receiver.is_none_or(|receiver| receiver.network.permits(source));
+            return Ok(if peers && permitted {
+                Verdict::Deliver(target)
+            } else {
+                Verdict::Drop(DropReason::PolicyDenied)
+            });
+        }
+        // Hosts behind a subnet router only exchange traffic with clients.
+        if from_subnet {
+            return Ok(Verdict::Drop(DropReason::PolicyDenied));
+        }
+        if self.switching.always_reachable.contains(&destination)
+            || sender.is_none_or(|sender| sender.network.permits_packet(destination, &transport))
+        {
+            Ok(Verdict::Kernel)
+        } else {
+            Ok(Verdict::Drop(DropReason::PolicyDenied))
+        }
     }
 
     fn uplink_allowed(&self, lease: Ipv4Addr, bytes: usize) -> bool {
@@ -889,6 +1597,11 @@ struct RouteHandle {
     limiter: Arc<AccountRateLimiter>,
     limiters: Arc<RateLimiters>,
     uplink: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<AccountRateLimiter>>>>,
+    context: Arc<RouteContext>,
+    contexts: Arc<parking_lot::RwLock<HashMap<Ipv4Addr, Arc<RouteContext>>>>,
+    peers: Arc<PeerDirectory>,
+    /// The exit rule this session installed, released when it closes.
+    exit: Option<(Arc<ExitRules>, u64)>,
 }
 
 impl RouteHandle {
@@ -937,6 +1650,18 @@ impl Cleanup for RouteHandle {
         {
             uplink.remove(&self.address);
         }
+        let mut contexts = self.contexts.write();
+        if contexts
+            .get(&self.address)
+            .is_some_and(|context| Arc::ptr_eq(context, &self.context))
+        {
+            contexts.remove(&self.address);
+        }
+        drop(contexts);
+        self.peers.withdraw(self.address, &self.context);
+        if let Some((exits, generation)) = &self.exit {
+            exits.release(self.address, *generation);
+        }
     }
 }
 
@@ -951,6 +1676,9 @@ impl PacketRouter for RouterAdapter {
         let limiter = self.limiters.limiter(&request.account_id);
         let limiters = self.limiters.clone();
         let uplink = self.uplink.clone();
+        let contexts = self.contexts.clone();
+        let peers = self.peers.clone();
+        let exits = self.switching.exits.clone();
         Box::pin(async move {
             let lease = lease.ok_or(RouteError::Conflict)?;
             let mut registered = None;
@@ -985,13 +1713,42 @@ impl PacketRouter for RouterAdapter {
                 .map_err(map_route_error)?;
             let cancellation = session.cancellation();
             let address = request.lease.address;
+            // The exit rule is in place before the client can send.
+            let exit = match (&request.network.exit, exits) {
+                (None, _) => None,
+                (Some(exit), Some(exits)) => match exits.assign(address, exit).await {
+                    Ok(generation) => Some((exits, generation)),
+                    Err(error) => {
+                        tracing::warn!(%error, %address, "refusing a tunnel whose exit is unavailable");
+                        session.close();
+                        return Err(RouteError::Unavailable);
+                    }
+                },
+                (Some(exit), None) => {
+                    tracing::warn!(exit, %address, "refusing a tunnel for an exit this gateway does not offer");
+                    session.close();
+                    return Err(RouteError::Unavailable);
+                }
+            };
             uplink.write().insert(address, limiter.clone());
+            let context = Arc::new(RouteContext {
+                account_id: request.account_id,
+                device_id: request.device_id,
+                network: request.network,
+                ipv6: request.lease.ipv6.map(|ipv6| ipv6.address),
+            });
+            contexts.write().insert(address, context.clone());
+            router.set_subnets(address, &context.network.subnets);
             let handle = Arc::new(RouteHandle {
                 session,
                 address,
                 limiter,
                 limiters,
                 uplink,
+                context,
+                contexts,
+                peers,
+                exit,
             });
             Ok(RouteSession {
                 downlink: handle.clone(),
@@ -1010,14 +1767,30 @@ impl PacketRouter for RouterAdapter {
     ) -> BoxFuture<'static, Result<(), RouteError>> {
         let router = self.router.clone();
         let allowed = self.uplink_allowed(lease, packet.len());
+        let verdict = self.classify(lease, &packet);
         Box::pin(async move {
             if !allowed {
                 return Ok(());
             }
-            router
-                .inject(&cancellation, lease, &packet)
-                .await
-                .map_err(map_route_error)
+            match verdict.map_err(map_route_error)? {
+                Verdict::Kernel => router
+                    .inject_validated(&cancellation, &packet)
+                    .await
+                    .map_err(map_route_error),
+                Verdict::Deliver(target) => {
+                    match forwarded(&packet) {
+                        Some(packet) => {
+                            router.deliver(target, packet);
+                        }
+                        None => router.record_policy_drop(DropReason::TtlExpired),
+                    }
+                    Ok(())
+                }
+                Verdict::Drop(reason) => {
+                    router.record_policy_drop(reason);
+                    Ok(())
+                }
+            }
         })
     }
 
@@ -1034,6 +1807,92 @@ impl PacketRouter for RouterAdapter {
                 .map_err(map_route_error)
         })
     }
+
+    fn offers_peers(&self) -> bool {
+        self.switching.peer_to_peer
+    }
+
+    fn announce_peer(
+        &self,
+        lease: Ipv4Addr,
+        endpoint: SocketAddr,
+        fingerprint: Fingerprint,
+    ) -> Option<tokio::sync::watch::Receiver<Vec<Peer>>> {
+        if !self.switching.peer_to_peer {
+            return None;
+        }
+        // Holding the session table keeps a closing session from being
+        // published after its withdrawal.
+        let contexts = self.contexts.read();
+        let context = contexts.get(&lease)?.clone();
+        let announced = self.peers.announce(lease, context, endpoint, fingerprint);
+        if announced.is_none() {
+            tracing::warn!(%lease, "refusing a direct-path offer with another device's certificate");
+        }
+        announced
+    }
+}
+
+impl crate::dns::Directory for RouterAdapter {
+    fn is_client(&self, address: Ipv4Addr) -> bool {
+        self.contexts.read().contains_key(&address)
+    }
+
+    fn resolve(&self, querier: Ipv4Addr, name: &str) -> Option<crate::dns::DeviceAddresses> {
+        let names = self.switching.names.as_ref()?.names();
+        let contexts = self.contexts.read();
+        let asker = contexts.get(&querier)?;
+        contexts
+            .iter()
+            .filter(|(_, target)| {
+                names
+                    .get(&(target.account_id.clone(), target.device_id.clone()))
+                    .is_some_and(|candidate| candidate == name)
+            })
+            .find(|(address, target)| {
+                self.visible(IpAddr::V4(querier), asker, IpAddr::V4(**address), target)
+            })
+            .map(|(address, target)| crate::dns::DeviceAddresses {
+                ipv4: *address,
+                // Only devices that both have IPv6 reach each other over it.
+                ipv6: target.ipv6.zip(asker.ipv6).and_then(|(ipv6, own)| {
+                    self.visible(IpAddr::V6(own), asker, IpAddr::V6(ipv6), target)
+                        .then_some(ipv6)
+                }),
+            })
+    }
+
+    fn reverse(&self, querier: Ipv4Addr, address: IpAddr) -> Option<String> {
+        let names = self.switching.names.as_ref()?.names();
+        let contexts = self.contexts.read();
+        let asker = contexts.get(&querier)?;
+        let (lease, own) = match address {
+            IpAddr::V4(address) => (address, IpAddr::V4(querier)),
+            IpAddr::V6(address) => (
+                self.router.ipv6()?.ipv4_address(address)?,
+                IpAddr::V6(asker.ipv6?),
+            ),
+        };
+        let target = contexts.get(&lease)?;
+        if let IpAddr::V6(address) = address {
+            if target.ipv6 != Some(address) {
+                return None;
+            }
+        }
+        if !self.visible(own, asker, address, target) {
+            return None;
+        }
+        names
+            .get(&(target.account_id.clone(), target.device_id.clone()))
+            .cloned()
+    }
+}
+
+/// A copy of `packet` with its TTL or hop limit decremented, as a router
+/// forwards it, or `None` once the limit is exhausted.
+fn forwarded(packet: &[u8]) -> Option<Bytes> {
+    let mut packet = packet.to_vec();
+    porta_wire::ip::decrement_hop_limit(&mut packet).then(|| Bytes::from(packet))
 }
 
 fn map_route_error(error: RouterError) -> RouteError {
@@ -1048,35 +1907,81 @@ fn map_route_error(error: RouterError) -> RouteError {
 
 pub struct UsageAdapter {
     store: Arc<usage::Store>,
+    audit: Option<Arc<crate::ops::audit::AuditLog>>,
 }
 
 impl UsageAdapter {
     pub fn new(store: Arc<usage::Store>) -> Arc<Self> {
-        Arc::new(Self { store })
+        Self::with_audit(store, None)
+    }
+
+    /// Also records tunnel connections and disconnections in `audit`.
+    pub fn with_audit(
+        store: Arc<usage::Store>,
+        audit: Option<Arc<crate::ops::audit::AuditLog>>,
+    ) -> Arc<Self> {
+        Arc::new(Self { store, audit })
     }
 }
 
 struct UsageHandle {
     session: usage::Session,
+    audit: Option<(Arc<crate::ops::audit::AuditLog>, UsageMetadata)>,
+    uploaded: AtomicU64,
+    downloaded: AtomicU64,
+}
+
+fn tunnel_event(metadata: &UsageMetadata, action: &str) -> crate::ops::audit::AuditEvent {
+    crate::ops::audit::AuditEvent::new(
+        crate::ops::audit::Actor {
+            kind: "client",
+            id: metadata.account_id.clone(),
+            name: String::new(),
+        },
+        action,
+        metadata.device_id.clone(),
+    )
+    .address(Some(metadata.address))
 }
 
 impl UsageSession for UsageHandle {
     fn uploaded(&self, bytes: u64, packets: u64) {
+        self.uploaded.fetch_add(bytes, Ordering::Relaxed);
         self.session.add_uploaded(bytes, packets);
     }
 
     fn downloaded(&self, bytes: u64, packets: u64) {
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
         self.session.add_downloaded(bytes, packets);
     }
 
     fn close(&self) {
         self.session.close();
+        if let Some((audit, metadata)) = &self.audit {
+            audit.record(
+                tunnel_event(metadata, "tunnel.disconnect").detail(serde_json::json!({
+                    "transport": metadata.transport,
+                    "uploaded_bytes": self.uploaded.load(Ordering::Relaxed),
+                    "downloaded_bytes": self.downloaded.load(Ordering::Relaxed),
+                })),
+            );
+        }
     }
 }
 
 impl Usage for UsageAdapter {
     fn begin(&self, metadata: UsageMetadata) -> Arc<dyn UsageSession> {
+        let audit = self.audit.clone().map(|audit| {
+            audit.record(
+                tunnel_event(&metadata, "tunnel.connect")
+                    .detail(serde_json::json!({ "transport": metadata.transport })),
+            );
+            (audit, metadata.clone())
+        });
         Arc::new(UsageHandle {
+            audit,
+            uploaded: AtomicU64::new(0),
+            downloaded: AtomicU64::new(0),
             session: self.store.begin(
                 if metadata.session_id.is_empty() {
                     String::new()
@@ -1089,7 +1994,10 @@ impl Usage for UsageAdapter {
                 metadata.account_id,
                 metadata.device_id,
                 metadata.transport,
-                metadata.address.to_string(),
+                match metadata.address6 {
+                    Some(address6) => format!("{}, {address6}", metadata.address),
+                    None => metadata.address.to_string(),
+                },
                 "",
             ),
         })
@@ -1115,6 +2023,10 @@ impl Metrics for OperationalMetrics {
 
     fn sent_to_client(&self) {
         OperationalMetrics::sent_to_client(self);
+    }
+
+    fn traffic(&self, from_client: u64, to_client: u64) {
+        OperationalMetrics::traffic(self, from_client, to_client);
     }
 
     fn dropped_from_client(&self) {
@@ -1247,6 +2159,8 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                device_id: "device".into(),
+                network: Default::default(),
             })
             .await;
         assert!(matches!(stale, Err(RouteError::Conflict)));
@@ -1257,6 +2171,8 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                device_id: "device".into(),
+                network: Default::default(),
             })
             .await
             .unwrap();
@@ -1274,6 +2190,644 @@ mod tests {
         route.cleanup.close();
         leases.release(&first);
         leases.release(&current);
+    }
+
+    fn addressed_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Bytes {
+        let mut packet = ipv4_packet(source).to_vec();
+        packet[16..20].copy_from_slice(&destination.octets());
+        porta_wire::ip::set_ipv4_header_checksum(&mut packet).unwrap();
+        Bytes::from(packet)
+    }
+
+    fn context(account_id: &str, network: NetworkPolicy) -> Arc<RouteContext> {
+        Arc::new(RouteContext {
+            account_id: account_id.into(),
+            device_id: format!("{account_id}-device"),
+            network,
+            ipv6: None,
+        })
+    }
+
+    #[test]
+    fn peer_lists_follow_switching_rules_both_ways_and_withdrawals() {
+        let directory = Arc::new(PeerDirectory::default());
+        let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
+        let c: Ipv4Addr = "10.66.0.4".parse().unwrap();
+        let d: Ipv4Addr = "10.66.0.5".parse().unwrap();
+        let alpha = context("alpha", NetworkPolicy::default());
+        let mut dual = context("alpha", NetworkPolicy::default());
+        Arc::get_mut(&mut dual).unwrap().ipv6 = Some("fd66::3".parse().unwrap());
+        // One account, but its policy keeps it away from a.
+        let fenced = context(
+            "alpha",
+            NetworkPolicy {
+                deny: vec!["10.66.0.2/32".parse().unwrap()],
+                ..NetworkPolicy::default()
+            },
+        );
+        let endpoint = |port| SocketAddr::new("198.51.100.7".parse().unwrap(), port);
+        let mut first = directory
+            .announce(a, alpha.clone(), endpoint(1000), [1; 32])
+            .unwrap();
+        assert!(first.borrow_and_update().is_empty());
+        let mut second = directory
+            .announce(b, dual.clone(), endpoint(2000), [2; 32])
+            .unwrap();
+        directory
+            .announce(c, fenced.clone(), endpoint(3000), [3; 32])
+            .unwrap();
+        let other = directory
+            .announce(
+                d,
+                context("beta", NetworkPolicy::default()),
+                "[::ffff:203.0.113.9]:4000".parse().unwrap(),
+                [4; 32],
+            )
+            .unwrap();
+        assert!(first.has_changed().unwrap());
+        let peers = first.borrow_and_update().clone();
+        assert_eq!(
+            peers,
+            vec![Peer {
+                address: b,
+                // a has no IPv6, so b's is not offered.
+                address6: None,
+                endpoint: endpoint(2000),
+                fingerprint: [2; 32],
+            }]
+        );
+        assert_eq!(
+            second
+                .borrow_and_update()
+                .iter()
+                .map(|peer| peer.address)
+                .collect::<Vec<_>>(),
+            vec![a, c]
+        );
+        assert!(other.borrow().is_empty());
+
+        // Reconnecting under another account leaves the old account's lists,
+        // and moving back returns to them.
+        drop(second);
+        let moved = context("gamma", NetworkPolicy::default());
+        directory
+            .announce(b, moved.clone(), endpoint(2000), [2; 32])
+            .unwrap();
+        assert!(first.borrow_and_update().is_empty());
+        directory
+            .announce(b, dual.clone(), endpoint(2000), [2; 32])
+            .unwrap();
+        assert_eq!(first.borrow_and_update().len(), 1);
+
+        // A stale session's withdrawal does not remove its successor.
+        directory.withdraw(b, &moved);
+        directory.withdraw(b, &alpha);
+        assert!(!first.has_changed().unwrap());
+        directory.withdraw(b, &dual);
+        assert!(first.borrow_and_update().is_empty());
+
+        // Another device's fingerprint is refused; a reconnect may reuse its own.
+        let beta = context("beta", NetworkPolicy::default());
+        assert!(directory
+            .announce(d, beta.clone(), endpoint(4000), [1; 32])
+            .is_none());
+        assert!(directory
+            .announce(a, alpha.clone(), endpoint(1000), [1; 32])
+            .is_some());
+        // Withdrawing releases the fingerprint.
+        directory.withdraw(a, &alpha);
+        assert!(directory
+            .announce(d, beta, endpoint(4000), [1; 32])
+            .is_some());
+
+        let switching = Arc::new(PeerDirectory {
+            client_to_client: true,
+            ..PeerDirectory::default()
+        });
+        let first = switching
+            .announce(a, alpha, endpoint(1000), [1; 32])
+            .unwrap();
+        switching
+            .announce(
+                d,
+                context("beta", NetworkPolicy::default()),
+                "[::ffff:203.0.113.9]:4000".parse().unwrap(),
+                [4; 32],
+            )
+            .unwrap();
+        assert_eq!(
+            first.borrow()[0].endpoint,
+            "203.0.113.9:4000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_lists_stay_cheap_when_thousands_of_devices_reconnect() {
+        let address = |index: u32| Ipv4Addr::from(0x0a40_0000 + index);
+        let endpoint =
+            |index: u32| SocketAddr::new("198.51.100.7".parse().unwrap(), 1024 + index as u16);
+        let fingerprint = |index: u32| {
+            let mut fingerprint = [0_u8; 32];
+            fingerprint[..4].copy_from_slice(&index.to_be_bytes());
+            fingerprint
+        };
+        for client_to_client in [true, false] {
+            let directory = Arc::new(PeerDirectory {
+                client_to_client,
+                ..PeerDirectory::default()
+            });
+            let started = std::time::Instant::now();
+            // Without client-to-client, accounts of two devices each.
+            let receivers = (0..4_000_u32)
+                .map(|index| {
+                    let account = if client_to_client {
+                        "one".to_owned()
+                    } else {
+                        format!("a{}", index / 2)
+                    };
+                    directory
+                        .announce(
+                            address(index),
+                            context(&account, NetworkPolicy::default()),
+                            endpoint(index),
+                            fingerprint(index),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "announcing took {:?}",
+                started.elapsed()
+            );
+            tokio::time::sleep(PEER_PUBLISH_DELAY * 4).await;
+            let expected = if client_to_client { MAX_PEERS } else { 1 };
+            for (index, receiver) in receivers.iter().enumerate() {
+                let peers = receiver.borrow();
+                assert_eq!(peers.len(), expected, "device {index}");
+                assert!(peers
+                    .iter()
+                    .all(|peer| peer.address != address(index as u32)));
+                assert!(peers
+                    .windows(2)
+                    .all(|pair| pair[0].address < pair[1].address));
+            }
+            if !client_to_client {
+                assert_eq!(receivers[0].borrow()[0].address, address(1));
+                assert_eq!(receivers[1].borrow()[0].address, address(0));
+            }
+            assert_eq!(directory.published(), 4_000);
+        }
+    }
+
+    /// A TCP or UDP packet with ports and, for TCP, flags.
+    fn service_packet(
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        protocol: u8,
+        ports: (u16, u16),
+        flags: u8,
+    ) -> Bytes {
+        let mut packet = vec![0_u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = protocol;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..22].copy_from_slice(&ports.0.to_be_bytes());
+        packet[22..24].copy_from_slice(&ports.1.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = flags;
+        porta_wire::ip::set_ipv4_header_checksum(&mut packet).unwrap();
+        Bytes::from(packet)
+    }
+
+    #[tokio::test]
+    async fn clients_older_than_the_minimum_version_are_outdated() {
+        use crate::transport::session::parse_version;
+        assert_eq!(parse_version("0.1.41"), Some((0, 1, 41)));
+        assert_eq!(parse_version("v1.2.3-beta.1"), Some((1, 2, 3)));
+        for invalid in ["", "1.2", "a.b.c", "1..3"] {
+            assert_eq!(parse_version(invalid), None, "{invalid}");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            StateRegistry::open(
+                directory.path().join("clients.json"),
+                "token-0123456789abcdef",
+            )
+            .await
+            .unwrap(),
+        );
+        let abuse = Arc::new(AbuseGuard::default_with_metrics(Arc::new(
+            OperationalMetrics::default(),
+        )));
+        let usage = Arc::new(usage::Store::open("").unwrap());
+        let authenticator =
+            NativeAuthenticator::with_usage(registry, abuse, usage, parse_version("0.1.41"));
+        assert!(!authenticator.outdated(Some("0.1.41")));
+        assert!(!authenticator.outdated(Some("0.2.0")));
+        assert!(authenticator.outdated(Some("0.1.40")));
+        assert!(authenticator.outdated(None));
+        assert!(authenticator.outdated(Some("garbage")));
+    }
+
+    #[tokio::test]
+    async fn port_rules_decide_which_connections_a_device_may_open() {
+        let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
+        let dns: Ipv4Addr = "192.0.2.53".parse().unwrap();
+        let router = Arc::new(Router::new(Arc::new(MemoryDevice::default()), None));
+        let adapter = RouterAdapter::with_switching(
+            router.clone(),
+            PoolAdapter::new(Arc::new(Pool::new("10.66.0.0/24").unwrap())),
+            RateLimiters::new(),
+            SwitchConfig::default(),
+        );
+        let parent = CancellationToken::new();
+        let _sessions = [a, b].map(|address| router.register(&parent, address));
+        let rules = |values: &[&str]| values.iter().map(|value| value.parse().unwrap()).collect();
+        adapter.contexts.write().insert(
+            a,
+            context(
+                "alpha",
+                NetworkPolicy {
+                    allow: rules(&[
+                        "10.66.0.3/32 tcp/22",
+                        "192.0.2.53/32 udp/53",
+                        "10.66.0.0/24 icmp",
+                    ]),
+                    deny: rules(&["192.0.2.53/32 tcp/53"]),
+                    ..NetworkPolicy::default()
+                },
+            ),
+        );
+        adapter
+            .contexts
+            .write()
+            .insert(b, context("alpha", NetworkPolicy::default()));
+        let syn = porta_wire::ip::Transport::TCP_SYN;
+        let ack = porta_wire::ip::Transport::TCP_ACK;
+        let verdict = |from, packet: Bytes| adapter.classify(from, &packet).unwrap();
+        let denied = Verdict::Drop(DropReason::PolicyDenied);
+
+        // a may open SSH to b, and nothing else over TCP.
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (40_000, 22), syn)),
+            Verdict::Deliver(b)
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (40_000, 80), syn)),
+            denied
+        );
+        // Segments after the opening pass, so replies to b's connections flow.
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (80, 40_000), syn | ack)),
+            Verdict::Deliver(b)
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, b, 6, (80, 40_000), ack)),
+            Verdict::Deliver(b)
+        );
+        // b is unrestricted and may connect to any of a's ports.
+        assert_eq!(
+            verdict(b, service_packet(b, a, 6, (40_000, 80), syn)),
+            Verdict::Deliver(a)
+        );
+        // UDP to the exit: DNS only; the deny rule wins over TCP DNS.
+        assert_eq!(
+            verdict(a, service_packet(a, dns, 17, (50_000, 53), 0)),
+            Verdict::Kernel
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, dns, 17, (50_000, 123), 0)),
+            denied
+        );
+        assert_eq!(
+            verdict(a, service_packet(a, dns, 6, (50_000, 53), syn)),
+            denied
+        );
+
+        // Direct paths would bypass these rules, so a and b are not introduced.
+        let a_policy = adapter.contexts.read()[&a].network.clone();
+        assert!(a_policy.permits(IpAddr::V4(b)));
+        assert!(!a_policy.permits_fully(IpAddr::V4(b)));
+    }
+
+    #[tokio::test]
+    async fn switching_enforces_sources_peers_and_access_policy() {
+        let a: Ipv4Addr = "10.66.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.66.0.3".parse().unwrap();
+        let c: Ipv4Addr = "10.66.0.4".parse().unwrap();
+        let lan: Ipv4Addr = "10.30.0.5".parse().unwrap();
+        let internet: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let gateway: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let subnet: ipnet::Ipv4Net = "10.30.0.0/24".parse().unwrap();
+        let build = |client_to_client| {
+            let router = Arc::new(Router::new(Arc::new(MemoryDevice::default()), None));
+            let pool = Arc::new(Pool::new("10.66.0.0/24").unwrap());
+            let adapter = RouterAdapter::with_switching(
+                router.clone(),
+                PoolAdapter::new(pool),
+                RateLimiters::new(),
+                SwitchConfig {
+                    client_to_client,
+                    peer_to_peer: false,
+                    always_reachable: vec![IpAddr::V4(gateway)],
+                    exits: None,
+                    names: None,
+                },
+            );
+            (router, adapter)
+        };
+        let parent = CancellationToken::new();
+        let (router, adapter) = build(false);
+        let _sessions = [a, b, c].map(|address| router.register(&parent, address));
+        router.set_subnets(b, &[subnet]);
+        let set = |address, account, network| {
+            adapter
+                .contexts
+                .write()
+                .insert(address, context(account, network));
+        };
+        let router_b = NetworkPolicy {
+            subnets: vec![subnet],
+            ..NetworkPolicy::default()
+        };
+        set(a, "alpha", NetworkPolicy::default());
+        set(b, "beta", router_b.clone());
+        set(c, "alpha", NetworkPolicy::default());
+        let verdict = |from, source, destination| {
+            adapter.classify(from, &addressed_packet(source, destination))
+        };
+
+        assert_eq!(verdict(a, a, internet).unwrap(), Verdict::Kernel);
+        // Devices of one account reach each other; other accounts do not.
+        assert_eq!(verdict(a, a, c).unwrap(), Verdict::Deliver(c));
+        assert_eq!(
+            verdict(a, a, b).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(
+            verdict(a, a, lan).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        // Only the subnet router may send from its subnet, and only to clients.
+        assert!(matches!(
+            verdict(a, lan, internet),
+            Err(RouterError::SourceSpoofed { .. })
+        ));
+        assert_eq!(
+            verdict(b, lan, internet).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+
+        // A shared group makes the accounts peers, including the subnet.
+        let team = Some("team".to_owned());
+        set(
+            a,
+            "alpha",
+            NetworkPolicy {
+                group: team.clone(),
+                ..NetworkPolicy::default()
+            },
+        );
+        set(
+            b,
+            "beta",
+            NetworkPolicy {
+                group: team.clone(),
+                ..router_b.clone()
+            },
+        );
+        assert_eq!(verdict(a, a, b).unwrap(), Verdict::Deliver(b));
+        assert_eq!(verdict(a, a, lan).unwrap(), Verdict::Deliver(b));
+        assert_eq!(verdict(b, lan, a).unwrap(), Verdict::Deliver(a));
+
+        // Deny lists win over peering, in both directions.
+        set(
+            a,
+            "alpha",
+            NetworkPolicy {
+                group: team.clone(),
+                deny: vec![subnet.into()],
+                ..NetworkPolicy::default()
+            },
+        );
+        assert_eq!(
+            verdict(a, a, lan).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(
+            verdict(b, lan, a).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+
+        // An allow list confines the exit but keeps the gateway reachable.
+        set(
+            a,
+            "alpha",
+            NetworkPolicy {
+                allow: vec![subnet.into()],
+                ..NetworkPolicy::default()
+            },
+        );
+        assert_eq!(
+            verdict(a, a, internet).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(verdict(a, a, gateway).unwrap(), Verdict::Kernel);
+
+        // --client-to-client makes every client a peer.
+        let (router, adapter) = build(true);
+        let _sessions = [a, b].map(|address| router.register(&parent, address));
+        adapter
+            .contexts
+            .write()
+            .insert(a, context("alpha", NetworkPolicy::default()));
+        adapter
+            .contexts
+            .write()
+            .insert(b, context("beta", NetworkPolicy::default()));
+        assert_eq!(
+            adapter.classify(a, &addressed_packet(a, b)).unwrap(),
+            Verdict::Deliver(b)
+        );
+    }
+
+    fn ipv6_packet(source: std::net::Ipv6Addr, destination: std::net::Ipv6Addr) -> Bytes {
+        let mut packet = vec![0; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8_u16.to_be_bytes());
+        packet[6] = 17;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source.octets());
+        packet[24..40].copy_from_slice(&destination.octets());
+        Bytes::from(packet)
+    }
+
+    #[tokio::test]
+    async fn dual_stack_leases_switch_route_and_validate_ipv6() {
+        let pool = Arc::new(Pool::new("10.66.0.0/24").unwrap());
+        let ipv6 = Ipv6Pool::new(
+            "10.66.0.0/24".parse().unwrap(),
+            "fd66::/64".parse().unwrap(),
+        )
+        .unwrap();
+        let leases = PoolAdapter::with_ipv6(pool, Some(ipv6));
+        let device = Arc::new(MemoryDevice::default());
+        let router = Arc::new(Router::with_ipv6(device.clone(), None, Some(ipv6)));
+        let adapter = RouterAdapter::with_switching(
+            router.clone(),
+            leases.clone(),
+            RateLimiters::new(),
+            SwitchConfig {
+                always_reachable: vec![IpAddr::V6(ipv6.gateway())],
+                ..SwitchConfig::default()
+            },
+        );
+        let mut sessions = Vec::new();
+        let mut addresses = Vec::new();
+        for (name, account) in [("first", "alpha"), ("second", "alpha"), ("third", "beta")] {
+            let lease = leases
+                .acquire(LeaseRequest {
+                    lease_id: name.into(),
+                    group_id: None,
+                    mode: LeaseMode::Exclusive,
+                })
+                .await
+                .unwrap();
+            let lease6 = lease.ipv6.unwrap();
+            assert_eq!(Some(lease6.address), ipv6.address(lease.address));
+            assert_eq!((lease6.prefix_len, lease6.gateway), (64, ipv6.gateway()));
+            sessions.push(
+                adapter
+                    .register(RouteRequest {
+                        lease: lease.clone(),
+                        kind: RouteKind::ConnectIp,
+                        parent: CancellationToken::new(),
+                        account_id: account.into(),
+                        device_id: name.into(),
+                        network: NetworkPolicy::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+            addresses.push((lease.address, lease6.address));
+        }
+        let [(a, a6), (b, b6), (c, c6)] = addresses[..] else {
+            unreachable!()
+        };
+        let internet: std::net::Ipv6Addr = "2001:db8::80".parse().unwrap();
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, internet)).unwrap(),
+            Verdict::Kernel
+        );
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, b6)).unwrap(),
+            Verdict::Deliver(b)
+        );
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, c6)).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert!(matches!(
+            adapter.classify(a, &ipv6_packet(b6, internet)),
+            Err(RouterError::SourceSpoofed { .. })
+        ));
+        assert_eq!(router.owner(IpAddr::V6(c6)), Some(c));
+
+        // Switched IPv6 packets reach the peer with a decremented hop limit.
+        adapter
+            .inject_from_client(sessions[1].cancellation.clone(), b, ipv6_packet(b6, a6))
+            .await
+            .unwrap();
+        let switched = sessions[0].downlink.try_packet().unwrap();
+        assert_eq!(switched[7], 63);
+
+        // IPv6 allow lists confine IPv6 destinations; the gateway stays
+        // reachable.
+        adapter.contexts.write().insert(
+            a,
+            Arc::new(RouteContext {
+                account_id: "alpha".into(),
+                device_id: "first".into(),
+                network: NetworkPolicy {
+                    allow: vec!["2001:db8:1::/48".parse().unwrap()],
+                    ..NetworkPolicy::default()
+                },
+                ipv6: Some(a6),
+            }),
+        );
+        assert_eq!(
+            adapter.classify(a, &ipv6_packet(a6, internet)).unwrap(),
+            Verdict::Drop(DropReason::PolicyDenied)
+        );
+        assert_eq!(
+            adapter
+                .classify(a, &ipv6_packet(a6, ipv6.gateway()))
+                .unwrap(),
+            Verdict::Kernel
+        );
+    }
+
+    #[tokio::test]
+    async fn switched_packets_reach_the_peer_with_a_decremented_ttl() {
+        let pool = Arc::new(Pool::new("10.66.0.0/24").unwrap());
+        let leases = PoolAdapter::new(pool);
+        let mut routes = Vec::new();
+        for name in ["first", "second"] {
+            let lease = leases
+                .acquire(LeaseRequest {
+                    lease_id: name.into(),
+                    group_id: None,
+                    mode: LeaseMode::Exclusive,
+                })
+                .await
+                .unwrap();
+            routes.push(lease);
+        }
+        let device = Arc::new(MemoryDevice::default());
+        let adapter = RouterAdapter::new(Arc::new(Router::new(device.clone(), None)), leases);
+        let mut sessions = Vec::new();
+        for lease in &routes {
+            sessions.push(
+                adapter
+                    .register(RouteRequest {
+                        lease: lease.clone(),
+                        kind: RouteKind::ConnectIp,
+                        parent: CancellationToken::new(),
+                        account_id: "account".into(),
+                        device_id: "device".into(),
+                        network: NetworkPolicy::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (first, second) = (routes[0].address, routes[1].address);
+        adapter
+            .inject_from_client(
+                sessions[0].cancellation.clone(),
+                first,
+                addressed_packet(first, second),
+            )
+            .await
+            .unwrap();
+        let switched = sessions[1].downlink.try_packet().unwrap();
+        assert_eq!(switched[8], 63);
+        assert!(porta_wire::ip::parse_ipv4(&switched).is_ok());
+        assert!(device.writes.lock().is_empty());
+        assert!(forwarded(&addressed_packet(first, second)[..]).is_some());
+        let mut expiring = addressed_packet(first, second).to_vec();
+        expiring[8] = 1;
+        assert!(forwarded(&expiring).is_none());
+
+        // A closed session's context and subnets disappear with it.
+        sessions[1].cleanup.close();
+        assert!(!adapter.contexts.read().contains_key(&second));
     }
 
     const TOKEN: &str = "bootstrap-token-0123456789";
@@ -1437,7 +2991,7 @@ mod tests {
         let response = admin
             .handle(
                 &put(r#"{"expires_at":"2030-01-01T00:00:00Z","monthly_quota_bytes":5000000000,"rate_limit_kbps":10000}"#),
-                false,
+                None,
             )
             .await
             .unwrap();
@@ -1458,7 +3012,7 @@ mod tests {
             r#"{"expires_at":"tomorrow","monthly_quota_bytes":null,"rate_limit_kbps":null}"#,
             r#"{"expires_at":null,"monthly_quota_bytes":null,"rate_limit_kbps":8}"#,
         ] {
-            let response = admin.handle(&put(invalid), false).await.unwrap();
+            let response = admin.handle(&put(invalid), None).await.unwrap();
             assert_eq!(response.status, 400, "{invalid}");
         }
 
@@ -1477,7 +3031,7 @@ mod tests {
         registry.set_quota_blocked(&id, true).await;
         let reset = RequestContext::new("POST", format!("/api/clients/{id}/usage/reset"))
             .with_header("Authorization", "Bearer admin-token-0123456789abcdef");
-        let response = admin.handle(&reset, false).await.unwrap();
+        let response = admin.handle(&reset, None).await.unwrap();
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["client"]["quota_used_bytes"], 0);
@@ -1511,6 +3065,8 @@ mod tests {
                 kind: RouteKind::ConnectIp,
                 parent: CancellationToken::new(),
                 account_id: "account".into(),
+                device_id: "device".into(),
+                network: Default::default(),
             })
             .await
             .unwrap();

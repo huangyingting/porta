@@ -1,9 +1,9 @@
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -498,6 +498,81 @@ fn valid_client_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// IPv6 addresses for dual-stack leases. Each IPv4 lease maps to the address
+/// at the same host offset in the IPv6 prefix, so both families share one
+/// allocator, persist together, and a device keeps both addresses across
+/// reconnects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv6Pool {
+    ipv4: Ipv4Net,
+    ipv6: Ipv6Net,
+}
+
+impl Ipv6Pool {
+    pub fn new(ipv4: Ipv4Net, ipv6: Ipv6Net) -> Result<Self> {
+        let ipv4 = ipv4.trunc();
+        if ipv6 != ipv6.trunc() {
+            return Err(PoolError::Invalid(format!(
+                "IPv6 pool {ipv6} has host bits set; use {}",
+                ipv6.trunc()
+            )));
+        }
+        let host_bits = 32 - u32::from(ipv4.prefix_len());
+        if 128 - u32::from(ipv6.prefix_len()) < host_bits || ipv6.prefix_len() < 8 {
+            return Err(PoolError::Invalid(format!(
+                "IPv6 pool {ipv6} must be between /8 and /{} to mirror the IPv4 pool {ipv4}",
+                128 - host_bits
+            )));
+        }
+        let network = ipv6.network();
+        if network.is_multicast()
+            || network.is_loopback()
+            || network.is_unspecified()
+            || network.is_unicast_link_local()
+            || network.to_ipv4_mapped().is_some()
+        {
+            return Err(PoolError::Invalid(format!(
+                "IPv6 pool {ipv6} must be a unicast global or unique local prefix"
+            )));
+        }
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    pub fn prefix(&self) -> Ipv6Net {
+        self.ipv6
+    }
+
+    /// The gateway's IPv6 address, mirroring the IPv4 gateway.
+    pub fn gateway(&self) -> Ipv6Addr {
+        self.address(increment(self.ipv4.network()).expect("validated pools have a gateway"))
+            .expect("the IPv4 gateway lies in the pool")
+    }
+
+    /// The IPv6 address paired with an IPv4 address of the pool.
+    pub fn address(&self, address: Ipv4Addr) -> Option<Ipv6Addr> {
+        if !self.ipv4.contains(&address) {
+            return None;
+        }
+        let offset = u32::from(address) - u32::from(self.ipv4.network());
+        Some(Ipv6Addr::from(
+            u128::from(self.ipv6.network()) + u128::from(offset),
+        ))
+    }
+
+    /// The IPv4 address paired with an IPv6 address of the pool.
+    pub fn ipv4_address(&self, address: Ipv6Addr) -> Option<Ipv4Addr> {
+        if !self.ipv6.contains(&address) {
+            return None;
+        }
+        let offset = u128::from(address) - u128::from(self.ipv6.network());
+        let offset = u32::try_from(offset).ok()?;
+        if u64::from(offset) >= 1_u64 << (32 - self.ipv4.prefix_len()) {
+            return None;
+        }
+        Some(Ipv4Addr::from(u32::from(self.ipv4.network()) + offset))
+    }
+}
+
 fn parse_ipv4_prefix(value: &str) -> Result<Ipv4Net> {
     let (address, bits) = value
         .split_once('/')
@@ -627,6 +702,40 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn ipv6_pool_mirrors_ipv4_host_offsets() {
+        let pool = Ipv6Pool::new(
+            "10.66.0.0/24".parse().unwrap(),
+            "fd66:1:2:3::/64".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pool.gateway(), "fd66:1:2:3::1".parse::<Ipv6Addr>().unwrap());
+        let address = pool.address("10.66.0.42".parse().unwrap()).unwrap();
+        assert_eq!(address, "fd66:1:2:3::2a".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            pool.ipv4_address(address),
+            Some("10.66.0.42".parse().unwrap())
+        );
+        assert_eq!(pool.address("10.67.0.1".parse().unwrap()), None);
+        assert_eq!(pool.ipv4_address("fd66:1:2:3::100".parse().unwrap()), None);
+        assert_eq!(pool.ipv4_address("fd66:1:2:4::2".parse().unwrap()), None);
+        let small = Ipv6Pool::new(
+            "10.66.0.0/16".parse().unwrap(),
+            "fd66::/112".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            small.ipv4_address("fd66::ffff".parse().unwrap()),
+            Some("10.66.255.255".parse().unwrap())
+        );
+        for invalid in ["fd66::/113", "fd66::1/64", "ff02::/64", "fe80::/64", "::/0"] {
+            assert!(
+                Ipv6Pool::new("10.66.0.0/16".parse().unwrap(), invalid.parse().unwrap()).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn validates_ipv4_pool_and_reserves_special_addresses() {

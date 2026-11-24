@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{Local, SecondsFormat, Utc};
-use porta_client::tls;
 use porta_client::tunnel::Transport;
 use porta_client::windows::client::{self, Event};
 use porta_client::windows::network::NetworkManager;
 use porta_client::windows::paths;
 use porta_client::windows::profiles::{Profile, Store};
+use porta_client::{captive, tls};
 use serde::{Deserialize, Serialize};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -25,6 +25,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 const MAX_ACTIVITY_LINES: usize = 200;
 const NETWORK_ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// The scheduled task that connects a profile when the user signs in.
+const LOGIN_TASK: &str = "Porta";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,8 +34,14 @@ struct ProfileInput {
     id: String,
     name: String,
     server_url: String,
+    #[serde(default)]
+    backup_servers: Vec<String>,
     transport: String,
     token: String,
+    #[serde(default)]
+    allow_lan: bool,
+    #[serde(default)]
+    connect_at_login: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -42,7 +50,10 @@ struct DesktopProfile {
     id: String,
     name: String,
     server_url: String,
+    backup_servers: Vec<String>,
     transport: String,
+    allow_lan: bool,
+    connect_at_login: bool,
     selected: bool,
     active: bool,
     status: String,
@@ -80,6 +91,15 @@ struct DesktopSnapshot {
     /// `account-expired` or `quota-exceeded` when an account limit ended
     /// the last connection attempt.
     account_denial: String,
+    /// Tunneled prefixes of a split tunnel; empty while a full tunnel is up.
+    split_routes: Vec<String>,
+    split_dns_domains: Vec<String>,
+    /// Devices reached directly, as `address via endpoint`.
+    direct_peers: Vec<String>,
+    /// RFC 3339 end of a network sign-in pause; empty when not paused.
+    sign_in_until: String,
+    /// The network appears to hold the gateway until the user signs in.
+    sign_in_suggested: bool,
     activity: Vec<String>,
 }
 
@@ -116,6 +136,13 @@ struct DesktopState {
     download_rate: u64,
     account: porta_client::tunnel::AccountStatus,
     account_denial: String,
+    routing: porta_client::tunnel::Routing,
+    direct_peers: Vec<porta_client::tunnel::DirectPeer>,
+    /// The end of a network sign-in pause, and its cancellation.
+    sign_in: Option<(String, CancellationToken)>,
+    /// The profile to pause for sign-in once the running session stops.
+    sign_in_after_stop: Option<String>,
+    sign_in_suggested: bool,
     last_sample_at: Option<Instant>,
     last_uploaded: u64,
     last_downloaded: u64,
@@ -214,6 +241,11 @@ impl Controller {
                 download_rate: 0,
                 account: Default::default(),
                 account_denial: String::new(),
+                routing: Default::default(),
+                direct_peers: Vec::new(),
+                sign_in: None,
+                sign_in_after_stop: None,
+                sign_in_suggested: false,
                 last_sample_at: None,
                 last_uploaded: 0,
                 last_downloaded: 0,
@@ -283,21 +315,44 @@ impl Controller {
         let name = input.name.trim();
         let server_url = input.server_url.trim();
         parse_origin(server_url)?;
+        let backup_servers = input
+            .backup_servers
+            .iter()
+            .map(|server| server.trim())
+            .filter(|server| !server.is_empty())
+            .map(|server| parse_origin(server).map(|_| server.to_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
         let transport = parse_transport(input.transport.trim())?;
         let mut profile = if input.id.trim().is_empty() {
-            Profile::new(name, server_url, transport)
+            let mut profile = Profile::new(name, server_url, transport);
+            profile.backup_servers.clone_from(&backup_servers);
+            profile
         } else {
             let mut profile = self.profile(input.id.trim())?;
             profile.name = name.to_owned();
             profile.server_url = server_url.to_owned();
+            profile.backup_servers.clone_from(&backup_servers);
             profile.transport = transport;
             profile
         };
+        profile.allow_lan = input.allow_lan;
+        profile.connect_at_login = input.connect_at_login;
         profile.id = input.id.trim().to_owned();
         let saved = self
             .store
             .save(profile, input.token.trim())
             .map_err(|error| error.to_string())?;
+        if saved.connect_at_login {
+            for mut other in self.store.list().map_err(|error| error.to_string())? {
+                if other.id != saved.id && other.connect_at_login {
+                    other.connect_at_login = false;
+                    self.store
+                        .save(other, "")
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        self.sync_login_task()?;
         let line;
         {
             let mut state = self.lock_state()?;
@@ -323,6 +378,7 @@ impl Controller {
         let profile = self.profile(id)?;
         self.store.delete(id).map_err(|error| error.to_string())?;
         let profiles = self.store.list().map_err(|error| error.to_string())?;
+        self.sync_login_task()?;
         let line;
         {
             let mut state = self.lock_state()?;
@@ -344,6 +400,54 @@ impl Controller {
         self.snapshot()
     }
 
+    /// Keeps the "Porta" logon task in step with the profiles. Windows
+    /// starts the app elevated and hidden at sign-in to connect the profile
+    /// marked Connect at login; a Run key cannot start an elevated app.
+    fn sync_login_task(&self) -> Result<(), String> {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let enabled = self
+            .store
+            .list()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|profile| profile.connect_at_login);
+        let schtasks = std::path::Path::new(
+            &std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+        )
+        .join("System32")
+        .join("schtasks.exe");
+        let mut command = std::process::Command::new(schtasks);
+        command.creation_flags(CREATE_NO_WINDOW);
+        if enabled {
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            command.args([
+                "/Create",
+                "/TN",
+                LOGIN_TASK,
+                "/TR",
+                &format!("\"{}\" --connect-at-login", executable.display()),
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ]);
+            let output = command.output().map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(format!(
+                    "could not register Porta to start at sign-in: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        } else {
+            // Deleting a task that does not exist fails harmlessly.
+            command.args(["/Delete", "/TN", LOGIN_TASK, "/F"]);
+            let _ = command.output();
+        }
+        Ok(())
+    }
+
     fn connect(self: &Arc<Self>, app: &AppHandle, id: &str) -> Result<(), String> {
         self.ensure_operational()?;
         let selected = if id.trim().is_empty() {
@@ -363,6 +467,10 @@ impl Controller {
             if state.running || state.restoring {
                 return Err("Porta is already connecting or restoring the network".to_owned());
             }
+            if let Some((_, pause)) = state.sign_in.take() {
+                pause.cancel();
+            }
+            state.sign_in_suggested = false;
             state.selected_id = profile.id.clone();
             state.active_id = profile.id.clone();
             state.cancellation = Some(cancellation.clone());
@@ -399,6 +507,17 @@ impl Controller {
             if state.restoring {
                 return Err("network restoration is already in progress".to_owned());
             }
+            if let Some((_, pause)) = state.sign_in.take() {
+                pause.cancel();
+                state.status = "Disconnected".to_owned();
+                state.detail = "Choose a profile to reconnect securely.".to_owned();
+                state.tone = "offline".to_owned();
+                let line = add_activity(&mut state, "Network sign-in pause ended");
+                drop(state);
+                self.write_activity(line);
+                self.publish(app);
+                return Ok(());
+            }
             let Some(cancellation) = state.cancellation.clone() else {
                 return Ok(());
             };
@@ -433,7 +552,11 @@ impl Controller {
         cancellation: CancellationToken,
     ) {
         let result = async {
-            let server = parse_origin(&profile.server_url).map_err(|error| (error, None))?;
+            let servers = std::iter::once(&profile.server_url)
+                .chain(&profile.backup_servers)
+                .map(|server| parse_origin(server))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| (error, None))?;
             let ca_path = (!profile.ca_path.is_empty()).then(|| Path::new(&profile.ca_path));
             let thumbprint =
                 (!profile.thumbprint.is_empty()).then_some(profile.thumbprint.as_str());
@@ -443,7 +566,7 @@ impl Controller {
             let observer_app = app.clone();
             match client::run(
                 client::Config {
-                    server,
+                    servers,
                     token,
                     tls,
                     transport: profile.transport,
@@ -454,6 +577,7 @@ impl Controller {
                     reconnect: profile.reconnect,
                     connect_timeout: Duration::from_secs(15),
                     reconnect_max_delay: profile.reconnect_max_delay,
+                    allow_lan: profile.allow_lan,
                 },
                 cancellation,
                 Arc::new(move |event| {
@@ -476,6 +600,7 @@ impl Controller {
         let recovery = network_recovery(&self.network_state).unwrap_or(true);
         let line;
         let should_exit;
+        let sign_in;
         {
             let mut state = match self.lock_state() {
                 Ok(state) => state,
@@ -487,8 +612,13 @@ impl Controller {
             state.cancellation = None;
             state.active_id.clear();
             state.recovery = recovery;
+            state.sign_in_suggested = false;
             reset_connection(&mut state);
             should_exit = state.quitting && result.is_ok() && !recovery;
+            sign_in = state
+                .sign_in_after_stop
+                .take()
+                .filter(|_| result.is_ok() && !recovery && !state.quitting);
             if let Err((error, denial)) = result {
                 state.quitting = false;
                 state.status = "Connection error".to_owned();
@@ -504,6 +634,9 @@ impl Controller {
             }
         }
         self.write_activity(line);
+        if let Some(id) = sign_in {
+            self.start_sign_in(&app, &id);
+        }
         self.publish(&app);
         if should_exit {
             app.exit(0);
@@ -533,12 +666,16 @@ impl Controller {
                 }
                 Event::Connecting {
                     attempt,
+                    gateway,
                     remote_address,
                 } => {
                     state.status = "Connecting".to_owned();
                     state.detail = format!("Secure endpoint {remote_address}");
                     state.tone = "warning".to_owned();
-                    add_activity(&mut state, &format!("Connection attempt {attempt}"))
+                    add_activity(
+                        &mut state,
+                        &format!("Connection attempt {attempt} to {gateway} ({remote_address})"),
+                    )
                 }
                 Event::ConfiguringNetwork => {
                     state.status = "Configuring network".to_owned();
@@ -563,11 +700,16 @@ impl Controller {
                     };
                     state.tone = "connected".to_owned();
                     state.connected = true;
-                    state.address = info.lease.address.to_string();
+                    state.sign_in_suggested = false;
+                    state.address = match info.lease.ipv6() {
+                        Some(ipv6) => format!("{} · {}", info.lease.address.addr(), ipv6.addr()),
+                        None => info.lease.address.to_string(),
+                    };
                     state.transport = transport_name(info.transport).to_owned();
                     state.mtu = info.lease.mtu;
                     state.account = info.account;
                     state.account_denial.clear();
+                    state.routing = info.routing;
                     state.connected_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
                     add_activity(
                         &mut state,
@@ -589,16 +731,33 @@ impl Controller {
                     traffic = Some(traffic_from(&state));
                     None
                 }
-                Event::Reconnecting { reason, delay } => {
-                    state.status = "Reconnecting".to_owned();
-                    state.detail = "The network changed; restoring the secure tunnel...".to_owned();
+                Event::DirectPeers(peers) => {
+                    let line = porta_client::tunnel::direct_summary(&peers);
+                    state.direct_peers = peers;
+                    add_activity(&mut state, &line)
+                }
+                Event::Reconnecting {
+                    reason,
+                    delay,
+                    sign_in_required,
+                } => {
+                    state.direct_peers.clear();
+                    if sign_in_required {
+                        state.status = "Network sign-in required".to_owned();
+                        state.detail = reason.clone();
+                        state.sign_in_suggested = true;
+                    } else {
+                        state.status = "Reconnecting".to_owned();
+                        state.detail =
+                            "The network changed; restoring the secure tunnel...".to_owned();
+                    }
                     state.tone = "warning".to_owned();
                     state.connected = false;
                     add_activity(
                         &mut state,
                         &format!(
                             "Reconnecting in {}: {reason}",
-                            humantime::format_duration(delay)
+                            porta_wire::duration::format_duration(delay)
                         ),
                     )
                 }
@@ -620,6 +779,154 @@ impl Controller {
             self.write_activity(Some(line));
         }
         self.publish(app);
+    }
+
+    /// Lifts leak protection for [`captive::SIGN_IN_PAUSE`] so the user can
+    /// sign in to a captive network, then reconnects the profile.
+    fn sign_in_network(self: &Arc<Self>, app: &AppHandle) -> Result<(), String> {
+        self.ensure_operational()?;
+        let mut state = self.lock_state()?;
+        if state.sign_in.is_some() {
+            return Err("protection is already paused for network sign-in".to_owned());
+        }
+        if state.restoring || state.disconnecting {
+            return Err("Porta is busy; try again in a moment".to_owned());
+        }
+        if state.running {
+            if state.connected {
+                return Err("the tunnel is connected, so the network needs no sign-in".to_owned());
+            }
+            let Some(cancellation) = state.cancellation.clone() else {
+                return Err("Porta is busy; try again in a moment".to_owned());
+            };
+            state.sign_in_after_stop = Some(state.active_id.clone());
+            state.disconnecting = true;
+            state.status = "Pausing protection".to_owned();
+            state.detail = "Lifting leak protection for network sign-in...".to_owned();
+            state.tone = "warning".to_owned();
+            drop(state);
+            self.publish(app);
+            cancellation.cancel();
+            return Ok(());
+        }
+        let selected = state.selected_id.clone();
+        if !state.recovery || selected.is_empty() {
+            return Err(
+                "Porta is not connecting, so nothing blocks the network's sign-in page".to_owned(),
+            );
+        }
+        // Protection was retained after an error: remove it, then pause.
+        state.restoring = true;
+        state.status = "Pausing protection".to_owned();
+        state.detail = "Lifting leak protection for network sign-in...".to_owned();
+        state.tone = "warning".to_owned();
+        drop(state);
+        self.publish(app);
+        let controller = Arc::clone(self);
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = async {
+                let mut network = NetworkManager::open(controller.network_state.clone())
+                    .map_err(|error| error.to_string())?;
+                tokio::time::timeout(NETWORK_ACTION_TIMEOUT, network.down())
+                    .await
+                    .map_err(|_| "network restoration timed out".to_owned())?
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let recovery = network_recovery(&controller.network_state).unwrap_or(true);
+            let line = {
+                let Ok(mut state) = controller.lock_state() else {
+                    return;
+                };
+                state.restoring = false;
+                state.recovery = recovery;
+                match result {
+                    Ok(()) if !recovery => None,
+                    Ok(()) => {
+                        state.status = "Network recovery failed".to_owned();
+                        state.detail = "Network recovery remains pending.".to_owned();
+                        state.tone = "danger".to_owned();
+                        add_activity(&mut state, "Network recovery remains pending.")
+                    }
+                    Err(error) => {
+                        state.status = "Network recovery failed".to_owned();
+                        state.detail = error.clone();
+                        state.tone = "danger".to_owned();
+                        add_activity(&mut state, &format!("Network recovery failed: {error}"))
+                    }
+                }
+            };
+            if line.is_none() {
+                controller.start_sign_in(&app, &selected);
+            }
+            controller.write_activity(line);
+            controller.publish(&app);
+        });
+        Ok(())
+    }
+
+    /// Starts a sign-in pause for the profile, whose end reconnects it.
+    fn start_sign_in(self: &Arc<Self>, app: &AppHandle, id: &str) {
+        let result = (|| {
+            let profile = self.profile(id)?;
+            let ca_path = (!profile.ca_path.is_empty()).then(|| Path::new(&profile.ca_path));
+            let thumbprint =
+                (!profile.thumbprint.is_empty()).then_some(profile.thumbprint.as_str());
+            let tls = tls::config(ca_path, thumbprint, false).map_err(|error| error.to_string())?;
+            Ok::<_, String>((profile, tls))
+        })();
+        let (profile, tls) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.record_error(app, "Could not pause for network sign-in", &error);
+                return;
+            }
+        };
+        let pause = CancellationToken::new();
+        let line = {
+            let Ok(mut state) = self.lock_state() else {
+                return;
+            };
+            let until =
+                Utc::now() + chrono::Duration::from_std(captive::SIGN_IN_PAUSE).unwrap_or_default();
+            state.sign_in = Some((
+                until.to_rfc3339_opts(SecondsFormat::Secs, true),
+                pause.clone(),
+            ));
+            state.status = "Paused for network sign-in".to_owned();
+            state.detail =
+                "Sign in to the network in your browser; Porta reconnects automatically."
+                    .to_owned();
+            state.tone = "warning".to_owned();
+            add_activity(&mut state, "Leak protection paused for network sign-in")
+        };
+        self.write_activity(line);
+        let controller = Arc::clone(self);
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let gateways = std::iter::once(profile.server_url.clone())
+                .chain(profile.backup_servers.iter().cloned())
+                .collect::<Vec<_>>();
+            if !captive::wait_for_sign_in(&gateways, &tls, captive::SIGN_IN_PAUSE, &pause).await {
+                return;
+            }
+            let line = {
+                let Ok(mut state) = controller.lock_state() else {
+                    return;
+                };
+                // A connect or disconnect ended the pause first.
+                if pause.is_cancelled() {
+                    return;
+                }
+                state.sign_in = None;
+                add_activity(&mut state, "Network sign-in pause ended")
+            };
+            controller.write_activity(line);
+            if let Err(error) = controller.connect(&app, &profile.id) {
+                controller.record_error(&app, "Could not reconnect after network sign-in", &error);
+            }
+        });
     }
 
     fn restore_network(self: &Arc<Self>, app: &AppHandle, exit_after: bool) -> Result<(), String> {
@@ -966,6 +1273,11 @@ fn clear_activity(app: AppHandle, controller: State<'_, Arc<Controller>>) -> Res
 }
 
 #[tauri::command]
+fn sign_in_network(app: AppHandle, controller: State<'_, Arc<Controller>>) -> Result<(), String> {
+    controller.sign_in_network(&app)
+}
+
+#[tauri::command]
 fn save_activity_log(controller: State<'_, Arc<Controller>>) -> Result<String, String> {
     controller.save_activity_log()
 }
@@ -997,8 +1309,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         return Ok(());
     }
-    if !arguments.is_empty() {
-        return Err("unsupported arguments; use --version or --cleanup-network".into());
+    let at_login = arguments == ["--connect-at-login"];
+    if !arguments.is_empty() && !at_login {
+        return Err(
+            "unsupported arguments; use --version, --cleanup-network or --connect-at-login".into(),
+        );
     }
     fs::create_dir_all(&data_directory)?;
     let store = Store::open(data_directory.join("profiles.json"))?;
@@ -1019,10 +1334,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             connect,
             disconnect,
             restore_network,
+            sign_in_network,
             clear_activity,
             save_activity_log
         ])
-        .setup(|app| {
+        .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("Porta {}", porta_client::VERSION.trim()));
             }
@@ -1079,8 +1395,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 })
                 .build(app)?;
-            let controller = app.state::<Arc<Controller>>();
+            let controller = app.state::<Arc<Controller>>().inner().clone();
             controller.publish(app.handle());
+            if at_login {
+                // Started by the logon task: stay in the tray and connect.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                let automatic = controller.store.list().ok().and_then(|profiles| {
+                    profiles
+                        .into_iter()
+                        .find(|profile| profile.connect_at_login)
+                });
+                if let Some(profile) = automatic {
+                    if let Err(error) = controller.connect(app.handle(), &profile.id) {
+                        controller.record_error(
+                            app.handle(),
+                            "Automatic connection failed",
+                            &error,
+                        );
+                    }
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1127,7 +1463,10 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
                 id: profile.id,
                 name: profile.name,
                 server_url: profile.server_url,
+                backup_servers: profile.backup_servers,
                 transport: transport_name(profile.transport).to_owned(),
+                allow_lan: profile.allow_lan,
+                connect_at_login: profile.connect_at_login,
                 status,
             }
         })
@@ -1159,6 +1498,20 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
         quota_used_bytes: state.account.quota_used_bytes,
         rate_limit_kbps: state.account.rate_limit_kbps.unwrap_or_default(),
         account_denial: state.account_denial.clone(),
+        split_routes: state
+            .routing
+            .routes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        split_dns_domains: state.routing.dns_domains.clone(),
+        direct_peers: state.direct_peers.iter().map(ToString::to_string).collect(),
+        sign_in_until: state
+            .sign_in
+            .as_ref()
+            .map(|(until, _)| until.clone())
+            .unwrap_or_default(),
+        sign_in_suggested: state.sign_in_suggested,
         activity: state.activity.clone(),
     }
 }
@@ -1277,6 +1630,8 @@ fn reset_connection(state: &mut DesktopState) {
     state.upload_rate = 0;
     state.download_rate = 0;
     state.account = Default::default();
+    state.routing = Default::default();
+    state.direct_peers.clear();
     state.last_sample_at = None;
     state.last_uploaded = 0;
     state.last_downloaded = 0;
@@ -1385,13 +1740,16 @@ mod tests {
 
     impl TestDirectory {
         fn new() -> Self {
+            // Parallel tests can read the same coarse Windows clock value.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::current_dir().unwrap().join(format!(
-                ".porta-log-test-{}-{}",
+                ".porta-log-test-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
             Self(path)

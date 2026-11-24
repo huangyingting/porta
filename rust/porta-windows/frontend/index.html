@@ -54,6 +54,11 @@
             <h1 id="status-text">Disconnected</h1>
             <p id="status-detail" class="muted">Choose a profile to connect.</p>
             <p id="account-detail" class="account-detail hidden"></p>
+            <p id="routing-detail" class="account-detail hidden"></p>
+            <div id="sign-in-actions" class="status-actions hidden">
+              <button id="sign-in-action" class="secondary-button" type="button" data-i18n="signInNetwork">Sign in to network</button>
+              <button id="reconnect-action" class="primary-button compact" type="button" data-i18n="reconnectNow">Reconnect now</button>
+            </div>
           </div>
         </section>
 
@@ -155,10 +160,28 @@
             <input id="profile-server" type="url" inputmode="url" spellcheck="false" autocapitalize="off" autocomplete="url" placeholder="https://vpn.example.com:8443">
           </label>
           <label>
+            <span data-i18n="backupGateways">Backup gateways</span>
+            <textarea id="profile-backups" rows="2" spellcheck="false" autocapitalize="off" data-i18n-placeholder="backupGatewaysPlaceholder" placeholder="Optional, one per line: gateways that share this account"></textarea>
+          </label>
+          <label>
             <span data-i18n="accessToken">Access token</span>
             <input id="profile-token" type="password" spellcheck="false" autocapitalize="off" autocomplete="off" data-i18n-placeholder="accessTokenPlaceholder" placeholder="Paste the token from your administrator">
           </label>
           <p id="token-help" class="field-help" data-i18n="tokenHelpNew">Stored securely for this Windows account.</p>
+          <label class="option-row">
+            <input id="profile-allow-lan" type="checkbox">
+            <span>
+              <span class="option-title" data-i18n="allowLan">Allow local network</span>
+              <span class="option-help" data-i18n="allowLanHelp">Keep printers, file shares and media players on this network reachable while everything else uses the tunnel. DNS still uses the tunnel.</span>
+            </span>
+          </label>
+          <label class="option-row">
+            <input id="profile-connect-at-login" type="checkbox">
+            <span>
+              <span class="option-title" data-i18n="connectAtLogin">Connect automatically</span>
+              <span id="connect-at-login-help" class="option-help" data-i18n="connectAtLoginHelp">Connect this profile when you sign in to Windows. Only one profile can connect automatically.</span>
+            </span>
+          </label>
           <div id="editor-error" class="inline-error hidden" role="alert"></div>
           <div class="form-actions">
             <button id="delete-profile" class="secondary-button danger-text hidden" type="button" data-i18n="delete">Delete</button>

@@ -1,22 +1,93 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+/// When the certificate the gateway serves expires, for monitoring.
+#[derive(Debug, Default)]
+pub struct CertificateExpiry {
+    /// Unix seconds; zero until a certificate is known.
+    not_after: AtomicI64,
+    /// The certificate last recorded, to parse each one only once.
+    recorded: AtomicUsize,
+}
+
+impl CertificateExpiry {
+    pub fn not_after(&self) -> Option<i64> {
+        Some(self.not_after.load(Ordering::Relaxed)).filter(|seconds| *seconds != 0)
+    }
+
+    /// Records the leaf certificate of `key` if it is not the last one seen.
+    pub fn record(&self, key: &Arc<CertifiedKey>) {
+        let identity = Arc::as_ptr(key) as usize;
+        if self.recorded.swap(identity, Ordering::Relaxed) == identity {
+            return;
+        }
+        if let Some(not_after) = key.end_entity_cert().ok().and_then(certificate_not_after) {
+            self.not_after.store(not_after, Ordering::Relaxed);
+        }
+    }
+
+    /// Reports expiry through `metrics` on every scrape.
+    pub fn export(self: &Arc<Self>, metrics: &crate::ops::metrics::Metrics) {
+        let expiry = self.clone();
+        metrics.register(Box::new(move |output| {
+            if let Some(not_after) = expiry.not_after() {
+                crate::ops::metrics::metric(
+                    output,
+                    "porta_tls_certificate_expiry_timestamp_seconds",
+                    "gauge",
+                    "When the TLS certificate the gateway serves expires, in Unix seconds.",
+                    not_after,
+                );
+            }
+        }));
+    }
+}
+
+/// The Unix time at which `certificate` stops being valid.
+pub fn certificate_not_after(certificate: &CertificateDer<'_>) -> Option<i64> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(certificate.as_ref()).ok()?;
+    Some(parsed.validity().not_after.timestamp())
+}
+
+/// Records the expiry of every certificate another resolver serves.
+#[derive(Debug)]
+pub struct ExpiryRecordingResolver {
+    pub inner: Arc<dyn ResolvesServerCert>,
+    pub expiry: Arc<CertificateExpiry>,
+}
+
+impl ResolvesServerCert for ExpiryRecordingResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // TLS-ALPN-01 challenge certificates are not the gateway's.
+        let challenge = client_hello
+            .alpn()
+            .is_some_and(|mut protocols| protocols.any(|protocol| protocol == b"acme-tls/1"));
+        let key = self.inner.resolve(client_hello)?;
+        if !challenge {
+            self.expiry.record(&key);
+        }
+        Some(key)
+    }
+}
+
 pub struct StaticCertificateResolver {
     certificate_path: PathBuf,
     private_key_path: PathBuf,
+    expiry: Arc<CertificateExpiry>,
     current: ArcSwap<CertifiedKey>,
     digest: Mutex<[u8; 32]>,
     stamps: Mutex<FileStamps>,
@@ -41,13 +112,20 @@ impl StaticCertificateResolver {
         let private_key_path = private_key_path.into();
         let loaded = load_key_pair(&certificate_path, &private_key_path)?;
         let stamps = file_stamps(&certificate_path, &private_key_path)?;
+        let expiry = Arc::new(CertificateExpiry::default());
+        expiry.record(&loaded.key);
         Ok(Arc::new(Self {
             certificate_path,
             private_key_path,
+            expiry,
             current: ArcSwap::from(loaded.key),
             digest: Mutex::new(loaded.digest),
             stamps: Mutex::new(stamps),
         }))
+    }
+
+    pub fn expiry(&self) -> Arc<CertificateExpiry> {
+        self.expiry.clone()
     }
 
     pub fn server_config(self: &Arc<Self>, alpn_protocols: Vec<Vec<u8>>) -> rustls::ServerConfig {
@@ -107,6 +185,7 @@ impl StaticCertificateResolver {
             *self.stamps.lock().expect("TLS reload stamp mutex poisoned") = stamps;
             return Ok(false);
         }
+        self.expiry.record(&loaded.key);
         self.current.store(loaded.key);
         *digest = loaded.digest;
         *self.stamps.lock().expect("TLS reload stamp mutex poisoned") = stamps;
@@ -179,16 +258,15 @@ fn load_key_pair(certificate_path: &Path, private_key_path: &Path) -> Result<Loa
         std::fs::read(private_key_path)
             .with_context(|| format!("read TLS private key {}", private_key_path.display()))?,
     );
-    let certificates = rustls_pemfile::certs(&mut Cursor::new(&certificate_bytes))
+    let certificates = CertificateDer::pem_slice_iter(&certificate_bytes)
         .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .context("parse TLS certificate")?;
     if certificates.is_empty() {
         bail!("TLS certificate file is empty");
     }
-    let private_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut Cursor::new(private_key_bytes.as_slice()))
-            .context("parse TLS private key")?
-            .context("TLS private key file is empty")?;
+    let private_key = private_key_from_pem(&private_key_bytes)
+        .context("parse TLS private key")?
+        .context("TLS private key file is empty")?;
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&private_key)
         .context("TLS private key is unsupported")?;
     let key = Arc::new(CertifiedKey::new(certificates, signing_key));
@@ -202,6 +280,17 @@ fn load_key_pair(certificate_path: &Path, private_key_path: &Path) -> Result<Loa
     Ok(LoadedKeyPair { key, digest })
 }
 
+/// The first private key in `pem`, or `None` when it holds none.
+pub(crate) fn private_key_from_pem(
+    pem: &[u8],
+) -> std::result::Result<Option<PrivateKeyDer<'static>>, rustls::pki_types::pem::Error> {
+    match PrivateKeyDer::from_pem_slice(pem) {
+        Ok(key) => Ok(Some(key)),
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +300,38 @@ mod tests {
         let GeneratedKey { cert, signing_key } =
             generate_simple_self_signed(vec![name.to_owned()]).unwrap();
         (cert.pem(), signing_key.serialize_pem())
+    }
+
+    #[test]
+    fn records_the_served_certificate_expiry_once_per_certificate() {
+        let mut params = rcgen::CertificateParams::new(vec!["vpn.example".to_owned()]).unwrap();
+        params.not_after = rcgen::date_time_ymd(2031, 5, 17);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        assert_eq!(
+            certificate_not_after(certificate.der()),
+            Some(time::macros::datetime!(2031-05-17 0:00 UTC).unix_timestamp())
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = (
+            directory.path().join("c.pem"),
+            directory.path().join("k.pem"),
+        );
+        std::fs::write(&cert_path, certificate.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let resolver = StaticCertificateResolver::open(&cert_path, &key_path).unwrap();
+        let expiry = resolver.expiry();
+        assert_eq!(expiry.not_after(), certificate_not_after(certificate.der()));
+
+        let metrics = crate::ops::metrics::Metrics::default();
+        expiry.export(&metrics);
+        assert!(metrics.render_prometheus().contains(&format!(
+            "porta_tls_certificate_expiry_timestamp_seconds {}",
+            expiry.not_after().unwrap()
+        )));
+        assert!(CertificateExpiry::default().not_after().is_none());
+        assert!(certificate_not_after(&CertificateDer::from(vec![0_u8; 8])).is_none());
     }
 
     #[test]

@@ -57,6 +57,13 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y iptables nftables iproute2 iputils-ping
           fi
+      - name: Resolve through systemd-resolved's stub, like an Ubuntu host
+        run: |
+          if [[ -f /run/systemd/resolve/stub-resolv.conf ]] &&
+             [[ $(readlink -f /etc/resolv.conf) != /run/systemd/resolve/stub-resolv.conf ]]; then
+            sudo ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          fi
+          ls -l /etc/resolv.conf
       - name: Exercise the real VPN data path
         env:
           PORTA_E2E_TOKEN: ${{ secrets.PORTA_E2E_TOKEN }}

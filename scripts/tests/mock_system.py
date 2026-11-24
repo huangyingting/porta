@@ -126,6 +126,11 @@ elif name == "systemctl":
                 active = state["active"]
                 enabled = state["enabled"]
                 active[unit] = False
+    elif operation == "reload":
+        for unit in units:
+            if not active.get(unit):
+                code = 1
+            state.setdefault("reloaded", []).append(unit)
     elif operation != "daemon-reload":
         raise RuntimeError(f"unexpected systemctl call: {args}")
 elif name == "sysctl":
@@ -150,19 +155,35 @@ elif name == "ip":
     elif args[:4] == ["-4", "route", "show", "default"]:
         print("default via 192.0.2.1 dev eth0")
     elif args[:3] == ["-4", "rule", "show"]:
+        selectors = dict(zip(args[3::2], args[4::2]))
         for rule in state.get("ip_rules", []):
+            if "priority" in selectors and not rule.startswith(selectors["priority"] + ":"):
+                continue
+            if "iif" in selectors and f" iif {selectors['iif']} " not in rule:
+                continue
             print(rule)
     elif args[:3] in (["-4", "rule", "add"], ["-4", "rule", "del"]):
         options = dict(zip(args[3::2], args[4::2]))
-        rule = (f"{options['priority']}:\tfrom all iif {options['iif']} "
-                f"lookup {options['lookup']}")
         rules = state.setdefault("ip_rules", [])
-        if args[2] == "add":
-            rules.append(rule)
-        elif rule in rules:
-            rules.remove(rule)
+        if args[2] == "del" and "lookup" not in options:
+            # Deletes the first rule matching the given selectors.
+            prefix = f"{options['priority']}:"
+            match = next((rule for rule in rules if rule.startswith(prefix)
+                          and f" iif {options['iif']} " in rule), None)
+            if match:
+                rules.remove(match)
+            else:
+                code = 2
         else:
-            code = 2
+            source = options.get("from", "all")
+            rule = (f"{options['priority']}:\tfrom {source} iif {options['iif']} "
+                    f"lookup {options['lookup']}")
+            if args[2] == "add":
+                rules.append(rule)
+            elif rule in rules:
+                rules.remove(rule)
+            else:
+                code = 2
     elif args[:3] == ["-4", "route", "replace"]:
         table = args[args.index("table") + 1]
         route = " ".join(args[3:args.index("table")])
@@ -199,7 +220,7 @@ elif name == "nft":
             tables = dict(state.get("nft_tables", {}))
             if not tables and state.get("nft_table"):
                 tables["ip porta"] = state["nft_table"]
-            for table in ("ip porta", "inet porta_guard"):
+            for table in ("ip porta", "ip6 porta", "inet porta_guard"):
                 if f"delete table {table}" in transaction:
                     tables.pop(table, None)
                 if f"table {table} {{" in transaction:
@@ -217,7 +238,9 @@ elif name == "nft":
             state["nft_table"] = "" if not tables else state.get("nft_table", "")
     else:
         raise RuntimeError(f"nontransactional nft invocation: {args}")
-elif name == "iptables":
+elif name in ("iptables", "ip6tables"):
+    # ip6tables keeps its own rules and Docker chain state.
+    family = "" if name == "iptables" else "6"
     args = [arg for arg in args if arg != "-w"]
     operation = args[0]
     if operation == "-S":
@@ -225,12 +248,12 @@ elif name == "iptables":
             code = 2
         elif len(args) == 1:
             print("-P FORWARD ACCEPT")
-            if state.get("docker"):
+            if state.get("docker" + family):
                 print("-N DOCKER-USER")
         else:
-            code = 0 if state.get("docker") else 1
+            code = 0 if state.get("docker" + family) else 1
     else:
-        rules = state.setdefault("iptables_rules", [])
+        rules = state.setdefault(name + "_rules", [])
         rule = args[2:] if operation != "-I" else args[3:]
         if operation == "-C":
             code = 2 if state.get("fail_iptables_check") else (0 if rule in rules else 1)
@@ -354,6 +377,36 @@ elif name == "adb":
                   "dev.porta.android/.TunnelService"]:
         if state.get("porta_service", True):
             print("ServiceRecord{porta dev.porta.android/.TunnelService}")
+elif name == "getent":
+    if args[0] == "group":
+        code = 0 if args[1] in state.get("groups", []) else 2
+    elif args[0] != "passwd":
+        raise RuntimeError(f"unexpected getent invocation: {args}")
+    elif args[1] == "porta":
+        code = 0 if args[1] in state.get("users", []) else 2
+    else:
+        code = subprocess.run(["/usr/bin/getent", *args], check=False).returncode
+elif name == "useradd":
+    if "--system" not in args or args[-1] in state.get("users", []):
+        raise RuntimeError(f"unexpected useradd invocation: {args}")
+    state.setdefault("users", []).append(args[-1])
+elif name == "groupadd":
+    if "--system" not in args or args[-1] in state.get("groups", []):
+        raise RuntimeError(f"unexpected groupadd invocation: {args}")
+    state.setdefault("groups", []).append(args[-1])
+elif name == "usermod":
+    if args[:3] != ["--append", "--groups", args[2]] or args[2] not in state.get("groups", []):
+        raise RuntimeError(f"unexpected usermod invocation: {args}")
+    state.setdefault("members", []).append([args[2], args[3]])
+elif name == "systemd-tmpfiles":
+    if args[0] != "--create":
+        raise RuntimeError(f"unexpected systemd-tmpfiles invocation: {args}")
+    safe(args[1])
+elif name in ("chown", "chgrp"):
+    owner, *paths = [arg for arg in args if not arg.startswith("-")]
+    for path in paths:
+        safe(path)
+    state.setdefault("ownership", []).append([name, owner, *map(str, paths)])
 elif name == "sleep":
     code = 1 if state.get("fail_sleep") else 0
 elif name == "uname":

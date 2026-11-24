@@ -46,6 +46,7 @@ pub struct AutomaticCertificateConfig {
 
 pub struct AutomaticCertificateManager {
     domain: String,
+    expiry: Arc<crate::ops::tls::CertificateExpiry>,
     resolver: Arc<ResolvesServerCertAcme>,
     tcp_config: Arc<ServerConfig>,
     quinn_config: quinn::ServerConfig,
@@ -105,14 +106,23 @@ impl AutomaticCertificateManager {
 
         let mut state = acme.state();
         let resolver = state.resolver();
-        let server_resolver: Arc<dyn ResolvesServerCert> = match cached_fallback {
-            Some(fallback) => Arc::new(CachedCertificateResolver {
-                primary: resolver.clone(),
-                fallback,
-                domain: domain.clone(),
-            }),
+        let expiry = Arc::new(crate::ops::tls::CertificateExpiry::default());
+        let served: Arc<dyn ResolvesServerCert> = match cached_fallback {
+            Some(fallback) => {
+                expiry.record(&fallback);
+                Arc::new(CachedCertificateResolver {
+                    primary: resolver.clone(),
+                    fallback,
+                    domain: domain.clone(),
+                })
+            }
             None => resolver.clone(),
         };
+        let server_resolver: Arc<dyn ResolvesServerCert> =
+            Arc::new(crate::ops::tls::ExpiryRecordingResolver {
+                inner: served,
+                expiry: expiry.clone(),
+            });
 
         let mut tcp_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         if http_listener.is_none() {
@@ -159,6 +169,7 @@ impl AutomaticCertificateManager {
 
         Ok(Self {
             domain,
+            expiry,
             resolver,
             tcp_config,
             quinn_config,
@@ -170,6 +181,11 @@ impl AutomaticCertificateManager {
 
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// When the certificate being served expires.
+    pub fn expiry(&self) -> Arc<crate::ops::tls::CertificateExpiry> {
+        self.expiry.clone()
     }
 
     pub fn allows_domain(&self, candidate: &str) -> bool {
@@ -312,14 +328,15 @@ async fn install_cached_certificate(target: PathBuf, cached: Zeroizing<Vec<u8>>)
 }
 
 fn prepare_cached_certificate(cached: Zeroizing<Vec<u8>>) -> Result<PreparedCachedCertificate> {
-    let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(cached.as_slice()))
+    use rustls::pki_types::pem::PemObject as _;
+    let certificates = CertificateDer::pem_slice_iter(cached.as_slice())
         .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .context("parse cached ACME certificate")?;
     if certificates.is_empty() {
         bail!("cached ACME certificate is empty");
     }
     let private_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut std::io::Cursor::new(cached.as_slice()))
+        crate::ops::tls::private_key_from_pem(cached.as_slice())
             .context("parse cached ACME private key")?
             .context("cached ACME private key is empty")?;
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&private_key)

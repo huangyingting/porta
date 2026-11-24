@@ -43,6 +43,14 @@ class AccountStatusTest {
             AccountDenial.QUOTA_EXCEEDED,
             accountDenialIn("account-denied:quota-exceeded: monthly data quota"),
         )
+        assertEquals(
+            AccountDenial.DEVICE_PENDING,
+            accountDenialIn("Connection rejected: account-denied:device-pending: waiting for approval"),
+        )
+        assertEquals(
+            AccountDenial.CLIENT_OUTDATED,
+            accountDenialIn("account-denied:client-outdated: this version of Porta is too old"),
+        )
         assertNull(accountDenialIn("gateway returned HTTP 401 Unauthorized"))
     }
 }

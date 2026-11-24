@@ -17,7 +17,7 @@
 
 ## Tunnel and proxy routes
 
-- `CONNECT /.well-known/masque/ip/*/*/` is the RFC 9484 unrestricted IPv4
+- `CONNECT /.well-known/masque/ip/*/*/` is the RFC 9484 unrestricted
   MASQUE endpoint. It requires Extended CONNECT with `:protocol=connect-ip`,
   `Capsule-Protocol: ?1`, a bearer token, a signed native-device proof, and a
   supported Porta protocol version.
@@ -51,9 +51,23 @@ and the short timestamp window remain part of replay protection. Forward-proxy
 requests do not use this protocol.
 
 Porta sends optional `X-Porta-Gateway`, `X-Porta-DNS` and `X-Porta-MTU` response
-extensions because RFC 9484 does not define that interface configuration. The
+extensions because RFC 9484 does not define that interface configuration.
+A split-tunnel gateway also sends `X-Porta-Routes` (comma-separated IPv4 and,
+with IPv6, IPv6 prefixes, also advertised as a ROUTE_ADVERTISEMENT capsule on
+HTTP/3) and
+`X-Porta-DNS-Domains` (comma-separated names). Clients treat a malformed or
+oversized value as a permanent error rather than guessing a routing policy. The
 authenticated gateway address also identifies the source of client-local ICMP
 MTU feedback; it is not inferred from an unrelated public endpoint address.
+
+On a dual-stack gateway, HTTP/3 clients request an IPv6 address alongside the
+IPv4 one in their ADDRESS_REQUEST capsule. Every ADDRESS_ASSIGN capsule lists
+all of the client's addresses, as RFC 9484 requires: answers carry the request
+ID, addresses the client did not request carry ID zero, and a request the
+gateway cannot satisfy gets the unspecified address. Full tunnels advertise
+`::`–`ffff:…` in addition to the IPv4 range. HTTP/2 lanes receive the IPv6
+address as `X-Porta-Address6: ADDRESS/128`. Gateways without IPv6, and devices
+whose access policy selects a named exit, get no IPv6 address.
 
 HTTP/3 clients additionally request the optional
 `X-Porta-MTU-Discovery: 1` capability. Server-side `--auto-mtu` is enabled by
@@ -74,7 +88,22 @@ The operations listener defaults to `127.0.0.1:9090`:
   external probes; failed required components return HTTP 503. Cascade relays
   add the required `upstream_tunnel` and `upstream_route` components.
 - `GET /metrics` is available only when `PORTA_METRICS_TOKEN` is configured and
-  requires that bearer token.
+  requires that bearer token. It serves Prometheus text:
+  - `porta_build_info{version}`;
+  - tunnels and connections: `porta_active_tunnels`, `porta_connections_total`,
+    `porta_public_connections`, `porta_public_connection_rejections_total`;
+  - traffic: `porta_traffic_bytes_total{direction}`, packet counters, and
+    `porta_router_dropped_packets_total{reason}`;
+  - authentication: `porta_auth_failures_total`, `porta_abuse_rejections_total`;
+  - `porta_tls_certificate_expiry_timestamp_seconds` for the certificate being
+    served;
+  - `porta_dns_answers_total{outcome}` with the built-in resolver;
+  - `porta_upstream_*` on cascade relays;
+  - `porta_federation_connected`, `porta_federation_last_sync_timestamp_seconds`
+    and `porta_federation_clients` on replicas;
+  - `porta_direct_path_devices` with `--peer-to-peer`.
+
+  `deploy/prometheus/porta-alerts.yml` holds alerting rules built on them.
 - `/api/*` accepts `PORTA_ADMIN_TOKEN` as a bearer token for local automation.
 
 Keep this listener private. Public browser sessions are handled separately on
@@ -172,12 +201,116 @@ that native clients display: `X-Porta-Account-Expires` (Unix seconds),
 `X-Porta-Quota-Bytes`, `X-Porta-Quota-Used-Bytes` (a snapshot at connection
 time) and `X-Porta-Rate-Limit-Kbps`. Enforcement never depends on them.
 
+## Device enrollment
+
+`PUT /api/clients/{clientID}/enrollment` sets the policy for unknown device
+keys: `{"policy": "open" | "approval" | "closed", "open_for_minutes": 15}`.
+`open_for_minutes` (1 to 10080) optionally lets new devices enroll directly
+until the window elapses. `POST /api/clients/{clientID}/devices/{deviceID}/approve`
+and `.../deny` review a device. Client summaries include `enrollment`,
+`enrollment_open_until`, and `pending_devices`, and each device has a
+`status` of `approved`, `pending`, or `denied`; `device_count` counts approved
+devices. Refused native tunnels receive HTTP 403 with `X-Porta-Reason`
+`device-pending`, `enrollment-closed`, or `device-denied`.
+
+The same body's optional `"standard_clients": true | false` allows or stops
+[standard CONNECT-IP clients](#standard-connect-ip-clients) for the account;
+summaries report it as `standard_clients`. Stopping them ends their sessions.
+
+## Standard CONNECT-IP clients
+
+Porta's own clients add a device proof and `X-Porta-Version` to every tunnel
+request. A request to the MASQUE endpoint that carries neither is a standard
+RFC 9484 request: it is authenticated by the bearer token alone and admitted
+only for accounts with `standard_clients` enabled, otherwise refused with
+HTTP 403 and `X-Porta-Reason: standard-clients-disabled`. The target may be
+`/.well-known/masque/ip/%2A/%2A/`, as RFC 6570 expansion of the RFC 9484
+template produces, over HTTP/3 or HTTP/2 Extended CONNECT. The gateway assigns the client's
+addresses and advertises its routes right after the response, with request ID
+zero, and also answers ADDRESS_REQUEST capsules. Standard clients receive the
+account's access policy, limits and DNS server header like native ones, but
+no MTU discovery.
+
+All of an account's standard clients share one logical device,
+`standard-masque` (**Standard MASQUE clients** in the device list), which
+takes one device slot and one lease: a second standard connection replaces
+the first. Without a device key they get none of the device guarantees:
+enrollment approval, per-device revocation, and proof against replay of a
+stolen token do not apply, so the token is their only credential.
+`scripts/test-standard-masque.sh` checks the mode against the independent
+quic-go/connect-ip-go client in `experiments/masque-interop`.
+
+## Access policy and subnet routes
+
+`PUT /api/clients/{clientID}/access` replaces an account's access policy:
+`{"allow": ["10.20.0.0/16", "10.1.2.3 tcp/443"], "deny": ["10.20.9.0/24"], "group": "team", "exit": null}`.
+Every field is optional; empty lists and `null` remove a rule. Each list
+holds at most 64 rules: a prefix or address, optionally followed by
+`tcp`, `udp` (each with an optional `/PORT` or `/FIRST-LAST`) or `icmp`
+([rule semantics](deployment.md#client-to-client-traffic-and-access-policy)). Group names have at most 32 letters, digits, `-`
+or `_`, and are stored in lower case. The change reconnects the account's
+devices. Client summaries include the policy as `access`.
+
+Device summaries include `dns_name`, the device's name under
+`porta.internal`, and `GET /api/gateway` reports `dns_resolver` when the
+built-in resolver serves those names.
+
+`PUT /api/clients/{clientID}/devices/{deviceID}/subnets` with
+`{"subnets": ["10.30.0.0/24"]}` routes networks to a device, and an empty list
+stops routing them; the device reconnects. Device summaries include
+`subnets`. The gateway tells the device its subnets with the
+`X-Porta-Subnets` response header, and adds other devices' subnets and the
+client pool to split-tunnel `X-Porta-Routes`.
+
+## Federation
+
+`GET /federation/v1/registry` on a primary's public listener returns its
+client registry (accounts, token hashes, devices and policies) as JSON to
+`Authorization: Bearer <PORTA_FEDERATION_TOKEN>`; anything else gets `401`
+and is rate limited and audited. A replica that does not know a device
+answers tunnel requests with `503` and `X-Porta-Reason`, which multi-gateway
+clients treat as a signal to try another gateway.
+
 ## Gateway status
 
 `GET /api/gateway` returns the server version and, on a cascade relay, the
 next hop: `{"version":"0.1.40","upstream":{"url":"https://exit.example.com","interface":"porta-up0","connected":true,"address":"10.66.0.2","transport":"h3"}}`.
 While disconnected, `connected` is `false` and `error` holds the last failure.
-The admin page shows this as a banner.
+A split-tunnel gateway adds `routes` and `dns_domains`, a dual-stack gateway
+adds `ipv6_pool`, `client_to_client`
+reports `--client-to-client`, `peer_to_peer` reports `--peer-to-peer`, `exits` lists the exit names access policies
+may select, and `upstreams` lists every next hop, with `name` set for named
+exits. `federation` reports `role` (`primary` or `replica`) and, on a
+replica, the `primary`, whether it is `connected`, the `last_sync` time,
+the mirrored `clients` count and the last `error`. The admin page shows the routing and next hop as
+banners.
+
+## Administrators and audit
+
+Admin API requests run as the signed-in administrator, or as an owner with the
+break-glass `Authorization: Bearer PORTA_ADMIN_TOKEN`. Viewers may only read;
+operators may change clients; owners may also manage administrators. A
+request the role does not allow returns HTTP 403.
+
+- `GET /api/me` returns the caller's `kind` (`token`, `admin` or `sso`),
+  `name`, `role` and whether `totp` is on. `POST /api/me/totp` starts TOTP
+  enrollment and returns `secret`, `uri` and a `qr_code` data URI;
+  `PUT /api/me/totp` with `{"code": "123456"}` turns it on.
+  `PUT /api/me/password` takes `{"current": ..., "password": ...}`.
+- `GET /api/admins` lists administrators; `POST /api/admins` creates one from
+  `{"username", "role", "password", "sso_email", "disabled"}`;
+  `PUT /api/admins/{id}` changes any of those except the username;
+  `DELETE /api/admins/{id}` removes one, and `DELETE /api/admins/{id}/totp`
+  turns off its two-factor authentication.
+- `GET /api/audit?limit=200` returns up to 1000 recent `events`, newest
+  first; `GET /api/audit/export` downloads every retained event as JSON
+  lines.
+
+Browser sign-in uses `POST /admin/sign-in` (form fields `username`,
+`password`, `code`), and single sign-on `GET /auth/oidc/start` and
+`GET /auth/oidc/callback`. With `--sso-user-domains`, `GET /auth/sso/start`
+signs a user in to their account through the same callback and redirects to
+`/portal/downloads`.
 
 ## Session administration
 
