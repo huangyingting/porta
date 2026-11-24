@@ -30,6 +30,8 @@ use super::{ClientError, Inbound, Lease, Routing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a path must last for its loss to be retried without delay.
+const STABLE_LINK: Duration = Duration::from_secs(30);
 /// How long a silent direct path lasts before packets return to the
 /// gateway; keep-alives make silence mean the path broke.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -255,9 +257,14 @@ impl Peers {
                         }) => result,
                     };
                     if let Ok(Some(link)) = connected {
+                        let started = tokio::time::Instant::now();
                         self.carry(peer, link, &token).await;
-                        backoff = Duration::from_secs(1);
-                        continue;
+                        // Paths that fail right after connecting back off
+                        // like failed attempts instead of redialling at once.
+                        if started.elapsed() >= STABLE_LINK {
+                            backoff = Duration::from_secs(1);
+                            continue;
+                        }
                     }
                 }
                 // The peer ignores this attempt; it only lets the peer's
