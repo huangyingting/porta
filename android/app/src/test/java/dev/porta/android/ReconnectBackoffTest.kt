@@ -8,10 +8,11 @@ class ReconnectBackoffTest {
     @Test
     fun growsToCapAndResets() {
         val backoff = ReconnectBackoff("android-test")
-        val delays = List(7) { backoff.nextDelayMillis() }
+        val delays = List(9) { backoff.nextDelayMillis() }
 
         assertTrue(delays.zipWithNext().all { (first, second) -> second >= first })
-        assertTrue(delays.last() in 30_000L..30_999L)
+        assertTrue(delays.first() in 250L..499L)
+        assertTrue(delays.last() in 30_000L..30_249L)
 
         backoff.reset()
         assertEquals(delays.first(), backoff.nextDelayMillis())

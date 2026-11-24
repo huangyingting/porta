@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate as _;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use porta_wire::device_auth::Proof;
 use rand::RngCore as _;
@@ -86,7 +86,7 @@ impl Identity {
         let signing_key = match read_private(path) {
             Ok(encoded) => decode(&encoded)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let key = SigningKey::random(&mut OsRng);
+                let key = SigningKey::generate();
                 persist(path, &key)?;
                 key
             }
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn identity_state_round_trips_without_changing_the_key() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let encoded = encode(&key).unwrap();
         assert!(encoded.ends_with(b"\n"));
         let decoded = decode(&encoded).unwrap();

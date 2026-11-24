@@ -40,7 +40,7 @@ struct Arguments {
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    humantime::parse_duration(value).map_err(|error| error.to_string())
+    porta_wire::duration::parse_duration(value).map_err(|error| error.to_string())
 }
 
 fn main() {

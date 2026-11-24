@@ -16,10 +16,20 @@ cargo="${CARGO:-$HOME/.cargo/bin/cargo}"
   --example linux-network-cycle \
   --locked
 binary="$repository_root/rust/target/debug/examples/linux-network-cycle"
-
-sudo -n unshare --net -- bash -euo pipefail -c '
+# Automatic Linux networking requires systemd-resolved's stub. The test gives
+# itself one in a private mount namespace (an overlay on /etc whose
+# resolv.conf links to it), so it does not depend on how the host resolves
+# names and leaves the host's /etc untouched.
+sudo -n unshare --net --mount --propagation private -- bash -euo pipefail -c '
 binary=$1
 runtime_directory=$(mktemp -d)
+mkdir -p "$runtime_directory/etc-upper" "$runtime_directory/etc-work"
+mount -t overlay porta-etc \
+  -o "lowerdir=/etc,upperdir=$runtime_directory/etc-upper,workdir=$runtime_directory/etc-work" /etc
+mkdir -p /run/systemd/resolve
+mount -t tmpfs porta-resolve /run/systemd/resolve
+printf "nameserver 127.0.0.53\noptions edns0 trust-ad\n" >/run/systemd/resolve/stub-resolv.conf
+ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 fake_bin="$runtime_directory/bin"
 state_path="$runtime_directory/network-state.json"
 mkdir -p "$fake_bin"
@@ -54,5 +64,7 @@ if nft list tables | grep -q porta_; then
   exit 1
 fi
 rm -f "$fake_bin/resolvectl" "$state_path.lock"
-rmdir "$fake_bin" "$runtime_directory"
+rmdir "$fake_bin"
+umount /etc /run/systemd/resolve
+rm -rf "$runtime_directory"
 ' _ "$binary"

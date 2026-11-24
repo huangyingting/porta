@@ -187,6 +187,35 @@ successful retry rather than making its address available to another identity.
 Linux forwarding and NAT are deliberately outside the daemon. The supplied
 setup script makes these changes explicit and reversible. The daemon itself can
 run with only access to `/dev/net/tun` plus the configured TCP/UDP port.
+Traffic between clients never reaches the kernel: the router delivers a
+packet whose destination is another live lease, or a subnet routed to another
+device, directly to that session's queue, decrementing its TTL. Before that,
+it checks the source (the sender's lease or one of its subnets), whether the
+two devices are peers (same account, shared access group, or
+`--client-to-client`), and both accounts' allow and deny lists, whose rules
+may name protocols and ports for what the sender opens (`porta-server`'s
+`policy` module). Packets toward the exit are checked against the sender's
+lists; packets sourced from a
+subnet may only reach other clients. The kernel forward chain therefore drops
+all `porta0`-to-`porta0` traffic.
+
+With `--peer-to-peer`, the gateway also introduces peers so that they can
+skip it (`porta_wire::peer`). It sets `x-porta-peers: ?1` on HTTP/3
+CONNECT-IP responses. A split-tunnel client then generates a self-signed
+certificate for the tunnel and sends its SHA-256 fingerprint in a
+`PEER_OFFER` capsule (`0xff7010`). The gateway records it with the UDP
+address it sees for the QUIC connection and answers with a `PEERS` capsule
+(`0xff7011`): every published device the two may both reach under the
+switching rules above, with its tunnel addresses, public address and
+fingerprint, resent whenever the list changes. Clients share the tunnel's
+UDP socket with their peer connections, so NATs map both to the address the
+gateway saw. Of each pair the lower tunnel address dials, over QUIC with
+ALPN `porta-peer/1` and mutual certificate pinning; the other side sends
+throwaway connection attempts of its own to open its NAT, accepts only from
+the address the gateway listed, and confirms the handshake by opening a
+stream, because a TLS client finishes before the server has checked its
+certificate. IP packets travel as QUIC datagrams; anything that does not
+fit or has no live path goes through the gateway.
 
 Packet-device reads transfer ownership of their buffers to the caller. The
 router and client receive queues pass those buffers onward without another
@@ -207,6 +236,57 @@ caches only fully validated public DNS answers for 30 seconds, and rejects the
 whole answer set if any address is private or reserved. Downstream response
 writes are coalesced up to 128 KiB or two milliseconds before a protocol flush;
 the final partial buffer is flushed when the copy direction completes.
+
+## Cascade relays
+
+With `--upstream`, a gateway is a relay: it joins the next-hop gateway as an
+ordinary native device, using the shared client tunnel implementation, its own
+persistent P-256 identity (`--upstream-identity`), and a client token from the
+next hop (`PORTA_UPSTREAM_TOKEN`). No protocol extension is involved, so any
+Porta gateway can serve as a next hop, and relays chain to any depth.
+
+```text
+client --MASQUE--> relay: porta0 -> policy route -> porta-up0 --MASQUE--> next hop
+```
+
+The relay owns a second TUN, `porta-up0`, addressed with a fixed relay address
+(`--upstream-address`, default `169.254.66.1/32`). The kernel still does the
+forwarding work:
+
+- an `iif porta0` rule (priority `10066`) selects table `10066`, whose default
+  route is `porta-up0`, whose `unreachable` fallback covers a missing
+  interface, and whose `throw` route for the pool keeps client-to-client
+  traffic in the main table;
+- named exits get their own TUN (`porta-up1`, ...) and table (`10067`, ...);
+  the daemon adds a priority-`10065` rule `from <lease> iif porta0` for each
+  lease whose account selects an exit (`lookup main` for the local exit),
+  reconciles those rules every 30 seconds, and removes them on shutdown;
+- the Porta forward chain accepts client traffic only toward `porta-up0`, and
+  masquerades it to the relay address; a mangle chain clamps TCP MSS to the
+  route MTU; unsolicited input from `porta-up0` is dropped.
+
+The daemon reads `porta-up0`, accepts only packets sourced from the relay
+address, translates that source to its current upstream lease, and sends the
+packets through the upstream tunnel. Received packets are translated back
+before being written to `porta-up0`, where conntrack restores each client
+address. Translation is stateless and one-to-one; it updates IPv4, TCP and UDP
+checksums incrementally and rewrites the packet quoted by ICMP errors so that
+conntrack can match PMTU and unreachable feedback. Because the upstream lease
+is never a local address, a relay and its next hop may use overlapping or
+identical pools. `accept_local=1` on `porta-up0` admits MTU feedback from a
+next-hop gateway whose address equals the relay's own gateway address.
+
+Hops decapsulate and re-encapsulate, so encapsulation overhead does not
+accumulate. The upstream interface MTU follows the upstream lease, including
+automatic HTTP/3 MTU selection. Larger downstream packets receive the normal
+kernel fragmentation or ICMP Fragmentation Needed treatment.
+
+The upstream connection reconnects with exponential backoff up to 30 seconds;
+authentication and protocol rejections retry every 30 seconds so that fixing
+the token or enrollment on the next hop recovers without a restart. While it
+is down, policy routing still selects `porta-up0` and the daemon drops what it
+reads, so traffic never falls back to the relay's physical route. The relay's
+own traffic, including its tunnel to the next hop, is not policy-routed.
 
 ## Transport behavior
 
@@ -252,8 +332,10 @@ calls and retries after an earlier close future was cancelled.
 
 ## Platform clients
 
-- Linux configures the TUN, endpoint escape and full-tunnel routes, and
-  systemd-resolved per-link DNS through an exclusively locked recovery journal.
+- Linux configures the TUN, endpoint escape and full- or split-tunnel routes,
+  and systemd-resolved per-link DNS through an exclusively locked recovery
+  journal. A split tunnel's guard blocks only the advertised prefixes outside
+  the tunnel.
   An owned nftables OUTPUT guard remains installed during reconnect and cleanup
   removes it last. This covers host traffic, not containers or forwarded traffic.
 - Windows calls the official Wintun API through a pinned DLL whose SHA-256 is
@@ -311,15 +393,18 @@ and reports that condition.
 The following changes require coordinated protocol and operational design, not
 isolated transport patches:
 
-1. **IPv6:** add IPv6 lease and route capsules, dual-stack source validation,
-   Android/Windows interface configuration, IPv6 forwarding, and tests that
-   prevent traffic leaks when only one address family is available.
+1. **IPv6 across relays:** carry IPv6 through cascade next hops and named
+   exits, which today stay IPv4-only. Gateways otherwise lease IPv6 addresses
+   that mirror the IPv4 leases (see [IPv6](deployment.md#ipv6-dual-stack)).
 2. **Split routing:** authenticate server-defined route policy, advertise only
    authorized prefixes, configure platform-specific route exclusions, and
    define DNS behavior for included and excluded destinations.
-3. **High availability:** use a shared identity and lease control plane,
-   coordinate duplicate-session ownership, and provide a packet-routing layer
-   that can deliver return traffic to the instance holding each live tunnel.
-   Sharing the JSON lease file between independent servers is not sufficient.
+3. **Clustered high availability:** gateways restart in place without
+   dropping their sockets or interfaces, and federated gateways with
+   multi-gateway profiles give active/standby redundancy. Keeping a device's
+   address across hosts needs a shared lease control plane, coordinated
+   session ownership, and a packet-routing layer that delivers return traffic
+   to the instance holding each live tunnel. Sharing the JSON lease file
+   between independent servers is not sufficient.
 QUIC connection migration, policy management, and a control-plane API remain
 future work.

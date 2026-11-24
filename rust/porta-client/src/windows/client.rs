@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::failover::{self, Candidate};
 use crate::identity::IdentityError;
 use crate::tunnel::{self, ClientError, Connection, DeliveryMode, Lease, Transport};
 
@@ -22,7 +23,8 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Config {
-    pub server: Url,
+    /// Gateways sharing one account registry, tried fastest first.
+    pub servers: Vec<Url>,
     pub token: String,
     pub tls: Arc<RustlsClientConfig>,
     pub transport: Transport,
@@ -33,6 +35,9 @@ pub struct Config {
     pub reconnect: bool,
     pub connect_timeout: Duration,
     pub reconnect_max_delay: Duration,
+    /// In a full tunnel, keep the directly connected private networks
+    /// reachable outside the tunnel.
+    pub allow_lan: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +46,10 @@ pub struct ConnectionInfo {
     pub delivery_mode: DeliveryMode,
     pub remote_address: SocketAddr,
     pub lease: Lease,
+    /// Account limits the gateway reported when the tunnel was established.
+    pub account: crate::tunnel::AccountStatus,
+    /// Destinations the gateway tunnels; empty routes mean a full tunnel.
+    pub routing: crate::tunnel::Routing,
     pub connected_at: Instant,
 }
 
@@ -49,6 +58,8 @@ pub enum Event {
     RecoveringNetwork,
     Connecting {
         attempt: u64,
+        /// The gateway's origin, from the profile's gateways.
+        gateway: String,
         remote_address: SocketAddr,
     },
     ConfiguringNetwork,
@@ -56,10 +67,17 @@ pub enum Event {
     Progress {
         uploaded_bytes: u64,
         downloaded_bytes: u64,
+        /// Latest gateway-reported limits, which can change while connected.
+        account: crate::tunnel::AccountStatus,
     },
+    /// The devices the tunnel reaches directly changed.
+    DirectPeers(Vec<crate::tunnel::DirectPeer>),
     Reconnecting {
         reason: String,
         delay: Duration,
+        /// The network intercepts the gateway, as a captive network does
+        /// until the user signs in; see [`crate::captive`].
+        sign_in_required: bool,
     },
     Stopping,
 }
@@ -101,6 +119,23 @@ pub enum RunError {
     Cancelled,
 }
 
+impl RunError {
+    /// The account limit that ended the tunnel, if the gateway reported one.
+    pub fn account_denial(&self) -> Option<crate::tunnel::AccountDenial> {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = source {
+            if let Some(denial) = error
+                .downcast_ref::<ClientError>()
+                .and_then(ClientError::denial)
+            {
+                return Some(denial);
+            }
+            source = error.source();
+        }
+        None
+    }
+}
+
 pub async fn run(
     config: Config,
     cancellation: CancellationToken,
@@ -118,7 +153,9 @@ pub async fn run(
     let mut network = if config.manual_network {
         None
     } else {
-        Some(NetworkManager::open(config.network_state_path.clone())?)
+        let mut manager = NetworkManager::open(config.network_state_path.clone())?;
+        manager.set_allow_lan(config.allow_lan);
+        Some(manager)
     };
     let mut network_active = network.as_ref().is_some_and(NetworkManager::needs_cleanup);
     let endpoints = if let Some(manager) = network.as_ref() {
@@ -133,17 +170,13 @@ pub async fn run(
                     ),
                 ));
             }
-            resolve_endpoints(&config.server, &cancellation)
-                .await
-                .map_err(RunError::Resolve)?
+            ordered_candidates(&config.servers, &cancellation).await?
         } else {
             observer.event(Event::RecoveringNetwork);
-            restored_endpoints(&config.server, saved)?
+            restored_candidates(&config.servers, saved)?
         }
     } else {
-        resolve_endpoints(&config.server, &cancellation)
-            .await
-            .map_err(RunError::Resolve)?
+        ordered_candidates(&config.servers, &cancellation).await?
     };
 
     let mut attempt = 0_u64;
@@ -167,10 +200,13 @@ pub async fn run(
         }
 
         attempt += 1;
-        let remote_address = endpoints[endpoint_index % endpoints.len()];
+        let candidate = endpoints[endpoint_index % endpoints.len()];
+        let remote_address = candidate.address;
+        let gateway = &config.servers[candidate.gateway];
         endpoint_index += 1;
         observer.event(Event::Connecting {
             attempt,
+            gateway: gateway.to_string(),
             remote_address,
         });
 
@@ -191,7 +227,7 @@ pub async fn run(
         }
 
         let connected = tunnel::connect(tunnel::ClientConfig {
-            url: config.server.to_string(),
+            url: gateway.to_string(),
             token: config.token.clone(),
             transport: config.transport,
             tls: Arc::clone(&config.tls),
@@ -214,12 +250,18 @@ pub async fn run(
                 )
                 .await;
             }
-            Err(error) if error.is_retryable() && config.reconnect => {
+            // With protection active, an intercepting network blocks its own
+            // sign-in page, so keep trying until the user signs in.
+            Err(error)
+                if config.reconnect
+                    && (error.is_retryable() || error.is_intercepted() && network_active) =>
+            {
                 let delay = reconnect_delay(failures, config.reconnect_max_delay);
                 failures = failures.saturating_add(1);
                 observer.event(Event::Reconnecting {
                     reason: error.to_string(),
                     delay,
+                    sign_in_required: error.is_intercepted(),
                 });
                 if wait_or_cancel(delay, &cancellation).await {
                     continue;
@@ -278,7 +320,12 @@ pub async fn run(
         if let Some(manager) = network.as_mut() {
             observer.event(Event::ConfiguringNetwork);
             let result = manager
-                .up(device.name(), &connection.remote_address, connection.lease)
+                .up(
+                    device.name(),
+                    &connection.remote_address,
+                    connection.lease,
+                    &connection.routing,
+                )
                 .await;
             if let Err(source) = result {
                 connection.close().await;
@@ -299,6 +346,8 @@ pub async fn run(
             delivery_mode: connection.delivery_mode,
             remote_address: connection.remote_address,
             lease: connection.lease,
+            account: connection.account(),
+            routing: connection.routing.clone(),
             connected_at: Instant::now(),
         }));
 
@@ -343,6 +392,7 @@ pub async fn run(
                 observer.event(Event::Reconnecting {
                     reason: error,
                     delay,
+                    sign_in_required: false,
                 });
                 if !wait_or_cancel(delay, &cancellation).await {
                     return stop(
@@ -383,10 +433,17 @@ async fn run_session(
     let mut progress = tokio::time::interval(Duration::from_secs(1));
     progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     progress.tick().await;
+    let mut direct = connection.direct_peers();
 
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return SessionEnd::Cancelled,
+            changed = async { direct.as_mut().expect("guarded").changed().await }, if direct.is_some() => {
+                match direct.as_mut().filter(|_| changed.is_ok()) {
+                    Some(peers) => observer.event(Event::DirectPeers(peers.borrow_and_update().clone())),
+                    None => direct = None,
+                }
+            }
             Some(error) = device_errors.recv() => {
                 return SessionEnd::Terminal(Box::new(error));
             }
@@ -422,6 +479,7 @@ async fn run_session(
             _ = progress.tick() => observer.event(Event::Progress {
                 uploaded_bytes,
                 downloaded_bytes,
+                account: connection.account(),
             }),
         }
     }
@@ -429,7 +487,7 @@ async fn run_session(
 
 fn packet_matches_lease(packet: &[u8], lease: Lease) -> bool {
     packet.len() <= usize::from(lease.mtu)
-        && porta_wire::ip::parse_ipv4(packet).is_ok_and(|info| info.source == lease.address.addr())
+        && porta_wire::ip::parse_ip(packet).is_ok_and(|info| lease.owns(info.source))
 }
 
 async fn wait_or_cancel(delay: Duration, cancellation: &CancellationToken) -> bool {
@@ -509,6 +567,66 @@ fn retained_if_needed(
     } else {
         RunError::Runtime(Box::new(source))
     }
+}
+
+/// Every endpoint of every gateway, fastest first; protection is not yet
+/// active, so each can be measured.
+async fn ordered_candidates(
+    gateways: &[Url],
+    cancellation: &CancellationToken,
+) -> Result<Vec<Candidate>, RunError> {
+    if gateways.is_empty() {
+        return Err(RunError::Invalid("a profile needs a gateway".to_owned()));
+    }
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match resolve_endpoints(gateway, cancellation).await {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(ClientError::Closed) => return Err(RunError::Resolve(ClientError::Closed)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(RunError::Resolve(last_error.unwrap_or_else(|| {
+            ClientError::unavailable("no gateway endpoint")
+        })));
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates);
+    }
+    let addresses = candidates
+        .iter()
+        .map(|candidate| candidate.address)
+        .collect::<Vec<_>>();
+    let latencies = failover::probe(&addresses, failover::PROBE_TIMEOUT, cancellation).await;
+    Ok(failover::order(&candidates, &latencies))
+}
+
+fn restored_candidates(
+    gateways: &[Url],
+    saved: Vec<SocketAddr>,
+) -> Result<Vec<Candidate>, RunError> {
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match restored_endpoints(gateway, saved.clone()) {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(
+            last_error.unwrap_or_else(|| RunError::Invalid("a profile needs a gateway".to_owned()))
+        );
+    }
+    Ok(candidates)
 }
 
 async fn resolve_endpoints(
@@ -612,9 +730,11 @@ fn usable_endpoint(address: IpAddr) -> bool {
     }
 }
 
+/// Waits 250 ms before the first retry, so a session a restarting gateway
+/// ended resumes at once, then doubles up to `maximum`.
 pub fn reconnect_delay(failures: u32, maximum: Duration) -> Duration {
     let maximum = maximum.max(Duration::from_secs(1));
-    Duration::from_secs(1_u64 << failures.min(5)).min(maximum)
+    Duration::from_millis(250_u64 << failures.min(7)).min(maximum)
 }
 
 #[cfg(test)]
@@ -628,6 +748,7 @@ mod tests {
             gateway: None,
             dns: Some("10.0.0.1".parse().unwrap()),
             mtu: 1280,
+            address6: None,
         };
         let mut packet = vec![0; usize::from(lease.mtu)];
         packet[0] = 0x45;
@@ -650,17 +771,31 @@ mod tests {
         assert!(!packet_matches_lease(&packet, lease));
         assert!(!packet_matches_lease(&[], lease));
         assert!(!packet_matches_lease(&packet[..19], lease));
+
+        // IPv6 packets need the IPv6 lease as their source.
+        let mut ipv6 = vec![0; 40];
+        ipv6[0] = 0x60;
+        ipv6[6] = 59;
+        ipv6[8..24].copy_from_slice(&"fd66::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert!(!packet_matches_lease(&ipv6, lease));
+        let dual = Lease {
+            address6: Some("fd66::2/128".parse().unwrap()),
+            ..lease
+        };
+        assert!(packet_matches_lease(&ipv6, dual));
+        ipv6[23] = 9;
+        assert!(!packet_matches_lease(&ipv6, dual));
     }
 
     #[test]
     fn reconnect_backoff_is_bounded() {
         assert_eq!(
             reconnect_delay(0, Duration::from_secs(30)),
-            Duration::from_secs(1)
+            Duration::from_millis(250)
         );
         assert_eq!(
             reconnect_delay(4, Duration::from_secs(30)),
-            Duration::from_secs(16)
+            Duration::from_secs(4)
         );
         assert_eq!(
             reconnect_delay(9, Duration::from_secs(30)),

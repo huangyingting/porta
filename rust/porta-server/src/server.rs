@@ -46,6 +46,47 @@ pub struct ServeOptions {
     pub idle_timeout: std::time::Duration,
 }
 
+/// A listening socket inherited from the previous program after an in-place
+/// restart, or a fresh one; either way it is kept for the next restart.
+#[cfg(unix)]
+pub fn listen_tcp(address: SocketAddr) -> Result<TcpListener> {
+    use std::os::fd::AsFd;
+    let listener = match crate::ops::handoff::take_socket(Type::STREAM, address) {
+        Some(socket) => {
+            socket.set_nonblocking(true)?;
+            TcpListener::from_std(socket.into())?
+        }
+        None => bind_tcp_listener(address)?,
+    };
+    crate::ops::handoff::pass_socket(listener.as_fd())?;
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+pub fn listen_tcp(address: SocketAddr) -> Result<TcpListener> {
+    bind_tcp_listener(address)
+}
+
+/// Like [`listen_tcp`] for the HTTP/3 UDP socket.
+#[cfg(unix)]
+pub fn listen_udp(address: SocketAddr) -> Result<std::net::UdpSocket> {
+    use std::os::fd::AsFd;
+    let socket = match crate::ops::handoff::take_socket(Type::DGRAM, address) {
+        Some(socket) => {
+            socket.set_nonblocking(true)?;
+            socket.into()
+        }
+        None => bind_udp_socket(address)?,
+    };
+    crate::ops::handoff::pass_socket(socket.as_fd())?;
+    Ok(socket)
+}
+
+#[cfg(not(unix))]
+pub fn listen_udp(address: SocketAddr) -> Result<std::net::UdpSocket> {
+    bind_udp_socket(address)
+}
+
 pub fn bind_tcp_listener(address: SocketAddr) -> Result<TcpListener> {
     let dual_stack = address.is_ipv6() && address.ip().is_unspecified();
     let domain = if address.is_ipv6() {

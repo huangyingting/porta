@@ -1,11 +1,15 @@
-//! Adaptive IPv4 datagram budgets, fragmentation, and bounded ICMP feedback.
+//! Adaptive datagram budgets, IPv4 fragmentation, and bounded ICMP and
+//! ICMPv6 feedback.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::ip::{classify_ipv4, internet_checksum, parse_ipv4, set_ipv4_header_checksum, FlowKey};
+use crate::ip::{
+    classify_packet, internet_checksum, parse_ipv4, parse_ipv6, set_ipv4_header_checksum, FlowKey,
+    IPV6_HEADER_LENGTH, IPV6_MIN_MTU,
+};
 
 const MIN_IPV4_MTU: usize = 68;
 const MAX_FEEDBACK_FLOWS: usize = 128;
@@ -140,7 +144,7 @@ impl FeedbackPolicy {
         }
         self.flows
             .retain(|state| now.saturating_duration_since(state.last_seen) < FLOW_IDLE_TIMEOUT);
-        let flow = classify_ipv4(packet).flow;
+        let flow = classify_packet(packet).flow;
         let index = match self.flows.iter().position(|state| state.flow == flow) {
             Some(index) => index,
             None => {
@@ -353,6 +357,61 @@ pub fn icmp_fragmentation_needed(
     response[22..24].copy_from_slice(&icmp_checksum);
     set_ipv4_header_checksum(&mut response).map_err(|_| MtuError::InvalidPacket)?;
     Ok(response)
+}
+
+/// An ICMPv6 Packet Too Big message from `gateway` telling the sender of an
+/// oversized IPv6 packet to use `mtu`, which IPv6 requires to be at least
+/// 1280 bytes. IPv6 routers never fragment, so this replaces fragmentation.
+pub fn icmpv6_packet_too_big(
+    packet: &[u8],
+    gateway: Ipv6Addr,
+    mtu: usize,
+) -> Result<Vec<u8>, MtuError> {
+    if !(IPV6_MIN_MTU..=u32::MAX as usize).contains(&mtu) {
+        return Err(MtuError::InvalidMtu);
+    }
+    let (source, destination) = parse_ipv6(packet).map_err(|_| MtuError::InvalidPacket)?;
+    if packet.len() <= mtu
+        || !unicast6(gateway)
+        || !unicast6(source)
+        || !unicast6(destination)
+        // Never answer an ICMPv6 error with another (RFC 4443 2.4).
+        || packet[6] == 58 && packet.get(IPV6_HEADER_LENGTH).is_none_or(|kind| *kind < 128)
+    {
+        return Err(MtuError::IcmpSuppressed);
+    }
+    // The reply quotes as much of the packet as fits the minimum MTU.
+    let quote_length = packet.len().min(IPV6_MIN_MTU - IPV6_HEADER_LENGTH - 8);
+    let icmp_length = 8 + quote_length;
+    let mut response = vec![0; IPV6_HEADER_LENGTH + icmp_length];
+    response[0] = 0x60;
+    response[4..6].copy_from_slice(&(icmp_length as u16).to_be_bytes());
+    response[6] = 58;
+    response[7] = 64;
+    response[8..24].copy_from_slice(&gateway.octets());
+    response[24..40].copy_from_slice(&source.octets());
+    response[40] = 2;
+    response[44..48].copy_from_slice(&(mtu as u32).to_be_bytes());
+    response[48..].copy_from_slice(&packet[..quote_length]);
+    let checksum = icmpv6_checksum(&response).to_be_bytes();
+    response[42..44].copy_from_slice(&checksum);
+    Ok(response)
+}
+
+/// The ICMPv6 checksum of a packet whose payload is one ICMPv6 message,
+/// over the IPv6 pseudo-header and the message.
+fn icmpv6_checksum(packet: &[u8]) -> u16 {
+    let message = &packet[IPV6_HEADER_LENGTH..];
+    let mut data = Vec::with_capacity(40 + message.len());
+    data.extend_from_slice(&packet[8..40]);
+    data.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    data.extend_from_slice(&[0, 0, 0, 58]);
+    data.extend_from_slice(message);
+    internet_checksum(&data)
+}
+
+fn unicast6(address: Ipv6Addr) -> bool {
+    !address.is_unspecified() && !address.is_loopback() && !address.is_multicast()
 }
 
 fn unicast(address: Ipv4Addr) -> bool {
@@ -838,8 +897,8 @@ mod tests {
             );
             let above_ceiling = packet(length, 0x4000, &[]);
             assert_eq!(
-                classify_ipv4(&within_ceiling).flow,
-                classify_ipv4(&above_ceiling).flow
+                classify_packet(&within_ceiling).flow,
+                classify_packet(&above_ceiling).flow
             );
             assert_eq!(
                 policy.on_oversized(&above_ceiling, 1160, 1300, at, rtt),
@@ -1033,7 +1092,7 @@ mod tests {
         let mut ack = oversized[..40].to_vec();
         ack[2..4].copy_from_slice(&40_u16.to_be_bytes());
         set_ipv4_header_checksum(&mut ack).unwrap();
-        assert_eq!(classify_ipv4(&ack).flow, classify_ipv4(&oversized).flow);
+        assert_eq!(classify_packet(&ack).flow, classify_packet(&oversized).flow);
         let now = Instant::now();
         let rtt = Duration::ZERO;
         for elapsed in [0, 100, 200] {
@@ -1119,5 +1178,48 @@ mod tests {
             policy.on_oversized(&flow_packet(port), 1160, 1400, now + ICMP_INTERVAL, rtt);
             assert_eq!(policy.flows.len(), 128);
         }
+    }
+
+    #[test]
+    fn ipv6_packet_too_big_quotes_the_packet_and_checksums() {
+        let gateway: Ipv6Addr = "fd66::1".parse().unwrap();
+        let sender: Ipv6Addr = "2001:db8::80".parse().unwrap();
+        let client: Ipv6Addr = "fd66::2".parse().unwrap();
+        let packet = crate::ip::tests::ipv6_packet(sender, client, 17, &vec![7; 1460]);
+        let reply = icmpv6_packet_too_big(&packet, gateway, 1300).unwrap();
+        assert_eq!(reply.len(), IPV6_MIN_MTU);
+        let (source, destination) = parse_ipv6(&reply).unwrap();
+        assert_eq!((source, destination), (gateway, sender));
+        assert_eq!(&reply[40..42], &[2, 0]);
+        assert_eq!(
+            u32::from_be_bytes([reply[44], reply[45], reply[46], reply[47]]),
+            1300
+        );
+        assert_eq!(&reply[48..88], &packet[..40]);
+        assert_eq!(icmpv6_checksum(&reply), 0);
+
+        assert_eq!(
+            icmpv6_packet_too_big(&packet, gateway, 1200),
+            Err(MtuError::InvalidMtu)
+        );
+        assert_eq!(
+            icmpv6_packet_too_big(&packet, gateway, 1500),
+            Err(MtuError::IcmpSuppressed)
+        );
+        let error = crate::ip::tests::ipv6_packet(sender, client, 58, &vec![1; 1400]);
+        assert_eq!(
+            icmpv6_packet_too_big(&error, gateway, 1300),
+            Err(MtuError::IcmpSuppressed)
+        );
+        let multicast =
+            crate::ip::tests::ipv6_packet(sender, "ff02::1".parse().unwrap(), 17, &vec![0; 1400]);
+        assert_eq!(
+            icmpv6_packet_too_big(&multicast, gateway, 1300),
+            Err(MtuError::IcmpSuppressed)
+        );
+        assert_eq!(
+            icmpv6_packet_too_big(&[0x45; 1400], gateway, 1300),
+            Err(MtuError::InvalidPacket)
+        );
     }
 }

@@ -15,6 +15,8 @@ struct FakeState {
     addresses: HashMap<String, Vec<String>>,
     routes: HashMap<String, Vec<RouteInfo>>,
     tables: HashMap<String, String>,
+    chains: Vec<(String, String)>,
+    sysctl: HashMap<String, String>,
     dns: HashMap<String, String>,
     domains: HashMap<String, String>,
     commands: Vec<String>,
@@ -99,6 +101,16 @@ impl FakeCommands {
                         let fields = line.split_whitespace().collect::<Vec<_>>();
                         if line.starts_with("delete table ") {
                             state.tables.remove(fields[3]);
+                            state.chains.retain(|(table, _)| table != fields[3]);
+                        } else if line.starts_with("add chain ") {
+                            let chain = (fields[3].to_owned(), fields[4].to_owned());
+                            if !state.chains.contains(&chain) {
+                                state.chains.push(chain);
+                            }
+                        } else if line.starts_with("delete chain ") {
+                            state.chains.retain(|(table, chain)| {
+                                !(table == fields[3] && chain == fields[4])
+                            });
                         } else if line.starts_with("add table ") {
                             state.tables.insert(
                                 fields[3].to_owned(),
@@ -107,6 +119,16 @@ impl FakeCommands {
                         }
                     }
                     return Ok(String::new());
+                }
+                if arguments.get(2).is_some_and(|value| value == "chains") {
+                    let chains = state
+                        .chains
+                        .iter()
+                        .map(|(table, chain)| {
+                            json!({"chain": {"family": "inet", "table": table, "name": chain}})
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(json!({"nftables": chains}).to_string());
                 }
                 let tables = state
                     .tables
@@ -121,6 +143,17 @@ impl FakeCommands {
                     })
                     .collect::<Vec<_>>();
                 Ok(json!({"nftables": tables}).to_string())
+            }
+            "sysctl" => {
+                if arguments[0] == "-n" {
+                    return Ok(format!(
+                        "{}\n",
+                        state.sysctl.get(&arguments[1]).map_or("0", String::as_str)
+                    ));
+                }
+                let (key, value) = arguments[1].split_once('=').unwrap();
+                state.sysctl.insert(key.to_owned(), value.to_owned());
+                Ok(String::new())
             }
             "resolvectl" => {
                 match arguments.first().map(String::as_str) {
@@ -412,6 +445,7 @@ fn test_lease() -> Lease {
         gateway: Some("10.77.0.1".parse().unwrap()),
         dns: Some("1.1.1.1".parse().unwrap()),
         mtu: 1280,
+        address6: None,
     }
 }
 
@@ -429,12 +463,282 @@ fn snapshot(commands: &FakeCommands) -> std::sync::MutexGuard<'_, FakeState> {
     commands.state.lock().unwrap()
 }
 
+fn tunnel_destinations(state: &FakeState) -> Vec<String> {
+    state
+        .routes
+        .iter()
+        .filter(|(_, routes)| routes.iter().any(|route| route.device == "porta0"))
+        .map(|(key, _)| key.trim_start_matches("-4 ").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn split_tunnel_routes_only_advertised_prefixes_and_scopes_dns_and_guard() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        routes: vec![
+            "10.20.0.0/16".parse().unwrap(),
+            "192.168.5.0/24".parse().unwrap(),
+        ],
+        dns_domains: vec!["corp.example".to_owned()],
+        ..crate::tunnel::Routing::default()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        let tunnel_routes = tunnel_destinations(&state);
+        for expected in ["10.20.0.0/16", "192.168.5.0/24", "1.1.1.1/32"] {
+            assert!(
+                tunnel_routes.iter().any(|route| route == expected),
+                "{tunnel_routes:?}"
+            );
+        }
+        assert!(!tunnel_routes.iter().any(|route| route == "0.0.0.0/1"));
+        assert_eq!(
+            state.domains.get("porta0").map(String::as_str),
+            Some("~corp.example")
+        );
+        let rules = state.scripts.last().unwrap();
+        assert!(rules.contains("policy accept"), "{rules}");
+        assert!(
+            rules.contains("ip daddr { 10.20.0.0/16, 192.168.5.0/24, 1.1.1.1/32 } drop"),
+            "{rules}"
+        );
+        assert!(!rules.contains("udp dport { 53, 853 } drop"), "{rules}");
+    }
+
+    // A later full-tunnel lease replaces the split routes and guard.
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        let tunnel_routes = tunnel_destinations(&state);
+        assert!(
+            !tunnel_routes.iter().any(|route| route == "10.20.0.0/16"),
+            "{tunnel_routes:?}"
+        );
+        assert!(tunnel_routes.iter().any(|route| route == "0.0.0.0/1"));
+        assert_eq!(state.domains.get("porta0").map(String::as_str), Some("~."));
+        let rules = state.scripts.last().unwrap();
+        assert!(rules.contains("policy drop"), "{rules}");
+    }
+    manager.down().await.unwrap();
+    assert!(snapshot(&commands).tables.is_empty());
+}
+
+#[tokio::test]
+async fn dual_stack_leases_route_ipv6_through_the_tunnel() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    snapshot(&commands).sysctl.insert(
+        "net/ipv6/conf/porta0/disable_ipv6".to_owned(),
+        "1".to_owned(),
+    );
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let lease = Lease {
+        address6: Some("fd66::2/128".parse().unwrap()),
+        ..test_lease()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            lease,
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.sysctl["net/ipv6/conf/porta0/disable_ipv6"], "0");
+        assert_eq!(
+            state.addresses["porta0"],
+            vec!["10.77.0.2/24".to_owned(), "fd66::2/128".to_owned()]
+        );
+        for route in ["-6 ::/1", "-6 8000::/1", "-4 0.0.0.0/1"] {
+            assert!(
+                state.routes.contains_key(route),
+                "{:?}",
+                state.routes.keys()
+            );
+        }
+        assert!(state.scripts.last().unwrap().contains("policy drop"));
+    }
+
+    // Split tunnels route and guard only the advertised IPv6 prefixes.
+    let routing = crate::tunnel::Routing {
+        routes: vec!["10.20.0.0/16".parse().unwrap()],
+        routes6: vec![
+            "fd66::/64".parse().unwrap(),
+            "2001:db8::/32".parse().unwrap(),
+        ],
+        ..crate::tunnel::Routing::default()
+    };
+    manager
+        .up("porta0", endpoint, lease, &routing)
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert!(!state.routes.contains_key("-6 ::/1"));
+        assert!(state.routes.contains_key("-6 fd66::/64"));
+        assert!(state.routes.contains_key("-6 2001:db8::/32"));
+        let rules = state.scripts.last().unwrap();
+        assert!(
+            rules.contains("ip6 daddr { fd66::/64, 2001:db8::/32 } drop"),
+            "{rules}"
+        );
+        assert!(rules.contains("ip daddr { 10.20.0.0/16 } drop"), "{rules}");
+    }
+
+    // Below the IPv6 minimum MTU the IPv6 address and routes go away.
+    let small = Lease { mtu: 1200, ..lease };
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            small,
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.addresses["porta0"], vec!["10.77.0.2/24".to_owned()]);
+        assert!(!state.routes.keys().any(|route| route.starts_with("-6 ")));
+    }
+    manager
+        .up("porta0", endpoint, lease, &routing)
+        .await
+        .unwrap();
+    manager.down().await.unwrap();
+    let state = snapshot(&commands);
+    assert!(state.routes.is_empty());
+    assert!(state.addresses.get("porta0").is_none_or(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn subnet_router_forwards_and_masquerades_its_subnets_and_restores_forwarding() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    manager.set_subnet_router(true);
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        subnets: vec!["10.30.0.0/24".parse().unwrap()],
+        ..crate::tunnel::Routing::default()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.sysctl["net.ipv4.ip_forward"], "1");
+        let rules = state.scripts.last().unwrap();
+        assert!(
+            rules.contains("iifname \"porta0\" ip daddr { 10.30.0.0/24 } masquerade"),
+            "{rules}"
+        );
+        // The full-tunnel output guard still applies to the host itself.
+        assert!(rules.contains("policy drop"), "{rules}");
+    }
+
+    // Without assigned subnets the NAT chain and forwarding are removed.
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let state = snapshot(&commands);
+        assert_eq!(state.sysctl["net.ipv4.ip_forward"], "0");
+        assert!(state.scripts.last().unwrap().contains("delete chain"));
+    }
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    manager.down().await.unwrap();
+    let state = snapshot(&commands);
+    assert_eq!(state.sysctl["net.ipv4.ip_forward"], "0");
+    assert!(state.tables.is_empty());
+}
+
+#[tokio::test]
+async fn subnet_router_leaves_forwarding_it_did_not_enable() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    manager.set_subnet_router(true);
+    snapshot(&commands)
+        .sysctl
+        .insert("net.ipv4.ip_forward".to_owned(), "1".to_owned());
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        subnets: vec!["10.30.0.0/24".parse().unwrap()],
+        ..crate::tunnel::Routing::default()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    manager.down().await.unwrap();
+    assert_eq!(snapshot(&commands).sysctl["net.ipv4.ip_forward"], "1");
+}
+
+#[tokio::test]
+async fn split_tunnel_without_dns_domains_leaves_dns_alone() {
+    let (_directory, _path, commands, mut manager) = new_fake();
+    let endpoint = "198.51.100.10:443".parse().unwrap();
+    let routing = crate::tunnel::Routing {
+        routes: vec!["10.20.0.0/16".parse().unwrap()],
+        dns_domains: Vec::new(),
+        ..crate::tunnel::Routing::default()
+    };
+    manager.prepare(endpoint).await.unwrap();
+    manager
+        .up("porta0", endpoint, test_lease(), &routing)
+        .await
+        .unwrap();
+    let state = snapshot(&commands);
+    assert!(!state.dns.contains_key("porta0"));
+    assert!(!state.routes.contains_key("-4 1.1.1.1/32"));
+    assert!(state
+        .scripts
+        .last()
+        .unwrap()
+        .contains("ip daddr { 10.20.0.0/16 } drop"));
+}
+
 #[tokio::test]
 async fn automatic_full_tunnel_is_journaled_and_cleaned_in_order() {
     let (_directory, path, commands, mut manager) = new_fake();
     let endpoint = "198.51.100.10:443".parse().unwrap();
     manager.prepare(endpoint).await.unwrap();
-    manager.up("porta0", endpoint, test_lease()).await.unwrap();
+    manager
+        .up(
+            "porta0",
+            endpoint,
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
+        .await
+        .unwrap();
     {
         let state = snapshot(&commands);
         assert_eq!(state.routes.len(), 4);
@@ -478,7 +782,12 @@ async fn automatic_full_tunnel_is_journaled_and_cleaned_in_order() {
 async fn interrupted_setup_resumes_without_removing_protection() {
     let (_baseline_directory, _path, baseline_commands, mut baseline) = new_fake();
     baseline
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     let mutation_count = baseline_commands.mutation_count();
@@ -489,7 +798,12 @@ async fn interrupted_setup_resumes_without_removing_protection() {
         commands.set_failure(failure, true);
         assert!(
             manager
-                .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+                .up(
+                    "porta0",
+                    "198.51.100.10:443".parse().unwrap(),
+                    test_lease(),
+                    &crate::tunnel::Routing::default()
+                )
                 .await
                 .is_err(),
             "mutation {failure} unexpectedly succeeded"
@@ -498,7 +812,12 @@ async fn interrupted_setup_resumes_without_removing_protection() {
         drop(manager);
         let mut recovered = NetworkManager::open_with_commands(path, commands.clone()).unwrap();
         recovered
-            .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+            .up(
+                "porta0",
+                "198.51.100.10:443".parse().unwrap(),
+                test_lease(),
+                &crate::tunnel::Routing::default(),
+            )
             .await
             .unwrap();
         let state = snapshot(&commands);
@@ -519,7 +838,12 @@ async fn interrupted_setup_resumes_without_removing_protection() {
 async fn every_interrupted_cleanup_is_retryable_after_restart() {
     let (_baseline_directory, _path, baseline_commands, mut baseline) = new_fake();
     baseline
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     baseline_commands.reset_mutations();
@@ -531,7 +855,12 @@ async fn every_interrupted_cleanup_is_retryable_after_restart() {
         for fail_after in [false, true] {
             let (_directory, path, commands, mut manager) = new_fake();
             manager
-                .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+                .up(
+                    "porta0",
+                    "198.51.100.10:443".parse().unwrap(),
+                    test_lease(),
+                    &crate::tunnel::Routing::default(),
+                )
                 .await
                 .unwrap();
             commands.reset_mutations();
@@ -596,7 +925,12 @@ fn existing_empty_or_unowned_journals_fail_closed() {
 async fn reused_physical_interface_index_does_not_receive_stale_cleanup() {
     let (_directory, _path, commands, mut manager) = new_fake();
     manager
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     {
@@ -626,7 +960,12 @@ async fn reused_physical_interface_index_does_not_receive_stale_cleanup() {
 async fn renamed_physical_interface_retains_escape_route_cleanup_ownership() {
     let (_directory, _path, commands, mut manager) = new_fake();
     manager
-        .up("porta0", "198.51.100.10:443".parse().unwrap(), test_lease())
+        .up(
+            "porta0",
+            "198.51.100.10:443".parse().unwrap(),
+            test_lease(),
+            &crate::tunnel::Routing::default(),
+        )
         .await
         .unwrap();
     {

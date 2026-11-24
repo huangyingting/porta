@@ -4,8 +4,25 @@ set -eu
 source_certificate=${1:?usage: sync-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
 source_key=${2:?usage: sync-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
 destination_directory=${3:?usage: sync-cert.sh SOURCE_CERTIFICATE SOURCE_KEY DESTINATION_DIRECTORY}
+# Optional group allowed to read the private key, such as the unprivileged
+# service user's group.
+key_group=${4:-}
 
-install -d -m 0700 "$destination_directory"
+if [ -n "$key_group" ]; then
+	install -d -m 0750 "$destination_directory"
+	chgrp "$key_group" "$destination_directory"
+	key_mode=0640
+else
+	install -d -m 0700 "$destination_directory"
+	key_mode=0600
+fi
+# Applies the key's group and mode, also to an unchanged pair after upgrades.
+publish_key_access() {
+	if [ -n "$key_group" ]; then
+		chgrp "$key_group" "$1"
+	fi
+	chmod "$key_mode" "$1"
+}
 exec 9>"$destination_directory/.sync.lock"
 flock 9
 stage=$(mktemp -d "$destination_directory/.sync.XXXXXX")
@@ -34,11 +51,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 install -m 0644 "$source_certificate" "$stage/server.crt"
 install -m 0600 "$source_key" "$stage/server.key"
+publish_key_access "$stage/server.key"
 
 if [ -f "$destination_directory/server.crt" ] &&
 	[ -f "$destination_directory/server.key" ] &&
 	cmp -s "$stage/server.crt" "$destination_directory/server.crt" &&
 	cmp -s "$stage/server.key" "$destination_directory/server.key"; then
+	publish_key_access "$destination_directory/server.key"
 	exit 0
 fi
 

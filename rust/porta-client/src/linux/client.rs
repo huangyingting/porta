@@ -12,9 +12,12 @@ use tokio::time::{interval_at, timeout, Instant as TokioInstant, MissedTickBehav
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::failover::{self, Candidate};
 use crate::identity::{self, IdentityError};
 use crate::tls::{self, TlsConfigError};
-use crate::tunnel::{self, ClientConfig, ClientError, Connection, DeliveryMode, Lease, Transport};
+use crate::tunnel::{
+    self, AccountStatus, ClientConfig, ClientError, Connection, DeliveryMode, Lease, Transport,
+};
 
 use super::network::{NetworkError, NetworkManager};
 use super::tun::Tun;
@@ -23,10 +26,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 const PACKET_QUEUE: usize = 256;
+const MAX_GATEWAYS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub server_url: String,
+    /// Gateways sharing one account registry, tried fastest first.
+    pub server_urls: Vec<String>,
     pub token: String,
     pub transport: Transport,
     pub interface_name: String,
@@ -38,6 +43,12 @@ pub struct Config {
     pub reconnect_max_delay: Duration,
     pub manual_network: bool,
     pub network_state: PathBuf,
+    /// Forward and masquerade tunnel traffic to the subnets the gateway
+    /// routes to this device.
+    pub subnet_router: bool,
+    /// In a full tunnel, keep the directly connected private networks
+    /// reachable outside the tunnel.
+    pub allow_lan: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +57,9 @@ pub enum State {
     Configuring,
     Connected,
     Reconnecting,
+    /// Reconnecting while the network intercepts the gateway, as a captive
+    /// network does until the user signs in; see [`crate::captive`].
+    SignInRequired,
     Disconnected,
     Error,
 }
@@ -55,9 +69,15 @@ pub struct Event {
     pub state: State,
     pub message: String,
     pub lease: Option<Lease>,
+    /// Account limits the gateway reported when the tunnel was established.
+    pub account: AccountStatus,
     pub transport: Transport,
     pub delivery_mode: DeliveryMode,
     pub connected_at: Option<SystemTime>,
+    /// Routes and DNS domains of the current tunnel.
+    pub routing: crate::tunnel::Routing,
+    /// Devices the tunnel currently reaches directly.
+    pub direct_peers: Vec<crate::tunnel::DirectPeer>,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub packets_uploaded: u64,
@@ -100,23 +120,30 @@ struct Counters {
     packets_downloaded: AtomicU64,
 }
 
+/// Connection fields reported with an event.
+#[derive(Clone)]
+struct EventDetails {
+    lease: Option<Lease>,
+    account: AccountStatus,
+    transport: Transport,
+    delivery_mode: DeliveryMode,
+    connected_at: Option<SystemTime>,
+    routing: crate::tunnel::Routing,
+    direct_peers: Vec<crate::tunnel::DirectPeer>,
+}
+
 impl Counters {
-    fn event(
-        &self,
-        state: State,
-        message: impl Into<String>,
-        lease: Option<Lease>,
-        transport: Transport,
-        delivery_mode: DeliveryMode,
-        connected_at: Option<SystemTime>,
-    ) -> Event {
+    fn event(&self, state: State, message: impl Into<String>, details: EventDetails) -> Event {
         Event {
             state,
             message: message.into(),
-            lease,
-            transport,
-            delivery_mode,
-            connected_at,
+            lease: details.lease,
+            account: details.account,
+            transport: details.transport,
+            delivery_mode: details.delivery_mode,
+            connected_at: details.connected_at,
+            routing: details.routing,
+            direct_peers: details.direct_peers,
             bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: self.bytes_downloaded.load(Ordering::Relaxed),
             packets_uploaded: self.packets_uploaded.load(Ordering::Relaxed),
@@ -153,7 +180,7 @@ impl DeviceReader {
                         }
                     },
                 };
-                if porta_wire::ip::parse_ipv4(&packet).is_err() {
+                if porta_wire::ip::parse_ip(&packet).is_err() {
                     continue;
                 }
                 tokio::select! {
@@ -191,9 +218,12 @@ struct Runtime {
     device_error_tx: mpsc::Sender<io::Error>,
     device_error_rx: mpsc::Receiver<io::Error>,
     lease: Option<Lease>,
+    account: AccountStatus,
     transport: Transport,
     delivery_mode: DeliveryMode,
     connected_at: Option<SystemTime>,
+    routing: crate::tunnel::Routing,
+    direct_peers: Vec<crate::tunnel::DirectPeer>,
     counters: Arc<Counters>,
 }
 
@@ -211,9 +241,12 @@ impl Runtime {
             device_error_tx,
             device_error_rx,
             lease: None,
+            account: AccountStatus::default(),
             transport,
             delivery_mode: DeliveryMode::Unknown,
             connected_at: None,
+            routing: crate::tunnel::Routing::default(),
+            direct_peers: Vec::new(),
             counters: Arc::new(Counters::default()),
         }
     }
@@ -255,12 +288,32 @@ impl Runtime {
         self.counters.event(
             state,
             message,
-            self.lease,
-            self.transport,
-            self.delivery_mode,
-            self.connected_at,
+            EventDetails {
+                lease: self.lease,
+                account: self.account,
+                transport: self.transport,
+                delivery_mode: self.delivery_mode,
+                connected_at: self.connected_at,
+                routing: self.routing.clone(),
+                direct_peers: self.direct_peers.clone(),
+            },
         )
     }
+}
+
+fn split_tunnel_summary(routing: &crate::tunnel::Routing) -> String {
+    let routes = routing
+        .routes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut summary = format!("split tunnel routes={routes}");
+    if !routing.dns_domains.is_empty() {
+        summary.push_str(" dns_domains=");
+        summary.push_str(&routing.dns_domains.join(","));
+    }
+    summary
 }
 
 pub async fn cleanup_network(
@@ -284,7 +337,11 @@ pub async fn run(
     mut observer: impl FnMut(Event),
 ) -> Result<(), RunError> {
     validate_config(&config)?;
-    let endpoint = parse_origin(&config.server_url)?;
+    let gateways = config
+        .server_urls
+        .iter()
+        .map(|url| parse_origin(url))
+        .collect::<Result<Vec<_>, _>>()?;
     let tls = tls::config(
         config.ca_path.as_deref(),
         config.thumbprint.as_deref(),
@@ -295,6 +352,7 @@ pub async fn run(
         state: State::Connecting,
         message: format!("Device: {} ({})", identity.name, identity.id),
         lease: None,
+        account: AccountStatus::default(),
         transport: config.transport,
         delivery_mode: DeliveryMode::Unknown,
         connected_at: None,
@@ -302,11 +360,14 @@ pub async fn run(
         bytes_downloaded: 0,
         packets_uploaded: 0,
         packets_downloaded: 0,
+        routing: crate::tunnel::Routing::default(),
+        direct_peers: Vec::new(),
     });
     observer(Event {
         state: State::Connecting,
         message: "Connecting".to_owned(),
         lease: None,
+        account: AccountStatus::default(),
         transport: config.transport,
         delivery_mode: DeliveryMode::Unknown,
         connected_at: None,
@@ -314,21 +375,26 @@ pub async fn run(
         bytes_downloaded: 0,
         packets_uploaded: 0,
         packets_downloaded: 0,
+        routing: crate::tunnel::Routing::default(),
+        direct_peers: Vec::new(),
     });
 
     let network = if config.manual_network {
         None
     } else {
-        Some(NetworkManager::open(config.network_state.clone())?)
+        let mut network = NetworkManager::open(config.network_state.clone())?;
+        network.set_subnet_router(config.subnet_router);
+        network.set_allow_lan(config.allow_lan);
+        Some(network)
     };
     let mut runtime = Runtime::new(network, config.transport);
-    let mut endpoints = if let Some(network) = runtime.network.as_ref() {
+    let mut candidates = if let Some(network) = runtime.network.as_ref() {
         let recovered = network.recovery_endpoints()?;
         if recovered.is_empty() {
             Vec::new()
         } else {
             runtime.network_started = true;
-            restored_endpoints(&endpoint, recovered)?
+            restored_candidates(&gateways, recovered)?
         }
     } else {
         Vec::new()
@@ -338,7 +404,7 @@ pub async fn run(
     let proof_identity = identity.clone();
     let proof_token = token.clone();
     let base_tunnel_config = ClientConfig {
-        url: config.server_url.clone(),
+        url: gateways[0].to_string(),
         token: config.token.clone(),
         transport: config.transport,
         tls,
@@ -355,10 +421,10 @@ pub async fn run(
 
     let result = run_loop(
         &config,
-        &endpoint,
+        &gateways,
         &base_tunnel_config,
         &mut runtime,
-        &mut endpoints,
+        &mut candidates,
         cancellation,
         &mut observer,
     )
@@ -417,26 +483,39 @@ pub async fn run(
 
 async fn run_loop(
     config: &Config,
-    endpoint: &Url,
+    gateways: &[Url],
     base_tunnel_config: &ClientConfig,
     runtime: &mut Runtime,
-    endpoints: &mut Vec<SocketAddr>,
+    candidates: &mut Vec<Candidate>,
     cancellation: &CancellationToken,
     observer: &mut impl FnMut(Event),
 ) -> Result<(), RunError> {
     let mut failures = 0_u32;
+    // Rotates through gateways and their endpoints on every failed attempt.
+    let mut attempts = 0_usize;
     let mut retry_error: Option<ClientError> = None;
     loop {
         if cancellation.is_cancelled() {
             return Err(RunError::Cancelled);
         }
         if let Some(error) = retry_error.take() {
-            if !config.reconnect || !error.is_retryable() {
+            // With protection active, an intercepting network blocks its own
+            // sign-in page, so keep trying until the user signs in.
+            let intercepted = error.is_intercepted() && runtime.network_started;
+            if !config.reconnect || !(error.is_retryable() || intercepted) {
                 return Err(RunError::Tunnel(error));
             }
             let delay = reconnect_delay(failures, config.reconnect_max_delay);
             failures = failures.saturating_add(1);
-            observer(runtime.event(State::Reconnecting, format!("Reconnecting in {delay:?}")));
+            attempts = attempts.wrapping_add(1);
+            observer(runtime.event(
+                if intercepted {
+                    State::SignInRequired
+                } else {
+                    State::Reconnecting
+                },
+                format!("Reconnecting in {delay:?} after: {error}"),
+            ));
             tokio::select! {
                 _ = cancellation.cancelled() => return Err(RunError::Cancelled),
                 error = runtime.device_error_rx.recv(), if runtime.reader.is_some() => {
@@ -446,19 +525,44 @@ async fn run_loop(
             }
         }
 
-        let dial_address = if runtime.network.is_some() {
-            if endpoints.is_empty() {
-                match resolve_endpoints(endpoint, cancellation).await {
-                    Ok(resolved) => *endpoints = resolved,
+        let (gateway, dial_address) = if runtime.network.is_some() {
+            if candidates.is_empty() {
+                match gateway_candidates(gateways, cancellation).await {
+                    Ok(resolved) => {
+                        // Before protection is active, every gateway can be
+                        // measured; fail over in that order afterwards.
+                        *candidates = if resolved.len() > 1 && !runtime.network_started {
+                            let addresses = resolved
+                                .iter()
+                                .map(|candidate| candidate.address)
+                                .collect::<Vec<_>>();
+                            let latencies =
+                                failover::probe(&addresses, failover::PROBE_TIMEOUT, cancellation)
+                                    .await;
+                            observer(runtime.event(
+                                State::Connecting,
+                                format!(
+                                    "gateway order: {}",
+                                    failover::describe(&resolved, &latencies, |index| {
+                                        gateways[index].host_str().unwrap_or_default().to_owned()
+                                    })
+                                ),
+                            ));
+                            failover::order(&resolved, &latencies)
+                        } else {
+                            resolved
+                        };
+                    }
                     Err(error) => {
                         retry_error = Some(error);
                         continue;
                     }
                 }
             }
-            Some(endpoints[failures as usize % endpoints.len()])
+            let candidate = candidates[attempts % candidates.len()];
+            (candidate.gateway, Some(candidate.address))
         } else {
-            None
+            (attempts % gateways.len(), None)
         };
 
         if runtime.network_started {
@@ -471,6 +575,7 @@ async fn run_loop(
         }
 
         let mut tunnel_config = base_tunnel_config.clone();
+        tunnel_config.url = gateways[gateway].to_string();
         tunnel_config.dial_address = dial_address;
         let connection = tokio::select! {
             _ = cancellation.cancelled() => return Err(RunError::Cancelled),
@@ -513,14 +618,44 @@ async fn run_loop(
         }
         runtime.transport = connection.transport;
         runtime.delivery_mode = connection.delivery_mode;
+        if !connection.routing.is_full_tunnel() {
+            observer(runtime.event(
+                State::Configuring,
+                split_tunnel_summary(&connection.routing),
+            ));
+        }
+        if !connection.routing.subnets.is_empty() {
+            let subnets = connection
+                .routing
+                .subnets
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            observer(runtime.event(
+                State::Configuring,
+                if config.subnet_router {
+                    format!("subnet router subnets={subnets}")
+                } else {
+                    format!(
+                        "the gateway routes {subnets} to this device; run with --subnet-router to forward them"
+                    )
+                },
+            ));
+        }
         if let Some(network) = runtime.network.as_mut() {
             observer(runtime.counters.event(
                 State::Configuring,
                 "Configuring network",
-                Some(connection.lease),
-                connection.transport,
-                connection.delivery_mode,
-                runtime.connected_at,
+                EventDetails {
+                    lease: Some(connection.lease),
+                    account: connection.account(),
+                    transport: connection.transport,
+                    delivery_mode: connection.delivery_mode,
+                    connected_at: runtime.connected_at,
+                    routing: connection.routing.clone(),
+                    direct_peers: Vec::new(),
+                },
             ));
             if let Err(error) = network
                 .up(
@@ -531,6 +666,7 @@ async fn run_loop(
                         .name(),
                     connection.remote_address,
                     connection.lease,
+                    &connection.routing,
                 )
                 .await
             {
@@ -539,6 +675,9 @@ async fn run_loop(
             }
         }
         runtime.lease = Some(connection.lease);
+        runtime.routing = connection.routing.clone();
+        runtime.account = connection.account();
+        runtime.direct_peers.clear();
         runtime.ensure_reader(cancellation);
         runtime.connected_at.get_or_insert_with(SystemTime::now);
         observer(runtime.event(State::Connected, "Connected"));
@@ -575,7 +714,8 @@ async fn run_connection(
     let upload_errors = errors_tx.clone();
     let outbound = runtime.outbound_rx.clone();
     let upload_counters = runtime.counters.clone();
-    let leased_source = connection.lease.address.addr();
+    let lease = connection.lease;
+    let routing = connection.routing.clone();
     let upload = tokio::spawn(async move {
         loop {
             let packet = tokio::select! {
@@ -588,7 +728,7 @@ async fn run_connection(
                     None => return,
                 }
             };
-            if !packet_has_source(&packet, leased_source) {
+            if !packet_has_source(&packet, &lease, &routing) {
                 continue;
             }
             let result = tokio::select! {
@@ -651,9 +791,21 @@ async fn run_connection(
         Duration::from_secs(1),
     );
     progress.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut direct = connection.direct_peers();
     let result = loop {
         tokio::select! {
             _ = cancellation.cancelled() => break RunError::Cancelled,
+            changed = async { direct.as_mut().expect("guarded").changed().await }, if direct.is_some() => {
+                let Some(peers) = direct.as_mut().filter(|_| changed.is_ok()) else {
+                    direct = None;
+                    continue;
+                };
+                runtime.direct_peers = peers.borrow_and_update().clone();
+                observer(runtime.event(
+                    State::Connected,
+                    crate::tunnel::direct_summary(&runtime.direct_peers),
+                ));
+            }
             error = runtime.device_error_rx.recv() => {
                 break RunError::Device(error.unwrap_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof)));
             }
@@ -664,7 +816,10 @@ async fn run_connection(
                     None => RunError::Tunnel(ClientError::Closed),
                 };
             }
-            _ = progress.tick() => observer(runtime.event(State::Connected, "Connected")),
+            _ = progress.tick() => {
+                runtime.account = connection.account();
+                observer(runtime.event(State::Connected, "Connected"));
+            }
         }
     };
     pumps.cancel();
@@ -678,14 +833,28 @@ async fn run_connection(
 }
 
 fn validate_config(config: &Config) -> Result<(), RunError> {
-    if config.server_url.trim().is_empty() || config.token.is_empty() {
+    if config.server_urls.is_empty()
+        || config.server_urls.iter().any(|url| url.trim().is_empty())
+        || config.token.is_empty()
+    {
         return Err(RunError::Invalid(
             "server URL and token are required".to_owned(),
         ));
     }
+    if config.server_urls.len() > MAX_GATEWAYS {
+        return Err(RunError::Invalid(format!(
+            "a profile lists at most {MAX_GATEWAYS} gateways"
+        )));
+    }
     if config.interface_name.is_empty() {
         return Err(RunError::Invalid(
             "TUN interface name is required".to_owned(),
+        ));
+    }
+    if config.subnet_router && config.manual_network {
+        return Err(RunError::Invalid(
+            "--subnet-router needs automatic networking; with --manual-network configure forwarding yourself"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -748,6 +917,53 @@ async fn resolve_endpoints(
     Ok(addresses)
 }
 
+/// Every endpoint of every gateway, in profile order.
+async fn gateway_candidates(
+    gateways: &[Url],
+    cancellation: &CancellationToken,
+) -> Result<Vec<Candidate>, ClientError> {
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match resolve_endpoints(gateway, cancellation).await {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(ClientError::Closed) => return Err(ClientError::Closed),
+            // Another gateway may still resolve.
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(last_error.unwrap_or_else(|| ClientError::unavailable("no gateway endpoint")));
+    }
+    Ok(candidates)
+}
+
+/// Endpoints cached in the recovery journal, matched to the gateways they
+/// can belong to; protection blocks DNS until a tunnel is up again.
+fn restored_candidates(
+    gateways: &[Url],
+    saved: Vec<SocketAddr>,
+) -> Result<Vec<Candidate>, RunError> {
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for (index, gateway) in gateways.iter().enumerate() {
+        match restored_endpoints(gateway, saved.clone()) {
+            Ok(addresses) => candidates.extend(addresses.into_iter().map(|address| Candidate {
+                gateway: index,
+                address,
+            })),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(last_error.expect("at least one gateway is configured"));
+    }
+    Ok(candidates)
+}
+
 fn restored_endpoints(endpoint: &Url, saved: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, RunError> {
     let host = endpoint
         .host_str()
@@ -781,8 +997,11 @@ fn restored_endpoints(endpoint: &Url, saved: Vec<SocketAddr>) -> Result<Vec<Sock
     Ok(endpoints)
 }
 
-fn packet_has_source(packet: &[u8], source: Ipv4Addr) -> bool {
-    porta_wire::ip::parse_ipv4(packet).is_ok_and(|info| info.source == source)
+/// Whether the tunnel may carry `packet`: it comes from the lease or, on a
+/// subnet router, from a network behind this device.
+fn packet_has_source(packet: &[u8], lease: &Lease, routing: &crate::tunnel::Routing) -> bool {
+    porta_wire::ip::parse_ip(packet)
+        .is_ok_and(|info| lease.owns(info.source) || routing.serves(info.source))
 }
 
 fn normalize_ip(address: IpAddr) -> IpAddr {
@@ -813,9 +1032,11 @@ fn usable_endpoint(address: IpAddr) -> bool {
     }
 }
 
+/// Waits 250 ms before the first retry, so a session a restarting gateway
+/// ended resumes at once, then doubles up to `maximum`.
 pub fn reconnect_delay(failures: u32, maximum: Duration) -> Duration {
     let maximum = maximum.max(Duration::from_secs(1));
-    Duration::from_secs(1_u64 << failures.min(5)).min(maximum)
+    Duration::from_millis(250_u64 << failures.min(7)).min(maximum)
 }
 
 #[cfg(test)]
@@ -833,7 +1054,11 @@ mod tests {
         ] {
             assert!(parse_origin(invalid).is_err(), "{invalid}");
         }
-        assert_eq!(reconnect_delay(0, Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(
+            reconnect_delay(0, Duration::ZERO),
+            Duration::from_millis(250)
+        );
+        assert_eq!(reconnect_delay(3, Duration::ZERO), Duration::from_secs(1));
         assert_eq!(
             reconnect_delay(100, Duration::from_secs(5)),
             Duration::from_secs(5)
@@ -847,13 +1072,40 @@ mod tests {
         packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
         packet[12..16].copy_from_slice(&[10, 66, 0, 2]);
         packet[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let lease = |address: &str| Lease {
+            address: address.parse().unwrap(),
+            gateway: None,
+            dns: None,
+            mtu: 1400,
+            address6: Some("fd66::2/128".parse().unwrap()),
+        };
 
-        assert!(packet_has_source(&packet, Ipv4Addr::new(10, 66, 0, 2)));
-        assert!(!packet_has_source(&packet, Ipv4Addr::new(192, 0, 2, 10)));
+        let full = crate::tunnel::Routing::default();
+        assert!(packet_has_source(&packet, &lease("10.66.0.2/32"), &full));
+        assert!(!packet_has_source(&packet, &lease("192.0.2.10/32"), &full));
         assert!(!packet_has_source(
             &packet[..10],
-            Ipv4Addr::new(10, 66, 0, 2)
+            &lease("10.66.0.2/32"),
+            &full
         ));
+
+        // IPv6 packets must come from the IPv6 lease.
+        let mut ipv6 = vec![0_u8; 40];
+        ipv6[0] = 0x60;
+        ipv6[6] = 59;
+        ipv6[8..24].copy_from_slice(&"fd66::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert!(packet_has_source(&ipv6, &lease("10.66.0.2/32"), &full));
+        ipv6[23] = 3;
+        assert!(!packet_has_source(&ipv6, &lease("10.66.0.2/32"), &full));
+
+        // A subnet router also carries packets from the networks behind it.
+        packet[12..16].copy_from_slice(&[10, 30, 0, 5]);
+        let router = crate::tunnel::Routing {
+            subnets: vec!["10.30.0.0/24".parse().unwrap()],
+            ..crate::tunnel::Routing::default()
+        };
+        assert!(!packet_has_source(&packet, &lease("10.66.0.2/32"), &full));
+        assert!(packet_has_source(&packet, &lease("10.66.0.2/32"), &router));
     }
 
     #[tokio::test]

@@ -47,13 +47,18 @@ mod native {
     use super::*;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
-    use std::net::UdpSocket;
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::net::{Ipv4Addr, UdpSocket};
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::unix::AsyncFd;
 
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+    const TUNGETIFF: libc::c_ulong = 0x8004_54d2;
     const SIOCSIFMTU: libc::c_ulong = 0x8922;
+    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+    const SIOCSIFADDR: libc::c_ulong = 0x8916;
     const IFF_TUN: libc::c_short = 0x0001;
     const IFF_NO_PI: libc::c_short = 0x1000;
     #[cfg(target_pointer_width = "64")]
@@ -65,6 +70,7 @@ mod native {
     union IfReqData {
         flags: libc::c_short,
         mtu: libc::c_int,
+        address: libc::sockaddr_in,
         padding: [u8; IFREQ_DATA_SIZE],
     }
 
@@ -107,12 +113,57 @@ mod native {
     pub struct NativeTun {
         fd: AsyncFd<File>,
         name: String,
-        mtu: usize,
+        mtu: AtomicUsize,
     }
 
     impl NativeTun {
+        /// Opens or creates the TUN device `name`, or adopts it from the
+        /// previous program after an in-place restart. Either way the device
+        /// is kept for the next restart.
         pub fn open(name: &str, mtu: usize) -> Result<Self, TunError> {
             validate(name, mtu)?;
+            let device = match crate::ops::handoff::take_tun(name) {
+                Some(fd) => Self::adopt(fd, name, mtu)?,
+                None => Self::create(name, mtu)?,
+            };
+            crate::ops::handoff::pass_tun(&device.name, device.fd.get_ref().as_fd()).map_err(
+                |source| TunError::Io {
+                    context: "keep TUN device for restarts",
+                    source,
+                },
+            )?;
+            Ok(device)
+        }
+
+        fn adopt(fd: std::os::fd::OwnedFd, name: &str, mtu: usize) -> Result<Self, TunError> {
+            let file = File::from(fd);
+            let mut request = IfReq::new("");
+            ioctl(file.as_raw_fd(), TUNGETIFF, &mut request).map_err(|source| TunError::Io {
+                context: "inspect inherited TUN device",
+                source,
+            })?;
+            if request.actual_name() != name {
+                return Err(TunError::Io {
+                    context: "adopt inherited TUN device",
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("inherited device is {}, not {name}", request.actual_name()),
+                    ),
+                });
+            }
+            // SAFETY: reading and setting status flags of an owned descriptor.
+            unsafe {
+                let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            set_mtu(name, mtu)?;
+            Self::from_file(file, name.to_owned(), mtu).map_err(|source| TunError::Io {
+                context: "register TUN with async runtime",
+                source,
+            })
+        }
+
+        fn create(name: &str, mtu: usize) -> Result<Self, TunError> {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -141,11 +192,57 @@ mod native {
         }
 
         pub fn mtu(&self) -> usize {
-            self.mtu
+            self.mtu.load(Ordering::Relaxed)
+        }
+
+        /// Changes the live interface MTU and the packet bound used by reads and writes.
+        pub fn set_mtu(&self, mtu: usize) -> Result<(), TunError> {
+            validate(&self.name, mtu)?;
+            set_mtu(&self.name, mtu)?;
+            self.mtu.store(mtu, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// Replaces the interface's primary IPv4 address. Point-to-point TUN
+        /// devices receive a /32 address without a connected prefix route.
+        pub fn set_ipv4_address(&self, address: Ipv4Addr) -> Result<(), TunError> {
+            let socket = configuration_socket()?;
+            let mut request = IfReq::new(&self.name);
+            request.data.address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(address).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            ioctl(socket.as_raw_fd(), SIOCSIFADDR, &mut request).map_err(|source| TunError::Io {
+                context: "configure TUN IPv4 address",
+                source,
+            })
+        }
+
+        pub fn set_up(&self) -> Result<(), TunError> {
+            let socket = configuration_socket()?;
+            let mut request = IfReq::new(&self.name);
+            ioctl(socket.as_raw_fd(), SIOCGIFFLAGS, &mut request).map_err(|source| {
+                TunError::Io {
+                    context: "read TUN interface flags",
+                    source,
+                }
+            })?;
+            // SAFETY: SIOCGIFFLAGS initialized the flags member.
+            let flags = unsafe { request.data.flags };
+            request.data.flags = flags | libc::IFF_UP as libc::c_short;
+            ioctl(socket.as_raw_fd(), SIOCSIFFLAGS, &mut request).map_err(|source| TunError::Io {
+                context: "bring TUN interface up",
+                source,
+            })
         }
 
         pub async fn read_packet(&self) -> io::Result<Vec<u8>> {
-            let mut packet = vec![0; self.mtu + 1];
+            let mtu = self.mtu();
+            let mut packet = vec![0; mtu + 1];
             loop {
                 let mut ready = self.fd.readable().await?;
                 match ready.try_io(|inner| {
@@ -158,10 +255,10 @@ mod native {
                             "TUN device closed",
                         ));
                     }
-                    Ok(Ok(length)) if length > self.mtu => {
+                    Ok(Ok(length)) if length > mtu => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("TUN packet length {length} exceeds MTU {}", self.mtu),
+                            format!("TUN packet length {length} exceeds MTU {mtu}"),
                         ));
                     }
                     Ok(Ok(length)) => {
@@ -182,14 +279,11 @@ mod native {
                     "cannot write an empty TUN packet",
                 ));
             }
-            if packet.len() > self.mtu {
+            let mtu = self.mtu();
+            if packet.len() > mtu {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "packet length {} exceeds TUN MTU {}",
-                        packet.len(),
-                        self.mtu
-                    ),
+                    format!("packet length {} exceeds TUN MTU {mtu}", packet.len()),
                 ));
             }
             loop {
@@ -218,10 +312,13 @@ mod native {
         }
 
         fn from_file(file: File, name: String, mtu: usize) -> io::Result<Self> {
+            // SAFETY: the File keeps its descriptor open and unchanged until
+            // the AsyncFd that owns it is dropped.
+            let fd = unsafe { AsyncFd::register(file) }.map_err(|error| error.into_parts().1)?;
             Ok(Self {
-                fd: AsyncFd::new(file)?,
+                fd,
                 name,
-                mtu,
+                mtu: AtomicUsize::new(mtu),
             })
         }
     }
@@ -244,14 +341,18 @@ mod native {
     }
 
     fn set_mtu(name: &str, mtu: usize) -> Result<(), TunError> {
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|source| TunError::Io {
-            context: "open interface configuration socket",
-            source,
-        })?;
+        let socket = configuration_socket()?;
         let mut request = IfReq::new(name);
         request.data.mtu = mtu as libc::c_int;
         ioctl(socket.as_raw_fd(), SIOCSIFMTU, &mut request).map_err(|source| TunError::Io {
             context: "configure TUN MTU",
+            source,
+        })
+    }
+
+    fn configuration_socket() -> Result<UdpSocket, TunError> {
+        UdpSocket::bind("0.0.0.0:0").map_err(|source| TunError::Io {
+            context: "open interface configuration socket",
             source,
         })
     }

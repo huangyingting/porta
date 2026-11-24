@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::tunnel::Lease;
+use crate::tunnel::{Lease, Routing};
 
 const STATE_VERSION: u8 = 2;
 const ROUTE_PROTOCOL: u16 = 186;
@@ -92,6 +92,9 @@ struct Action {
     mtu: u16,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     was_up: bool,
+    /// A sysctl value to restore, for `forwarding`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    previous_value: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -106,6 +109,18 @@ struct NetworkState {
     index: u32,
     endpoints: Vec<EndpointState>,
     undo: Vec<Action>,
+    /// Split tunnel: prefixes that may only leave through the tunnel. Empty
+    /// means a full tunnel, which guards all traffic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    split_prefixes: Vec<String>,
+    /// Subnet router: networks behind this device that tunnel traffic is
+    /// forwarded and masqueraded to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subnet_routes: Vec<String>,
+    /// Full tunnel with local network access: the directly connected
+    /// private networks the firewall lets through outside the tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_networks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -164,6 +179,8 @@ pub struct NetworkManager {
     _lock: File,
     state: NetworkState,
     commands: Arc<dyn CommandRunner>,
+    subnet_router: bool,
+    allow_lan: bool,
 }
 
 impl NetworkManager {
@@ -191,6 +208,8 @@ impl NetworkManager {
             None => NetworkState::default(),
         };
         Ok(Self {
+            subnet_router: false,
+            allow_lan: false,
             state_path,
             _lock: lock,
             state,
@@ -228,13 +247,73 @@ impl NetworkManager {
         self.ensure_escape(&endpoint).await
     }
 
+    /// Forwards and masquerades tunnel traffic to the subnets the gateway
+    /// routes to this device.
+    pub fn set_subnet_router(&mut self, enabled: bool) {
+        self.subnet_router = enabled;
+    }
+
+    /// In a full tunnel, keeps directly connected private networks, such as
+    /// printers and media players on the LAN, reachable outside the tunnel.
+    pub fn set_allow_lan(&mut self, enabled: bool) {
+        self.allow_lan = enabled;
+    }
+
+    /// Directly connected private networks other than the tunnel's, which
+    /// must not contain the tunnel's addresses or DNS server.
+    async fn local_networks(
+        &self,
+        interface: &str,
+        lease: &Lease,
+    ) -> Result<Vec<String>, NetworkError> {
+        let tunnel_addresses = [
+            Some(IpAddr::V4(lease.address.addr())),
+            lease.dns.map(IpAddr::V4),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(lease.ipv6().map(|address| IpAddr::V6(address.addr())))
+        .collect::<Vec<_>>();
+        let mut networks = Vec::new();
+        for family in [4, 6] {
+            for route in self.routes(family, Some(("scope", "link"))).await? {
+                let Ok(network) = route.destination.parse::<ipnet::IpNet>() else {
+                    continue;
+                };
+                let private = match network {
+                    ipnet::IpNet::V4(network) => {
+                        network.addr().is_private() || network.addr().is_link_local()
+                    }
+                    // Unique local addresses (fc00::/7).
+                    ipnet::IpNet::V6(network) => network.addr().segments()[0] & 0xfe00 == 0xfc00,
+                };
+                if route.device != interface
+                    && private
+                    && network.prefix_len() >= if family == 4 { 8 } else { 48 }
+                    && !tunnel_addresses
+                        .iter()
+                        .any(|address| network.contains(address))
+                {
+                    networks.push(network.trunc().to_string());
+                }
+            }
+        }
+        networks.sort();
+        networks.dedup();
+        Ok(networks)
+    }
+
     pub async fn up(
         &mut self,
         interface: &str,
         endpoint: SocketAddr,
         lease: Lease,
+        routing: &Routing,
     ) -> Result<(), NetworkError> {
-        validate_lease(interface, lease)?;
+        // Full tunnels resolve every name through the tunnel; split tunnels
+        // only their DNS domains, and leave DNS alone without any.
+        let tunnel_dns = routing.is_full_tunnel() || !routing.dns_domains.is_empty();
+        validate_lease(interface, lease, tunnel_dns)?;
         self.prepare(endpoint).await?;
         if lease.dns
             == Some(match endpoint.ip() {
@@ -278,6 +357,7 @@ impl NetworkManager {
                 .await?;
             self.state.interface.clear();
             self.state.index = 0;
+            self.state.subnet_routes.clear();
             self.persist()?;
             link = self
                 .link(interface)
@@ -355,20 +435,181 @@ impl NetworkManager {
             )
             .await?;
         }
-        for destination in ["0.0.0.0/1", "128.0.0.0/1"] {
+        // IPv6 rides the tunnel only with an IPv6 lease; otherwise a full
+        // tunnel keeps blocking it and a split tunnel leaves it alone.
+        let address6 = match lease.ipv6() {
+            Some(address6) if self.enable_ipv6(interface).await? => Some(address6.to_string()),
+            _ => None,
+        };
+        if let Some(address6) = &address6 {
+            if !self.has_action("address", interface, address6) {
+                let mut action = link_action("address", &link, &alias);
+                action.address = address6.clone();
+                self.record(action).await?;
+            }
+            if !self.addresses(interface).await?.contains(address6) {
+                self.invoke(
+                    "ip",
+                    &[
+                        "-6",
+                        "address",
+                        "add",
+                        address6,
+                        "dev",
+                        interface,
+                        "nodad",
+                        "noprefixroute",
+                    ],
+                    "",
+                )
+                .await?;
+            }
+        }
+        let mut destinations: Vec<String> = if routing.is_full_tunnel() {
+            vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
+        } else {
+            routing.routes.iter().map(ToString::to_string).collect()
+        };
+        if address6.is_some() {
+            if routing.is_full_tunnel() {
+                destinations.extend(["::/1".to_owned(), "8000::/1".to_owned()]);
+            } else {
+                destinations.extend(routing.routes6.iter().map(ToString::to_string));
+            }
+        }
+        for destination in &destinations {
             let mut action = link_action("route", &link, &alias);
-            action.family = 4;
-            action.destination = destination.to_owned();
+            action.family = if destination.contains(':') { 6 } else { 4 };
+            action.destination = destination.clone();
             self.ensure_route(action).await?;
         }
-        let dns = lease
-            .dns
-            .expect("validated automatic Linux lease includes DNS");
-        let dns_destination = format!("{dns}/32");
-        let mut dns_route = link_action("dns-route", &link, &alias);
-        dns_route.family = 4;
-        dns_route.destination = dns_destination.clone();
-        self.ensure_route(dns_route).await?;
+        let dns_destination = if tunnel_dns {
+            let dns = lease
+                .dns
+                .expect("validated automatic Linux lease includes DNS");
+            let dns_destination = format!("{dns}/32");
+            let mut dns_route = link_action("dns-route", &link, &alias);
+            dns_route.family = 4;
+            dns_route.destination = dns_destination.clone();
+            self.ensure_route(dns_route).await?;
+            self.configure_dns(interface, &link, &alias, dns, routing)
+                .await?;
+            Some(dns_destination)
+        } else {
+            self.cleanup_matching(|action| matches!(action.kind.as_str(), "dns" | "dns-route"))
+                .await?;
+            None
+        };
+        let endpoint = parse_endpoint(endpoint)?;
+        let previous = std::mem::replace(&mut self.state.endpoints, vec![endpoint.clone()]);
+        let mut split_prefixes = if routing.is_full_tunnel() {
+            Vec::new()
+        } else {
+            destinations.clone()
+        };
+        if let Some(dns) = dns_destination
+            .as_ref()
+            .filter(|_| !routing.is_full_tunnel())
+        {
+            split_prefixes.push(dns.clone());
+        }
+        let subnet_routes = if self.subnet_router {
+            routing.subnets.iter().map(ToString::to_string).collect()
+        } else {
+            Vec::new()
+        };
+        if !subnet_routes.is_empty() {
+            self.ensure_forwarding(&link, &alias).await?;
+        }
+        let local_networks = if self.allow_lan && split_prefixes.is_empty() {
+            self.local_networks(interface, &lease).await?
+        } else {
+            Vec::new()
+        };
+        let previous_split = std::mem::replace(&mut self.state.split_prefixes, split_prefixes);
+        let previous_subnets = std::mem::replace(&mut self.state.subnet_routes, subnet_routes);
+        let previous_local = std::mem::replace(&mut self.state.local_networks, local_networks);
+        if let Err(error) = self.persist() {
+            self.state.endpoints = previous;
+            self.state.split_prefixes = previous_split;
+            self.state.subnet_routes = previous_subnets;
+            self.state.local_networks = previous_local;
+            return Err(error);
+        }
+        self.protect().await?;
+        if self.state.subnet_routes.is_empty() {
+            self.cleanup_matching(|action| action.kind == "forwarding")
+                .await?;
+        }
+        let address_copy = address.clone();
+        let address6_copy = address6.unwrap_or_default();
+        let dns_copy = dns_destination.unwrap_or_default();
+        let endpoint_prefix = endpoint.prefix()?;
+        self.cleanup_matching(move |action| {
+            (action.kind == "address"
+                && action.address != address_copy
+                && action.address != address6_copy)
+                || (action.kind == "route" && !destinations.contains(&action.destination))
+                || (action.kind == "dns-route" && action.destination != dns_copy)
+                || (action.kind == "escape" && action.destination != endpoint_prefix)
+        })
+        .await
+    }
+
+    /// Turns IPv6 on for the TUN, which hosts may disable for new interfaces.
+    /// The setting belongs to the TUN and disappears with it. Returns false
+    /// when the kernel has no IPv6.
+    async fn enable_ipv6(&self, interface: &str) -> Result<bool, NetworkError> {
+        let key = format!("net/ipv6/conf/{interface}/disable_ipv6");
+        let Ok(current) = self.invoke("sysctl", &["-n", &key], "").await else {
+            return Ok(false);
+        };
+        if current.trim() != "0" {
+            self.invoke("sysctl", &["-w", &format!("{key}=0")], "")
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// Enables IPv4 forwarding for a subnet router, journaling the value it
+    /// replaces. Forwarding that was already on is left to its owner.
+    async fn ensure_forwarding(
+        &mut self,
+        link: &LinkInfo,
+        alias: &str,
+    ) -> Result<(), NetworkError> {
+        if self
+            .state
+            .undo
+            .iter()
+            .any(|action| action.kind == "forwarding")
+        {
+            return Ok(());
+        }
+        let current = self
+            .invoke("sysctl", &["-n", "net.ipv4.ip_forward"], "")
+            .await?;
+        if current.trim() == "1" {
+            return Ok(());
+        }
+        let mut action = link_action("forwarding", link, alias);
+        action.previous_value = current.trim().to_owned();
+        self.record(action).await?;
+        self.invoke("sysctl", &["-w", "net.ipv4.ip_forward=1"], "")
+            .await?;
+        Ok(())
+    }
+
+    /// Points systemd-resolved at the tunnel DNS server: for every name in a
+    /// full tunnel, or only for the advertised domains in a split tunnel.
+    async fn configure_dns(
+        &mut self,
+        interface: &str,
+        link: &LinkInfo,
+        alias: &str,
+        dns: Ipv4Addr,
+        routing: &Routing,
+    ) -> Result<(), NetworkError> {
         if !self.has_action("dns", interface, "") {
             for property in ["dns", "domain"] {
                 let output = self
@@ -389,31 +630,35 @@ impl NetworkManager {
                     ));
                 }
             }
-            self.record(link_action("dns", &link, &alias)).await?;
+            self.record(link_action("dns", link, alias)).await?;
         }
-        for arguments in [
-            vec!["dns", interface, &dns.to_string()],
-            vec!["domain", interface, "~."],
-            vec!["default-route", interface, "yes"],
-        ] {
-            self.invoke("resolvectl", &arguments, "").await?;
+        let dns = dns.to_string();
+        let mut domains = vec!["domain".to_owned(), interface.to_owned()];
+        if routing.is_full_tunnel() {
+            domains.push("~.".to_owned());
+        } else {
+            domains.extend(
+                routing
+                    .dns_domains
+                    .iter()
+                    .map(|domain| format!("~{domain}")),
+            );
         }
-        let endpoint = parse_endpoint(endpoint)?;
-        let previous = std::mem::replace(&mut self.state.endpoints, vec![endpoint.clone()]);
-        if let Err(error) = self.persist() {
-            self.state.endpoints = previous;
-            return Err(error);
-        }
-        self.protect().await?;
-        let address_copy = address.clone();
-        let dns_copy = dns_destination.clone();
-        let endpoint_prefix = endpoint.prefix()?;
-        self.cleanup_matching(move |action| {
-            (action.kind == "address" && action.address != address_copy)
-                || (action.kind == "dns-route" && action.destination != dns_copy)
-                || (action.kind == "escape" && action.destination != endpoint_prefix)
-        })
-        .await
+        let default_route = if routing.is_full_tunnel() {
+            "yes"
+        } else {
+            "no"
+        };
+        self.invoke("resolvectl", &["dns", interface, &dns], "")
+            .await?;
+        self.invoke_owned("resolvectl", domains, "").await?;
+        self.invoke(
+            "resolvectl",
+            &["default-route", interface, default_route],
+            "",
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn down(&mut self) -> Result<(), NetworkError> {
@@ -466,15 +711,39 @@ impl NetworkManager {
     async fn protect(&self) -> Result<(), NetworkError> {
         let exists = self.table_exists().await?;
         let mut script = String::new();
+        let split = !self.state.split_prefixes.is_empty();
         if exists {
+            // Redeclaring the base chain updates its policy, which differs
+            // between full and split tunnels, in the same transaction.
             script.push_str(&format!("flush chain inet {} output\n", self.state.table));
+            script.push_str(&format!(
+                "add chain inet {} output {{ type filter hook output priority -150; policy {}; }}\n",
+                self.state.table,
+                if split { "accept" } else { "drop" }
+            ));
         } else {
             script.push_str(&format!(
                 "add table inet {} {{ comment \"Porta client {}\"; }}\n",
                 self.state.table, self.state.table
             ));
             script.push_str(&format!(
-                "add chain inet {} output {{ type filter hook output priority -150; policy drop; }}\n",
+                "add chain inet {} output {{ type filter hook output priority -150; policy {}; }}\n",
+                self.state.table,
+                if split { "accept" } else { "drop" }
+            ));
+        }
+        if !self.state.subnet_routes.is_empty() {
+            script.push_str(&format!(
+                "add chain inet {table} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n\
+                 flush chain inet {table} postrouting\n\
+                 add rule inet {table} postrouting iifname \"{interface}\" ip daddr {{ {subnets} }} masquerade\n",
+                table = self.state.table,
+                interface = self.state.interface,
+                subnets = self.state.subnet_routes.join(", "),
+            ));
+        } else if exists && self.chain_exists("postrouting").await? {
+            script.push_str(&format!(
+                "delete chain inet {} postrouting\n",
                 self.state.table
             ));
         }
@@ -502,8 +771,46 @@ impl NetworkManager {
                 ));
             }
         }
+        if split {
+            // Only tunneled destinations are guarded: they may not leave
+            // through any other interface. Other traffic, including IPv6
+            // without an IPv6 lease, uses the device's own network.
+            let (ipv6, ipv4): (Vec<_>, Vec<_>) = self
+                .state
+                .split_prefixes
+                .iter()
+                .map(String::as_str)
+                .partition(|prefix| prefix.contains(':'));
+            if !ipv4.is_empty() {
+                add(&format!("ip daddr {{ {} }} drop", ipv4.join(", ")));
+            }
+            if !ipv6.is_empty() {
+                add(&format!("ip6 daddr {{ {} }} drop", ipv6.join(", ")));
+            }
+            self.invoke("nft", &["-f", "-"], &script).await?;
+            return Ok(());
+        }
         add("udp dport { 53, 853 } drop");
         add("tcp dport { 53, 853 } drop");
+        // Local network access: connected private networks, and the
+        // multicast and broadcast that discovery (mDNS, SSDP) uses. DNS
+        // stays in the tunnel because the rules above come first.
+        if !self.state.local_networks.is_empty() {
+            let (ipv6, ipv4): (Vec<_>, Vec<_>) = self
+                .state
+                .local_networks
+                .iter()
+                .map(String::as_str)
+                .partition(|network| network.contains(':'));
+            if !ipv4.is_empty() {
+                add(&format!("ip daddr {{ {} }} accept", ipv4.join(", ")));
+            }
+            if !ipv6.is_empty() {
+                add(&format!("ip6 daddr {{ {} }} accept", ipv6.join(", ")));
+            }
+            add("ip daddr { 224.0.0.0/4, 255.255.255.255 } accept");
+            add("ip6 daddr { fe80::/10, ff00::/8 } accept");
+        }
         let mut ipv6 = false;
         for endpoint in &self.state.endpoints {
             let family = if endpoint.address()?.is_ipv4() {
@@ -524,6 +831,24 @@ impl NetworkManager {
         }
         self.invoke("nft", &["-f", "-"], &script).await?;
         Ok(())
+    }
+
+    async fn chain_exists(&self, chain: &str) -> Result<bool, NetworkError> {
+        let output = self
+            .invoke("nft", &["-j", "list", "chains", "inet"], "")
+            .await?;
+        let listing: Value = serde_json::from_str(&output)?;
+        Ok(listing
+            .get("nftables")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("chain").is_some_and(|value| {
+                        value.get("table").and_then(Value::as_str) == Some(&self.state.table)
+                            && value.get("name").and_then(Value::as_str) == Some(chain)
+                    })
+                })
+            }))
     }
 
     async fn table_exists(&self) -> Result<bool, NetworkError> {
@@ -776,6 +1101,25 @@ impl NetworkManager {
     }
 
     async fn undo(&self, action: &Action) -> Result<(), NetworkError> {
+        if action.kind == "forwarding" {
+            // Restore even when the TUN is already gone; leave a value that
+            // something else changed since.
+            let current = self
+                .invoke("sysctl", &["-n", "net.ipv4.ip_forward"], "")
+                .await?;
+            if current.trim() == "1" {
+                self.invoke(
+                    "sysctl",
+                    &[
+                        "-w",
+                        &format!("net.ipv4.ip_forward={}", action.previous_value),
+                    ],
+                    "",
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         let mut link = self.action_link(action).await?;
         if link.is_none() && action.kind == "escape" && !stable_link_identity(action) {
             let named = self.link(&action.interface).await?;
@@ -822,9 +1166,14 @@ impl NetworkManager {
             }
             "address" => {
                 if self.addresses(&link.name).await?.contains(&action.address) {
+                    let family = if action.address.contains(':') {
+                        "-6"
+                    } else {
+                        "-4"
+                    };
                     self.invoke(
                         "ip",
-                        &["-4", "address", "del", &action.address, "dev", &link.name],
+                        &[family, "address", "del", &action.address, "dev", &link.name],
                         "",
                     )
                     .await?;
@@ -1333,6 +1682,29 @@ fn validate_state(state: &NetworkState) -> Result<(), NetworkError> {
             "invalid network journal header".to_owned(),
         ));
     }
+    if state.split_prefixes.len() > 128
+        || state.split_prefixes.iter().any(|prefix| {
+            prefix.parse::<IpNet>().map_or(true, |parsed| {
+                parsed.prefix_len() == 0 || parsed != parsed.trunc()
+            })
+        })
+    {
+        return Err(NetworkError::Invalid(
+            "invalid network journal split route".to_owned(),
+        ));
+    }
+    if state.subnet_routes.len() > 16
+        || state.subnet_routes.iter().any(|prefix| {
+            prefix.parse::<ipnet::Ipv4Net>().map_or(true, |parsed| {
+                parsed.prefix_len() == 0 || parsed != parsed.trunc()
+            })
+        })
+        || (!state.subnet_routes.is_empty() && !valid_interface(&state.interface))
+    {
+        return Err(NetworkError::Invalid(
+            "invalid network journal subnet route".to_owned(),
+        ));
+    }
     for endpoint in &state.endpoints {
         let parsed = parse_endpoint(SocketAddr::new(endpoint.address()?, endpoint.port))?;
         if parsed != *endpoint {
@@ -1372,9 +1744,17 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
         "link" if (68..=u16::MAX).contains(&action.mtu) => Ok(()),
         "address" => action
             .address
-            .parse::<ipnet::Ipv4Net>()
+            .parse::<IpNet>()
             .ok()
-            .filter(|prefix| valid_unicast(prefix.addr()))
+            .filter(|prefix| match prefix {
+                IpNet::V4(prefix) => valid_unicast(prefix.addr()),
+                IpNet::V6(prefix) => {
+                    prefix.prefix_len() == 128
+                        && !prefix.addr().is_multicast()
+                        && !prefix.addr().is_unspecified()
+                        && !prefix.addr().is_loopback()
+                }
+            })
             .map(|_| ())
             .ok_or_else(|| NetworkError::Invalid("invalid network journal address".to_owned())),
         "route" | "escape" | "dns-route" => {
@@ -1392,7 +1772,7 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
             if !matches!(action.family, 4 | 6)
                 || prefix.addr().is_ipv4() != (action.family == 4)
                 || (action.kind == "route"
-                    && !matches!(action.destination.as_str(), "0.0.0.0/1" | "128.0.0.0/1"))
+                    && (prefix.prefix_len() == 0 || prefix != prefix.trunc()))
                 || (action.kind == "escape"
                     && prefix.prefix_len() != if action.family == 4 { 32 } else { 128 })
                 || (action.kind == "dns-route"
@@ -1411,6 +1791,7 @@ fn validate_action(action: &Action, state: &NetworkState) -> Result<(), NetworkE
             Ok(())
         }
         "dns" => Ok(()),
+        "forwarding" if action.previous_value == "0" => Ok(()),
         _ => Err(NetworkError::Invalid(
             "invalid network journal action".to_owned(),
         )),
@@ -1452,12 +1833,13 @@ fn valid_unicast(address: Ipv4Addr) -> bool {
         && address != Ipv4Addr::BROADCAST
 }
 
-fn validate_lease(interface: &str, lease: Lease) -> Result<(), NetworkError> {
+fn validate_lease(interface: &str, lease: Lease, tunnel_dns: bool) -> Result<(), NetworkError> {
     if !valid_interface(interface)
         || !valid_unicast(lease.address.addr())
-        || lease
-            .dns
-            .is_none_or(|dns| !valid_unicast(dns) || dns == lease.address.addr())
+        || (tunnel_dns
+            && lease
+                .dns
+                .is_none_or(|dns| !valid_unicast(dns) || dns == lease.address.addr()))
         || !(576..=9000).contains(&lease.mtu)
     {
         return Err(NetworkError::Invalid(

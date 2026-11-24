@@ -33,9 +33,17 @@ const messages = {
     profileName: "Profile name",
     profileNamePlaceholder: "Home, work, travel…",
     gateway: "Gateway URL",
+    backupGateways: "Backup gateways",
+    backupGatewaysPlaceholder: "Optional, one per line: gateways that share this account",
+    allowLan: "Allow local network",
+    allowLanHelp: "Keep printers, file shares and media players on this network reachable while everything else uses the tunnel. DNS still uses the tunnel.",
+    connectAtLogin: "Connect automatically",
+    connectAtLoginHelp: "Connect this profile when you sign in to Windows. Only one profile can connect automatically.",
+    connectAtLoginHelpLinux: "Connect this profile when this computer starts. Only one profile can connect automatically.",
     accessToken: "Access token",
     accessTokenPlaceholder: "Paste the token from your administrator",
     tokenHelpNew: "Stored securely for this Windows account.",
+    tokenHelpNewLinux: "Stored by the Porta service in a file only root can read.",
     tokenHelpEdit: "Leave blank to keep the current protected token.",
     delete: "Delete",
     confirmDelete: "Confirm delete",
@@ -72,12 +80,35 @@ const messages = {
     chooseProfile: "Choose a profile to connect.",
     addProfileDetail: "Add a profile to connect.",
     profileReady: "{name} · {server}",
+    accountExpiredDenied: "This account has expired. Ask your administrator to renew it.",
+    quotaExceededDenied: "This account has used its monthly data allowance. Access resumes next month or when your administrator raises it.",
+    devicePendingDenied: "This device is waiting for administrator approval. Connect again once it is approved.",
+    enrollmentClosedDenied: "This account accepts no new devices. Ask your administrator to allow enrollment.",
+    deviceDeniedDenied: "Your administrator has not allowed this device to connect.",
+    clientOutdatedDenied: "This version of Porta is too old for the gateway. Install the latest version from the downloads page.",
+    accountExpires: "Access until {date}",
+    fullTunnel: "All traffic goes through the gateway",
+    splitTunnel: "Split tunnel · {count} networks via the gateway",
+    splitTunnelDns: "Split tunnel · {count} networks via the gateway · DNS for {domains}",
+    directPeers: "{count} devices reached directly",
+    accountExpiresSoon: "Access ends {date}",
+    quotaUsage: "{used} of {total} used this month",
+    quotaAllowance: "{total} monthly allowance",
+    speedLimit: "Speed limited to {rate} Mbit/s",
     establishingTunnel: "Establishing a secure tunnel…",
     configuringTunnel: "Applying private routes, DNS, and tunnel MTU…",
     connectedH3: "HTTP/3 MASQUE · fast and resilient · MTU {mtu}",
     connectedH2: "4-lane HTTP/2 fallback · encrypted · MTU {mtu}",
     connectedAuto: "Encrypted tunnel active · MTU {mtu}",
     reconnectingDetail: "The network changed; restoring the secure tunnel…",
+    signInRequired: "Network sign-in required",
+    signInRequiredDetail: "This network is holding the connection to the gateway. If it has a sign-in page, choose Sign in to network.",
+    pausingProtection: "Pausing protection",
+    pausingProtectionDetail: "Lifting leak protection for network sign-in…",
+    pausedForSignIn: "Paused for network sign-in",
+    pausedForSignInDetail: "Sign in to the network in your browser. Porta reconnects once the gateway is reachable, or in {time}.",
+    signInNetwork: "Sign in to network",
+    reconnectNow: "Reconnect now",
     disconnectingDetail: "Restoring normal network access…",
     recoveryDetail: "Reconnect to resume protection, or restore normal connectivity.",
     recoveryActive: "Resuming retained fail-closed protection…",
@@ -119,9 +150,17 @@ const messages = {
     profileName: "配置名称",
     profileNamePlaceholder: "家庭、工作、旅行…",
     gateway: "网关地址",
+    backupGateways: "备用网关",
+    backupGatewaysPlaceholder: "可选，每行一个：共享此账户的网关",
+    allowLan: "允许访问本地网络",
+    allowLanHelp: "其他流量经由隧道时，仍可访问此网络上的打印机、文件共享和媒体设备。DNS 仍经由隧道。",
+    connectAtLogin: "自动连接",
+    connectAtLoginHelp: "登录 Windows 时连接此配置。只能有一个配置自动连接。",
+    connectAtLoginHelpLinux: "此电脑启动时连接此配置。只能有一个配置自动连接。",
     accessToken: "访问令牌",
     accessTokenPlaceholder: "粘贴管理员提供的令牌",
     tokenHelpNew: "令牌将为当前 Windows 账户安全存储。",
+    tokenHelpNewLinux: "令牌由 Porta 服务保存在仅 root 可读的文件中。",
     tokenHelpEdit: "留空可继续使用当前受保护的令牌。",
     delete: "删除",
     confirmDelete: "确认删除",
@@ -158,12 +197,35 @@ const messages = {
     chooseProfile: "选择一个配置以建立连接。",
     addProfileDetail: "添加配置后即可连接。",
     profileReady: "{name} · {server}",
+    accountExpiredDenied: "此账户已过期，请联系管理员续期。",
+    quotaExceededDenied: "此账户已用完本月流量额度。下月恢复，或请管理员提高额度。",
+    devicePendingDenied: "此设备正在等待管理员批准。批准后请重新连接。",
+    enrollmentClosedDenied: "此账户不再接受新设备，请联系管理员开放注册。",
+    deviceDeniedDenied: "管理员未允许此设备连接。",
+    clientOutdatedDenied: "此版本的 Porta 过旧，网关不再允许连接。请从下载页面安装最新版本。",
+    accountExpires: "可使用至 {date}",
+    fullTunnel: "所有流量均经由网关",
+    splitTunnel: "分流模式 · {count} 个网络经由网关",
+    splitTunnelDns: "分流模式 · {count} 个网络经由网关 · {domains} 使用隧道 DNS",
+    directPeers: "{count} 台设备直连",
+    accountExpiresSoon: "将于 {date} 到期",
+    quotaUsage: "本月已用 {used} / {total}",
+    quotaAllowance: "每月额度 {total}",
+    speedLimit: "限速 {rate} Mbit/s",
     establishingTunnel: "正在建立安全隧道…",
     configuringTunnel: "正在应用私有路由、DNS 和隧道 MTU…",
     connectedH3: "HTTP/3 MASQUE · 快速且稳定 · MTU {mtu}",
     connectedH2: "4 通道 HTTP/2 备用连接 · 已加密 · MTU {mtu}",
     connectedAuto: "加密隧道已启用 · MTU {mtu}",
     reconnectingDetail: "网络已变化，正在恢复安全隧道…",
+    signInRequired: "需要登录网络",
+    signInRequiredDetail: "此网络拦截了与网关的连接。如果它有登录页面，请选择“登录网络”。",
+    pausingProtection: "正在暂停保护",
+    pausingProtectionDetail: "正在暂时解除防泄漏保护以登录网络…",
+    pausedForSignIn: "已暂停以登录网络",
+    pausedForSignInDetail: "请在浏览器中登录此网络。网关可访问后 Porta 会立即重新连接，最迟在 {time} 后。",
+    signInNetwork: "登录网络",
+    reconnectNow: "立即重新连接",
     disconnectingDetail: "正在恢复正常网络访问…",
     recoveryDetail: "重新连接可恢复保护，也可以直接恢复正常网络。",
     recoveryActive: "正在恢复保留的防泄漏保护…",
@@ -188,6 +250,9 @@ const statusKeys = {
   "Network recovery failed": "recoveryFailed",
   Ready: "ready",
   Reconnecting: "reconnecting",
+  "Network sign-in required": "signInRequired",
+  "Pausing protection": "pausingProtection",
+  "Paused for network sign-in": "pausedForSignIn",
   "Recovering network": "recoveringNetwork",
   "Restoring network": "restoringNetwork",
 };
@@ -302,6 +367,7 @@ async function call(name, ...args) {
     Connect: ["connect", { id: args[0] }],
     Disconnect: ["disconnect", {}],
     RestoreNetwork: ["restore_network", {}],
+    SignInNetwork: ["sign_in_network", {}],
     ClearActivity: ["clear_activity", {}],
     SaveActivityLog: ["save_activity_log", {}],
   };
@@ -350,6 +416,7 @@ function updatePendingState() {
     element.disabled = busy;
   });
   $("language-action").disabled = busy;
+  updateSignInActions();
   $("restore-action").disabled =
     busy || !state.snapshot?.recoveryAvailable || state.snapshot?.running ||
     state.snapshot?.restoring;
@@ -392,6 +459,8 @@ function applySnapshot(snapshot, recordTraffic) {
   const status = t(statusKeys[snapshot.status] || "") || snapshot.status;
   setText("status-text", status);
   setText("status-detail", localizedDetail(snapshot));
+  renderAccount(snapshot);
+  renderRouting(snapshot);
   const tone = snapshot.tone === "connected"
     ? "connected"
     : snapshot.tone === "warning"
@@ -414,7 +483,65 @@ function applySnapshot(snapshot, recordTraffic) {
   renderProfilesIfNeeded();
   renderActivityIfNeeded();
   updateRecoveryAction();
+  updateSignInActions();
   updateDuration();
+}
+
+// Account limits the gateway reported for the current connection.
+function accountSummary(snapshot) {
+  if (!snapshot.connected) return { text: "", warning: false };
+  const parts = [];
+  let warning = false;
+  if (snapshot.accountExpiresAt) {
+    const expires = new Date(snapshot.accountExpiresAt * 1000);
+    const soon = expires.getTime() - Date.now() < 7 * 86400000;
+    warning ||= soon;
+    const date = new Intl.DateTimeFormat(state.language, { dateStyle: "medium" }).format(expires);
+    parts.push(t(soon ? "accountExpiresSoon" : "accountExpires", { date }));
+  }
+  if (snapshot.quotaBytes) {
+    if (snapshot.quotaUsedBytes == null) {
+      parts.push(t("quotaAllowance", { total: formatBytes(snapshot.quotaBytes) }));
+    } else {
+      warning ||= snapshot.quotaUsedBytes >= snapshot.quotaBytes * 0.9;
+      parts.push(t("quotaUsage", {
+        used: formatBytes(snapshot.quotaUsedBytes),
+        total: formatBytes(snapshot.quotaBytes),
+      }));
+    }
+  }
+  if (snapshot.rateLimitKbps) {
+    const rate = new Intl.NumberFormat(state.language, { maximumFractionDigits: 3 })
+      .format(snapshot.rateLimitKbps / 1000);
+    parts.push(t("speedLimit", { rate }));
+  }
+  return { text: parts.join(" · "), warning };
+}
+
+function renderAccount(snapshot) {
+  const { text, warning } = accountSummary(snapshot);
+  const element = $("account-detail");
+  setText("account-detail", text);
+  element.classList.toggle("hidden", !text);
+  element.classList.toggle("warning", warning);
+}
+
+// Which destinations the gateway tunnels for the current connection.
+function renderRouting(snapshot) {
+  const element = $("routing-detail");
+  const routes = snapshot.splitRoutes || [];
+  const domains = snapshot.splitDnsDomains || [];
+  let text = "";
+  if (snapshot.connected) {
+    if (!routes.length) text = t("fullTunnel");
+    else if (domains.length) text = t("splitTunnelDns", { count: routes.length, domains: domains.join(", ") });
+    else text = t("splitTunnel", { count: routes.length });
+    const direct = snapshot.directPeers || [];
+    if (direct.length) text += " · " + t("directPeers", { count: direct.length });
+  }
+  setText("routing-detail", text);
+  element.title = routes.concat(snapshot.directPeers || []).join("\n");
+  element.classList.toggle("hidden", !text);
 }
 
 function localizedDetail(snapshot) {
@@ -437,6 +564,12 @@ function localizedDetail(snapshot) {
       return t("connectedAuto", { mtu: snapshot.mtu });
     case "Reconnecting":
       return t("reconnectingDetail");
+    case "Network sign-in required":
+      return t("signInRequiredDetail");
+    case "Pausing protection":
+      return t("pausingProtectionDetail");
+    case "Paused for network sign-in":
+      return t("pausedForSignInDetail", { time: signInRemaining(snapshot) });
     case "Disconnecting":
     case "Restoring network":
       return t("disconnectingDetail");
@@ -445,6 +578,12 @@ function localizedDetail(snapshot) {
     case "Recovering network":
       return t("recoveryActive");
     default:
+      if (snapshot.accountDenial === "account-expired") return t("accountExpiredDenied");
+      if (snapshot.accountDenial === "quota-exceeded") return t("quotaExceededDenied");
+      if (snapshot.accountDenial === "device-pending") return t("devicePendingDenied");
+      if (snapshot.accountDenial === "enrollment-closed") return t("enrollmentClosedDenied");
+      if (snapshot.accountDenial === "device-denied") return t("deviceDeniedDenied");
+      if (snapshot.accountDenial === "client-outdated") return t("clientOutdatedDenied");
       if (snapshot.detail === "Normal network access has been restored.") return t("networkRestored");
       if (snapshot.detail === "Network recovery remains pending.") return t("recoveryPending");
       return snapshot.detail;
@@ -603,6 +742,9 @@ function openEditor(profile = null) {
   resetDeleteAction();
   $("profile-name").value = profile?.name || "";
   $("profile-server").value = profile?.serverUrl || "https://";
+  $("profile-backups").value = (profile?.backupServers || []).join("\n");
+  $("profile-allow-lan").checked = Boolean(profile?.allowLan);
+  $("profile-connect-at-login").checked = Boolean(profile?.connectAtLogin);
   $("profile-token").value = "";
   $("delete-profile").classList.toggle("hidden", !profile);
   $("editor-error").classList.add("hidden");
@@ -613,7 +755,12 @@ function openEditor(profile = null) {
 
 function updateEditorLabels() {
   setText("editor-title", t(state.editorProfile ? "editProfileTitle" : "addProfileTitle"));
-  setText("token-help", t(state.editorProfile ? "tokenHelpEdit" : "tokenHelpNew"));
+  const newTokenHelp = state.snapshot?.platform === "linux" ? "tokenHelpNewLinux" : "tokenHelpNew";
+  setText(
+    "connect-at-login-help",
+    t(state.snapshot?.platform === "linux" ? "connectAtLoginHelpLinux" : "connectAtLoginHelp"),
+  );
+  setText("token-help", t(state.editorProfile ? "tokenHelpEdit" : newTokenHelp));
   if (!state.deleteArmed) setText("delete-profile", t("delete"));
 }
 
@@ -672,8 +819,11 @@ async function saveProfile(event) {
     id: state.editorProfile?.id || "",
     name: $("profile-name").value,
     serverUrl: $("profile-server").value,
+    backupServers: $("profile-backups").value.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean),
     transport: state.editorProfile?.transport || "auto",
     token: $("profile-token").value,
+    allowLan: $("profile-allow-lan").checked,
+    connectAtLogin: $("profile-connect-at-login").checked,
   };
   const invalid = validateProfileInput(input);
   if (invalid) {
@@ -710,6 +860,16 @@ function validateProfileInput(input) {
   } catch (_) {
     return { field: "profile-server", message: t("invalidServer") };
   }
+  for (const backup of input.backupServers) {
+    try {
+      const url = new URL(backup);
+      if (url.protocol !== "https:" || !url.hostname || (url.pathname !== "" && url.pathname !== "/")) {
+        return { field: "profile-backups", message: t("httpsOriginRequired") };
+      }
+    } catch (_) {
+      return { field: "profile-backups", message: t("invalidServer") };
+    }
+  }
   if (!state.editorProfile && !input.token.trim()) {
     return { field: "profile-token", message: t("tokenRequired") };
   }
@@ -744,6 +904,27 @@ function renderActivityIfNeeded() {
   $("activity-empty").classList.toggle("hidden", activity.length !== 0);
   $("export-action").disabled = activity.length === 0 || Boolean(state.pendingAction);
   $("clear-action").disabled = activity.length === 0 || Boolean(state.pendingAction);
+}
+
+// The time left in a network sign-in pause, as m:ss.
+function signInRemaining(snapshot) {
+  const seconds = Math.max(0, Math.ceil((Date.parse(snapshot.signInUntil) - Date.now()) / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+// Leak protection blocks a captive network's sign-in page, so offer a short
+// pause while the tunnel cannot connect, and an early end to the pause.
+function updateSignInActions() {
+  const snapshot = state.snapshot;
+  const paused = Boolean(snapshot?.signInUntil);
+  const blocked = Boolean(snapshot) && !snapshot.startupBlocked && !snapshot.disconnecting &&
+    !snapshot.restoring &&
+    ((snapshot.running && !snapshot.connected) || (!snapshot.running && snapshot.recoveryAvailable));
+  $("sign-in-actions").classList.toggle("hidden", !paused && !blocked);
+  $("sign-in-action").classList.toggle("hidden", paused || !blocked);
+  $("reconnect-action").classList.toggle("hidden", !paused);
+  $("sign-in-action").disabled = Boolean(state.pendingAction);
+  $("reconnect-action").disabled = Boolean(state.pendingAction);
 }
 
 function updateRecoveryAction() {
@@ -786,6 +967,7 @@ function firstLetter(value = "") {
 }
 
 function updateDuration() {
+  if (state.snapshot?.signInUntil) setText("status-detail", localizedDetail(state.snapshot));
   const connectedAt = state.snapshot?.connectedAt;
   if (!connectedAt) {
     setText("session-duration", "00:00");
@@ -908,6 +1090,13 @@ $("delete-profile").addEventListener("click", deleteProfile);
 $("error-dismiss").addEventListener("click", hideError);
 $("restore-action").addEventListener("click", async () => {
   await performAction("restore", "", () => call("RestoreNetwork"));
+});
+$("sign-in-action").addEventListener("click", async () => {
+  await performAction("sign-in", "", () => call("SignInNetwork"));
+});
+$("reconnect-action").addEventListener("click", async () => {
+  const id = state.snapshot?.selectedProfileId || "";
+  await performAction("connect", id, () => call("Connect", id));
 });
 $("clear-action").addEventListener("click", clearActivity);
 $("export-action").addEventListener("click", saveActivity);

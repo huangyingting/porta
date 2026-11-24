@@ -43,11 +43,15 @@
     <string name="token_hint">Access token</string>
     <string name="token_unchanged_hint">Leave blank to keep current token</string>
     <string name="gateway_label">Gateway</string>
+    <string name="backup_gateways_label">Backup gateways</string>
+    <string name="backup_gateways_hint">Optional, one per line: gateways sharing this account</string>
     <string name="token_label">Access token</string>
     <string name="device_identity_automatic">Device identity uses a security key; the device or model name is shown for recognition.</string>
     <string name="device_identity_unavailable">Could not load this device’s security key. See Log for details.</string>
     <string name="security_note">Protected by TLS and Android VPN security</string>
     <string name="auto_connect">Reconnect after device restart</string>
+    <string name="allow_lan">Allow local network</string>
+    <string name="allow_lan_help">Keep printers, file shares and casting on this network reachable while everything else uses the tunnel.</string>
     <string name="secure_storage_failed">Could not store the token securely</string>
     <string name="profile_delete_failed">Could not delete the VPN profile.</string>
     <string name="disconnect_before_editing">Disconnect this profile before editing it.</string>
@@ -55,6 +59,27 @@
     <string name="disconnect_active_profile">Disconnect the active profile before connecting another one.</string>
     <string name="connected">Connected</string>
     <string name="connection_blocked">Connection blocked</string>
+    <string name="connection_rejected">Connection rejected</string>
+    <string name="account_expired_denied">This account has expired. Ask your administrator to renew it.</string>
+    <string name="quota_exceeded_denied">This account has used its monthly data allowance. Access resumes next month or when your administrator raises it.</string>
+    <string name="device_pending_denied">This device is waiting for administrator approval. Connect again once it is approved.</string>
+    <string name="enrollment_closed_denied">This account accepts no new devices. Ask your administrator to allow enrollment.</string>
+    <string name="device_denied_denied">Your administrator has not allowed this device to connect.</string>
+    <string name="client_outdated_denied">This version of Porta is too old for the gateway. Install the latest version from the downloads page.</string>
+    <string name="routing_full_tunnel">All traffic goes through the gateway</string>
+    <plurals name="routing_split_tunnel">
+        <item quantity="one">Split tunnel · %1$d network via the gateway</item>
+        <item quantity="other">Split tunnel · %1$d networks via the gateway</item>
+    </plurals>
+    <plurals name="routing_split_tunnel_dns">
+        <item quantity="one">Split tunnel · %1$d network via the gateway · DNS for %2$s</item>
+        <item quantity="other">Split tunnel · %1$d networks via the gateway · DNS for %2$s</item>
+    </plurals>
+    <string name="account_expires">Access until %1$s</string>
+    <string name="account_expires_soon">Access ends %1$s</string>
+    <string name="quota_usage">%1$s of %2$s used this month</string>
+    <string name="quota_allowance">%1$s monthly allowance</string>
+    <string name="speed_limit">Speed limited to %1$s Mbit/s</string>
     <string name="disconnected">Disconnected</string>
     <string name="connecting">Connecting</string>
     <string name="waiting_for_network">Waiting for network</string>
@@ -91,4 +116,20 @@
     <string name="notification_connected">Secure tunnel connected</string>
     <string name="notification_connected_transport">Connected over %1$s</string>
     <string name="notification_permission_revoked">VPN permission revoked</string>
+    <string name="apps_label">Apps</string>
+    <string name="apps_all">All apps</string>
+    <string name="apps_mode_all">All apps use the tunnel</string>
+    <string name="apps_mode_only">Only chosen apps use the tunnel</string>
+    <string name="apps_mode_except">Chosen apps bypass the tunnel</string>
+    <string name="apps_choose_one">Choose at least one app</string>
+    <string name="apps_too_many">Choose at most %1$d apps</string>
+    <string name="no_selected_apps_installed">None of the apps chosen for this profile are installed</string>
+    <plurals name="apps_only">
+        <item quantity="one">Only %1$d app</item>
+        <item quantity="other">Only %1$d apps</item>
+    </plurals>
+    <plurals name="apps_except">
+        <item quantity="one">All except %1$d app</item>
+        <item quantity="other">All except %1$d apps</item>
+    </plurals>
 </resources>

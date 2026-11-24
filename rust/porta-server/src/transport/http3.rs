@@ -18,23 +18,27 @@ use tracing::Instrument;
 
 use crate::ops::admission::{AdmissionPermit, ConnectionAdmission, RetryController};
 use crate::transport::session::{
-    bearer_token, fragment_ipv4, icmp_fragmentation_needed, AuthenticationRequest, DeviceProof,
+    bearer_token, client_version, fragment_ipv4, icmp_fragmentation_needed, is_masque_path,
+    is_standard_request, set_account_headers, AuthenticationRequest, DenialReason, DeviceProof,
     Lease, LeaseError, MtuError, OpenSessionError, OpenSessionRequest, RouteError, RouteKind,
     Services, Session, HEADER_MAX_VERSION, HEADER_MIN_VERSION, HEADER_VERSION, MASQUE_AUTH_PATH,
-    MASQUE_PATH, PROTOCOL_VERSION,
+    PROTOCOL_VERSION, REASON_HEADER,
 };
 use crate::web::landing::LandingSite;
 use crate::web::portal::Portal;
 use crate::web::session::{normalized_headers, RequestContext, Response as WebResponse};
+use crate::wire::ip::parse_ip;
+#[cfg(test)]
 use crate::wire::ip::parse_ipv4;
 use crate::wire::masque::{
     decode_address_assign, decode_address_request, decode_mtu_probe, decode_mtu_selection,
     decode_route_advertisement, encode_address_assign, encode_mtu_selection,
-    encode_route_advertisement, parse_varint, Address, MasqueError, MtuProbe, MtuToken, Route,
+    encode_route_advertisement, parse_varint, Address, MasqueError, MtuProbe, MtuToken,
     CAPSULE_ADDRESS_ASSIGN, CAPSULE_ADDRESS_REQUEST, CAPSULE_DATAGRAM, CAPSULE_MTU_SELECT,
     CAPSULE_MTU_SELECTED, CAPSULE_ROUTE_ADVERTISEMENT, MAX_CAPSULE_SIZE, MAX_DISCOVERED_MTU,
     MTU_DISCOVERY_HEADER, SAFE_MTU,
 };
+use crate::wire::peer::{self, Peer, CAPSULE_PEERS, CAPSULE_PEER_OFFER, PEERS_HEADER};
 
 const CAPSULE_PROTOCOL: &str = "Capsule-Protocol";
 const MAX_WEB_BODY: usize = 16 << 10;
@@ -116,7 +120,12 @@ pub async fn serve_quinn(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                endpoint.close(0_u32.into(), b"server shutting down");
+                let reason: &[u8] = if crate::ops::shutdown::restarting() {
+                    b"gateway restarting"
+                } else {
+                    b"server shutting down"
+                };
+                endpoint.close(0_u32.into(), reason);
                 connections.close();
                 endpoint.wait_idle().await;
                 connections.wait().await;
@@ -216,7 +225,7 @@ async fn serve_connection(
                     }
                 };
                 if request.method() == http::Method::CONNECT
-                    && request.uri().path().eq_ignore_ascii_case(MASQUE_PATH)
+                    && is_masque_path(request.uri().path())
                 {
                     if tunnel_active.swap(true, Ordering::AcqRel) {
                         requests.spawn(async move {
@@ -420,7 +429,7 @@ where
     RecvHandler: h3_datagram::quic_traits::RecvDatagram + Send + 'static,
     RecvHandler::Buffer: Send + 'static,
 {
-    if !request.uri().path().eq_ignore_ascii_case(MASQUE_PATH) {
+    if !is_masque_path(request.uri().path()) {
         send_error(
             &mut stream,
             http::StatusCode::NOT_FOUND,
@@ -459,11 +468,13 @@ where
         .await?;
         return Ok(());
     }
-    if request
-        .headers()
-        .get(HEADER_VERSION)
-        .and_then(|value| value.to_str().ok())
-        != Some(PROTOCOL_VERSION)
+    let standard = is_standard_request(request.headers());
+    if !standard
+        && request
+            .headers()
+            .get(HEADER_VERSION)
+            .and_then(|value| value.to_str().ok())
+            != Some(PROTOCOL_VERSION)
     {
         send_error(
             &mut stream,
@@ -523,10 +534,16 @@ where
         .open(OpenSessionRequest {
             authentication: AuthenticationRequest {
                 bearer_token: token,
-                proof: DeviceProof::from_headers(request.headers()),
+                proof: if standard {
+                    DeviceProof::standard()
+                } else {
+                    DeviceProof::from_headers(request.headers())
+                },
                 method: request.method().clone(),
                 path: MASQUE_AUTH_PATH.to_owned(),
                 peer,
+                standard,
+                client_version: client_version(request.headers()),
             },
             group_id: None,
             route: RouteKind::ConnectIp,
@@ -599,7 +616,15 @@ where
     RecvHandler: h3_datagram::quic_traits::RecvDatagram + Send + 'static,
     RecvHandler::Buffer: Send + 'static,
 {
-    let response = success_response(config, mtu.as_ref(), &session.lease);
+    let mut response = success_response(config, mtu.as_ref(), &session.lease);
+    set_account_headers(response.headers_mut(), &session.account);
+    session.routing.set_headers(response.headers_mut());
+    let offers_peers = !session.proof.is_standard() && session.services().router.offers_peers();
+    if offers_peers {
+        response
+            .headers_mut()
+            .insert(PEERS_HEADER, http::HeaderValue::from_static("?1"));
+    }
     let response_sent = tokio::select! {
         biased;
         _ = session.cancellation.cancelled() => false,
@@ -651,8 +676,19 @@ where
     let mut downlink_ready = false;
     let mut assignment_ack: Option<oneshot::Receiver<()>> = None;
     let (writer, commands) = ReliableQueue::new();
+    // Standard clients may wait for the proxy to assign addresses unasked.
+    if session.proof.is_standard() {
+        let (tx, rx) = oneshot::channel();
+        assignment_ack = Some(rx);
+        writer.control(
+            unsolicited_assignment(&session.lease, &session.routing)?,
+            Some(tx),
+        )?;
+        assigned = true;
+    }
     let writer_cancellation = CancellationToken::new();
     let connection = diagnostics.connection.clone();
+    let mut peer_updates: Option<tokio::sync::watch::Receiver<Vec<Peer>>> = None;
 
     let mut result: Result<&'static str> = {
         // Poll writes independently: receive handlers only try_enqueue, even while
@@ -707,7 +743,7 @@ where
                                 break 'tunnel Err(MasqueError::InvalidMtuMessage.into());
                             }
                             let (control, becomes_assigned) =
-                                address_response(&session.lease, assigned, &value)?;
+                                address_response(&session.lease, &session.routing, assigned, &value)?;
                             let ack = if becomes_assigned && !assigned {
                                 let (tx, rx) = oneshot::channel();
                                 assignment_ack = Some(rx);
@@ -733,6 +769,25 @@ where
                         }
                         CAPSULE_ADDRESS_ASSIGN => {
                             decode_address_assign(&value)?;
+                        }
+                        CAPSULE_PEER_OFFER if offers_peers && assigned && peer_updates.is_none() => {
+                            let Ok(fingerprint) = peer::decode_offer(&value) else {
+                                continue;
+                            };
+                            peer_updates = session.services().router.announce_peer(
+                                session.lease.address,
+                                connection.remote_address(),
+                                fingerprint,
+                            );
+                            if let Some(updates) = peer_updates.as_mut() {
+                                tracing::info!(
+                                    address = %session.lease.address,
+                                    endpoint = %connection.remote_address(),
+                                    "device published for direct paths"
+                                );
+                                let peers = updates.borrow_and_update().clone();
+                                writer.control(peers_capsule(&peers)?, None)?;
+                            }
                         }
                         CAPSULE_ROUTE_ADVERTISEMENT => {
                             decode_route_advertisement(&value)?;
@@ -776,6 +831,14 @@ where
                     }
                     Err(_) => session.services().metrics.dropped_from_client(),
                 }
+            }
+            changed = async { peer_updates.as_mut().expect("guarded").changed().await }, if peer_updates.is_some() => {
+                if changed.is_err() {
+                    peer_updates = None;
+                    continue;
+                }
+                let peers = peer_updates.as_mut().expect("guarded").borrow_and_update().clone();
+                writer.control(peers_capsule(&peers)?, None)?;
             }
             packet = session.downlink.next_packet(), if downlink_ready => {
                 let Some(packet) = packet else {
@@ -1352,7 +1415,7 @@ impl Http3Diagnostics {
 
 fn is_connect_ip(request: &http::Request<()>) -> bool {
     request.method() == http::Method::CONNECT
-        && request.uri().path().eq_ignore_ascii_case(MASQUE_PATH)
+        && is_masque_path(request.uri().path())
         && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP)
 }
 
@@ -1385,6 +1448,39 @@ fn success_response(
     response
 }
 
+/// A retryable refusal whose reason tells a multi-gateway client to try
+/// another gateway.
+async fn send_unavailable<S, B>(
+    stream: &mut h3::server::RequestStream<S, B>,
+    message: &'static str,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<B>,
+    B: Buf + From<Bytes>,
+{
+    let mut response = http::Response::new(());
+    *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+    for (name, value) in [
+        (http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+        (http::header::CACHE_CONTROL, "no-store"),
+        (http::header::RETRY_AFTER, "5"),
+    ] {
+        response
+            .headers_mut()
+            .insert(name, http::HeaderValue::from_static(value));
+    }
+    response
+        .headers_mut()
+        .insert(REASON_HEADER, http::HeaderValue::from_static(message));
+    set_security_headers(response.headers_mut());
+    stream.send_response(response).await?;
+    stream
+        .send_data(Bytes::from_static(message.as_bytes()).into())
+        .await?;
+    stream.finish().await?;
+    Ok(())
+}
+
 async fn send_error<S, B>(
     stream: &mut h3::server::RequestStream<S, B>,
     status: http::StatusCode,
@@ -1412,6 +1508,37 @@ where
     stream.send_response(response).await?;
     stream
         .send_data(Bytes::from_static(message.as_bytes()).into())
+        .await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+async fn send_forbidden<S, B>(
+    stream: &mut h3::server::RequestStream<S, B>,
+    reason: DenialReason,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<B>,
+    B: Buf + From<Bytes>,
+{
+    let mut response = http::Response::new(());
+    *response.status_mut() = http::StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        REASON_HEADER,
+        http::HeaderValue::from_static(reason.as_str()),
+    );
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    set_security_headers(response.headers_mut());
+    stream.send_response(response).await?;
+    stream
+        .send_data(Bytes::from(format!("{reason}\n")).into())
         .await?;
     stream.finish().await?;
     Ok(())
@@ -1487,6 +1614,7 @@ where
 {
     match error {
         OpenSessionError::Unauthorized => send_unauthorized(stream).await,
+        OpenSessionError::Forbidden(reason) => send_forbidden(stream, reason).await,
         OpenSessionError::RateLimited {
             retry_after_seconds,
         } => {
@@ -1512,6 +1640,7 @@ where
             stream.finish().await?;
             Ok(())
         }
+        OpenSessionError::Unavailable(message) => send_unavailable(stream, message).await,
         OpenSessionError::Lease(LeaseError::Exhausted | LeaseError::Internal) => {
             send_error(
                 stream,
@@ -1557,48 +1686,88 @@ fn set_version_headers(headers: &mut http::HeaderMap) {
     );
 }
 
+/// ADDRESS_ASSIGN with all of the client's addresses under request ID zero,
+/// followed by the route advertisement.
+pub(crate) fn unsolicited_assignment(
+    lease: &Lease,
+    routing: &crate::transport::session::TunnelRouting,
+) -> Result<Bytes> {
+    let mut addresses = vec![Address {
+        request_id: 0,
+        prefix: IpNet::V4(Ipv4Net::new(lease.address, 32).expect("IPv4 /32 is valid")),
+    }];
+    if let Some(ipv6) = lease.ipv6 {
+        addresses.push(Address {
+            request_id: 0,
+            prefix: IpNet::V6(Ipv6Net::new(ipv6.address, 128).expect("IPv6 /128 is valid")),
+        });
+    }
+    let assignment = encode_address_assign(&addresses)?;
+    let routes = encode_route_advertisement(&routing.advertisement())?;
+    let mut control = BytesMut::with_capacity(assignment.len() + routes.len() + 16);
+    append_capsule(&mut control, CAPSULE_ADDRESS_ASSIGN, &assignment)?;
+    append_capsule(&mut control, CAPSULE_ROUTE_ADVERTISEMENT, &routes)?;
+    Ok(control.freeze())
+}
+
+fn peers_capsule(peers: &[Peer]) -> Result<Bytes> {
+    let value = peer::encode_peers(peers)?;
+    let mut control = BytesMut::with_capacity(value.len() + 16);
+    append_capsule(&mut control, CAPSULE_PEERS, &value)?;
+    Ok(control.freeze())
+}
+
 pub(crate) fn address_response(
     lease: &Lease,
+    routing: &crate::transport::session::TunnelRouting,
     assigned: bool,
     value: &[u8],
 ) -> Result<(Bytes, bool)> {
     let requests = decode_address_request(value)?;
-    let mut responses = Vec::with_capacity(requests.len() + 1);
-    let mut requested_ipv4 = false;
+    let mut responses = Vec::with_capacity(requests.len() + 2);
+    let mut requested_ipv4 = None;
+    let mut requested_ipv6 = None;
     for request in requests {
-        let prefix = match request.prefix {
-            IpNet::V4(_) if !requested_ipv4 => {
-                requested_ipv4 = true;
-                IpNet::V4(Ipv4Net::new(lease.address, 32).expect("IPv4 /32 is valid"))
+        match request.prefix {
+            IpNet::V4(_) if requested_ipv4.is_none() => requested_ipv4 = Some(request.request_id),
+            IpNet::V6(_) if requested_ipv6.is_none() && lease.ipv6.is_some() => {
+                requested_ipv6 = Some(request.request_id);
             }
-            IpNet::V4(_) => {
-                IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).expect("IPv4 /32 is valid"))
-            }
-            IpNet::V6(_) => {
-                IpNet::V6(Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128).expect("IPv6 /128 is valid"))
-            }
-        };
-        responses.push(Address {
-            request_id: request.request_id,
-            prefix,
-        });
+            // Requests this gateway cannot satisfy get the unspecified address.
+            IpNet::V4(_) => responses.push(Address {
+                request_id: request.request_id,
+                prefix: IpNet::V4(
+                    Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).expect("IPv4 /32 is valid"),
+                ),
+            }),
+            IpNet::V6(_) => responses.push(Address {
+                request_id: request.request_id,
+                prefix: IpNet::V6(
+                    Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128).expect("IPv6 /128 is valid"),
+                ),
+            }),
+        }
     }
-    if assigned && !requested_ipv4 {
+    let becomes_assigned = assigned || requested_ipv4.is_some() || requested_ipv6.is_some();
+    // Every assignment lists all of the client's addresses (RFC 9484 4.7.2);
+    // addresses it did not request carry request ID zero.
+    if becomes_assigned {
         responses.push(Address {
-            request_id: 0,
+            request_id: requested_ipv4.unwrap_or(0),
             prefix: IpNet::V4(Ipv4Net::new(lease.address, 32).expect("IPv4 /32 is valid")),
         });
+        if let Some(ipv6) = lease.ipv6 {
+            responses.push(Address {
+                request_id: requested_ipv6.unwrap_or(0),
+                prefix: IpNet::V6(Ipv6Net::new(ipv6.address, 128).expect("IPv6 /128 is valid")),
+            });
+        }
     }
     let assignment = encode_address_assign(&responses)?;
     let mut control = BytesMut::with_capacity(assignment.len() + 32);
     append_capsule(&mut control, CAPSULE_ADDRESS_ASSIGN, &assignment)?;
-    let becomes_assigned = assigned || requested_ipv4;
     if becomes_assigned {
-        let routes = encode_route_advertisement(&[Route {
-            start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            end: IpAddr::V4(Ipv4Addr::BROADCAST),
-            protocol: 0,
-        }])?;
+        let routes = encode_route_advertisement(&routing.advertisement())?;
         append_capsule(&mut control, CAPSULE_ROUTE_ADVERTISEMENT, &routes)?;
     }
     Ok((control.freeze(), becomes_assigned))
@@ -1609,11 +1778,11 @@ pub(crate) async fn inject_packet(session: &Session, packet: Bytes, mtu: u16) ->
         session.services().metrics.dropped_from_client();
         return Ok(());
     }
-    let Ok(info) = parse_ipv4(&packet) else {
+    let Ok(info) = parse_ip(&packet) else {
         session.services().metrics.dropped_from_client();
         return Ok(());
     };
-    if info.source != session.lease.address {
+    if !session.may_send_from(info.source) {
         session.services().metrics.dropped_from_client();
         return Ok(());
     }
@@ -1698,6 +1867,20 @@ async fn send_downlink(
         } else {
             usize::from(mtu)
         };
+        if packet.len() > limit
+            && diagnostics.datagrams_enabled
+            && limit < crate::wire::ip::IPV6_MIN_MTU
+            && packet.len() <= usize::from(mtu)
+            && crate::wire::ip::ip_version(&packet) == Some(6)
+        {
+            // IPv6 senders cannot go below 1280 bytes, so a smaller datagram
+            // path carries the packet on the reliable stream instead.
+            writer.packet(&packet)?;
+            session.services().metrics.datagram_oversize();
+            diagnostics.fallback(DatagramErrorKind::TooLarge, packet.len());
+            diagnostics.sends.capsule_submitted(packet.len(), 1);
+            continue;
+        }
         if packet.len() > limit {
             match fragment_ipv4(&packet, limit) {
                 Ok(fragments) => {
@@ -1953,6 +2136,7 @@ impl MtuResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::session::MASQUE_PATH;
     use crate::transport::session::{
         Authenticated, AuthenticationError, Authenticator, ClientIdentity, LeaseAllocator,
         LeaseRequest, NoopCleanup, NoopMetrics, NoopUsage, PacketQueue, PacketRouter, QueueConfig,
@@ -2017,6 +2201,8 @@ mod tests {
             router: router.clone(),
             usage: Arc::new(NoopUsage),
             metrics: metrics.clone(),
+            routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -2026,6 +2212,8 @@ mod tests {
                     method: http::Method::CONNECT,
                     path: MASQUE_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
+                    client_version: None,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,
@@ -3188,6 +3376,7 @@ mod tests {
             prefix_len: 24,
             gateway: "10.66.0.1".parse().unwrap(),
             opaque_id: 1,
+            ipv6: None,
         }
     }
 
@@ -3235,7 +3424,8 @@ mod tests {
             prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).unwrap()),
         }])
         .unwrap();
-        let (control, assigned) = address_response(&lease(), false, &request).unwrap();
+        let (control, assigned) =
+            address_response(&lease(), &Default::default(), false, &request).unwrap();
         assert!(assigned);
         let mut buffered = BytesMut::from(control.as_ref());
         let (first, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
@@ -3255,6 +3445,74 @@ mod tests {
         let (kind, value) = take_capsule(&mut datagram).unwrap().unwrap();
         assert_eq!(kind, CAPSULE_DATAGRAM);
         assert_eq!(value[0], 0);
+    }
+
+    #[test]
+    fn dual_stack_assignment_lists_both_addresses_and_routes() {
+        let mut lease = lease();
+        lease.ipv6 = Some(crate::transport::session::Ipv6Lease {
+            address: "fd66::2".parse().unwrap(),
+            prefix_len: 64,
+            gateway: "fd66::1".parse().unwrap(),
+        });
+        let routing = crate::transport::session::TunnelRouting {
+            ipv6: true,
+            ..Default::default()
+        };
+        let request = crate::wire::masque::encode_address_request(&[
+            Address {
+                request_id: 1,
+                prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).unwrap()),
+            },
+            Address {
+                request_id: 2,
+                prefix: IpNet::V6(Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 128).unwrap()),
+            },
+        ])
+        .unwrap();
+        let (control, assigned) = address_response(&lease, &routing, false, &request).unwrap();
+        assert!(assigned);
+        let mut buffered = BytesMut::from(control.as_ref());
+        let (_, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
+        let assignment = decode_address_assign(&assignment).unwrap();
+        assert_eq!(
+            assignment
+                .iter()
+                .map(|address| (address.request_id, address.prefix.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(1, "10.66.0.2/32".into()), (2, "fd66::2/128".into())]
+        );
+        let (_, routes) = take_capsule(&mut buffered).unwrap().unwrap();
+        let routes = decode_route_advertisement(&routes).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[1].end, IpAddr::V6(Ipv6Addr::from(u128::MAX)));
+
+        // A later IPv4-only request still lists the IPv6 address.
+        let again = crate::wire::masque::encode_address_request(&[Address {
+            request_id: 3,
+            prefix: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 32).unwrap()),
+        }])
+        .unwrap();
+        let (control, _) = address_response(&lease, &routing, true, &again).unwrap();
+        let mut buffered = BytesMut::from(control.as_ref());
+        let (_, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
+        let assignment = decode_address_assign(&assignment).unwrap();
+        assert_eq!(assignment[1].request_id, 0);
+        assert_eq!(assignment[1].prefix.to_string(), "fd66::2/128");
+
+        // Without an IPv6 lease the request gets the unspecified address.
+        let (control, _) =
+            address_response(&super::tests::lease(), &Default::default(), false, &request).unwrap();
+        let mut buffered = BytesMut::from(control.as_ref());
+        let (_, assignment) = take_capsule(&mut buffered).unwrap().unwrap();
+        let assignment = decode_address_assign(&assignment).unwrap();
+        assert_eq!(
+            assignment
+                .iter()
+                .map(|address| (address.request_id, address.prefix.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(2, "::/128".into()), (1, "10.66.0.2/32".into())]
+        );
     }
 
     #[test]
@@ -3290,12 +3548,14 @@ mod tests {
             Box::pin(async {
                 let token = CancellationToken::new();
                 Ok(Authenticated {
+                    account: Default::default(),
                     identity: ClientIdentity {
                         account_id: "account".into(),
                         lease_id: "lease".into(),
                     },
                     cancellation: Arc::new(TokenCancellation::new(token)),
                     cleanup: Arc::new(NoopCleanup),
+                    network: Default::default(),
                 })
             })
         }
@@ -3377,6 +3637,8 @@ mod tests {
             }),
             usage: Arc::new(NoopUsage),
             metrics: Arc::new(NoopMetrics),
+            routing: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let session = services
             .open(OpenSessionRequest {
@@ -3386,6 +3648,8 @@ mod tests {
                     method: http::Method::CONNECT,
                     path: MASQUE_PATH.into(),
                     peer: "127.0.0.1:1234".parse().unwrap(),
+                    standard: false,
+                    client_version: None,
                 },
                 group_id: None,
                 route: RouteKind::ConnectIp,

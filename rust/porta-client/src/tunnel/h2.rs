@@ -170,6 +170,10 @@ struct Group {
     session: String,
     lanes: [Arc<Lane>; LANE_COUNT],
     lease: Mutex<Option<Lease>>,
+    /// Account status from the most recently established lane.
+    account: Arc<Mutex<super::AccountStatus>>,
+    /// Routing from the first lane that established the group.
+    routing: Mutex<Option<super::Routing>>,
     flows: Mutex<FlowTable>,
     established: AtomicBool,
     failure: Arc<FailureSignal>,
@@ -185,6 +189,8 @@ struct LaneConnection {
     driver: AbortOnDropHandle<Result<(), ::h2::Error>>,
     remote_address: SocketAddr,
     lease: Lease,
+    account: super::AccountStatus,
+    routing: super::Routing,
 }
 
 pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientError> {
@@ -220,6 +226,8 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         session,
         lanes,
         lease: Mutex::new(None),
+        account: Arc::default(),
+        routing: Mutex::new(None),
         flows: Mutex::new(FlowTable::default()),
         established: AtomicBool::new(false),
         failure: failure.clone(),
@@ -249,6 +257,13 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
         .expect("HTTP/2 lane address lock poisoned")
         .expect("control lane has a remote address");
 
+    let account = group.account.clone();
+    let routing = group
+        .routing
+        .lock()
+        .expect("HTTP/2 routing lock poisoned")
+        .clone()
+        .unwrap_or_default();
     tasks.spawn(dispatch_outbound(group.clone(), outbound_rx));
     tasks.spawn(merge_downstream(group.clone(), receivers));
     tasks.spawn(monitor_capacity(group));
@@ -256,11 +271,14 @@ pub(super) async fn connect(config: ClientConfig) -> Result<Connection, ClientEr
     setup_guard.disarm();
     Ok(Connection {
         lease,
+        account,
+        routing,
         remote_address,
         transport: Transport::Http2,
         delivery_mode: DeliveryMode::Framed,
         mtu_automatic: false,
         mtu_ceiling: None,
+        peers: None,
         inner: Arc::new(ConnectionInner {
             outbound: outbound_tx,
             inbound: tokio::sync::Mutex::new(inbound_rx),
@@ -356,7 +374,11 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         let connection = match connection {
             Ok(connection) => connection,
             Err(error) => {
-                if matches!(error, ClientError::Permanent(_)) {
+                // A refusal before the group is up means another gateway
+                // should be tried now rather than after the setup timeout.
+                let refused_setup = matches!(error, ClientError::Refused(_))
+                    && !group.established.load(Ordering::Acquire);
+                if error.is_permanent() || refused_setup {
                     group.fail(error);
                     return;
                 }
@@ -368,6 +390,18 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
             }
         };
         let lease = connection.lease;
+        *group.account.lock().expect("HTTP/2 account lock poisoned") = connection.account;
+        let routing_changed = {
+            let mut routing = group.routing.lock().expect("HTTP/2 routing lock poisoned");
+            routing.get_or_insert_with(|| connection.routing.clone()) != &connection.routing
+        };
+        if routing_changed {
+            // The gateway changed this device's routes or subnets, as after an
+            // administrator update; reconnecting reconfigures the network.
+            close_lane(connection).await;
+            group.fail(ClientError::retryable("gateway routing changed"));
+            return;
+        }
         if let Err(error) = group.accept_lease(lease) {
             close_lane(connection).await;
             group.fail(error);
@@ -381,7 +415,7 @@ async fn run_lane(group: Arc<Group>, lane: Arc<Lane>) {
         if group.cancellation.is_cancelled() {
             return;
         }
-        if matches!(error, ClientError::Permanent(_)) {
+        if error.is_permanent() {
             group.fail(error);
             return;
         }
@@ -443,10 +477,12 @@ async fn establish_lane(group: &Group, index: usize) -> Result<LaneConnection, C
         let response = response.await.map_err(classify_h2_startup)?;
         validate_response(&response, &group.session, index)?;
         let lease = lease_from_headers(response.headers())?;
-        Ok((sender, response.into_body(), lease))
+        let account = super::parse_account_status(response.headers());
+        let routing = super::parse_routing(response.headers())?;
+        Ok((sender, response.into_body(), lease, account, routing))
     }
     .await;
-    let (sender, receiver, lease) = match established {
+    let (sender, receiver, lease, account, routing) = match established {
         Ok(established) => established,
         Err(error) => {
             driver.abort();
@@ -461,6 +497,8 @@ async fn establish_lane(group: &Group, index: usize) -> Result<LaneConnection, C
         driver,
         remote_address,
         lease,
+        account,
+        routing,
     })
 }
 
@@ -474,6 +512,7 @@ fn lane_request(group: &Group, index: usize) -> Result<Request<()>, ClientError>
             format!("Bearer {}", group.config.token),
         )
         .header(frame::HEADER_VERSION, frame::VERSION)
+        .header(super::HEADER_CLIENT_VERSION, crate::VERSION.trim_ascii())
         .header("X-Porta-Lane-Session", &group.session)
         .header("X-Porta-Lane", index)
         .header("X-Porta-Lanes", LANE_COUNT)
@@ -554,13 +593,40 @@ async fn dial_tcp(
     ))
 }
 
+/// Completes a TLS handshake with the gateway, verifying its certificate,
+/// without opening a tunnel.
+pub(super) async fn probe(
+    url: &Url,
+    tls: &Arc<rustls::ClientConfig>,
+    cancellation: &CancellationToken,
+) -> Result<(), ClientError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ClientError::permanent("gateway URL has no hostname"))?
+        .trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ClientError::permanent("gateway URL has no port"))?;
+    let (tcp, _) = dial_tcp(host, port, None, None, cancellation).await?;
+    let mut tls = (**tls).clone();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|_| ClientError::permanent("gateway hostname is invalid for TLS"))?;
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(ClientError::Closed),
+        result = TlsConnector::from(Arc::new(tls)).connect(server_name, tcp) => {
+            result.map(drop).map_err(classify_tls_error)
+        }
+    }
+}
+
 fn classify_tls_error(error: std::io::Error) -> ClientError {
     if error
         .get_ref()
         .and_then(|cause| cause.downcast_ref::<rustls::Error>())
         .is_some()
     {
-        ClientError::permanent(format!("TLS handshake failed: {error}"))
+        ClientError::Intercepted(error.to_string())
     } else {
         ClientError::unavailable(error)
     }
@@ -587,7 +653,15 @@ fn validate_response(
             header(response.headers(), frame::HEADER_MIN_VERSION),
             header(response.headers(), frame::HEADER_MAX_VERSION),
         );
-        let detail = format!("gateway returned HTTP {status}");
+        if let Some(denial) =
+            super::account_denial(status, header(response.headers(), super::REASON_HEADER))
+        {
+            return Err(denial);
+        }
+        let detail = match header(response.headers(), super::REASON_HEADER) {
+            Some(reason) => format!("gateway returned HTTP {status} ({reason})"),
+            None => format!("gateway returned HTTP {status}"),
+        };
         return match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
@@ -596,6 +670,11 @@ fn validate_response(
             | StatusCode::HTTP_VERSION_NOT_SUPPORTED => Err(ClientError::unavailable(detail)),
             StatusCode::UPGRADE_REQUIRED if versions == (None, None) => {
                 Err(ClientError::unavailable(detail))
+            }
+            StatusCode::SERVICE_UNAVAILABLE
+                if header(response.headers(), super::REASON_HEADER).is_some() =>
+            {
+                Err(ClientError::Refused(detail))
             }
             StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_EARLY
@@ -675,11 +754,25 @@ fn lease_from_headers(headers: &HeaderMap) -> Result<Lease, ClientError> {
         }
         None => None,
     };
+    let address6 = match header(headers, "x-porta-address6") {
+        Some(value) => {
+            let address6 = value
+                .parse::<ipnet::Ipv6Net>()
+                .ok()
+                .filter(|prefix| prefix.prefix_len() == 128 && super::valid_unicast6(prefix.addr()))
+                .ok_or_else(|| {
+                    ClientError::permanent("gateway returned an invalid IPv6 tunnel address")
+                })?;
+            Some(address6)
+        }
+        None => None,
+    };
     Ok(Lease {
         address,
         gateway: Some(gateway),
         dns,
         mtu,
+        address6,
     })
 }
 
@@ -787,6 +880,12 @@ async fn download_lane(
         .lock()
         .expect("HTTP/2 lease lock poisoned")
         .expect("active HTTP/2 lane has a lease");
+    let routing = group
+        .routing
+        .lock()
+        .expect("HTTP/2 routing lock poisoned")
+        .clone()
+        .unwrap_or_default();
     let mut framed = BytesMut::new();
     loop {
         let data = tokio::select! {
@@ -817,10 +916,10 @@ async fn download_lane(
             if packet.is_empty() || packet.len() > usize::from(lease.mtu) {
                 continue;
             }
-            let Ok(info) = porta_wire::ip::parse_ipv4(&packet) else {
+            let Ok(info) = porta_wire::ip::parse_ip(&packet) else {
                 continue;
             };
-            if info.destination != lease.address.addr() {
+            if !lease.owns(info.destination) && !routing.serves(info.destination) {
                 continue;
             }
             tokio::select! {
@@ -973,7 +1072,7 @@ impl Group {
         if self.cancellation.is_cancelled() {
             return Err(ClientError::Closed);
         }
-        let metadata = porta_wire::ip::classify_ipv4(&packet);
+        let metadata = porta_wire::ip::classify_packet(&packet);
         let lane = if metadata.class == PacketClass::Control {
             self.control_lane()
         } else {
@@ -1179,6 +1278,8 @@ mod tests {
                 session: "test".to_owned(),
                 lanes,
                 lease: Mutex::new(None),
+                account: Arc::default(),
+                routing: Mutex::new(None),
                 flows: Mutex::new(FlowTable::default()),
                 established: AtomicBool::new(true),
                 failure: Arc::new(FailureSignal::default()),
@@ -1298,8 +1399,10 @@ mod tests {
     #[test]
     fn flow_table_evicts_the_least_recent_assignment_in_constant_time() {
         fn flow(index: u32) -> FlowKey {
+            let mut source = [0; 16];
+            source[..4].copy_from_slice(&index.to_be_bytes());
             FlowKey {
-                source: index.to_be_bytes(),
+                source,
                 destination_port: index as u16,
                 protocol: 17,
                 ..FlowKey::default()
@@ -1324,7 +1427,7 @@ mod tests {
     fn saturated_upload_queues_drop_a_packet_without_failing_the_tunnel() {
         let (group, _receivers) = test_group_with_full_upload_queues();
         let queued = tcp_packet(443);
-        let metadata = porta_wire::ip::classify_ipv4(&queued);
+        let metadata = porta_wire::ip::classify_packet(&queued);
         assert_eq!(metadata.class, PacketClass::Tcp);
         for lane in &group.lanes {
             assert!(lane
@@ -1342,7 +1445,7 @@ mod tests {
     fn saturated_healthy_lane_preserves_tcp_flow_affinity() {
         let (group, _receivers) = test_group_with_full_upload_queues();
         let packet = tcp_packet(443);
-        let metadata = porta_wire::ip::classify_ipv4(&packet);
+        let metadata = porta_wire::ip::classify_packet(&packet);
         group
             .flows
             .lock()

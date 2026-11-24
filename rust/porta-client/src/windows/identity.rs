@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
 use fs2::FileExt as _;
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate as _;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ fn load_or_create(path: &Path, name: &str) -> Result<Identity, IdentityError> {
     let signing_key = match read_private(path) {
         Ok(encoded) => decode(&encoded)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = SigningKey::random(&mut OsRng);
+            let key = SigningKey::generate();
             persist(path, &key)?;
             key
         }

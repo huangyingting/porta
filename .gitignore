@@ -4,6 +4,9 @@
 /.server-interop/
 /rust/target/
 /rust/*/target/
+/rust/fuzz/artifacts/
+/rust/fuzz/corpus/
+/rust/fuzz/coverage/
 /rust/porta-windows/gen/
 __pycache__/
 /*.pem
@@ -21,3 +24,5 @@ __pycache__/
 *.p12
 signing.properties
 android-signing.properties
+/apple/build/
+/apple/.build/

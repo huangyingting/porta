@@ -1,11 +1,11 @@
 use std::fmt;
 use std::fs;
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use rustls_platform_verifier::Verifier;
@@ -26,7 +26,7 @@ pub enum TlsConfigError {
     #[error("CA file contains no certificates")]
     EmptyCa,
     #[error("parse CA certificate: {0}")]
-    ParseCa(#[source] std::io::Error),
+    ParseCa(#[source] rustls::pki_types::pem::Error),
     #[error("configure certificate verification: {0}")]
     Configure(#[from] RustlsError),
     #[error("configure certificate roots: {0}")]
@@ -77,7 +77,7 @@ fn platform_verifier(
         return Ok(Arc::new(Verifier::new(provider)?));
     };
     let data = fs::read(path).map_err(TlsConfigError::ReadCa)?;
-    let certificates = rustls_pemfile::certs(&mut Cursor::new(data))
+    let certificates = CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(TlsConfigError::ParseCa)?;
     if certificates.is_empty() {

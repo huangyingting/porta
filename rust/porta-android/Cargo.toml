@@ -1,6 +1,6 @@
 [package]
 name = "porta-android"
-version = "0.1.39"
+version = "0.1.41"
 edition = "2021"
 publish = false
 
@@ -8,7 +8,8 @@ publish = false
 name = "porta_android"
 crate-type = ["cdylib", "rlib"]
 
-[dependencies]
+# The bridge only exists on Android; other hosts build an empty library.
+[target.'cfg(target_os = "android")'.dependencies]
 base64 = "0.22.1"
 porta-client-rust = { path = "../porta-client" }
 porta-wire = { path = "../porta-wire" }
@@ -16,9 +17,10 @@ thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.17", features = ["rt"] }
 url = "2.5.7"
-
-[target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22.1", default-features = false }
-rustls-platform-verifier = "0.7.0"
+# Exactly 0.7.0: later releases stop bundling the Android verifier AAR that
+# android/app/build.gradle.kts loads from the crate, fetching it from a
+# GitHub-hosted Maven repository at build time instead.
+rustls-platform-verifier = "=0.7.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

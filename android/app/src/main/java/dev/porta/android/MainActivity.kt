@@ -386,11 +386,13 @@ class MainActivity : Activity() {
         if (!::status.isInitialized) return
         val connected = value.startsWith("Connected")
         val blocked = value.startsWith("Connection blocked")
+        val rejected = value.startsWith("Connection rejected")
         val waiting = value.startsWith("Waiting")
         val active = isActiveStatus(value)
         status.text = when {
             connected -> getString(R.string.connected)
             blocked -> getString(R.string.connection_blocked)
+            rejected -> getString(R.string.connection_rejected)
             waiting -> getString(R.string.waiting_for_network)
             active -> getString(R.string.connecting)
             else -> getString(R.string.disconnected)
@@ -398,7 +400,8 @@ class MainActivity : Activity() {
         statusDetail.text = when {
             value.contains("HTTP/3") -> getString(R.string.transport_http3)
             value.contains("HTTP/2") -> getString(R.string.transport_http2)
-            blocked -> value.substringAfter(": ", getString(R.string.connection_blocked))
+            blocked || rejected -> accountDenialText(value)
+                ?: value.substringAfter(": ", getString(R.string.connection_blocked))
             value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
                 getString(R.string.reconnecting_secure_tunnel)
             waiting -> getString(R.string.waiting_for_network)
@@ -413,6 +416,8 @@ class MainActivity : Activity() {
                         details.mtu,
                     ),
                 )
+                accountSummary(details.account)?.let { statusDetail.append("\n" + it) }
+                statusDetail.append("\n" + routingSummary(details.routing))
             }
         }
         statusDot.background = circle(
@@ -705,6 +710,14 @@ class MainActivity : Activity() {
             R.string.gateway_hint,
             initial?.server.orEmpty(),
         )
+        val backups = dialogField(
+            R.string.backup_gateways_hint,
+            initial?.backupServers.orEmpty().joinToString("\n"),
+        ).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 1
+        }
         val token = dialogField(
             if (existing == null) R.string.token_hint else R.string.token_unchanged_hint,
             imported?.token.orEmpty(),
@@ -717,6 +730,38 @@ class MainActivity : Activity() {
             setTextColor(COLOR_TEXT)
             buttonTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
         }
+        val allowLan = CheckBox(this).apply {
+            setText(R.string.allow_lan)
+            isChecked = initial?.allowLan ?: false
+            setTextColor(COLOR_TEXT)
+            buttonTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
+        }
+        val allowLanHelp = TextView(this).apply {
+            setText(R.string.allow_lan_help)
+            textSize = 12f
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(34), 0, dp(2), dp(4))
+        }
+        // Which apps use the tunnel is a choice for this device, so an
+        // imported profile starts with every app.
+        var appMode = existing?.appMode ?: AppMode.ALL
+        var apps = existing?.apps.orEmpty()
+        val appChoice = TextView(this).apply {
+            text = appSummary(appMode, apps)
+            textSize = 15f
+            setTextColor(COLOR_TEXT)
+            background = rounded(COLOR_FIELD, 12f, COLOR_BORDER)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(13), 0, dp(13), 0)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50))
+            setOnClickListener {
+                chooseApps(appMode, apps) { mode, selected ->
+                    appMode = mode
+                    apps = selected
+                    text = appSummary(mode, selected)
+                }
+            }
+        }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(4), dp(4), dp(4), 0)
@@ -724,6 +769,8 @@ class MainActivity : Activity() {
             addView(name)
             addView(dialogLabel(R.string.gateway_label))
             addView(server)
+            addView(dialogLabel(R.string.backup_gateways_label))
+            addView(backups)
             addView(dialogLabel(R.string.token_label))
             addView(token)
             addView(TextView(this@MainActivity).apply {
@@ -732,7 +779,11 @@ class MainActivity : Activity() {
                 setTextColor(COLOR_MUTED)
                 setPadding(dp(2), dp(14), dp(2), dp(4))
             })
+            addView(dialogLabel(R.string.apps_label))
+            addView(appChoice)
             addView(autoConnect)
+            addView(allowLan)
+            addView(allowLanHelp)
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (existing == null) R.string.add_profile else R.string.edit_profile)
@@ -752,6 +803,13 @@ class MainActivity : Activity() {
                     server = server.text.toString().trim().trimEnd('/'),
                     token = token.text.toString().ifBlank { existing?.token.orEmpty() },
                     autoConnect = autoConnect.isChecked,
+                    allowLan = allowLan.isChecked,
+                    appMode = appMode,
+                    apps = if (appMode == AppMode.ALL) emptyList() else apps,
+                    backupServers = parseBackupServers(backups.text.toString()) ?: run {
+                        backups.error = getString(R.string.https_required)
+                        return@setOnClickListener
+                    },
                 )
                 val error = profileValidationError(profile)
                 if (error != null) {
@@ -768,6 +826,76 @@ class MainActivity : Activity() {
             }
         }
         dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        dialog.show()
+    }
+
+    private fun appSummary(mode: AppMode, apps: List<String>): String = when (mode) {
+        AppMode.ALL -> getString(R.string.apps_all)
+        AppMode.ONLY -> resources.getQuantityString(R.plurals.apps_only, apps.size, apps.size)
+        AppMode.EXCEPT -> resources.getQuantityString(R.plurals.apps_except, apps.size, apps.size)
+    }
+
+    /** Asks which apps use the tunnel, then which apps the choice names. */
+    private fun chooseApps(
+        mode: AppMode,
+        apps: List<String>,
+        chosen: (AppMode, List<String>) -> Unit,
+    ) {
+        val modes = AppMode.entries
+        val labels = arrayOf(
+            getString(R.string.apps_mode_all),
+            getString(R.string.apps_mode_only),
+            getString(R.string.apps_mode_except),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(R.string.apps_label)
+            .setSingleChoiceItems(labels, modes.indexOf(mode)) { dialog, which ->
+                dialog.dismiss()
+                val next = modes[which]
+                if (next == AppMode.ALL) {
+                    chosen(next, emptyList())
+                } else {
+                    pickApps(next, if (next == mode) apps else emptyList()) { selected -> chosen(next, selected) }
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun pickApps(mode: AppMode, apps: List<String>, picked: (List<String>) -> Unit) {
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val installed = packageManager.queryIntentActivities(launcher, 0)
+            .map { it.activityInfo.applicationInfo }
+            .filter { it.packageName != packageName }
+            .distinctBy { it.packageName }
+            .associate { it.packageName to it.loadLabel(packageManager).toString() }
+        // Keep choices for apps that are no longer installed so they can be removed.
+        val entries = (installed + apps.filter { it !in installed }.associateWith { it })
+            .entries.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.value })
+        val checked = BooleanArray(entries.size) { entries[it].key in apps }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (mode == AppMode.ONLY) R.string.apps_mode_only else R.string.apps_mode_except)
+            .setMultiChoiceItems(entries.map { it.value }.toTypedArray(), checked) { _, which, isChecked ->
+                checked[which] = isChecked
+            }
+            .setPositiveButton(R.string.save, null)
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val selected = entries.indices.filter { checked[it] }.map { entries[it].key }
+                when {
+                    selected.isEmpty() ->
+                        Toast.makeText(this, R.string.apps_choose_one, Toast.LENGTH_SHORT).show()
+                    selected.size > MAX_PROFILE_APPS ->
+                        Toast.makeText(this, getString(R.string.apps_too_many, MAX_PROFILE_APPS), Toast.LENGTH_SHORT).show()
+                    else -> {
+                        picked(selected)
+                        dialog.dismiss()
+                    }
+                }
+            }
+        }
         dialog.show()
     }
 
@@ -905,14 +1033,7 @@ class MainActivity : Activity() {
         profileStore.select(profile.id)
         bandwidthChart.reset()
         updateBandwidth(TrafficSnapshot(), addSample = false)
-        startForegroundService(
-            Intent(this, TunnelService::class.java)
-                .setAction(TunnelService.ACTION_START)
-                .putExtra(TunnelService.EXTRA_PROFILE_ID, profile.id)
-                .putExtra(TunnelService.EXTRA_PROFILE_NAME, profile.name)
-                .putExtra(TunnelService.EXTRA_SERVER, profile.server)
-                .putExtra(TunnelService.EXTRA_TOKEN, profile.token),
-        )
+        startForegroundService(TunnelService.startIntent(this, profile))
         render("Connecting")
     }
 
@@ -933,9 +1054,69 @@ class MainActivity : Activity() {
         return null
     }
 
+    private fun accountDenialText(value: String): String? = when (accountDenialIn(value)) {
+        AccountDenial.EXPIRED -> getString(R.string.account_expired_denied)
+        AccountDenial.QUOTA_EXCEEDED -> getString(R.string.quota_exceeded_denied)
+        AccountDenial.DEVICE_PENDING -> getString(R.string.device_pending_denied)
+        AccountDenial.ENROLLMENT_CLOSED -> getString(R.string.enrollment_closed_denied)
+        AccountDenial.DEVICE_DENIED -> getString(R.string.device_denied_denied)
+        AccountDenial.CLIENT_OUTDATED -> getString(R.string.client_outdated_denied)
+        null -> null
+    }
+
+    /** One line describing which destinations this connection tunnels. */
+    private fun routingSummary(routing: TunnelRouting): String = when {
+        routing.isFullTunnel -> getString(R.string.routing_full_tunnel)
+        routing.dnsDomains.isEmpty() -> resources.getQuantityString(
+            R.plurals.routing_split_tunnel,
+            routing.routes.size,
+            routing.routes.size,
+        )
+        else -> resources.getQuantityString(
+            R.plurals.routing_split_tunnel_dns,
+            routing.routes.size,
+            routing.routes.size,
+            routing.dnsDomains.joinToString(", "),
+        )
+    }
+
+    /** One line describing the account limits reported for this connection. */
+    private fun accountSummary(account: AccountLimits): String? {
+        if (!account.isLimited) return null
+        val parts = mutableListOf<String>()
+        account.expiresAtSeconds?.let { seconds ->
+            val date = java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM)
+                .format(Date(seconds * 1_000L))
+            parts += getString(
+                if (account.expiresSoon(System.currentTimeMillis())) R.string.account_expires_soon
+                else R.string.account_expires,
+                date,
+            )
+        }
+        account.quotaBytes?.let { quota ->
+            val total = android.text.format.Formatter.formatShortFileSize(this, quota)
+            parts += account.quotaUsedBytes?.let { used ->
+                getString(
+                    R.string.quota_usage,
+                    android.text.format.Formatter.formatShortFileSize(this, used),
+                    total,
+                )
+            } ?: getString(R.string.quota_allowance, total)
+        }
+        account.rateLimitKbps?.let { rate ->
+            parts += getString(
+                R.string.speed_limit,
+                java.text.NumberFormat.getNumberInstance().apply { maximumFractionDigits = 3 }
+                    .format(rate / 1_000.0),
+            )
+        }
+        return parts.joinToString(" · ")
+    }
+
     private fun profileStatus(value: String): String = when {
         value.startsWith("Connected") -> getString(R.string.profile_connected)
         value.startsWith("Connection blocked") -> getString(R.string.connection_blocked)
+        value.startsWith("Connection rejected") -> getString(R.string.connection_rejected)
         value.startsWith("Reconnecting") || value.startsWith("Connection lost") ->
             getString(R.string.profile_reconnecting)
         value.startsWith("Waiting") -> getString(R.string.waiting_for_network)
