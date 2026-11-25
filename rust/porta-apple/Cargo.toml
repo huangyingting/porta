@@ -11,7 +11,7 @@ name = "porta"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 porta-client-rust = { path = "../porta-client" }
 porta-wire = { path = "../porta-wire" }
 rand = "0.9.2"

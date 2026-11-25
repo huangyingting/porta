@@ -3588,7 +3588,7 @@ dependencies = [
 name = "porta-android"
 version = "0.1.41"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "jni 0.22.4",
  "porta-client-rust",
  "porta-wire",
@@ -3605,7 +3605,7 @@ dependencies = [
 name = "porta-apple"
 version = "0.1.41"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "p256",
  "porta-client-rust",
  "porta-wire",
@@ -3622,7 +3622,7 @@ name = "porta-client-rust"
 version = "0.1.41"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",
@@ -3706,7 +3706,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "futures-util",
@@ -3781,7 +3781,7 @@ dependencies = [
 name = "porta-wire"
 version = "0.1.41"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "hex",
  "http",
  "ipnet",
