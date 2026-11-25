@@ -9,7 +9,7 @@ use fs2::FileExt as _;
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::Generate as _;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
-use rand::RngCore as _;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use rand::Rng as _;
+use rand::RngExt as _;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
     KeyUsagePurpose, SerialNumber, PKCS_ED25519,

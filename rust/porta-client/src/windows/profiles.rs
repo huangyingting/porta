@@ -8,7 +8,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
-use rand::RngCore as _;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use windows_sys::Win32::Storage::FileSystem::{
