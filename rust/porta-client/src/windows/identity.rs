@@ -53,8 +53,17 @@ fn load_or_create(path: &Path, name: &str) -> Result<Identity, IdentityError> {
     lock.lock_exclusive().map_err(IdentityError::Lock)?;
 
     let signing_key = match read_private(path) {
-        Ok(encoded) => decode(&encoded)?,
+        Ok(encoded) => {
+            if let Some(key) = crate::identity::decode_tpm_key(&encoded)? {
+                return Identity::from_tpm_key(std::sync::Arc::new(key), name);
+            }
+            decode(&encoded)?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // New installs keep their key in the TPM when there is one.
+            if let Ok(key) = create_tpm_key(path) {
+                return Identity::from_tpm_key(std::sync::Arc::new(key), name);
+            }
             let key = SigningKey::generate();
             persist(path, &key)?;
             key
@@ -62,6 +71,35 @@ fn load_or_create(path: &Path, name: &str) -> Result<Identity, IdentityError> {
         Err(error) => return Err(IdentityError::Read(error)),
     };
     Identity::from_signing_key(signing_key, name)
+}
+
+/// Replaces this computer's device key with one in its TPM, for accounts
+/// that require hardware-protected keys. The device then enrolls again,
+/// as a new device.
+pub fn upgrade_to_tpm() -> Result<Identity, IdentityError> {
+    let path = identity_path()?;
+    let name = hostname().map_err(IdentityError::Hostname)?;
+    let directory = path.parent().ok_or(IdentityError::MissingPath)?;
+    let _directory = prepare_directory(directory)?;
+    let lock_path = path.with_file_name("client-identity.lock");
+    let lock = open_private(&lock_path, true).map_err(IdentityError::Lock)?;
+    lock.lock_exclusive().map_err(IdentityError::Lock)?;
+    if let Ok(encoded) = read_private(&path) {
+        if let Some(key) = crate::identity::decode_tpm_key(&encoded)? {
+            return Identity::from_tpm_key(std::sync::Arc::new(key), name);
+        }
+    }
+    let key = create_tpm_key(&path)?;
+    Identity::from_tpm_key(std::sync::Arc::new(key), name)
+}
+
+fn create_tpm_key(path: &Path) -> Result<crate::tpm::DeviceKey, IdentityError> {
+    let tpm = crate::tpm::Tpm::open().map_err(|error| IdentityError::Tpm(error.to_string()))?;
+    let key = tpm
+        .create_device_key()
+        .map_err(|error| IdentityError::Tpm(error.to_string()))?;
+    write_contents(path, &crate::identity::encode_tpm_key(&key)?)?;
+    Ok(key)
 }
 
 fn prepare_directory(path: &Path) -> Result<File, IdentityError> {
@@ -126,7 +164,10 @@ fn persist(path: &Path, signing_key: &SigningKey) -> Result<(), IdentityError> {
     };
     let mut contents = Zeroizing::new(serde_json::to_vec_pretty(&stored)?);
     contents.push(b'\n');
+    write_contents(path, &contents)
+}
 
+fn write_contents(path: &Path, contents: &[u8]) -> Result<(), IdentityError> {
     let directory = path.parent().ok_or(IdentityError::MissingPath)?;
     let mut random = [0_u8; 8];
     rand::rng().fill_bytes(&mut random);
@@ -140,7 +181,7 @@ fn persist(path: &Path, signing_key: &SigningKey) -> Result<(), IdentityError> {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&pending)?;
         paths::secure_new_admin_file(&pending, &file)?;
-        file.write_all(&contents)?;
+        file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&pending, path)?;

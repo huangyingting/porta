@@ -132,4 +132,10 @@
         <item quantity="one">All except %1$d app</item>
         <item quantity="other">All except %1$d apps</item>
     </plurals>
+    <string name="relay_label">Relay address</string>
+    <string name="relay_hint">Optional IP:port of a relay to the gateway</string>
+    <string name="relay_invalid">Enter the relay as an IP address and port, such as 203.0.113.7:8443</string>
+    <string name="relay_one_gateway">A relay forwards to one gateway. Remove the backup gateways or the relay.</string>
+    <string name="hardware_required_denied">This account accepts only devices whose key is protected by secure hardware, and this device could not prove that. Ask your administrator.</string>
+    <string name="hardware_key_unavailable">This device cannot create a hardware-attested key, which this account requires.</string>
 </resources>

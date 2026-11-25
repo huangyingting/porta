@@ -21,6 +21,7 @@ is in [deployment.md](deployment.md).
 | `/var/lib/porta/acme/` | Let's Encrypt account and certificates | yes |
 | `/var/lib/porta/upstream-identity.json` | A relay's device key at its next hop | yes |
 | `/var/lib/porta/downloads/` | Client packages served to users | no; `deploy.sh` fetches them |
+| `/var/lib/porta/tpm-ca/` | TPM vendor CAs for `--verify-tpm` | no; `porta-tpm-cas` fetches them |
 
 The gateway replaces each JSON file atomically, so a copy is always one
 complete version of that file.

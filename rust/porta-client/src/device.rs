@@ -28,32 +28,58 @@ pub fn create_proof(
     path: &str,
     now: SystemTime,
 ) -> Result<Proof, DeviceProofError> {
+    let encoded_public_key = signing_key
+        .verifying_key()
+        .to_public_key_der()
+        .map_err(|_| DeviceProofError::PublicKey)?;
+    create_proof_with(
+        encoded_public_key.as_bytes(),
+        name,
+        token,
+        method,
+        path,
+        now,
+        |digest| {
+            let signature: Signature = signing_key
+                .sign_prehash(digest)
+                .map_err(|_| DeviceProofError::Signature)?;
+            Ok(signature.to_der().as_bytes().to_vec())
+        },
+    )
+}
+
+/// A proof by any P-256 key: `encoded_public_key` is its DER
+/// `SubjectPublicKeyInfo`, and `sign` returns a DER ECDSA signature of a
+/// SHA-256 digest, such as one made in a TPM.
+pub fn create_proof_with(
+    encoded_public_key: &[u8],
+    name: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    now: SystemTime,
+    sign: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, DeviceProofError>,
+) -> Result<Proof, DeviceProofError> {
     let timestamp = now
         .duration_since(UNIX_EPOCH)
         .map_err(|_| DeviceProofError::InvalidSystemTime)?
         .as_secs()
         .to_string();
-    let encoded_public_key = signing_key
-        .verifying_key()
-        .to_public_key_der()
-        .map_err(|_| DeviceProofError::PublicKey)?;
-    let device_id = device_auth::device_id_from_encoded(encoded_public_key.as_bytes())
+    let device_id = device_auth::device_id_from_encoded(encoded_public_key)
         .map_err(|_| DeviceProofError::PublicKey)?;
     let mut nonce = [0_u8; device_auth::NONCE_SIZE];
     rand::rng().fill_bytes(&mut nonce);
     let mut proof = Proof {
         device_id,
         name: name.to_owned(),
-        public_key: URL_SAFE_NO_PAD.encode(encoded_public_key.as_bytes()),
+        public_key: URL_SAFE_NO_PAD.encode(encoded_public_key),
         timestamp,
         nonce: URL_SAFE_NO_PAD.encode(nonce),
         signature: String::new(),
     };
-    let digest = Sha256::digest(device_auth::signature_payload(&proof, token, method, path));
-    let signature: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| DeviceProofError::Signature)?;
-    proof.signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
+    let digest: [u8; 32] =
+        Sha256::digest(device_auth::signature_payload(&proof, token, method, path)).into();
+    proof.signature = URL_SAFE_NO_PAD.encode(sign(&digest)?);
     Ok(proof)
 }
 

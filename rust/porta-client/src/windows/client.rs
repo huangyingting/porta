@@ -38,6 +38,9 @@ pub struct Config {
     /// In a full tunnel, keep the directly connected private networks
     /// reachable outside the tunnel.
     pub allow_lan: bool,
+    /// Dial this `IP[:PORT]`, a relay that forwards to the only gateway,
+    /// instead of the gateway's own address.
+    pub relay: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,14 +144,28 @@ pub async fn run(
     cancellation: CancellationToken,
     observer: Arc<dyn Observer>,
 ) -> Result<(), RunError> {
-    let identity = Arc::new(identity::current()?);
+    // The identity can change once: to a TPM key, when an account
+    // requires hardware-protected devices.
+    let identity = Arc::new(std::sync::RwLock::new(Arc::new(identity::current()?)));
+    let current_identity = {
+        let identity = Arc::clone(&identity);
+        move || {
+            Arc::clone(
+                &identity
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+    };
     let proof_token = config.token.clone();
-    let proof_identity = Arc::clone(&identity);
+    let proof_identity = current_identity.clone();
     let proof = Arc::new(move |method: &str, path: &str| {
-        proof_identity
+        proof_identity()
             .proof(&proof_token, method, path)
             .map_err(ClientError::permanent)
     });
+    let mut attested = false;
+    let mut upgraded = false;
 
     let mut network = if config.manual_network {
         None
@@ -158,7 +175,14 @@ pub async fn run(
         Some(manager)
     };
     let mut network_active = network.as_ref().is_some_and(NetworkManager::needs_cleanup);
-    let endpoints = if let Some(manager) = network.as_ref() {
+    let relay = crate::failover::relay_candidate(&config.servers, config.relay.as_deref())
+        .map_err(RunError::Invalid)?;
+    let endpoints = if let Some(relay) = relay {
+        if network.as_ref().is_some_and(NetworkManager::needs_cleanup) {
+            observer.event(Event::RecoveringNetwork);
+        }
+        vec![relay]
+    } else if let Some(manager) = network.as_ref() {
         let saved = manager.recovery_endpoints()?;
         if saved.is_empty() {
             if network_active {
@@ -226,7 +250,7 @@ pub async fn run(
             }
         }
 
-        let connected = tunnel::connect(tunnel::ClientConfig {
+        let tunnel_config = tunnel::ClientConfig {
             url: gateway.to_string(),
             token: config.token.clone(),
             transport: config.transport,
@@ -236,10 +260,98 @@ pub async fn run(
             proof: proof.clone(),
             socket_protector: None,
             cancellation: cancellation.child_token(),
-        })
-        .await;
+        };
+        let attestation_config = tunnel_config.clone();
+        let connected = tunnel::connect(tunnel_config).await;
         let connection = match connected {
             Ok(connection) => Arc::new(connection),
+            Err(error)
+                if error.denial() == Some(crate::tunnel::AccountDenial::HardwareRequired)
+                    && !(attested && upgraded) =>
+            {
+                let current = current_identity();
+                match current.tpm_key() {
+                    Some(key) if !attested => {
+                        // Prove the key, then connect again at once.
+                        attested = true;
+                        observer.event(Event::Reconnecting {
+                            reason: "proving to the gateway that the device key is in the TPM"
+                                .to_owned(),
+                            delay: Duration::ZERO,
+                            sign_in_required: false,
+                        });
+                        if let Err(reason) =
+                            crate::tpm::attest(&attestation_config, Arc::clone(key)).await
+                        {
+                            return Err(fail_after_device(
+                                &config,
+                                &network,
+                                tun.as_ref(),
+                                &mut reader,
+                                ClientError::permanent(format!(
+                                    "the account requires a hardware-protected device key, and the TPM could not prove this one: {reason}"
+                                )),
+                            )
+                            .await);
+                        }
+                        endpoint_index = endpoint_index.saturating_sub(1);
+                        continue;
+                    }
+                    None if !upgraded => {
+                        // A key from before TPM support: move to the TPM and
+                        // enroll again, as a new device.
+                        upgraded = true;
+                        observer.event(Event::Reconnecting {
+                            reason: "the account requires a hardware-protected key; creating one in the TPM"
+                                .to_owned(),
+                            delay: Duration::ZERO,
+                            sign_in_required: false,
+                        });
+                        match tokio::task::spawn_blocking(identity::upgrade_to_tpm).await {
+                            Ok(Ok(next)) => {
+                                *identity
+                                    .write()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Arc::new(next);
+                                endpoint_index = endpoint_index.saturating_sub(1);
+                                continue;
+                            }
+                            Ok(Err(reason)) => {
+                                return Err(fail_after_device(
+                                    &config,
+                                    &network,
+                                    tun.as_ref(),
+                                    &mut reader,
+                                    ClientError::permanent(format!(
+                                        "the account requires a hardware-protected device key, and this computer's TPM is unavailable: {reason}"
+                                    )),
+                                )
+                                .await);
+                            }
+                            Err(reason) => {
+                                return Err(fail_after_device(
+                                    &config,
+                                    &network,
+                                    tun.as_ref(),
+                                    &mut reader,
+                                    ClientError::permanent(reason),
+                                )
+                                .await);
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(fail_after_device(
+                            &config,
+                            &network,
+                            tun.as_ref(),
+                            &mut reader,
+                            error,
+                        )
+                        .await);
+                    }
+                }
+            }
             Err(_error) if cancellation.is_cancelled() => {
                 return stop(
                     &config,
@@ -341,6 +453,15 @@ pub async fn run(
         }
         while packet_rx.try_recv().is_ok() {}
 
+        if let Some(key) = current_identity().tpm_key().filter(|_| !attested) {
+            // Let the gateway record the key as hardware-protected; the
+            // tunnel does not wait for it.
+            attested = true;
+            let key = Arc::clone(key);
+            tokio::spawn(async move {
+                let _ = crate::tpm::attest(&attestation_config, key).await;
+            });
+        }
         observer.event(Event::Connected(ConnectionInfo {
             transport: connection.transport,
             delivery_mode: connection.delivery_mode,

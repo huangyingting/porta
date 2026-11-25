@@ -41,6 +41,20 @@ pub struct DeviceSummary {
     /// Name clients resolve through the built-in resolver.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dns_name: String,
+    /// Verified evidence that the device key is in secure hardware.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareSummary>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HardwareSummary {
+    /// `android` or `tpm`.
+    pub platform: String,
+    /// `strongbox`, `tee`, or `tpm`.
+    pub level: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vendor: String,
+    pub verified_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,6 +100,9 @@ pub struct ClientSummary {
     /// Standard CONNECT-IP clients may connect with the token alone.
     #[serde(default)]
     pub standard_clients: bool,
+    /// Only devices with a verified hardware key may connect.
+    #[serde(default)]
+    pub require_hardware: bool,
 }
 
 /// Network access rules of an account, as returned in summaries and
@@ -127,6 +144,10 @@ pub struct ClientEnrollment {
     /// device key; unset keeps the current setting.
     #[serde(default)]
     pub standard_clients: Option<bool>,
+    /// Requires devices whose key is verified to be in secure hardware;
+    /// unset keeps the current setting.
+    #[serde(default)]
+    pub require_hardware: Option<bool>,
 }
 
 /// Account limits accepted by `PUT /api/clients/{id}/limits`. Every field

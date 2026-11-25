@@ -718,6 +718,9 @@ class MainActivity : Activity() {
                 InputType.TYPE_TEXT_FLAG_MULTI_LINE
             minLines = 1
         }
+        val relay = dialogField(R.string.relay_hint, initial?.relay.orEmpty()).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
         val token = dialogField(
             if (existing == null) R.string.token_hint else R.string.token_unchanged_hint,
             imported?.token.orEmpty(),
@@ -771,6 +774,8 @@ class MainActivity : Activity() {
             addView(server)
             addView(dialogLabel(R.string.backup_gateways_label))
             addView(backups)
+            addView(dialogLabel(R.string.relay_label))
+            addView(relay)
             addView(dialogLabel(R.string.token_label))
             addView(token)
             addView(TextView(this@MainActivity).apply {
@@ -806,6 +811,7 @@ class MainActivity : Activity() {
                     allowLan = allowLan.isChecked,
                     appMode = appMode,
                     apps = if (appMode == AppMode.ALL) emptyList() else apps,
+                    relay = relay.text.toString().trim(),
                     backupServers = parseBackupServers(backups.text.toString()) ?: run {
                         backups.error = getString(R.string.https_required)
                         return@setOnClickListener
@@ -1051,6 +1057,10 @@ class MainActivity : Activity() {
         if (!isValidToken(profile.token)) {
             return R.string.credentials_required
         }
+        if (profile.relay.isNotEmpty()) {
+            if (!isRelayAddress(profile.relay)) return R.string.relay_invalid
+            if (profile.backupServers.isNotEmpty()) return R.string.relay_one_gateway
+        }
         return null
     }
 
@@ -1061,6 +1071,7 @@ class MainActivity : Activity() {
         AccountDenial.ENROLLMENT_CLOSED -> getString(R.string.enrollment_closed_denied)
         AccountDenial.DEVICE_DENIED -> getString(R.string.device_denied_denied)
         AccountDenial.CLIENT_OUTDATED -> getString(R.string.client_outdated_denied)
+        AccountDenial.HARDWARE_REQUIRED -> getString(R.string.hardware_required_denied)
         null -> null
     }
 

@@ -13,6 +13,9 @@ pub enum AccountDenial {
     DeviceDenied,
     /// The gateway requires a newer version of the app.
     ClientOutdated,
+    /// The account accepts only device keys verified to be in secure
+    /// hardware, and this device has not proven its key.
+    HardwareRequired,
 }
 
 impl AccountDenial {
@@ -25,6 +28,7 @@ impl AccountDenial {
             "enrollment-closed" => Some(Self::EnrollmentClosed),
             "device-denied" => Some(Self::DeviceDenied),
             "client-outdated" => Some(Self::ClientOutdated),
+            "hardware-required" => Some(Self::HardwareRequired),
             _ => None,
         }
     }
@@ -38,6 +42,7 @@ impl AccountDenial {
             Self::EnrollmentClosed => "enrollment-closed",
             Self::DeviceDenied => "device-denied",
             Self::ClientOutdated => "client-outdated",
+            Self::HardwareRequired => "hardware-required",
         }
     }
 
@@ -56,6 +61,9 @@ impl AccountDenial {
             Self::DeviceDenied => "the administrator has not allowed this device to connect",
             Self::ClientOutdated => {
                 "this version of Porta is too old for the gateway; install the latest version from the downloads page"
+            }
+            Self::HardwareRequired => {
+                "this account accepts only devices whose key is verified to be in secure hardware, and this device could not prove its key"
             }
         }
     }

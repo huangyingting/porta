@@ -42,6 +42,8 @@ struct ProfileInput {
     allow_lan: bool,
     #[serde(default)]
     connect_at_login: bool,
+    #[serde(default)]
+    relay: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,6 +56,7 @@ struct DesktopProfile {
     transport: String,
     allow_lan: bool,
     connect_at_login: bool,
+    relay: String,
     selected: bool,
     active: bool,
     status: String,
@@ -337,6 +340,12 @@ impl Controller {
         };
         profile.allow_lan = input.allow_lan;
         profile.connect_at_login = input.connect_at_login;
+        profile.relay = input.relay.trim().to_owned();
+        let gateways = std::iter::once(&profile.server_url)
+            .chain(&profile.backup_servers)
+            .map(|server| parse_origin(server))
+            .collect::<Result<Vec<_>, _>>()?;
+        porta_client::failover::relay_candidate(&gateways, Some(&profile.relay))?;
         profile.id = input.id.trim().to_owned();
         let saved = self
             .store
@@ -578,6 +587,7 @@ impl Controller {
                     connect_timeout: Duration::from_secs(15),
                     reconnect_max_delay: profile.reconnect_max_delay,
                     allow_lan: profile.allow_lan,
+                    relay: (!profile.relay.is_empty()).then(|| profile.relay.clone()),
                 },
                 cancellation,
                 Arc::new(move |event| {
@@ -1467,6 +1477,7 @@ fn snapshot_from(state: &DesktopState, profiles: Vec<Profile>) -> DesktopSnapsho
                 transport: transport_name(profile.transport).to_owned(),
                 allow_lan: profile.allow_lan,
                 connect_at_login: profile.connect_at_login,
+                relay: profile.relay,
                 status,
             }
         })

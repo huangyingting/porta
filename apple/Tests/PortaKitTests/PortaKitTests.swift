@@ -63,6 +63,13 @@ final class ProfileTests: XCTestCase {
         XCTAssertEqual(spki.prefix(2), Data([0x30, 0x59]))
     }
 
+    func testRelayHostsDropThePort() {
+        XCTAssertEqual(PortaPacketTunnelProvider.relayHost("203.0.113.7:8443"), "203.0.113.7")
+        XCTAssertEqual(PortaPacketTunnelProvider.relayHost("203.0.113.7"), "203.0.113.7")
+        XCTAssertEqual(PortaPacketTunnelProvider.relayHost("[2001:db8::7]:443"), "2001:db8::7")
+        XCTAssertEqual(PortaPacketTunnelProvider.relayHost("2001:db8::7"), "2001:db8::7")
+    }
+
     func testDenialsCarryTheirCode() {
         XCTAssertEqual(
             PortaError(status: -3, message: "account-denied:device-pending: Waiting for approval"),

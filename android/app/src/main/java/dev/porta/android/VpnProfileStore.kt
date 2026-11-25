@@ -33,6 +33,8 @@ internal data class VpnProfile(
     val appMode: AppMode = AppMode.ALL,
     /** Package names for [AppMode.ONLY] and [AppMode.EXCEPT]. */
     val apps: List<String> = emptyList(),
+    /** `IP[:PORT]` of a relay that forwards to the gateway, or empty. */
+    val relay: String = "",
 )
 
 internal class VpnProfileStore(private val context: Context) {
@@ -157,6 +159,7 @@ internal class VpnProfileStore(private val context: Context) {
             .put(KEY_ALLOW_LAN, profile.allowLan)
             .put(KEY_APP_MODE, profile.appMode.code)
             .put(KEY_APPS, org.json.JSONArray(profile.apps))
+            .put(KEY_RELAY, profile.relay)
             .put(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .put(KEY_TOKEN, Base64.encodeToString(encrypted, Base64.NO_WRAP))
     }
@@ -180,6 +183,7 @@ internal class VpnProfileStore(private val context: Context) {
                 apps = entry.optJSONArray(KEY_APPS)?.let { array ->
                     (0 until array.length()).map { array.getString(it) }.filter(::isPackageName)
                 }.orEmpty().take(MAX_PROFILE_APPS),
+                relay = entry.optString(KEY_RELAY).takeIf(::isRelayAddress)?.trim().orEmpty(),
             )
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
@@ -244,6 +248,7 @@ internal class VpnProfileStore(private val context: Context) {
         private const val KEY_ALLOW_LAN = "allowLan"
         private const val KEY_APP_MODE = "appMode"
         private const val KEY_APPS = "apps"
+        private const val KEY_RELAY = "relay"
         private const val KEY_VERSION = "version"
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_IV = "iv"

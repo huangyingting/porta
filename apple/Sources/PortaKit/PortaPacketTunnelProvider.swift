@@ -57,6 +57,15 @@ open class PortaPacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// The IP of a relay given as `IP`, `IP:PORT` or `[IPv6]:PORT`.
+    static func relayHost(_ relay: String) -> String {
+        if relay.hasPrefix("["), let end = relay.firstIndex(of: "]") {
+            return String(relay[relay.index(after: relay.startIndex)..<end])
+        }
+        let parts = relay.split(separator: ":")
+        return parts.count == 2 ? String(parts[0]) : relay
+    }
+
     private struct Connected {
         let session: TunnelSession
         let remoteAddress: String
@@ -82,6 +91,18 @@ open class PortaPacketTunnelProvider: NEPacketTunnelProvider {
         case "h3": transport = .http3
         case "h2": transport = .http2
         default: transport = .automatic
+        }
+        // A relay forwards TCP and UDP to the only gateway; every attempt
+        // dials it, and the gateway's name and certificate are still checked.
+        if let relay = options["relayAddress"] as? String, !relay.isEmpty {
+            let session = try TunnelSession.connect(
+                server: server,
+                token: token,
+                identity: identity,
+                remoteAddress: relay,
+                transport: transport
+            )
+            return Connected(session: session, remoteAddress: Self.relayHost(relay))
         }
         var lastError: Error = PortaError.retryable("no gateway answered")
         for gateway in [server] + (options["backupServers"] as? [String] ?? []) {

@@ -522,6 +522,14 @@ fn lane_request(group: &Group, index: usize) -> Result<Request<()>, ClientError>
         .config
         .proof
         .proof(Method::POST.as_str(), TUNNEL_PATH)?;
+    insert_proof(request.headers_mut(), proof)?;
+    Ok(request)
+}
+
+fn insert_proof(
+    headers: &mut HeaderMap,
+    proof: porta_wire::device_auth::Proof,
+) -> Result<(), ClientError> {
     for (name, value) in [
         ("x-porta-client-id", proof.device_id),
         ("x-porta-device-name", proof.name),
@@ -530,13 +538,121 @@ fn lane_request(group: &Group, index: usize) -> Result<Request<()>, ClientError>
         ("x-porta-device-nonce", proof.nonce),
         ("x-porta-device-signature", proof.signature),
     ] {
-        request.headers_mut().insert(
+        headers.insert(
             HeaderName::from_static(name),
             HeaderValue::from_str(&value)
                 .map_err(|_| ClientError::permanent("device proof contains an invalid header"))?,
         );
     }
-    Ok(request)
+    Ok(())
+}
+
+/// The most of a response body [`post_signed`] reads.
+const MAX_RESPONSE_BODY: usize = 64 << 10;
+
+/// Sends JSON `body` to `path` on the gateway, signed like a tunnel request
+/// with the account token and a device proof for `path`, and returns the
+/// response body. It dials as the tunnel does: the configured address,
+/// socket protector and TLS settings.
+pub(super) async fn post_signed(
+    config: &ClientConfig,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<Bytes, ClientError> {
+    let exchange = async {
+        let url = Url::parse(&config.url).map_err(ClientError::permanent)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| ClientError::permanent("gateway URL has no hostname"))?
+            .trim_matches(['[', ']'])
+            .to_owned();
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| ClientError::permanent("gateway URL has no port"))?;
+        let endpoint = url.join(path).map_err(ClientError::permanent)?;
+        let (tcp, _) = dial_tcp(
+            &host,
+            port,
+            config.dial_address,
+            config.socket_protector.as_ref(),
+            &config.cancellation,
+        )
+        .await?;
+        let mut tls = (*config.tls).clone();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let server_name = ServerName::try_from(host)
+            .map_err(|_| ClientError::permanent("gateway hostname is invalid for TLS"))?;
+        let stream = TlsConnector::from(Arc::new(tls))
+            .connect(server_name, tcp)
+            .await
+            .map_err(classify_tls_error)?;
+        let (requests, connection) = ::h2::client::handshake(stream)
+            .await
+            .map_err(classify_h2_startup)?;
+        let _driver = AbortOnDropHandle::new(tokio::spawn(connection));
+        let mut requests = requests.ready().await.map_err(classify_h2_startup)?;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(endpoint.as_str())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", config.token),
+            )
+            .header(super::HEADER_CLIENT_VERSION, crate::VERSION.trim_ascii())
+            .body(())
+            .map_err(ClientError::permanent)?;
+        insert_proof(
+            request.headers_mut(),
+            config.proof.proof(Method::POST.as_str(), path)?,
+        )?;
+        let (response, mut sender) = requests
+            .send_request(request, false)
+            .map_err(ClientError::retryable)?;
+        sender
+            .send_data(Bytes::from(body), true)
+            .map_err(ClientError::retryable)?;
+        let response = response.await.map_err(ClientError::retryable)?;
+        let status = response.status();
+        let reason = response
+            .headers()
+            .get(crate::tunnel::REASON_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut stream = response.into_body();
+        let mut received = BytesMut::new();
+        while let Some(chunk) = stream.data().await {
+            let chunk = chunk.map_err(ClientError::retryable)?;
+            let _ = stream.flow_control().release_capacity(chunk.len());
+            if received.len() + chunk.len() > MAX_RESPONSE_BODY {
+                return Err(ClientError::permanent("the gateway's answer is too large"));
+            }
+            received.extend_from_slice(&chunk);
+        }
+        let received = received.freeze();
+        if status == StatusCode::OK {
+            return Ok(received);
+        }
+        if let Some(denial) = super::account_denial(status, reason.as_deref()) {
+            return Err(denial);
+        }
+        let message = serde_json::from_slice::<serde_json::Value>(&received)
+            .ok()
+            .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("the gateway answered {status}"));
+        Err(
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                ClientError::retryable(message)
+            } else {
+                ClientError::permanent(message)
+            },
+        )
+    };
+    tokio::select! {
+        _ = config.cancellation.cancelled() => Err(ClientError::Closed),
+        result = timeout(config.timeout, exchange) => result
+            .unwrap_or_else(|_| Err(ClientError::unavailable("the gateway did not answer in time"))),
+    }
 }
 
 async fn dial_tcp(

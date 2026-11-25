@@ -5,6 +5,7 @@ pub mod identity;
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub mod linux;
 pub mod tls;
+pub mod tpm;
 pub mod tunnel;
 #[cfg(target_os = "windows")]
 pub mod windows;

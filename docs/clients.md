@@ -32,9 +32,9 @@ key, fingerprint ID, and readable name; the private key is never uploaded.
 
 | Client | Private-key storage | Readable name |
 | --- | --- | --- |
-| Linux | `/var/lib/porta/client-identity.json` for root, or the user's config directory; mode `0600` | System hostname |
-| Windows desktop and CLI | `%ProgramData%\Porta\client-identity.json`, protected with machine-bound Windows DPAPI | Windows computer name |
-| Android | Non-exportable Android Keystore alias `porta-device-auth-v1`; StrongBox is preferred when available | `Settings.Global.DEVICE_NAME`, falling back to `Build.MODEL` |
+| Linux | `/var/lib/porta/client-identity.json` for root, or the user's config directory; mode `0600`. With `--hardware-key`, the key is in the TPM and the file holds only its TPM-wrapped blob | System hostname |
+| Windows desktop and CLI | In the TPM for new installs, with `%ProgramData%\Porta\client-identity.json` holding its TPM-wrapped blob; otherwise in that file, protected with machine-bound Windows DPAPI | Windows computer name |
+| Android | Non-exportable Android Keystore alias `porta-device-auth-v2`, generated with key attestation; StrongBox is preferred when available. Installs from before attestation keep `porta-device-auth-v1` until an account requires a hardware-protected key | `Settings.Global.DEVICE_NAME`, falling back to `Build.MODEL` |
 
 Names keep their case and ASCII letters, digits, dots, underscores, and hyphens.
 Each run of other characters, including spaces, becomes one hyphen. Leading and
@@ -60,8 +60,9 @@ Deleting the Linux/Windows identity file or clearing/uninstalling the Android
 app creates a new key and therefore a new enrollment. Copying the Linux
 software-key file also clones that identity. Windows DPAPI prevents an exported
 file from decrypting on another machine. Android Keystore keys are normally
-non-exportable and may be hardware-backed, but Porta does not request or verify
-key attestation. Rooted/modified clients and privileged local attackers remain
+non-exportable and may be hardware-backed; with key attestation, and with
+TPM-backed keys on Windows and Linux, devices can prove that to the gateway
+(see [Hardware-protected devices](deployment.md#hardware-protected-devices)). Rooted/modified clients and privileged local attackers remain
 outside this identity guarantee. Device limits count enrolled keys, not
 provably distinct physical hardware. Forward proxy is the token-only exception
 described below.
@@ -96,6 +97,45 @@ protection stays on while they fail over: only the profile's gateway endpoints a
 reachable outside the tunnel. While protection is active the order is not
 re-measured and DNS is unavailable, so failover uses the endpoints resolved
 when the client started.
+
+## Hardware-protected keys
+
+Accounts can require device keys that are verified to live in secure
+hardware ([Hardware-protected devices](deployment.md#hardware-protected-devices)).
+Clients prove their key on their own:
+
+- Android generates its key with key attestation and sends the attestation
+  certificate chain when it first connects to a gateway.
+- Windows keeps its key in the TPM 2.0 and answers the gateway's credential
+  challenge with it. Windows reads the TPM through the TPM Base Services,
+  which the desktop app can use because it runs as administrator.
+- On Linux, pass `--hardware-key` to the CLI or to `porta-client --daemon`
+  (`/dev/tpmrm0`). The key moves to the TPM, so the device enrolls again.
+
+When an account refuses a device for lacking a hardware-protected key, the
+client proves its key and connects again at once. An Android or Windows
+install whose key predates this support first creates a hardware-protected
+key; this changes its device ID, so the device enrolls as a new one. A device
+without usable secure hardware, or a TPM without an endorsement key
+certificate, shows why it was refused. macOS and iOS cannot prove their key
+yet.
+
+## Relays
+
+When a [transport relay](deployment.md#transport-relays) forwards to the
+gateway, keep the gateway's URL in the profile and set the relay as the
+**Relay address** (Linux and Windows apps, Android), `--relay-address
+IP:PORT` (Linux and Windows CLIs) or the `relayAddress` provider option
+(macOS and iOS). The address is an IP with an optional port, such as
+`203.0.113.7:8443` or `[2001:db8::7]:443`; without a port, the gateway's
+port is used.
+
+The client then dials the relay for every connection and reconnect, over
+HTTP/3 and HTTP/2, and never falls back to dialing the gateway directly. It
+still checks the gateway's name and certificate and authenticates to the
+gateway, so a relay cannot impersonate it. Leak protection lets only the
+relay through outside the tunnel. A relay forwards to one gateway, so a
+profile with a relay has no backup gateways.
 
 ## Connecting automatically
 

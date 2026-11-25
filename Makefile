@@ -11,7 +11,7 @@ WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef5
 
 .PHONY: all build build-rust-server build-rust-clients build-windows build-linux-desktop build-masque-probe build-apple android android-debug \
 	check-version check-dependencies lint-scripts fuzz clean test test-automation test-rust test-rust-server test-rust-client \
-	test-rust-interop test-live-vpn test-cascade test-split-tunnel test-subnet-router test-exit-selection test-dns-resolver test-admin-identity test-gateway-failover test-ipv6 test-graceful-restart test-client-daemon test-peer-to-peer test-standard-masque test-apple-ffi test-apple test-service-user test-windows-cross test-native-firewall test-server-web \
+	test-rust-interop test-live-vpn test-cascade test-transport-relay test-tpm-attestation test-split-tunnel test-subnet-router test-exit-selection test-dns-resolver test-admin-identity test-gateway-failover test-ipv6 test-graceful-restart test-client-daemon test-peer-to-peer test-standard-masque test-apple-ffi test-apple test-service-user test-windows-cross test-native-firewall test-server-web \
 	verify-wintun vet
 
 all: build
@@ -187,6 +187,16 @@ test-service-user:
 	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
 		--package porta-server-rust --package porta-client-rust --locked
 	sudo -n ./scripts/test-service-user.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+
+test-tpm-attestation:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-server-rust --package porta-client-rust --locked
+	sudo -n ./scripts/test-tpm-attestation.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
+
+test-transport-relay:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
+		--package porta-server-rust --package porta-client-rust --locked
+	sudo -n ./scripts/test-transport-relay.sh $(RUST_TARGET)/debug/porta-server $(RUST_TARGET)/debug/porta-client
 
 test-split-tunnel:
 	$(CARGO) build --manifest-path $(RUST_MANIFEST) \

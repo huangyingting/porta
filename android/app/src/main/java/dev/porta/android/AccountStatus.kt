@@ -45,6 +45,7 @@ internal enum class AccountDenial(val code: String) {
     ENROLLMENT_CLOSED("enrollment-closed"),
     DEVICE_DENIED("device-denied"),
     CLIENT_OUTDATED("client-outdated"),
+    HARDWARE_REQUIRED("hardware-required"),
 }
 
 /** Finds the stable denial code the native bridge places in failure messages. */
