@@ -6,7 +6,7 @@ use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::EncodePublicKey;
 use porta_wire::device_auth::{self, Proof};
-use rand::RngCore as _;
+use rand::Rng as _;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use porta_wire::tpm::{Public, Reader, ALG_NULL, ALG_SHA256};
-use rand::RngCore as _;
+use rand::Rng as _;
 use thiserror::Error;
 
 use transport::Transport;

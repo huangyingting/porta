@@ -14,7 +14,7 @@ use crate::state::sso_users::{email_domain, SsoUser, SsoUsers};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::TryRngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Read;
@@ -122,7 +122,7 @@ impl Portal {
         let admin_token = admin_token.into();
         let downloads_directory = downloads_directory.into();
         let mut download_ticket_key = [0_u8; 32];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut download_ticket_key)
             .map_err(|_| "generate download ticket key")?;
         let token_cipher = CredentialCipher::derive(&download_ticket_key, "session-token-v1");
@@ -1798,8 +1798,8 @@ fn query_parameter(query: &str, key: &str) -> Option<String> {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts keys of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }

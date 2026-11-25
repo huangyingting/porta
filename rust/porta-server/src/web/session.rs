@@ -1,9 +1,9 @@
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::TryRngCore;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -260,7 +260,7 @@ impl SessionStore {
 
     pub fn start(&self, session: PortalSession, now: u64) -> Result<(String, String), CryptoError> {
         let mut id_bytes = [0_u8; 32];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut id_bytes)
             .map_err(|_| CryptoError::Random)?;
         let id = URL_SAFE_NO_PAD.encode(id_bytes);
@@ -486,7 +486,7 @@ impl CredentialCipher {
 
     pub fn seal(&self, value: &[u8], binding: &str) -> Result<String, CryptoError> {
         let mut nonce = [0_u8; 12];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut nonce)
             .map_err(|_| CryptoError::Random)?;
         let (ciphertext, tag) = aes_256_gcm_seal(&self.key, &nonce, value, binding.as_bytes());
@@ -521,8 +521,8 @@ impl CredentialCipher {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts keys of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
@@ -537,7 +537,7 @@ fn aes_256_gcm_seal(
     let mut ciphertext = plaintext.to_vec();
     let nonce = Nonce::from(*nonce);
     let tag = cipher
-        .encrypt_in_place_detached(&nonce, aad, &mut ciphertext)
+        .encrypt_inout_detached(&nonce, aad, ciphertext.as_mut_slice().into())
         .expect("AES-GCM message length is within supported limits");
     (ciphertext, tag.into())
 }
@@ -554,7 +554,7 @@ fn aes_256_gcm_open(
     let nonce = Nonce::from(*nonce);
     let tag = Tag::from(*tag);
     cipher
-        .decrypt_in_place_detached(&nonce, aad, &mut plaintext, &tag)
+        .decrypt_inout_detached(&nonce, aad, plaintext.as_mut_slice().into(), &tag)
         .map_err(|_| CryptoError::Invalid)?;
     Ok(plaintext)
 }
