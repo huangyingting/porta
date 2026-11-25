@@ -13,7 +13,6 @@
 //! `account-denied:CODE:` so the app can explain them.
 
 use std::ffi::{c_char, c_void, CStr};
-use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -384,15 +383,16 @@ unsafe fn connect(
     };
     let dial_address =
         match optional_string(config.remote_address, "remote address").map_err(permanent)? {
+            // The gateway's resolved IP, or a relay's `IP[:PORT]`.
             Some(address) => {
-                let ip = address
-                    .parse::<IpAddr>()
-                    .map_err(|_| permanent(format!("invalid remote address {address}")))?;
                 let port = Url::parse(&server)
                     .ok()
                     .and_then(|url| url.port_or_known_default())
                     .ok_or_else(|| permanent("server must be an HTTPS origin".to_owned()))?;
-                Some(SocketAddr::new(ip, port))
+                Some(
+                    porta_client::tunnel::parse_dial_address(&address, port)
+                        .map_err(|error| permanent(format!("invalid remote address: {error}")))?,
+                )
             }
             None => None,
         };

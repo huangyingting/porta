@@ -323,6 +323,8 @@ pub enum DenialReason {
     StandardClientsDisabled,
     /// The client is older than the gateway's `--min-client-version`.
     ClientOutdated,
+    /// The account requires a device key verified to be in secure hardware.
+    HardwareRequired,
 }
 
 impl DenialReason {
@@ -336,6 +338,7 @@ impl DenialReason {
             Self::DeviceDenied => "device-denied",
             Self::StandardClientsDisabled => "standard-clients-disabled",
             Self::ClientOutdated => "client-outdated",
+            Self::HardwareRequired => "hardware-required",
         }
     }
 }

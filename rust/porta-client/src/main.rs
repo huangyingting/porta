@@ -105,6 +105,18 @@ mod linux {
         allow_lan: bool,
         #[arg(
             long,
+            value_name = "IP[:PORT]",
+            help = "Dial a relay that forwards TCP and UDP to the gateway, instead of the gateway's own address; the gateway's name and certificate are still verified"
+        )]
+        relay_address: Option<String>,
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            help = "Keep the device key in this computer's TPM, for accounts that require hardware-protected devices; an existing key is replaced and the device enrolls again"
+        )]
+        hardware_key: bool,
+        #[arg(
+            long,
             action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
@@ -172,6 +184,7 @@ mod linux {
                     group: arguments.control_group,
                     ca_path: arguments.ca,
                     thumbprint: arguments.thumbprint,
+                    hardware_key: arguments.hardware_key,
                 },
                 &cancellation,
             )
@@ -195,6 +208,8 @@ mod linux {
                     network_state: arguments.network_state,
                     subnet_router: arguments.subnet_router,
                     allow_lan: arguments.allow_lan,
+                    relay: arguments.relay_address,
+                    hardware_key: arguments.hardware_key,
                 },
                 &cancellation,
                 print_event,
@@ -372,6 +387,12 @@ mod windows {
         allow_lan: bool,
         #[arg(
             long,
+            value_name = "IP[:PORT]",
+            help = "Dial a relay that forwards TCP and UDP to the gateway, instead of the gateway's own address; the gateway's name and certificate are still verified"
+        )]
+        relay_address: Option<String>,
+        #[arg(
+            long,
             action = ArgAction::SetTrue,
             help = "Restore Porta networking and exit"
         )]
@@ -435,6 +456,7 @@ mod windows {
                 connect_timeout: Duration::from_secs(15),
                 reconnect_max_delay: arguments.reconnect_max_delay,
                 allow_lan: arguments.allow_lan,
+                relay: arguments.relay_address,
             },
             cancellation,
             Arc::new(print_event),

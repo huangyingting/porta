@@ -499,6 +499,61 @@ impl Drop for ConnectionInner {
     }
 }
 
+/// Sends device key evidence to the gateway, which records the device as
+/// hardware-protected when the evidence holds.
+pub async fn attest(
+    config: &ClientConfig,
+    request: &porta_wire::attestation::AttestationRequest,
+) -> Result<porta_wire::attestation::AttestationResult, ClientError> {
+    let body = serde_json::to_vec(request).map_err(ClientError::permanent)?;
+    let answer = h2::post_signed(config, porta_wire::attestation::ATTESTATION_PATH, body).await?;
+    serde_json::from_slice(&answer)
+        .map_err(|_| ClientError::permanent("the gateway's attestation answer is malformed"))
+}
+
+/// Asks the gateway for a TPM credential challenge for this device key.
+pub async fn tpm_challenge(
+    config: &ClientConfig,
+    request: &porta_wire::attestation::TpmChallengeRequest,
+) -> Result<porta_wire::attestation::TpmChallenge, ClientError> {
+    let body = serde_json::to_vec(request).map_err(ClientError::permanent)?;
+    let answer = h2::post_signed(
+        config,
+        porta_wire::attestation::ATTESTATION_CHALLENGE_PATH,
+        body,
+    )
+    .await?;
+    serde_json::from_slice(&answer)
+        .map_err(|_| ClientError::permanent("the gateway's challenge is malformed"))
+}
+
+/// Parses where to dial instead of the gateway's resolved address, such as
+/// a relay that forwards TCP and UDP to the gateway unchanged: `IP:PORT`,
+/// `[IPv6]:PORT`, or a bare IP that uses `default_port`. The URL, TLS name
+/// and certificate stay the gateway's.
+pub fn parse_dial_address(value: &str, default_port: u16) -> Result<SocketAddr, String> {
+    let value = value.trim();
+    let address = value
+        .parse::<SocketAddr>()
+        .or_else(|_| {
+            value
+                .parse::<IpAddr>()
+                .map(|ip| SocketAddr::new(ip, default_port))
+        })
+        .map_err(|_| format!("{value:?} is not an IP address with an optional port"))?;
+    let ip = match address.ip() {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
+    };
+    if ip.is_unspecified() || ip.is_multicast() || ip == IpAddr::V4(Ipv4Addr::BROADCAST) {
+        return Err(format!("{value:?} is not a unicast address"));
+    }
+    if address.port() == 0 {
+        return Err(format!("{value:?} has no port"));
+    }
+    Ok(SocketAddr::new(ip, address.port()))
+}
+
 /// Checks that the gateway at `url` answers with a certificate `tls`
 /// trusts, as it does once a captive network lets it through. It neither
 /// authenticates nor opens a tunnel.
@@ -597,6 +652,37 @@ fn valid_unicast(address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_addresses_are_unicast_ips_with_ports() {
+        assert_eq!(
+            parse_dial_address("203.0.113.7:9443", 8443).unwrap(),
+            "203.0.113.7:9443".parse().unwrap()
+        );
+        assert_eq!(
+            parse_dial_address(" 203.0.113.7 ", 8443).unwrap(),
+            "203.0.113.7:8443".parse().unwrap()
+        );
+        assert_eq!(
+            parse_dial_address("[2001:db8::7]:443", 8443).unwrap(),
+            "[2001:db8::7]:443".parse().unwrap()
+        );
+        assert_eq!(
+            parse_dial_address("[::ffff:203.0.113.7]:443", 8443).unwrap(),
+            "203.0.113.7:443".parse().unwrap()
+        );
+        for invalid in [
+            "",
+            "relay.example.com:443",
+            "0.0.0.0:443",
+            "224.0.0.1:443",
+            "255.255.255.255:443",
+            "203.0.113.7:0",
+            "203.0.113.7:99999",
+        ] {
+            assert!(parse_dial_address(invalid, 8443).is_err(), "{invalid}");
+        }
+    }
 
     #[tokio::test]
     async fn repeated_close_waits_for_workers_even_if_the_first_close_was_cancelled() {

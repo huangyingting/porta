@@ -46,6 +46,7 @@ tunnel.providerConfiguration = [
     "accessGroup": "TEAMID.com.example.porta",
     "backupServers": [],
     "transport": "auto",
+    // "relayAddress": "203.0.113.7:8443", // dial a relay that forwards to the gateway
 ]
 tunnel.includeAllNetworks = true   // fail closed for a full tunnel
 tunnel.excludeLocalNetworks = true // the "Allow local network" option

@@ -217,6 +217,14 @@ The same body's optional `"standard_clients": true | false` allows or stops
 [standard CONNECT-IP clients](#standard-connect-ip-clients) for the account;
 summaries report it as `standard_clients`. Stopping them ends their sessions.
 
+Its optional `"require_hardware": true | false` makes the account accept only
+devices that proved a hardware-protected key ([Device attestation](#device-attestation));
+summaries report it as `require_hardware`, and verified devices carry
+`hardware: {"platform", "level", "vendor", "verified_at"}`. Other devices,
+the forward proxy and standard clients receive 403 with `X-Porta-Reason:
+hardware-required`. Turning it on ends the sessions of devices without
+evidence.
+
 ## Standard CONNECT-IP clients
 
 Porta's own clients add a device proof and `X-Porta-Version` to every tunnel
@@ -311,6 +319,28 @@ Browser sign-in uses `POST /admin/sign-in` (form fields `username`,
 `GET /auth/oidc/callback`. With `--sso-user-domains`, `GET /auth/sso/start`
 signs a user in to their account through the same callback and redirects to
 `/portal/downloads`.
+
+## Device attestation
+
+Native clients prove that their device key lives in secure hardware. Both
+requests are signed like a tunnel request: `Authorization: Bearer TOKEN` and
+the device proof headers for the request's path. The device must be enrolled.
+
+- `POST /v1/device/attestation` with
+  `{"platform": "android", "certificates": [...]}` sends an Android Keystore
+  attestation chain, leaf first, each certificate base64url DER.
+- `POST /v1/device/attestation/challenge` with `{"endorsement_key",
+  "endorsement_certificates", "device_key"}` (base64url TPM `TPMT_PUBLIC`
+  areas and DER certificates) returns `{"challenge", "credential_blob",
+  "encrypted_secret"}` for TPM2_ActivateCredential. The answer is
+  `POST /v1/device/attestation` with
+  `{"platform": "tpm", "challenge", "secret"}`. Challenges expire after five
+  minutes and are answered once.
+
+Accepted evidence returns `{"platform", "level", "vendor"}` and records the
+device as hardware-protected. Refused evidence returns 422 with an
+`{"error"}` message; a missing or invalid proof returns 401. Gateways
+deployed without `--verify-tpm` return 404 for TPM requests.
 
 ## Session administration
 

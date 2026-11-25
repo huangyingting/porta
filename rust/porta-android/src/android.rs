@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -272,16 +272,11 @@ fn parse_server(server: &str) -> Result<(String, u16), BridgeError> {
     Ok((host, port))
 }
 
-fn parse_remote(remote_ip: &str, port: u16) -> Result<SocketAddr, BridgeError> {
-    let ip = remote_ip
-        .parse::<IpAddr>()
-        .map_err(|error| BridgeError::Message(format!("invalid remote IP address: {error}")))?;
-    if ip.is_unspecified() || ip.is_multicast() {
-        return Err(BridgeError::Message(
-            "remote IP address must be unicast".to_string(),
-        ));
-    }
-    Ok(SocketAddr::new(ip, port))
+/// The address to dial: the gateway's resolved IP, or a relay's
+/// `IP[:PORT]` that forwards to it.
+fn parse_remote(remote: &str, port: u16) -> Result<SocketAddr, BridgeError> {
+    porta_client::tunnel::parse_dial_address(remote, port)
+        .map_err(|error| BridgeError::Message(format!("invalid remote address: {error}")))
 }
 
 fn get_dialer(id: jlong) -> Result<Arc<DialerHandle>, BridgeError> {
@@ -459,6 +454,68 @@ pub extern "system" fn Java_portamobile_Portamobile_nativeDial(
             }),
         );
         Ok(id)
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Sends the device key's attestation certificate chain (base64url DER,
+/// leaf first, comma-separated) to the gateway; returns its JSON verdict.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_portamobile_Portamobile_nativeAttest(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    dialer_id: jlong,
+    server: JString<'_>,
+    token: JString<'_>,
+    remote_ip: JString<'_>,
+    certificates: JString<'_>,
+    proof_provider: JObject<'_>,
+    protector: JObject<'_>,
+) -> jstring {
+    env.with_env(|env| -> Result<jstring, BridgeError> {
+        if !INITIALIZED.load(Ordering::Acquire) {
+            return Err(BridgeError::Message(
+                "native Android TLS is not initialized".to_string(),
+            ));
+        }
+        let dialer = get_dialer(dialer_id)?;
+        let server = read_string(env, &server, "server")?;
+        let token = read_string(env, &token, "token")?;
+        let remote_ip = read_string(env, &remote_ip, "remote IP address")?;
+        let certificates = read_string(env, &certificates, "certificates")?
+            .split(',')
+            .filter(|certificate| !certificate.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let (_server_name, port) = parse_server(&server)?;
+        let remote = parse_remote(&remote_ip, port)?;
+        let vm = Arc::new(env.get_java_vm()?);
+        let proof_provider: Arc<dyn ProofProvider> = Arc::new(AndroidProofProvider {
+            vm: Arc::clone(&vm),
+            provider: env.new_global_ref(proof_provider)?,
+            device_id: Mutex::new(None),
+        });
+        let socket_protector = Arc::new(AndroidSocketProtector {
+            vm,
+            protector: env.new_global_ref(protector)?,
+        });
+        let config = ClientConfig {
+            url: server,
+            token,
+            transport: Transport::Http2,
+            tls: tls::platform_config()?,
+            timeout: Duration::from_secs(15),
+            dial_address: Some(remote),
+            proof: proof_provider,
+            socket_protector: Some(socket_protector),
+            cancellation: dialer.cancellation.clone(),
+        };
+        let request = porta_wire::attestation::AttestationRequest::Android { certificates };
+        let result = runtime()?.block_on(porta_client::tunnel::attest(&config, &request))?;
+        let encoded = serde_json::to_string(&result)
+            .map_err(|error| BridgeError::Message(error.to_string()))?;
+        Ok(JString::from_str(env, encoded)?.into_raw())
     })
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }

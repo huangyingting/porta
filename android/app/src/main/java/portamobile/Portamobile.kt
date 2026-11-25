@@ -55,6 +55,35 @@ class Dialer internal constructor(handle: Long) : AutoCloseable {
         )
     }
 
+    /**
+     * Sends the device key's attestation [certificates] (DER, leaf first) to
+     * the gateway, which records the key as hardware-protected when they
+     * hold. Returns the gateway's JSON verdict.
+     */
+    fun attest(
+        server: String,
+        token: String,
+        remoteIP: String,
+        certificates: List<ByteArray>,
+        proofProvider: ProofProvider,
+        protector: Protector,
+    ): String {
+        val activeHandle = handle.get()
+        if (activeHandle == 0L) throw IOException("tunnel dialer is closed")
+        val encoder = java.util.Base64.getUrlEncoder().withoutPadding()
+        return Portamobile.callNative {
+            Portamobile.attest(
+                activeHandle,
+                server,
+                token,
+                remoteIP,
+                certificates.joinToString(",") { encoder.encodeToString(it) },
+                proofProvider,
+                protector,
+            )
+        }
+    }
+
     override fun close() {
         val activeHandle = handle.getAndSet(0)
         if (activeHandle != 0L) Portamobile.closeDialer(activeHandle)
@@ -185,6 +214,16 @@ object Portamobile {
         protector,
     )
 
+    internal fun attest(
+        dialer: Long,
+        server: String,
+        token: String,
+        remoteIP: String,
+        certificates: String,
+        proofProvider: ProofProvider,
+        protector: Protector,
+    ): String = nativeAttest(dialer, server, token, remoteIP, certificates, proofProvider, protector)
+
     internal fun closeDialer(handle: Long) = nativeCloseDialer(handle)
     internal fun sessionSend(handle: Long, packet: ByteArray) = nativeSessionSend(handle, packet)
     internal fun sessionReceive(handle: Long): ByteArray = nativeSessionReceive(handle)
@@ -220,6 +259,15 @@ object Portamobile {
         timestamp: String,
         nonce: String,
     ): ByteArray
+    @JvmStatic private external fun nativeAttest(
+        dialer: Long,
+        server: String,
+        token: String,
+        remoteIP: String,
+        certificates: String,
+        proofProvider: ProofProvider,
+        protector: Protector,
+    ): String
     @JvmStatic private external fun nativeDial(
         dialer: Long,
         server: String,

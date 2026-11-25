@@ -55,6 +55,10 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y nftables iproute2
           fi
+          if ! command -v swtpm >/dev/null || ! command -v swtpm_localca >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y swtpm swtpm-tools
+          fi
       - name: Resolve through systemd-resolved's stub, like an Ubuntu host
         # Clients configure DNS through systemd-resolved and require
         # /etc/resolv.conf to be its stub; some runner images manage the
@@ -74,6 +78,10 @@ jobs:
         run: make test-native-firewall
       - name: Test cascade relay chain end to end
         run: make test-cascade
+      - name: Test the transport relay end to end
+        run: make test-transport-relay
+      - name: Test TPM device keys end to end
+        run: make test-tpm-attestation
       - name: Test split tunneling end to end
         run: make test-split-tunnel
       - name: Test subnet routing and access policy end to end
@@ -226,6 +234,8 @@ jobs:
         env:
           PORTA_WFP_NATIVE_TEST: "1"
           PORTA_WFP_NATIVE_TEST_MARKER: ${{ runner.temp }}\porta-wfp-native.ok
+          PORTA_TPM_NATIVE_TEST: "1"
+          PORTA_TPM_NATIVE_TEST_MARKER: ${{ runner.temp }}\porta-tpm-native.ok
         shell: pwsh
         run: |
           Remove-Item -LiteralPath $env:PORTA_WFP_NATIVE_TEST_MARKER -Force -ErrorAction SilentlyContinue
@@ -238,6 +248,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
           if (-not (Test-Path -LiteralPath $env:PORTA_WFP_NATIVE_TEST_MARKER)) {
             throw "native WFP rollback acceptance did not run"
+          }
+          # Runners may have no TPM; report whether the TPM test used one.
+          if (Test-Path -LiteralPath $env:PORTA_TPM_NATIVE_TEST_MARKER) {
+            Write-Output "TPM device keys worked on this runner (parent: $(Get-Content $env:PORTA_TPM_NATIVE_TEST_MARKER))"
+          } else {
+            Write-Output "::notice::This runner has no usable TPM; the TPM device key test was skipped"
           }
       - name: Build Windows applications
         run: >

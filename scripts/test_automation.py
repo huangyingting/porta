@@ -1036,6 +1036,38 @@ class AutomationTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.run_deploy(deploy, "--build-local", *options, success=False)
 
+    def test_deploy_verify_tpm_installs_vendor_cas_and_points_the_gateway_at_them(self):
+        deploy = self.prepare_deploy(timer=False)
+        self.run_deploy(deploy, "--build-local", "--verify-tpm", success=False)
+        # A stand-in for cabextract that unpacks one vendor root and one of
+        # Microsoft's AIK service CAs, which are not needed.
+        cabextract = self.bin / "cabextract"
+        cabextract.write_text(
+            "#!/bin/sh\n"
+            "while [ $# -gt 0 ]; do [ \"$1\" = -d ] && out=$2; shift; done\n"
+            "mkdir -p \"$out/Infineon/RootCA\" \"$out/Microsoft/IntermediateCA\"\n"
+            "echo root > \"$out/Infineon/RootCA/root.cer\"\n"
+            "echo aik > \"$out/Microsoft/IntermediateCA/aik.cer\"\n")
+        cabextract.chmod(0o755)
+        cab = self.root / "TrustedTpm.cab"
+        cab.write_text("cab")
+        self.env["PORTA_TPM_CAS_CAB"] = str(cab)
+        result = self.run_deploy(deploy, "--build-local", "--verify-tpm")
+        directory = self.root / "system/var/lib/porta/tpm-ca"
+        self.assertTrue((directory / "Infineon/RootCA/root.cer").exists())
+        self.assertFalse((directory / "Microsoft/IntermediateCA").exists())
+        unit = (self.root / "system/etc/systemd/system/porta.service").read_text()
+        self.assertIn(f"--tpm-ca-dir {directory} --mtu", unit)
+        self.assertIn("TPM device keys: verified", result.stdout)
+        self.assertTrue((self.root / "system/usr/local/sbin/porta-tpm-cas").exists())
+        # Saved like other options, and turned off explicitly.
+        self.assertIn("--tpm-ca-dir", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        self.run_deploy(deploy, "--build-local")
+        self.assertIn("--tpm-ca-dir", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        result = self.run_deploy(deploy, "--build-local", "--verify-tpm=false")
+        self.assertNotIn("--tpm-ca-dir", (self.root / "system/etc/systemd/system/porta.service").read_text())
+        self.assertIn("TPM device keys: not verified", result.stdout)
+
     def test_deploy_federation_saves_the_token_and_points_replicas_at_the_primary(self):
         deploy = self.prepare_deploy(timer=False)
         token = "federation-token-0123456789abcdefghij"

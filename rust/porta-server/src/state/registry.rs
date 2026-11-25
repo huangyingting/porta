@@ -75,6 +75,8 @@ pub enum RegistryError {
     ReadOnly,
     #[error("new devices enroll on the primary gateway first")]
     EnrollOnPrimary,
+    #[error("this account accepts only devices whose key is verified to be in secure hardware")]
+    HardwareRequired,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -107,6 +109,10 @@ pub struct ClientRecord {
     /// a Porta device key.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub standard_clients: bool,
+    /// Only devices with a verified hardware key may connect; token-only
+    /// access (the forward proxy, standard clients) is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_hardware: bool,
 }
 
 /// Network access rules for an account's tunnels. The default reaches every
@@ -290,6 +296,23 @@ pub struct DeviceRecord {
     /// Networks behind this device that the gateway routes to it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subnets: Vec<Ipv4Net>,
+    /// Evidence that the device's key lives in secure hardware.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareAttestation>,
+}
+
+/// A verified claim that a device key cannot leave secure hardware.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HardwareAttestation {
+    /// `android` or `tpm`.
+    pub platform: String,
+    /// `strongbox` or `tee` on Android, `tpm` for a TPM.
+    pub level: String,
+    /// The device brand or TPM manufacturer, when the evidence names it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vendor: String,
+    #[serde(with = "rfc3339")]
+    pub verified_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,6 +370,7 @@ pub struct ClientSummary {
     pub access: AccessPolicy,
     /// Standard CONNECT-IP clients may connect with the token alone.
     pub standard_clients: bool,
+    pub require_hardware: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -377,6 +401,8 @@ pub struct DeviceSummary {
     pub target: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub subnets: Vec<Ipv4Net>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareAttestation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -559,6 +585,7 @@ impl ClientRegistry {
                     enrollment_open_until: None,
                     access: AccessPolicy::default(),
                     standard_clients: false,
+                    require_hardware: false,
                 }]
             }
             Err(error) => return Err(error.into()),
@@ -800,6 +827,7 @@ impl ClientRegistry {
             enrollment_open_until: None,
             access: AccessPolicy::default(),
             standard_clients: false,
+            require_hardware: false,
         };
         let _mutation = self.inner.mutations.lock().await;
         self.ensure_open()?;
@@ -964,6 +992,110 @@ impl ClientRegistry {
             Ok(())
         })
         .await
+    }
+
+    /// Requires, or stops requiring, devices with a verified hardware key.
+    /// Turning it on ends the sessions of every device without one.
+    pub async fn set_require_hardware(
+        &self,
+        id: &str,
+        required: bool,
+    ) -> Result<ClientSummary, RegistryError> {
+        let summary = self
+            .mutate_client(id, |client| {
+                client.require_hardware = required;
+                Ok(())
+            })
+            .await?;
+        if required {
+            let unverified = {
+                let state = self.inner.state.lock();
+                state
+                    .clients
+                    .iter()
+                    .find(|client| client.id == id)
+                    .map(|client| {
+                        client
+                            .devices
+                            .iter()
+                            .filter(|device| device.hardware.is_none())
+                            .map(|device| device.id.clone())
+                            .chain([
+                                FORWARD_PROXY_DEVICE_ID.to_owned(),
+                                STANDARD_DEVICE_ID.to_owned(),
+                            ])
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            for device in unverified {
+                self.inner.sessions.cancel_device(id, &device).await;
+            }
+        }
+        Ok(summary)
+    }
+
+    /// The account and enrolled device behind a signed attestation request.
+    /// It checks the token and proof as a tunnel does, but admits a device
+    /// that is pending or lacks hardware evidence, since proving its key is
+    /// what such a device needs to do.
+    pub async fn authenticate_attestation(
+        &self,
+        token: &str,
+        proof: &device_auth::Proof,
+        method: &str,
+        path: &str,
+    ) -> Result<(String, String, Vec<u8>), RegistryError> {
+        self.ensure_open()?;
+        let verified = device_auth::verify(proof, token, method, path, OffsetDateTime::now_utc())
+            .map_err(|_| RegistryError::Unauthorized)?;
+        let canonical_key = URL_SAFE_NO_PAD.encode(&verified.encoded_public_key);
+        let now = OffsetDateTime::now_utc();
+        let mut state = self.inner.state.lock();
+        let client_index = client_index_for_token(&state, token)?;
+        let client = &state.clients[client_index];
+        let account_id = client.id.clone();
+        let device = client
+            .devices
+            .iter()
+            .find(|device| device.id == proof.device_id)
+            .ok_or(RegistryError::Unauthorized)?;
+        if device.public_key != canonical_key {
+            return Err(RegistryError::Unauthorized);
+        }
+        if device.status == DeviceStatus::Denied {
+            return Err(RegistryError::DeviceDenied);
+        }
+        let key = DeviceKey::new(&account_id, &proof.device_id);
+        if nonce_seen(&mut state, &key, &proof.nonce, verified.signed_at, now) {
+            return Err(RegistryError::Unauthorized);
+        }
+        remember_nonce(&mut state, key, proof.nonce.clone(), verified.signed_at);
+        Ok((
+            account_id,
+            proof.device_id.clone(),
+            verified.encoded_public_key,
+        ))
+    }
+
+    /// Records verified hardware evidence for an enrolled device.
+    pub async fn record_hardware(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        hardware: HardwareAttestation,
+    ) -> Result<(), RegistryError> {
+        self.mutate_client(account_id, |client| {
+            let device = client
+                .devices
+                .iter_mut()
+                .find(|device| device.id == device_id)
+                .ok_or(RegistryError::NotFound)?;
+            device.hardware = Some(hardware.clone());
+            Ok(())
+        })
+        .await
+        .map(drop)
     }
 
     /// Lets standard CONNECT-IP clients connect with the account's token
@@ -1496,6 +1628,7 @@ impl ClientRegistry {
                     return Err(RegistryError::Unauthorized);
                 }
                 device_access(device.status)?;
+                hardware_access(&state.clients[client_index], device)?;
                 if device.name == proof.name
                     && !elapsed_at_least(device.last_seen, now, LAST_SEEN_INTERVAL)
                 {
@@ -1537,6 +1670,7 @@ impl ClientRegistry {
                     return Err(RegistryError::Unauthorized);
                 }
                 device_access(device.status)?;
+                hardware_access(&state.clients[client_index], device)?;
                 let needs_persist = device.name != proof.name
                     || elapsed_at_least(device.last_seen, now, LAST_SEEN_INTERVAL);
                 if !needs_persist {
@@ -1574,6 +1708,7 @@ impl ClientRegistry {
                     last_seen: now,
                     status,
                     subnets: Vec::new(),
+                    hardware: None,
                 });
                 (account_id, clients, None, true)
             }
@@ -1605,6 +1740,12 @@ impl ClientRegistry {
                     let key = DeviceKey::new(&account_id, &proof.device_id);
                     remember_nonce(&mut state, key, proof.nonce.clone(), verified.signed_at);
                     return Err(RegistryError::DevicePending);
+                }
+                if client.require_hardware {
+                    // Enrolled; it connects once it proves its key.
+                    let key = DeviceKey::new(&account_id, &proof.device_id);
+                    remember_nonce(&mut state, key, proof.nonce.clone(), verified.signed_at);
+                    return Err(RegistryError::HardwareRequired);
                 }
             } else if let Some(device_index) = existing_index {
                 let persisted = candidate
@@ -1688,6 +1829,9 @@ impl ClientRegistry {
             let mut state = self.inner.state.lock();
             self.ensure_open()?;
             let client_index = client_index_for_token(&state, token)?;
+            if state.clients[client_index].require_hardware {
+                return Err(RegistryError::HardwareRequired);
+            }
             permitted(&state.clients[client_index])?;
             let account_id = state.clients[client_index].id.clone();
             let key = DeviceKey::new(&account_id, device_id);
@@ -1726,6 +1870,9 @@ impl ClientRegistry {
         let (account_id, candidate) = {
             let state = self.inner.state.lock();
             let client_index = client_index_for_token(&state, token)?;
+            if state.clients[client_index].require_hardware {
+                return Err(RegistryError::HardwareRequired);
+            }
             permitted(&state.clients[client_index])?;
             let account_id = state.clients[client_index].id.clone();
             let key = DeviceKey::new(&account_id, device_id);
@@ -1762,6 +1909,7 @@ impl ClientRegistry {
                 last_seen: now,
                 status: DeviceStatus::Approved,
                 subnets: Vec::new(),
+                hardware: None,
             });
             (account_id, clients)
         };
@@ -2243,6 +2391,15 @@ fn validate_client_input(name: &str, max_devices: usize) -> Result<String, Regis
     Ok(name.into())
 }
 
+/// Refuses a device without verified hardware when the account requires it.
+fn hardware_access(client: &ClientRecord, device: &DeviceRecord) -> Result<(), RegistryError> {
+    if client.require_hardware && device.hardware.is_none() {
+        Err(RegistryError::HardwareRequired)
+    } else {
+        Ok(())
+    }
+}
+
 fn summarize_client(
     client: &ClientRecord,
     sessions: &LiveSessions,
@@ -2295,6 +2452,7 @@ fn summarize_client(
                     ),
                     status: device.status.as_str(),
                     subnets: device.subnets,
+                    hardware: device.hardware,
                     id: device.id,
                     name: device.name,
                     first_seen: device.first_seen,
@@ -2331,6 +2489,7 @@ fn summarize_client(
         limits: client.limits.clone(),
         access: client.access.clone(),
         standard_clients: client.standard_clients,
+        require_hardware: client.require_hardware,
     }
 }
 
@@ -2676,6 +2835,7 @@ mod tests {
             last_seen: at,
             status: DeviceStatus::Approved,
             subnets: Vec::new(),
+            hardware: None,
         }
     }
 
@@ -2684,6 +2844,17 @@ mod tests {
         name: &str,
         token: &str,
         nonce_byte: u8,
+    ) -> device_auth::Proof {
+        signed_proof_for(key, name, token, nonce_byte, "POST", "/v1/tunnel")
+    }
+
+    fn signed_proof_for(
+        key: &SigningKey,
+        name: &str,
+        token: &str,
+        nonce_byte: u8,
+        method: &str,
+        path: &str,
     ) -> device_auth::Proof {
         let public_key = key
             .verifying_key()
@@ -2699,12 +2870,7 @@ mod tests {
             nonce: URL_SAFE_NO_PAD.encode([nonce_byte; 16]),
             signature: String::new(),
         };
-        let digest = Sha256::digest(device_auth::signature_payload(
-            &proof,
-            token,
-            "POST",
-            "/v1/tunnel",
-        ));
+        let digest = Sha256::digest(device_auth::signature_payload(&proof, token, method, path));
         let signature: Signature = key.sign_prehash(&digest).unwrap();
         proof.signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
         proof
@@ -2889,6 +3055,7 @@ mod tests {
                     enrollment_open_until: None,
                     access: AccessPolicy::default(),
                     standard_clients: false,
+                    require_hardware: false,
                 })
                 .collect(),
             ..RegistryState::default()
@@ -2915,6 +3082,7 @@ mod tests {
                 enrollment_open_until: None,
                 access: AccessPolicy::default(),
                 standard_clients: false,
+                require_hardware: false,
             },
             ClientRecord {
                 id: "8899aabbccddeeff".into(),
@@ -2930,6 +3098,7 @@ mod tests {
                 enrollment_open_until: None,
                 access: AccessPolicy::default(),
                 standard_clients: false,
+                require_hardware: false,
             },
         ];
         rebuild_token_index(&mut state);
@@ -2960,6 +3129,7 @@ mod tests {
                 enrollment_open_until: None,
                 access: AccessPolicy::default(),
                 standard_clients: false,
+                require_hardware: false,
             }],
         };
         tokio::fs::write(&path, serde_json::to_vec(&file).unwrap())
@@ -3288,6 +3458,7 @@ mod tests {
             enrollment_open_until: None,
             access: AccessPolicy::default(),
             standard_clients: false,
+            require_hardware: false,
         };
         let mut phone = test_device("Phone", at);
         phone.id = "d-phone".into();
@@ -3531,6 +3702,119 @@ mod tests {
             Err(RegistryError::DeviceDenied)
         ));
         assert_eq!(registry.list()[0].device_count, 1);
+        registry.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hardware_policy_admits_only_devices_that_proved_their_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clients.json");
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let id = registry.list()[0].id.clone();
+        let existing = SigningKey::generate();
+        drop(enroll(&registry, &existing, 1).await.unwrap());
+        drop(
+            registry
+                .authenticate_proxy_session(BOOTSTRAP_TOKEN)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            registry
+                .set_require_hardware(&id, true)
+                .await
+                .unwrap()
+                .require_hardware
+        );
+
+        // Neither enrolled devices without evidence nor token-only access get in.
+        assert!(matches!(
+            enroll(&registry, &existing, 2).await,
+            Err(RegistryError::HardwareRequired)
+        ));
+        assert!(matches!(
+            registry.authenticate_proxy_session(BOOTSTRAP_TOKEN).await,
+            Err(RegistryError::HardwareRequired)
+        ));
+        // A new device enrolls, so that it can prove its key, but waits.
+        let attested = SigningKey::generate();
+        assert!(matches!(
+            enroll(&registry, &attested, 3).await,
+            Err(RegistryError::HardwareRequired)
+        ));
+        let attestation_path = "/v1/device/attestation";
+        let proof = signed_proof_for(
+            &attested,
+            "Phone",
+            BOOTSTRAP_TOKEN,
+            4,
+            "POST",
+            attestation_path,
+        );
+        let (account, device, public_key) = registry
+            .authenticate_attestation(BOOTSTRAP_TOKEN, &proof, "POST", attestation_path)
+            .await
+            .unwrap();
+        assert_eq!(account, id);
+        assert_eq!(device, proof.device_id);
+        assert_eq!(URL_SAFE_NO_PAD.encode(public_key), proof.public_key);
+        assert!(matches!(
+            registry
+                .authenticate_attestation(BOOTSTRAP_TOKEN, &proof, "POST", attestation_path)
+                .await,
+            Err(RegistryError::Unauthorized)
+        ));
+        let unknown = SigningKey::generate();
+        assert!(registry
+            .authenticate_attestation(
+                BOOTSTRAP_TOKEN,
+                &signed_proof_for(
+                    &unknown,
+                    "Other",
+                    BOOTSTRAP_TOKEN,
+                    5,
+                    "POST",
+                    attestation_path
+                ),
+                "POST",
+                attestation_path,
+            )
+            .await
+            .is_err());
+        registry
+            .record_hardware(
+                &account,
+                &device,
+                HardwareAttestation {
+                    platform: "android".into(),
+                    level: "strongbox".into(),
+                    vendor: "google".into(),
+                    verified_at: OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(enroll(&registry, &attested, 6).await.unwrap());
+
+        // The evidence and the policy survive a restart.
+        registry.close().await.unwrap();
+        let registry = ClientRegistry::open(&path, BOOTSTRAP_TOKEN).await.unwrap();
+        let summary = &registry.list()[0];
+        assert!(summary.require_hardware);
+        let hardware = summary
+            .devices
+            .iter()
+            .find(|summary| summary.id == device)
+            .and_then(|summary| summary.hardware.clone())
+            .unwrap();
+        assert_eq!(hardware.level, "strongbox");
+        drop(enroll(&registry, &attested, 7).await.unwrap());
+        assert!(matches!(
+            enroll(&registry, &existing, 8).await,
+            Err(RegistryError::HardwareRequired)
+        ));
+        registry.set_require_hardware(&id, false).await.unwrap();
+        drop(enroll(&registry, &existing, 9).await.unwrap());
         registry.close().await.unwrap();
     }
 

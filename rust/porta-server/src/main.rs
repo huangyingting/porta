@@ -1,5 +1,8 @@
 use anyhow::{Context as _, Result};
 use porta_server_rust::app::OperationsHandler;
+use porta_server_rust::attestation::android::AndroidVerifier;
+use porta_server_rust::attestation::service::AttestationService;
+use porta_server_rust::attestation::tpm::TpmVerifier;
 use porta_server_rust::config::{version_requested, Config};
 use porta_server_rust::data::ratelimit::RateLimiters;
 use porta_server_rust::data::router::Router;
@@ -469,14 +472,61 @@ async fn run() -> Result<Stop> {
             ..Http3Config::default()
         },
     )?);
-    let public_handler: Arc<dyn Handler> = Arc::new(PublicHttpHandler::new(
-        proxy,
-        portal,
-        landing,
-        transport,
-        trust_proxy_headers,
-        drain.cancellation(),
-    ));
+    let android_attestation = Arc::new(AndroidVerifier::new());
+    {
+        // Google's revocation list changes rarely; refresh it daily and keep
+        // the last good copy when a fetch fails.
+        let verifier = android_attestation.clone();
+        let shutdown = drain.cancellation();
+        tokio::spawn(async move {
+            let Ok(http) = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+            else {
+                return;
+            };
+            loop {
+                match verifier.refresh_revocations(&http).await {
+                    Ok(count) => tracing::info!(
+                        revoked = count,
+                        "loaded the Android attestation revocation list"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not load the Android attestation revocation list")
+                    }
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(24 * 60 * 60)) => {}
+                }
+            }
+        });
+    }
+    let mut attestation = AttestationService::new(registry.clone(), android_attestation);
+    if let Some(directory) = &config.tpm_ca_dir {
+        let tpm = TpmVerifier::from_directory(directory)
+            .with_context(|| format!("read the TPM vendor CAs in {}", directory.display()))?;
+        if tpm.root_count() == 0 {
+            anyhow::bail!(
+                "{} has no TPM vendor root certificates",
+                directory.display()
+            );
+        }
+        tracing::info!(roots = tpm.root_count(), "TPM device keys are verified");
+        attestation = attestation.with_tpm(Arc::new(tpm));
+    }
+    let attestation = Arc::new(attestation);
+    let public_handler: Arc<dyn Handler> = Arc::new(
+        PublicHttpHandler::new(
+            proxy,
+            portal,
+            landing,
+            transport,
+            trust_proxy_headers,
+            drain.cancellation(),
+        )
+        .with_attestation(attestation),
+    );
     let admin_handler: Arc<dyn Handler> = Arc::new(AdminHttpHandler::new(
         Arc::new(
             AdminService::new(web_registry, admin_token.as_bytes().to_vec())

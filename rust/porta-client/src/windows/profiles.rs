@@ -46,6 +46,9 @@ pub struct Profile {
     /// Connected when the user signs in; at most one profile has it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub connect_at_login: bool,
+    /// `IP[:PORT]` of a relay that forwards to the gateway.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relay: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -68,6 +71,7 @@ impl Profile {
             reconnect_max_delay: Duration::from_secs(30),
             allow_lan: false,
             connect_at_login: false,
+            relay: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }

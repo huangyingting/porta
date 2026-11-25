@@ -60,6 +60,8 @@ pub enum IdentityError {
     InsecureDirectory,
     #[error("create device proof: {0}")]
     Proof(#[from] DeviceProofError),
+    #[error("the TPM is unavailable: {0}")]
+    Tpm(String),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -71,7 +73,79 @@ struct StoredIdentity {
 pub struct Identity {
     pub id: String,
     pub name: String,
-    signing_key: SigningKey,
+    signer: Signer,
+}
+
+/// Where the device key lives: in this file, or in the computer's TPM.
+enum Signer {
+    Software(SigningKey),
+    Tpm(std::sync::Arc<crate::tpm::DeviceKey>),
+}
+
+/// An identity file that holds a TPM key: its parent and blobs. The
+/// private blob is wrapped by the TPM's storage key, so only that TPM can
+/// load it.
+#[derive(Deserialize, Serialize)]
+pub(crate) struct StoredTpmKey {
+    pub parent: String,
+    pub private: String,
+    pub public: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredTpmIdentity {
+    version: u8,
+    tpm: StoredTpmKey,
+}
+
+#[derive(Deserialize)]
+struct StoredVersion {
+    version: u8,
+}
+
+/// The identity file version for TPM keys.
+pub(crate) const TPM_STATE_VERSION: u8 = 2;
+
+/// The stored form of a TPM device key.
+pub(crate) fn encode_tpm_key(key: &crate::tpm::DeviceKey) -> Result<Vec<u8>, IdentityError> {
+    let stored = StoredTpmIdentity {
+        version: TPM_STATE_VERSION,
+        tpm: StoredTpmKey {
+            parent: key.parent().as_str().to_owned(),
+            private: STANDARD_NO_PAD.encode(key.private_blob()),
+            public: STANDARD_NO_PAD.encode(key.public_area()),
+        },
+    };
+    let mut output = serde_json::to_vec_pretty(&stored)?;
+    output.push(b'\n');
+    Ok(output)
+}
+
+/// The TPM key in an identity file, or `None` for a file holding a key
+/// of its own.
+pub(crate) fn decode_tpm_key(
+    encoded: &[u8],
+) -> Result<Option<crate::tpm::DeviceKey>, IdentityError> {
+    let version: StoredVersion = serde_json::from_slice(encoded)?;
+    if version.version != TPM_STATE_VERSION {
+        return Ok(None);
+    }
+    let stored: StoredTpmIdentity = serde_json::from_slice(encoded)?;
+    let parent = crate::tpm::Parent::parse(&stored.tpm.parent).ok_or(IdentityError::CorruptKey)?;
+    let decode = |value: &str| {
+        STANDARD_NO_PAD
+            .decode(value)
+            .map_err(|_| IdentityError::CorruptKey)
+    };
+    let tpm = crate::tpm::Tpm::open().map_err(|error| IdentityError::Tpm(error.to_string()))?;
+    crate::tpm::DeviceKey::from_parts(
+        tpm,
+        parent,
+        decode(&stored.tpm.private)?,
+        decode(&stored.tpm.public)?,
+    )
+    .map(Some)
+    .map_err(|_| IdentityError::CorruptKey)
 }
 
 impl Identity {
@@ -84,7 +158,12 @@ impl Identity {
         let lock = open_private(&lock_path(path), true).map_err(IdentityError::Lock)?;
         lock_exclusive(&lock).map_err(IdentityError::Lock)?;
         let signing_key = match read_private(path) {
-            Ok(encoded) => decode(&encoded)?,
+            Ok(encoded) => {
+                if let Some(key) = decode_tpm_key(&encoded)? {
+                    return Self::from_tpm_key(std::sync::Arc::new(key), name);
+                }
+                decode(&encoded)?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let key = SigningKey::generate();
                 persist(path, &key)?;
@@ -93,6 +172,57 @@ impl Identity {
             Err(error) => return Err(IdentityError::Read(error)),
         };
         Self::from_signing_key(signing_key, name)
+    }
+
+    /// Like [`Self::load_or_create`], but keeps the key in the computer's
+    /// TPM. A key of the file's own is replaced, so the device enrolls
+    /// again as a new device.
+    pub fn load_or_create_in_tpm(path: &Path, name: &str) -> Result<Self, IdentityError> {
+        if path.as_os_str().is_empty() {
+            return Err(IdentityError::MissingPath);
+        }
+        let name = normalize_name(name)?;
+        prepare_storage(path)?;
+        let lock = open_private(&lock_path(path), true).map_err(IdentityError::Lock)?;
+        lock_exclusive(&lock).map_err(IdentityError::Lock)?;
+        match read_private(path) {
+            Ok(encoded) => {
+                if let Some(key) = decode_tpm_key(&encoded)? {
+                    return Self::from_tpm_key(std::sync::Arc::new(key), name);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(IdentityError::Read(error)),
+        }
+        let tpm = crate::tpm::Tpm::open().map_err(|error| IdentityError::Tpm(error.to_string()))?;
+        let key = tpm
+            .create_device_key()
+            .map_err(|error| IdentityError::Tpm(error.to_string()))?;
+        write_private(path, &encode_tpm_key(&key)?)?;
+        Self::from_tpm_key(std::sync::Arc::new(key), name)
+    }
+
+    /// An identity whose key lives in a TPM.
+    pub fn from_tpm_key(
+        key: std::sync::Arc<crate::tpm::DeviceKey>,
+        name: impl Into<String>,
+    ) -> Result<Self, IdentityError> {
+        let name = normalize_name(&name.into())?;
+        let id = porta_wire::device_auth::device_id_from_encoded(key.spki())
+            .map_err(|_| IdentityError::CorruptKey)?;
+        Ok(Self {
+            id,
+            name,
+            signer: Signer::Tpm(key),
+        })
+    }
+
+    /// The TPM the key lives in, if it does.
+    pub fn tpm_key(&self) -> Option<&std::sync::Arc<crate::tpm::DeviceKey>> {
+        match &self.signer {
+            Signer::Tpm(key) => Some(key),
+            Signer::Software(_) => None,
+        }
     }
 
     pub fn from_signing_key(
@@ -109,19 +239,33 @@ impl Identity {
         Ok(Self {
             id,
             name,
-            signing_key,
+            signer: Signer::Software(signing_key),
         })
     }
 
     pub fn proof(&self, token: &str, method: &str, path: &str) -> Result<Proof, IdentityError> {
-        Ok(device::create_proof(
-            &self.signing_key,
-            &self.name,
-            token,
-            method,
-            path,
-            SystemTime::now(),
-        )?)
+        Ok(match &self.signer {
+            Signer::Software(signing_key) => device::create_proof(
+                signing_key,
+                &self.name,
+                token,
+                method,
+                path,
+                SystemTime::now(),
+            )?,
+            Signer::Tpm(key) => device::create_proof_with(
+                key.spki(),
+                &self.name,
+                token,
+                method,
+                path,
+                SystemTime::now(),
+                |digest| {
+                    key.sign(digest)
+                        .map_err(|_| device::DeviceProofError::Signature)
+                },
+            )?,
+        })
     }
 }
 
@@ -139,6 +283,18 @@ pub fn current_at(path: Option<&Path>) -> Result<Identity, IdentityError> {
     };
     let name = hostname().map_err(IdentityError::Hostname)?;
     Identity::load_or_create(&path, &name)
+}
+
+/// Like [`current_at`], with the key in the computer's TPM.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+pub fn current_in_tpm_at(path: Option<&Path>) -> Result<Identity, IdentityError> {
+    let path = match path {
+        Some(path) if !path.is_absolute() => return Err(IdentityError::RelativeIdentityPath),
+        Some(path) => path.to_owned(),
+        None => identity_path()?,
+    };
+    let name = hostname().map_err(IdentityError::Hostname)?;
+    Identity::load_or_create_in_tpm(&path, &name)
 }
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
@@ -290,7 +446,10 @@ fn lock_exclusive(_file: &File) -> std::io::Result<()> {
 }
 
 fn persist(path: &Path, signing_key: &SigningKey) -> Result<(), IdentityError> {
-    let encoded = encode(signing_key)?;
+    write_private(path, &encode(signing_key)?)
+}
+
+fn write_private(path: &Path, encoded: &[u8]) -> Result<(), IdentityError> {
     let directory = path.parent().ok_or(IdentityError::MissingPath)?;
     let mut random = [0_u8; 8];
     rand::rng().fill_bytes(&mut random);
@@ -307,7 +466,7 @@ fn persist(path: &Path, signing_key: &SigningKey) -> Result<(), IdentityError> {
                 .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         }
         let mut file = options.open(&pending)?;
-        file.write_all(&encoded)?;
+        file.write_all(encoded)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&pending, path)?;

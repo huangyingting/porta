@@ -149,6 +149,18 @@ not conceal transport fingerprints from network inspection.
   `rp_filter=2`. Incoming
   client packet sources must still match their authenticated lease. Physical
   interfaces and global reverse-path filtering are not weakened.
+- Hardware attestation proves that a device key cannot leave the phone's
+  secure hardware or the computer's TPM, not that the device is
+  uncompromised: malware on a verified device can still use the key while it
+  runs there. It trusts Google's attestation roots and revocation list and
+  the TPM vendors' CAs; a vendor's compromised key would let software keys
+  pass. Requiring hardware does not stop a stolen account token from
+  enrolling another genuine device; combine it with approval of new devices.
+- A transport relay forwards the encrypted connection without terminating
+  it: it cannot read or change tunnel traffic, and clients still verify the
+  gateway's certificate. It does see client addresses, timing and traffic
+  volume, and can drop or delay traffic. The gateway sees the relay's
+  address instead of the clients'.
 - A cascade relay is not an anonymity network. Every hop terminates TLS and
   sees the inner IPv4 packets it forwards, and each relay authenticates to its
   next hop as one device with a stored token and software key. The exit sees

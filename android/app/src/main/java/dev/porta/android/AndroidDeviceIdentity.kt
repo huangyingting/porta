@@ -34,6 +34,8 @@ internal data class AndroidDeviceIdentity(
     val publicKey: String,
     private val privateKey: PrivateKey,
     val hardwareBacked: Boolean,
+    /** The key's attestation certificate chain, leaf first; empty without one. */
+    val attestation: List<ByteArray> = emptyList(),
 ) {
     fun proof(token: String, method: String, path: String): DeviceProof {
         try {
@@ -62,10 +64,14 @@ internal data class AndroidDeviceIdentity(
 
 internal fun androidDeviceIdentity(context: Context): AndroidDeviceIdentity {
     try {
-        val privateKey = loadOrCreateSigningKey(context)
+        val (alias, privateKey) = loadOrCreateSigningKey(context)
         val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        val certificate = store.getCertificate(KEY_ALIAS)
+        val certificate = store.getCertificate(alias)
             ?: throw DeviceIdentityUnavailableException("The device security key has no public certificate")
+        val attestation = store.getCertificateChain(alias)
+            ?.map { it.encoded }
+            ?.takeIf { it.size > 1 }
+            .orEmpty()
         val encodedPublicKey = certificate.publicKey.encoded
         val publicKey = Base64.getUrlEncoder().withoutPadding().encodeToString(encodedPublicKey)
         val id = Portamobile.deviceID(encodedPublicKey)
@@ -78,7 +84,7 @@ internal fun androidDeviceIdentity(context: Context): AndroidDeviceIdentity {
                 ClientLogStore(context).add("$message; Android API ${Build.VERSION.SDK_INT}")
             },
         )
-        return AndroidDeviceIdentity(id, name, publicKey, privateKey, isHardwareBacked(privateKey))
+        return AndroidDeviceIdentity(id, name, publicKey, privateKey, isHardwareBacked(privateKey), attestation)
     } catch (error: DeviceIdentityUnavailableException) {
         throw error
     } catch (error: Exception) {
@@ -86,28 +92,56 @@ internal fun androidDeviceIdentity(context: Context): AndroidDeviceIdentity {
     }
 }
 
-private fun loadOrCreateSigningKey(context: Context): PrivateKey {
+/**
+ * The device key: the attested key if there is one, otherwise a key from an
+ * older install, which stays in use until an account requires attestation.
+ * New installs get an attested key.
+ */
+private fun loadOrCreateSigningKey(context: Context): Pair<String, PrivateKey> {
     val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-    if (!store.containsAlias(KEY_ALIAS)) {
-        val preferStrongBox = Build.VERSION.SDK_INT >= 28 &&
-            context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
-        try {
-            generateSigningKey(preferStrongBox)
-        } catch (error: StrongBoxUnavailableException) {
-            if (!preferStrongBox) throw error
-            generateSigningKey(false)
+    val alias = when {
+        store.containsAlias(ATTESTED_KEY_ALIAS) -> ATTESTED_KEY_ALIAS
+        store.containsAlias(KEY_ALIAS) -> KEY_ALIAS
+        else -> {
+            createAttestedKey(context)
+            ATTESTED_KEY_ALIAS
         }
     }
-    val key = store.getKey(KEY_ALIAS, null)
-    return key as? PrivateKey
-        ?: throw DeviceIdentityUnavailableException("The saved device security key is invalid")
+    val key = store.getKey(alias, null)
+    return alias to (
+        key as? PrivateKey
+            ?: throw DeviceIdentityUnavailableException("The saved device security key is invalid")
+        )
+}
+
+/**
+ * Replaces a key from an older install with an attested one. The device then
+ * enrolls again, as a new device, with a key it can prove.
+ */
+internal fun upgradeToAttestedKey(context: Context): AndroidDeviceIdentity {
+    val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    if (!store.containsAlias(ATTESTED_KEY_ALIAS)) createAttestedKey(context)
+    if (store.containsAlias(KEY_ALIAS)) store.deleteEntry(KEY_ALIAS)
+    return androidDeviceIdentity(context)
+}
+
+private fun createAttestedKey(context: Context) {
+    val preferStrongBox = Build.VERSION.SDK_INT >= 28 &&
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
+    try {
+        generateSigningKey(preferStrongBox)
+    } catch (error: StrongBoxUnavailableException) {
+        if (!preferStrongBox) throw error
+        generateSigningKey(false)
+    }
 }
 
 private fun generateSigningKey(strongBox: Boolean) {
-    val spec = KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
+    val spec = KeyGenParameterSpec.Builder(ATTESTED_KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
         .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
         .setDigests(KeyProperties.DIGEST_SHA256)
         .setUserAuthenticationRequired(false)
+        .setAttestationChallenge(ATTESTATION_CHALLENGE)
         .apply {
             if (Build.VERSION.SDK_INT >= 28 && strongBox) {
                 setIsStrongBoxBacked(true)
@@ -158,3 +192,6 @@ internal fun deviceIdentityFromName(name: String?): String? = name
 
 private const val ANDROID_KEYSTORE = "AndroidKeyStore"
 private const val KEY_ALIAS = "porta-device-auth-v1"
+private const val ATTESTED_KEY_ALIAS = "porta-device-auth-v2"
+/** Must match porta_wire::attestation::ANDROID_ATTESTATION_CHALLENGE. */
+private val ATTESTATION_CHALLENGE = "porta-device-key-attestation-v1".toByteArray(Charsets.US_ASCII)
