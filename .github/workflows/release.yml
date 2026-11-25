@@ -27,7 +27,7 @@ jobs:
       contents: read
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - name: Install Rust toolchain
@@ -56,7 +56,7 @@ jobs:
           Copy-Item wintun\wintun\bin\amd64\wintun.dll package\wintun.dll
           cargo run --manifest-path rust/Cargo.toml --locked --release `
             --package porta-windows-package -- porta-client-windows-amd64.zip package
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: porta-windows-release
           path: porta-client-windows-amd64.zip
@@ -73,7 +73,7 @@ jobs:
       contents: write
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
@@ -129,10 +129,10 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/porta-release.p12"
           test -s "$RUNNER_TEMP/porta-release.p12"
           echo "PORTA_ANDROID_KEYSTORE=$RUNNER_TEMP/porta-release.p12" >> "$GITHUB_ENV"
-      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           packages: platform-tools
-      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       - name: Test release source
         run: make test
@@ -173,7 +173,7 @@ jobs:
               exit 1
             fi
           done
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: porta-windows-release
           path: dist
@@ -198,7 +198,7 @@ jobs:
           ./gradlew testDebugUnitTest assembleRelease --no-daemon
           expected=$(tr -d '\r\n' < signing-certificate.sha256)
           for apk in app/build/outputs/apk/release/*.apk; do
-            actual=$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk" |
+            actual=$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$apk" |
               sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p')
             [[ "$actual" == "$expected" ]] || {
               echo "APK signing identity does not match the Porta certificate pin: $apk" >&2

@@ -7,12 +7,12 @@ import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
-import android.security.keystore.StrongBoxUnavailableException
 import portamobile.Portamobile
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
+import java.security.ProviderException
 import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
@@ -130,7 +130,9 @@ private fun createAttestedKey(context: Context) {
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
     try {
         generateSigningKey(preferStrongBox)
-    } catch (error: StrongBoxUnavailableException) {
+    } catch (error: ProviderException) {
+        // StrongBoxUnavailableException (API 28+) is a ProviderException;
+        // without StrongBox there is nothing to fall back from.
         if (!preferStrongBox) throw error
         generateSigningKey(false)
     }

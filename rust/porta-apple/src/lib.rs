@@ -23,7 +23,7 @@ use porta_client::identity::Identity;
 use porta_client::tls;
 use porta_client::tunnel::{ClientConfig, ClientError, Connection, ProofProvider, Transport};
 use porta_wire::device_auth::{device_id_from_encoded, signature_payload, Proof, NONCE_SIZE};
-use rand::RngCore as _;
+use rand::Rng as _;
 use serde_json::json;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;

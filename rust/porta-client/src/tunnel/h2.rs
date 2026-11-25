@@ -12,7 +12,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Vers
 use ipnet::Ipv4Net;
 use porta_wire::frame;
 use porta_wire::ip::{FlowKey, PacketClass, PacketMetadata};
-use rand::RngCore as _;
+use rand::Rng as _;
 use rustls::pki_types::ServerName;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;

@@ -6,8 +6,8 @@ import java.security.PrivateKey
 import java.util.Properties
 
 plugins {
+    // Android Gradle plugin 9 compiles Kotlin itself.
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 fun rustlsPlatformVerifierAar(): File {
@@ -147,7 +147,7 @@ val validatePortaReleaseSigning by tasks.registering {
 
 android {
     namespace = "dev.porta.android"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "dev.porta.android"
@@ -198,29 +198,37 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+}
 
-    sourceSets {
-        getByName("main") {
-            jniLibs.srcDir(rustJniLibs)
-        }
+androidComponents {
+    onVariants { variant ->
+        // buildRustAndroid fills this directory before preBuild.
+        variant.sources.jniLibs?.addStaticSourceDirectory(rustJniLibs.get().asFile.absolutePath)
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
 dependencies {
     implementation(files(rustlsPlatformVerifierAar()))
-    implementation("com.squareup.okio:okio:3.9.0")
-    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.squareup.okio:okio:3.18.2")
+    implementation("com.google.zxing:core:3.5.4")
     implementation("androidx.activity:activity:1.9.3")
-    implementation("androidx.camera:camera-camera2:1.4.2")
-    implementation("androidx.camera:camera-lifecycle:1.4.2")
-    implementation("androidx.camera:camera-view:1.4.2")
+    implementation("androidx.camera:camera-camera2:1.7.0")
+    implementation("androidx.camera:camera-lifecycle:1.7.0")
+    implementation("androidx.camera:camera-view:1.7.0")
     testImplementation("junit:junit:4.13.2")
     androidTestCompileOnly(files(
-        android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.base.jar"),
-        android.sdkDirectory.resolve("platforms/android-${android.compileSdk}/optional/android.test.runner.jar"),
+        androidComponents.sdkComponents.sdkDirectory.map {
+            it.file("platforms/android-${android.compileSdk}/optional/android.test.base.jar")
+        },
+        androidComponents.sdkComponents.sdkDirectory.map {
+            it.file("platforms/android-${android.compileSdk}/optional/android.test.runner.jar")
+        },
     ))
 }
 
