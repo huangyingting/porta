@@ -9,7 +9,7 @@ name = "porta-server"
 path = "src/main.rs"
 
 [dependencies]
-aes-gcm = "0.10.3"
+aes-gcm = "0.11.1"
 anyhow = "1.0.100"
 arc-swap = "1.7.1"
 aws-lc-rs = "1.18.1"
