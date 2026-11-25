@@ -1,0 +1,37 @@
+name: Apple release
+
+# Uploads the iOS and macOS apps to App Store Connect, for TestFlight and
+# App Store review. Start it from the Actions tab on main once a release is
+# out. It needs the App Store Connect secrets described in apple/README.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-release
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: macos-latest
+    environment: app-store
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build the tunnel and generate the project
+        run: make build-apple apple-project
+      - name: Archive and upload the apps
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: ./scripts/upload-apple.sh "${{ github.run_number }}"

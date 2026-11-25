@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "porta-android"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "base64 0.23.1",
  "jni 0.22.4",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "porta-apple"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "base64 0.23.1",
  "p256",
@@ -3601,7 +3601,7 @@ dependencies = [
 
 [[package]]
 name = "porta-client-rust"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3643,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "porta-keygen"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "clap",
  "porta-wire",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "porta-linux"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "libc",
  "serde_json",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "porta-loadgen"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "anyhow",
  "p256",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "porta-server-rust"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "porta-windows"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "chrono",
  "porta-client-rust",
@@ -3753,7 +3753,7 @@ dependencies = [
 
 [[package]]
 name = "porta-windows-package"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "tempfile",
  "zip",
@@ -3761,7 +3761,7 @@ dependencies = [
 
 [[package]]
 name = "porta-wire"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "base64 0.23.1",
  "hex",
