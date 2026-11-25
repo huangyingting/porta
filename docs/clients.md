@@ -631,11 +631,11 @@ For manual setup, tap **Add profile**, then **Enter manually**, and enter:
 - the client token.
 
 Android generates one ECDSA P-256 key under the Android Keystore alias
-`porta-device-auth-v1`. It requests StrongBox where Android reports it as
-available, then falls back to the ordinary Android Keystore if StrongBox key
-generation is unavailable. The same key is shared by all profiles. Clearing app
-data or uninstalling normally deletes it, so the next installation creates a
-new enrollment.
+`porta-device-auth-v2`, with key attestation. It requests StrongBox where
+Android reports it as available, then falls back to the ordinary Android
+Keystore if StrongBox key generation is unavailable. The same key is shared by
+all profiles. Clearing app data or uninstalling normally deletes it, so the
+next installation creates a new enrollment.
 
 Android reads `Settings.Global.DEVICE_NAME` when starting a connection. If it
 is missing, denied, or unusable after normalization, the app uses `Build.MODEL`,
@@ -644,9 +644,10 @@ exception contents. The name is not the device ID: changing it updates metadata
 for the existing key. No `ANDROID_ID`, IMEI, serial number, or profile-provided
 device ID is used.
 
-There is no device identity in QR/paste configuration. Porta does not currently
-send or verify Android key-attestation certificates, so hardware-backed status
-is local diagnostic information rather than proof to the server.
+There is no device identity in QR/paste configuration. The app sends the key's
+attestation certificate chain when it first connects to a gateway, so the
+gateway can verify that the key is hardware-backed (see
+[Hardware-protected keys](#hardware-protected-keys)).
 
 Approve Android's VPN prompt and enable the profile. Android prefers native
 HTTP/3 MASQUE. If UDP or HTTP/3 is unavailable, it automatically falls back to

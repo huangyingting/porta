@@ -24,6 +24,8 @@ make test-rust-interop
 make test-windows-cross
 make test-native-firewall
 make test-cascade
+make test-transport-relay
+make test-tpm-attestation
 make test-split-tunnel
 make test-subnet-router
 make test-exit-selection
@@ -55,6 +57,21 @@ gateways in network namespaces form a client -> relay -> relay -> exit chain
 with identical pools. It checks the exit address seen by a web server, a
 full-size DF ping, a bulk transfer, client-to-client reachability, fail-closed
 behavior while the exit is down, and automatic recovery after it returns.
+
+`make test-transport-relay` runs `scripts/test-transport-relay.sh` over
+HTTP/3 and HTTP/2. The client cannot reach the gateway directly, only a host
+running `scripts/relay.sh` on another port. The client keeps the gateway's
+URL and certificate, dials the relay with `--relay-address`, and the test
+checks that leak protection lets only the relay through and that a relay
+combined with backup gateways is refused.
+
+`make test-tpm-attestation` runs `scripts/test-tpm-attestation.sh` with a
+software TPM (`swtpm` and `swtpm_localca` from `swtpm-tools`), whose
+endorsement key certificate a local CA issues and the gateway trusts as a
+TPM vendor. On an account that requires hardware-protected devices, a client
+with its key in the TPM is refused, proves its key by credential activation
+and connects, and connects at once on later runs. A client with a software
+key stays refused.
 
 `make test-service-user` runs `scripts/test-service-user.sh`, which needs
 systemd. It starts a relay and an exit gateway with every sandbox setting of
