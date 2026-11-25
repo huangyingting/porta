@@ -1,0 +1,161 @@
+# XcodeGen spec for the Porta iOS and macOS apps and their packet tunnel
+# extensions. `make apple-project` generates Porta.xcodeproj from it; the
+# generated project, Info.plists and entitlements are not committed.
+name: Porta
+options:
+  bundleIdPrefix: dev.porta
+  deploymentTarget:
+    iOS: "16.0"
+    macOS: "13.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/Porta.xcconfig
+  Release: Config/Porta.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+    DEAD_CODE_STRIPPING: YES
+packages:
+  PortaKit:
+    path: ..
+
+targets:
+  Porta-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Shared
+    dependencies:
+      - package: PortaKit
+      - target: PortaTunnel-iOS
+    scheme: {}
+    settings:
+      base:
+        PRODUCT_NAME: Porta
+        PRODUCT_BUNDLE_IDENTIFIER: $(PORTA_BUNDLE_ID)
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    info:
+      path: Support/Porta-iOS-Info.plist
+      properties:
+        CFBundleDisplayName: Porta
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: Porta uses the camera to scan the profile QR code on your downloads page.
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.porta.profile
+            CFBundleURLSchemes: [porta]
+        PortaKeychainGroup: $(AppIdentifierPrefix)$(PORTA_BUNDLE_ID)
+    entitlements:
+      path: Support/Porta-iOS.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(PORTA_BUNDLE_ID)]
+
+  PortaTunnel-iOS:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel
+    dependencies:
+      - package: PortaKit
+    settings:
+      base:
+        PRODUCT_NAME: PortaTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: $(PORTA_BUNDLE_ID).tunnel
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: Support/PortaTunnel-iOS-Info.plist
+      properties:
+        CFBundleDisplayName: Porta Tunnel
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: Support/PortaTunnel-iOS.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(PORTA_BUNDLE_ID)]
+
+  Porta-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - path: Shared
+    dependencies:
+      - package: PortaKit
+      - target: PortaTunnel-macOS
+    scheme: {}
+    settings:
+      base:
+        PRODUCT_NAME: Porta
+        PRODUCT_BUNDLE_IDENTIFIER: $(PORTA_BUNDLE_ID)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        COMBINE_HIDPI_IMAGES: YES
+    info:
+      path: Support/Porta-macOS-Info.plist
+      properties:
+        CFBundleDisplayName: Porta
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.porta.profile
+            CFBundleURLSchemes: [porta]
+        PortaKeychainGroup: $(AppIdentifierPrefix)$(PORTA_BUNDLE_ID)
+    entitlements:
+      path: Support/Porta-macOS.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(PORTA_BUNDLE_ID)]
+
+  PortaTunnel-macOS:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Tunnel
+    dependencies:
+      - package: PortaKit
+    settings:
+      base:
+        PRODUCT_NAME: PortaTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: $(PORTA_BUNDLE_ID).tunnel
+    info:
+      path: Support/PortaTunnel-macOS-Info.plist
+      properties:
+        CFBundleDisplayName: Porta Tunnel
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: Support/PortaTunnel-macOS.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(PORTA_BUNDLE_ID)]

@@ -1,0 +1,13 @@
+// Settings shared by the Porta apps and their tunnel extensions.
+
+// The app's bundle ID; the extension is PORTA_BUNDLE_ID.tunnel. Register both
+// in the Apple Developer account (see apple/README.md).
+PORTA_BUNDLE_ID = dev.porta.app
+
+MARKETING_VERSION = 0.0.0
+CURRENT_PROJECT_VERSION = 1
+
+// Written by `make apple-project` from internal/buildinfo/VERSION.
+#include? "Version.xcconfig"
+// Local signing, for example DEVELOPMENT_TEAM = ABCDE12345; not committed.
+#include? "Signing.xcconfig"

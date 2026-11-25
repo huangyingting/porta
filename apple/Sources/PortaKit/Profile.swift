@@ -56,7 +56,7 @@ public struct Profile: Equatable {
         value.replacingOccurrences(of: "+", with: " ").removingPercentEncoding
     }
 
-    static func isHTTPSOrigin(_ value: String) -> Bool {
+    public static func isHTTPSOrigin(_ value: String) -> Bool {
         guard let components = URLComponents(string: value),
               components.scheme == "https",
               let host = components.host, !host.isEmpty,
