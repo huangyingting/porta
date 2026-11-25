@@ -70,9 +70,11 @@ struct ContentView: View {
             }
             .sheet(item: $editing) { draft in
                 ProfileEditor(draft: draft)
+                    .environmentObject(store)
             }
             .sheet(isPresented: $showingLog) {
                 LogView()
+                    .environmentObject(store)
             }
             #if os(iOS)
             .fullScreenCover(isPresented: $scanning) {

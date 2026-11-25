@@ -66,7 +66,7 @@ final class ProfileStore: ObservableObject {
         statuses[profile.id] ?? .disconnected
     }
 
-    static func isActive(_ status: NEVPNStatus) -> Bool {
+    nonisolated static func isActive(_ status: NEVPNStatus) -> Bool {
         [.connecting, .connected, .reasserting, .disconnecting].contains(status)
     }
 
