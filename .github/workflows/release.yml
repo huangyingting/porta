@@ -132,7 +132,7 @@ jobs:
       - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           packages: platform-tools
-      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       - name: Test release source
         run: make test
@@ -198,7 +198,7 @@ jobs:
           ./gradlew testDebugUnitTest assembleRelease --no-daemon
           expected=$(tr -d '\r\n' < signing-certificate.sha256)
           for apk in app/build/outputs/apk/release/*.apk; do
-            actual=$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk" |
+            actual=$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$apk" |
               sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p')
             [[ "$actual" == "$expected" ]] || {
               echo "APK signing identity does not match the Porta certificate pin: $apk" >&2

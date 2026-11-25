@@ -2422,7 +2422,7 @@ mkdir porta
         gradle = self.root / "gradlew"
         gradle.write_text("#!/bin/sh\nexit 0\n")
         gradle.chmod(0o755)
-        apksigner = self.root / "sdk/build-tools/35.0.0/apksigner"
+        apksigner = self.root / "sdk/build-tools/36.0.0/apksigner"
         apksigner.parent.mkdir(parents=True)
         apksigner.write_text(
             '#!/bin/sh\nprintf "%s\\n" "$APK_SIGNER_OUTPUT"\nexit "$APK_VERIFY_STATUS"\n'
