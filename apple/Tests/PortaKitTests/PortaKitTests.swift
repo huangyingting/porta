@@ -77,4 +77,36 @@ final class ProfileTests: XCTestCase {
         )
         XCTAssertEqual(PortaError(status: -1, message: "timeout"), .retryable("timeout"))
     }
+
+    func testReportedErrorsKeepTheirMeaning() {
+        let denied = PortaError.denied(code: "device-pending", message: "Waiting for approval")
+        // The system passes the extension's error to the app as an NSError.
+        let reported = denied as NSError
+        XCTAssertEqual(reported.domain, PortaError.errorDomain)
+        XCTAssertEqual(reported.localizedDescription, "Waiting for approval")
+        XCTAssertEqual(PortaError(reported: reported), denied)
+        XCTAssertEqual(PortaError(reported: PortaError.retryable("timeout") as NSError), .retryable("timeout"))
+        XCTAssertNil(PortaError(reported: NSError(domain: NSPOSIXErrorDomain, code: 1)))
+    }
+
+    func testReportsRoundTrip() throws {
+        var log = EventLog(capacity: 2)
+        for message in ["one", "two", "three"] {
+            log.append(message, at: Date(timeIntervalSince1970: 1_700_000_000))
+        }
+        XCTAssertEqual(log.entries.map(\.message), ["two", "three"])
+        let report = TunnelReport(
+            info: SessionInfo(
+                address: "10.66.0.2/32", gateway: nil, address6: nil, dns: "10.66.0.1", mtu: 1400,
+                transport: "h3", routes: [], routes6: [], dnsDomains: [], fullTunnel: true,
+                account: .init(expiresAt: 1_800_000_000, quotaBytes: nil, quotaUsedBytes: nil, rateLimitKbps: nil)
+            ),
+            connectedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            bytesSent: 1200,
+            bytesReceived: 3400,
+            log: log.entries
+        )
+        XCTAssertEqual(TunnelReport.decode(report.encoded()), report)
+        XCTAssertNil(TunnelReport.decode(Data("not json".utf8)))
+    }
 }

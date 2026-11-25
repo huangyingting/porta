@@ -26,3 +26,8 @@ signing.properties
 android-signing.properties
 /apple/build/
 /apple/.build/
+/apple/App/Porta.xcodeproj/
+/apple/App/Support/
+/apple/App/Config/Signing.xcconfig
+/apple/App/Config/Version.xcconfig
+*.p8

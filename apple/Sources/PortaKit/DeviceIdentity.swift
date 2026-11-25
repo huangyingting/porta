@@ -10,13 +10,33 @@ public enum PortaError: Error, Equatable, CustomStringConvertible {
     case permanent(String)
     /// The gateway refused the account or device: `code` is
     /// `account-expired`, `quota-exceeded`, `device-pending`,
-    /// `enrollment-closed` or `device-denied`.
+    /// `enrollment-closed`, `device-denied`, `client-outdated` or
+    /// `hardware-required`.
     case denied(code: String, message: String)
 
     public var description: String {
         switch self {
         case let .retryable(message), let .permanent(message): return message
         case let .denied(_, message): return message
+        }
+    }
+
+    /// The denial code, or nil for other failures.
+    public var denialCode: String? {
+        if case let .denied(code, _) = self { return code }
+        return nil
+    }
+
+    /// Recovers the error a tunnel extension reported, which reaches the app
+    /// through `NEVPNConnection.fetchLastDisconnectError` as an `NSError`.
+    public init?(reported error: Error) {
+        let error = error as NSError
+        guard error.domain == PortaError.errorDomain else { return nil }
+        let message = error.localizedDescription
+        switch error.code {
+        case 1: self = .retryable(message)
+        case 3: self = .denied(code: error.userInfo[PortaError.denialCodeKey] as? String ?? "", message: message)
+        default: self = .permanent(message)
         }
     }
 
@@ -36,6 +56,31 @@ public enum PortaError: Error, Equatable, CustomStringConvertible {
             self = .permanent(message)
         }
     }
+}
+
+/// Keeps the case, message and denial code when the error crosses from the
+/// tunnel extension to the app as an `NSError`.
+extension PortaError: CustomNSError, LocalizedError {
+    public static let errorDomain = "dev.porta.tunnel"
+    static let denialCodeKey = "PortaDenialCode"
+
+    public var errorCode: Int {
+        switch self {
+        case .retryable: return 1
+        case .permanent: return 2
+        case .denied: return 3
+        }
+    }
+
+    public var errorUserInfo: [String: Any] {
+        var info: [String: Any] = [NSLocalizedDescriptionKey: description]
+        if let denialCode {
+            info[PortaError.denialCodeKey] = denialCode
+        }
+        return info
+    }
+
+    public var errorDescription: String? { description }
 }
 
 let errorCapacity = 512
@@ -133,6 +178,9 @@ public final class DeviceIdentity {
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: Data(tag.utf8),
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            // The keychain that access groups and the Secure Enclave use on
+            // macOS too, not the file-based login keychain.
+            kSecUseDataProtectionKeychain as String: true,
         ]
         if let accessGroup {
             query[kSecAttrAccessGroup as String] = accessGroup
@@ -175,6 +223,7 @@ public final class DeviceIdentity {
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits as String: 256,
             kSecPrivateKeyAttrs as String: privateAttributes,
+            kSecUseDataProtectionKeychain as String: true,
         ]
         if secureEnclave {
             attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave

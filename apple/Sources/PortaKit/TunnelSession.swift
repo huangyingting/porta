@@ -2,8 +2,8 @@ import CPorta
 import Foundation
 
 /// The network settings of a connected tunnel, as the gateway assigned them.
-public struct SessionInfo: Decodable, Equatable {
-    public struct Account: Decodable, Equatable {
+public struct SessionInfo: Codable, Equatable {
+    public struct Account: Codable, Equatable {
         public var expiresAt: Int64?
         public var quotaBytes: UInt64?
         public var quotaUsedBytes: UInt64?

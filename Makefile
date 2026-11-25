@@ -9,7 +9,7 @@ WINTUN_VERSION := 0.14.1
 WINTUN_ZIP := bin/wintun-$(WINTUN_VERSION).zip
 WINTUN_SHA256 := 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
 
-.PHONY: all build build-rust-server build-rust-clients build-windows build-linux-desktop build-masque-probe build-apple android android-debug \
+.PHONY: all build build-rust-server build-rust-clients build-windows build-linux-desktop build-masque-probe build-apple apple-project build-apple-apps android android-debug \
 	check-version check-dependencies lint-scripts fuzz clean test test-automation test-rust test-rust-server test-rust-client \
 	test-rust-interop test-live-vpn test-cascade test-transport-relay test-tpm-attestation test-split-tunnel test-subnet-router test-exit-selection test-dns-resolver test-admin-identity test-gateway-failover test-ipv6 test-graceful-restart test-client-daemon test-peer-to-peer test-standard-masque test-apple-ffi test-apple test-service-user test-windows-cross test-native-firewall test-server-web \
 	verify-wintun vet
@@ -170,6 +170,21 @@ test-apple: build-apple
 	swift test --package-path apple
 	cd apple && xcodebuild -quiet -scheme PortaKit -destination 'generic/platform=iOS' \
 		-derivedDataPath build/derived build
+
+# macOS with Xcode and XcodeGen (brew install xcodegen): generates
+# apple/App/Porta.xcodeproj for the iOS and macOS apps.
+apple-project:
+	printf 'MARKETING_VERSION = %s\n' "$$(cat internal/buildinfo/VERSION)" >apple/App/Config/Version.xcconfig
+	cd apple/App && xcodegen generate --quiet
+
+# Builds both apps and their tunnel extensions without signing.
+build-apple-apps: build-apple apple-project
+	for scheme in Porta-iOS Porta-macOS; do \
+		platform=$${scheme#Porta-}; \
+		xcodebuild -quiet -project apple/App/Porta.xcodeproj -scheme "$$scheme" \
+			-destination "generic/platform=$$platform" -derivedDataPath apple/build/apps \
+			CODE_SIGNING_ALLOWED=NO build || exit 1; \
+	done
 
 test-client-daemon:
 	$(CARGO) build --manifest-path $(RUST_MANIFEST) \
