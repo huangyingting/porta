@@ -237,6 +237,40 @@ whole answer set if any address is private or reserved. Downstream response
 writes are coalesced up to 128 KiB or two milliseconds before a protocol flush;
 the final partial buffer is flushed when the copy direction completes.
 
+## Device identity and attestation
+
+Each native client holds one ECDSA P-256 key and signs every tunnel request
+with it, alongside the account token. The device ID is the key's public-key
+fingerprint, so an account's device limit and enrollment policy count keys,
+and a copied token alone cannot become a new device on an account that
+requires approval. See [automatic device identity](clients.md#automatic-device-identity).
+
+A gateway cannot tell from a signature whether the key lives in secure
+hardware, so devices can prove it once enrolled
+([endpoints](endpoints.md#device-attestation)):
+
+- **Android** generates the key with key attestation and sends the
+  certificate chain. The gateway verifies it to Google's attestation roots
+  and checks Google's revocation list, fetched at startup and daily. It then
+  reads the leaf's key description and requires that the attestation and the
+  key both live in the TEE or StrongBox, that the key was generated there
+  rather than imported, and that it belongs to the Porta app.
+- **TPM** devices (Windows, and Linux with `--hardware-key`) send the
+  TPM's endorsement key, its certificate and the device key's public area.
+  The gateway checks the certificate chain to a TPM vendor root, then
+  encrypts a random secret to the endorsement key with `TPM2_MakeCredential`,
+  bound to the device key's name. Only that TPM, with that exact key loaded,
+  recovers it with `TPM2_ActivateCredential`. The name covers the key's
+  attributes, which say it was generated in the TPM and cannot leave it.
+  Challenges expire after five minutes and are answered once.
+
+The verdict (platform, level, vendor and time) is stored with the device. An
+account with **Require hardware-protected devices** refuses enrolled devices
+without one, with a reason the client shows, so a client proves its key and
+connects again. Federated replicas show the primary's verdicts. Neither chain
+is a TLS chain, so the gateway verifies each signature to a configured
+anchor directly instead of using the TLS verifier.
+
 ## Cascade relays
 
 With `--upstream`, a gateway is a relay: it joins the next-hop gateway as an
@@ -287,6 +321,26 @@ the token or enrollment on the next hop recovers without a restart. While it
 is down, policy routing still selects `porta-up0` and the daemon drops what it
 reads, so traffic never falls back to the relay's physical route. The relay's
 own traffic, including its tunnel to the next hop, is not policy-routed.
+
+## Transport relays
+
+A [transport relay](deployment.md#transport-relays) is not a gateway: it is
+an nftables DNAT and masquerade rule set on another host
+(`scripts/relay.sh`) that forwards the tunnel port's TCP and UDP flows to the
+gateway unchanged. It holds no tokens or keys and sees only TLS and QUIC.
+
+```text
+client --TLS/QUIC to the gateway's name--> relay IP:port --NAT--> gateway
+```
+
+A profile with a relay address keeps the gateway's URL. The client dials the
+relay for every attempt and reconnect, over HTTP/3 and HTTP/2, while still
+sending the gateway's name and verifying its certificate. A relay can
+therefore pass traffic along but cannot impersonate the gateway. The client
+never falls back to dialing the gateway directly, and its leak guard exempts
+only the relay endpoint. A relay reaches one gateway, so a relayed profile
+has no backup gateways. The gateway sees every relayed client at the relay's
+address, so per-address limits apply to the relay as a whole.
 
 ## Transport behavior
 
@@ -372,6 +426,25 @@ and discards stale queued packets when replacement is required. Initial DNS and 
 outside the guard. Recovery journals allow crash restart without physical DNS,
 but cannot discover previously unknown hostname addresses while protected.
 
+## Captive network sign-in
+
+Captive networks hold every connection until the user signs in on a web
+page, which the leak guard blocks. The desktop clients (`captive.rs`) detect
+this when the gateway's TLS handshake fails while protection is active: the
+network is answering in the gateway's place with its own certificate. They
+then report **Network sign-in required** and keep retrying instead of
+treating the failure as terminal.
+
+On request, a sign-in pause removes the guard, routes and DNS for up to five
+minutes (`SIGN_IN_PAUSE`). Every five seconds the client probes each
+gateway endpoint with a TLS handshake verified like the tunnel's. It
+reconnects as soon as one presents the gateway's own certificate, or when
+the pause ends. The pause can also end early with a reconnect, or with a
+disconnect that does not reconnect. On Linux the desktop app asks the root
+service for the pause with the `sign_in_network` control command. Traffic
+during the pause is not protected by the tunnel. Android and Apple platforms
+detect captive networks themselves and show the sign-in page outside the VPN.
+
 ## Native HTTP/2 fallback
 
 The native fallback uses the private media type
@@ -396,15 +469,11 @@ isolated transport patches:
 1. **IPv6 across relays:** carry IPv6 through cascade next hops and named
    exits, which today stay IPv4-only. Gateways otherwise lease IPv6 addresses
    that mirror the IPv4 leases (see [IPv6](deployment.md#ipv6-dual-stack)).
-2. **Split routing:** authenticate server-defined route policy, advertise only
-   authorized prefixes, configure platform-specific route exclusions, and
-   define DNS behavior for included and excluded destinations.
-3. **Clustered high availability:** gateways restart in place without
+2. **Clustered high availability:** gateways restart in place without
    dropping their sockets or interfaces, and federated gateways with
    multi-gateway profiles give active/standby redundancy. Keeping a device's
    address across hosts needs a shared lease control plane, coordinated
    session ownership, and a packet-routing layer that delivers return traffic
    to the instance holding each live tunnel. Sharing the JSON lease file
    between independent servers is not sufficient.
-QUIC connection migration, policy management, and a control-plane API remain
-future work.
+QUIC connection migration and a control-plane API remain future work.

@@ -5,6 +5,43 @@ Porta is a dual-stack VPN and authenticated HTTPS forward proxy built on MASQUE
 the same port, with clients for Linux, Windows, and Android, and the
 [PortaKit](apple/README.md) foundation for macOS and iOS apps.
 
+<p>
+<img src="docs/images/desktop-connected.png" alt="Porta for Windows, connected" height="420">
+<img src="docs/images/android-connected.png" alt="Porta for Android, connected" height="420">
+</p>
+
+![Porta Control, the gateway's admin console](docs/images/admin-devices.png)
+
+New to Porta? The [user manual](docs/user-manual.md) shows how to install
+and connect each client, and the [administrator guide](docs/admin-guide.md)
+walks through the admin console.
+
+## Features
+
+- **Tunnels:** a full or split VPN over MASQUE `CONNECT-IP`, HTTP/3 first with
+  automatic fallback to HTTP/2 on the same port, automatic MTU selection,
+  IPv4 and IPv6, and an authenticated HTTPS forward proxy.
+- **Clients:** desktop apps for Windows and Linux with a tray and live
+  traffic, command-line clients for Linux and Windows, and an Android app
+  with QR setup and per-app tunnelling, in English and Simplified Chinese.
+- **Leak protection:** clients block traffic outside the tunnel while
+  connecting, reconnecting and after errors, and let users sign in to hotel
+  and airport Wi-Fi briefly.
+- **Accounts and devices:** one token per person or team, per-device keys,
+  device limits, approval of new devices, hardware-protected keys
+  (Android key attestation and TPM), expiry dates, monthly quotas and speed
+  limits.
+- **Onboarding:** private access links and QR codes, a downloads portal, and
+  sign-in with your organisation through OpenID Connect.
+- **Administration:** a web console with owner, operator and viewer roles,
+  two-factor authentication, single sign-on and an audit log.
+- **Networks:** access policies, a built-in DNS resolver, subnet routing,
+  client-to-client traffic with direct peer-to-peer paths, multi-hop relays,
+  named exits, transport relays and several gateways per account.
+- **Operations:** one-command deployment with Let's Encrypt, in-place
+  restarts and upgrades that clients reconnect from within about a second,
+  backups, Prometheus metrics and alerts, and signed releases.
+
 ## Deploy
 
 Porta can be deployed from either:
@@ -232,6 +269,8 @@ for fallback, IPv4 handling, and nested-VPN limits.
 
 ## Documentation
 
+- [User manual](docs/user-manual.md)
+- [Administrator guide](docs/admin-guide.md)
 - [Production deployment](docs/deployment.md)
 - [Operations: monitoring, backups, upgrades](docs/operations.md)
 - [Client guide](docs/clients.md)

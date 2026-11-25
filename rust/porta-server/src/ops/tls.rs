@@ -302,6 +302,14 @@ mod tests {
         (cert.pem(), signing_key.serialize_pem())
     }
 
+    /// Replaces a file the way certificate tooling does, with a rename, so the
+    /// change is visible even when the length and modification time match.
+    fn replace(path: &Path, contents: impl AsRef<[u8]>) {
+        let staged = path.with_extension("new");
+        std::fs::write(&staged, contents).unwrap();
+        std::fs::rename(&staged, path).unwrap();
+    }
+
     #[test]
     fn records_the_served_certificate_expiry_once_per_certificate() {
         let mut params = rcgen::CertificateParams::new(vec!["vpn.example".to_owned()]).unwrap();
@@ -365,13 +373,13 @@ mod tests {
         assert!(!resolver.reload_if_changed().unwrap());
 
         let (certificate, private_key) = generate("second.example");
-        std::fs::write(&certificate_path, certificate).unwrap();
-        std::fs::write(&private_key_path, private_key).unwrap();
+        replace(&certificate_path, certificate);
+        replace(&private_key_path, private_key);
         assert!(resolver.reload_if_changed().unwrap());
         let second = resolver.current.load().cert[0].as_ref().to_vec();
         assert_ne!(first, second);
 
-        std::fs::write(&certificate_path, "invalid certificate").unwrap();
+        replace(&certificate_path, "invalid certificate");
         assert!(resolver.reload_if_changed().is_err());
         assert_eq!(resolver.current.load().cert[0].as_ref(), second);
     }
